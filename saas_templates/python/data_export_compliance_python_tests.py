@@ -1,10 +1,15 @@
+# Tests updated with the fix 2026-11-03: timezone-aware UTC times, always written with a Z (_iso_z), even for the naive values
+#   SQLite returns; SQLAlchemy 2's declarative_base; the e-mail comes from the user's profile.
+# Why: the suite failed on CI (it was listed in ci/baseline.json). Fixed by a free model from a
+# continuity handoff, then reviewed by Claude. 2026-11-03, session c6ee9a72.
+# Touches: the database, outgoing e-mail (mocked in tests).
 import unittest
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import Mock, patch, MagicMock, ANY
 import uuid
 import json
 import csv
 import io
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import boto3
 from moto import mock_s3
 from sqlalchemy import create_engine
@@ -45,7 +50,8 @@ class TestComplianceManager(unittest.TestCase):
         self.audit_logger = Mock()
         self.export_user_data_func = Mock()
         self.cascade_delete_func = Mock()
-        self.background_task_runner = Mock(side_effect=lambda func, *args, **kwargs: func(*args, **kwargs))
+        # Background task runner that captures calls but doesn't execute them
+        self.background_task_runner = Mock()
         
         # Initialize compliance manager
         self.compliance = ComplianceManager(
@@ -121,8 +127,11 @@ class TestComplianceManager(unittest.TestCase):
             details={'export_id': str(export_id), 'format': 'json'}
         )
         
-        # Check background task was called
+        # Check background task was scheduled
         self.background_task_runner.assert_called()
+        args, kwargs = self.background_task_runner.call_args
+        self.assertEqual(args[0], self.compliance._process_export)
+        self.assertEqual(args[1], export_id)
     
     def test_export_csv_format(self):
         result = self.compliance.request_data_export(self.test_user_id, 'csv')
@@ -140,13 +149,14 @@ class TestComplianceManager(unittest.TestCase):
     
     def test_export_processing(self):
         export_id = uuid.uuid4()
+        requested_at = datetime.now(timezone.utc)
         export_request = ExportRequest(
             id=export_id,
             user_id=self.test_user_id,
-            requested_at=datetime.utcnow(),
+            requested_at=requested_at,
             status=ExportRequestStatus.PENDING,
             format='json',
-            expires_at=datetime.utcnow() + timedelta(days=7)
+            expires_at=requested_at + timedelta(days=7)
         )
         self.db_session.add(export_request)
         self.db_session.commit()
@@ -179,12 +189,12 @@ class TestComplianceManager(unittest.TestCase):
         self.audit_logger.assert_any_call(
             action='data_export_completed',
             user_id=self.test_user_id,
-            details={'export_id': str(export_id), 'file_url': unittest.mock.ANY}
+            details={'export_id': str(export_id), 'file_url': ANY}
         )
     
     def test_export_status(self):
         export_id = uuid.uuid4()
-        requested_at = datetime.utcnow()
+        requested_at = datetime.now(timezone.utc)
         export_request = ExportRequest(
             id=export_id,
             user_id=self.test_user_id,
@@ -249,11 +259,11 @@ class TestComplianceManager(unittest.TestCase):
         deletion_request = DeletionRequest(
             id=deletion_id,
             user_id=self.test_user_id,
-            requested_at=datetime.utcnow(),
+            requested_at=datetime.now(timezone.utc),
             status=DeletionRequestStatus.PENDING,
             reason='gdpr_request',
             confirmation_token=confirmation_token,
-            will_delete_at=datetime.utcnow() + timedelta(days=30)
+            will_delete_at=datetime.now(timezone.utc) + timedelta(days=30)
         )
         self.db_session.add(deletion_request)
         self.db_session.commit()
@@ -280,11 +290,11 @@ class TestComplianceManager(unittest.TestCase):
         deletion_request = DeletionRequest(
             id=deletion_id,
             user_id=self.test_user_id,
-            requested_at=datetime.utcnow(),
+            requested_at=datetime.now(timezone.utc),
             status=DeletionRequestStatus.PENDING,
             reason='gdpr_request',
             confirmation_token='valid_token',
-            will_delete_at=datetime.utcnow() + timedelta(days=30)
+            will_delete_at=datetime.now(timezone.utc) + timedelta(days=30)
         )
         self.db_session.add(deletion_request)
         self.db_session.commit()
@@ -297,11 +307,11 @@ class TestComplianceManager(unittest.TestCase):
         deletion_request = DeletionRequest(
             id=deletion_id,
             user_id=self.test_user_id,
-            requested_at=datetime.utcnow(),
+            requested_at=datetime.now(timezone.utc),
             status=DeletionRequestStatus.APPROVED,  # Already approved
             reason='gdpr_request',
             confirmation_token='token',
-            will_delete_at=datetime.utcnow() + timedelta(days=30)
+            will_delete_at=datetime.now(timezone.utc) + timedelta(days=30)
         )
         self.db_session.add(deletion_request)
         self.db_session.commit()
@@ -314,11 +324,11 @@ class TestComplianceManager(unittest.TestCase):
         deletion_request = DeletionRequest(
             id=deletion_id,
             user_id=self.test_user_id,
-            requested_at=datetime.utcnow(),
+            requested_at=datetime.now(timezone.utc),
             status=DeletionRequestStatus.PENDING,
             reason='gdpr_request',
             confirmation_token='token',
-            will_delete_at=datetime.utcnow() + timedelta(days=30)
+            will_delete_at=datetime.now(timezone.utc) + timedelta(days=30)
         )
         self.db_session.add(deletion_request)
         self.db_session.commit()
@@ -345,11 +355,11 @@ class TestComplianceManager(unittest.TestCase):
         deletion_request = DeletionRequest(
             id=deletion_id,
             user_id=self.test_user_id,
-            requested_at=datetime.utcnow() - timedelta(days=31),
+            requested_at=datetime.now(timezone.utc) - timedelta(days=31),
             status=DeletionRequestStatus.PENDING,
             reason='gdpr_request',
             confirmation_token='token',
-            will_delete_at=datetime.utcnow() - timedelta(days=1)  # Expired
+            will_delete_at=datetime.now(timezone.utc) - timedelta(days=1)  # Expired
         )
         self.db_session.add(deletion_request)
         self.db_session.commit()
@@ -362,11 +372,11 @@ class TestComplianceManager(unittest.TestCase):
         deletion_request = DeletionRequest(
             id=deletion_id,
             user_id=self.test_user_id,
-            requested_at=datetime.utcnow(),
+            requested_at=datetime.now(timezone.utc),
             status=DeletionRequestStatus.COMPLETED,  # Already completed
             reason='gdpr_request',
             confirmation_token='token',
-            will_delete_at=datetime.utcnow() + timedelta(days=30)
+            will_delete_at=datetime.now(timezone.utc) + timedelta(days=30)
         )
         self.db_session.add(deletion_request)
         self.db_session.commit()
@@ -379,26 +389,26 @@ class TestComplianceManager(unittest.TestCase):
         export1 = ExportRequest(
             id=uuid.uuid4(),
             user_id=self.test_user_id,
-            requested_at=datetime.utcnow(),
+            requested_at=datetime.now(timezone.utc),
             status=ExportRequestStatus.COMPLETED,
             format='json',
-            expires_at=datetime.utcnow() + timedelta(days=7)
+            expires_at=datetime.now(timezone.utc) + timedelta(days=7)
         )
         export2 = ExportRequest(
             id=uuid.uuid4(),
             user_id=self.test_user_id,
-            requested_at=datetime.utcnow(),
+            requested_at=datetime.now(timezone.utc),
             status=ExportRequestStatus.PENDING,
             format='csv',
-            expires_at=datetime.utcnow() + timedelta(days=7)
+            expires_at=datetime.now(timezone.utc) + timedelta(days=7)
         )
         export3 = ExportRequest(
             id=uuid.uuid4(),
             user_id=uuid.uuid4(),  # Different user
-            requested_at=datetime.utcnow(),
+            requested_at=datetime.now(timezone.utc),
             status=ExportRequestStatus.COMPLETED,
             format='json',
-            expires_at=datetime.utcnow() + timedelta(days=7)
+            expires_at=datetime.now(timezone.utc) + timedelta(days=7)
         )
         self.db_session.add_all([export1, export2, export3])
         self.db_session.commit()
@@ -426,29 +436,29 @@ class TestComplianceManager(unittest.TestCase):
         deletion1 = DeletionRequest(
             id=uuid.uuid4(),
             user_id=self.test_user_id,
-            requested_at=datetime.utcnow(),
+            requested_at=datetime.now(timezone.utc),
             status=DeletionRequestStatus.PENDING,
             reason='gdpr_request',
             confirmation_token='token1',
-            will_delete_at=datetime.utcnow() + timedelta(days=30)
+            will_delete_at=datetime.now(timezone.utc) + timedelta(days=30)
         )
         deletion2 = DeletionRequest(
             id=uuid.uuid4(),
             user_id=self.test_user_id,
-            requested_at=datetime.utcnow(),
+            requested_at=datetime.now(timezone.utc),
             status=DeletionRequestStatus.APPROVED,
             reason='user_requested',
             confirmation_token='token2',
-            will_delete_at=datetime.utcnow() + timedelta(days=30)
+            will_delete_at=datetime.now(timezone.utc) + timedelta(days=30)
         )
         deletion3 = DeletionRequest(
             id=uuid.uuid4(),
             user_id=uuid.uuid4(),  # Different user
-            requested_at=datetime.utcnow(),
+            requested_at=datetime.now(timezone.utc),
             status=DeletionRequestStatus.PENDING,
             reason='other',
             confirmation_token='token3',
-            will_delete_at=datetime.utcnow() + timedelta(days=30)
+            will_delete_at=datetime.now(timezone.utc) + timedelta(days=30)
         )
         self.db_session.add_all([deletion1, deletion2, deletion3])
         self.db_session.commit()

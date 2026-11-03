@@ -1,3 +1,8 @@
+# Repaired 2026-11-03: uses the stripe package's current error classes and timezone-aware UTC times
+#   (datetime.utcnow is deprecated).
+# Why: the suite failed on CI (it was listed in ci/baseline.json). Fixed by a free model from a
+# continuity handoff, then reviewed by Claude. 2026-11-03, session c6ee9a72.
+# Touches: Stripe API (mocked in tests), SQLite.
 import os
 import json
 import time
@@ -6,6 +11,7 @@ import sqlite3
 from typing import Any, Dict, Optional
 
 import stripe
+from stripe import SignatureVerificationError, StripeError
 
 # Stripe configuration
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY", "")
@@ -63,7 +69,7 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 """
 
 def iso_now() -> str:
-    return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return datetime.datetime.now(datetime.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 class Database:
     def __init__(self, db_path: str = ":memory:"):
@@ -107,7 +113,7 @@ class BillingSystem:
                 customer=customer_id,
                 items=[{"price": PRICE_IDS[tier]}],
             )
-        except stripe.error.StripeError as e:
+        except StripeError as e:
             return {"error": "stripe_error", "message": str(e)}
 
         created_at = iso_now()
@@ -134,9 +140,9 @@ class BillingSystem:
                 "stripe_sub_id": stripe_sub.id,
             },
         )
-        next_billing_date = datetime.datetime.utcfromtimestamp(
-            stripe_sub.current_period_end
-        ).isoformat() + "Z"
+        next_billing_date = datetime.datetime.fromtimestamp(
+            stripe_sub.current_period_end, datetime.UTC
+        ).isoformat().replace("+00:00", "Z")
 
         return {
             "success": True,
@@ -164,7 +170,7 @@ class BillingSystem:
                 items=[{"price": PRICE_IDS[new_tier]}],
                 proration_behavior="create_prorations",
             )
-        except stripe.error.StripeError as e:
+        except StripeError as e:
             return {"error": "stripe_error", "message": str(e)}
 
         proration_credit = 0
@@ -192,9 +198,9 @@ class BillingSystem:
                 "proration_credits": proration_credit,
             },
         )
-        effective_date = datetime.datetime.utcfromtimestamp(
-            stripe_sub.current_period_start
-        ).isoformat() + "Z"
+        effective_date = datetime.datetime.fromtimestamp(
+            stripe_sub.current_period_start, datetime.UTC
+        ).isoformat().replace("+00:00", "Z")
 
         return {
             "success": True,
@@ -248,7 +254,7 @@ class BillingSystem:
             event = stripe.Webhook.construct_event(
                 payload, sig_header, webhook_secret
             )
-        except stripe.error.SignatureVerificationError:
+        except SignatureVerificationError:
             return {"error": "invalid_signature", "message": "Invalid signature."}
         except Exception as e:
             return {"error": "invalid_payload", "message": str(e)}

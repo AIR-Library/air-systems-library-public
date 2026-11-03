@@ -1,9 +1,13 @@
+# Repaired 2026-11-03: timezone-aware UTC times (datetime.utcnow is deprecated).
+# Why: the suite failed on CI (it was listed in ci/baseline.json). Fixed by a free model from a
+# continuity handoff, then reviewed by Claude. 2026-11-03, session c6ee9a72.
+# Touches: SQLite, SMTP and SMS (mocked in tests).
 import json
 import smtplib
 import sqlite3
 import threading
 import time
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime, time as dtime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Any, Dict, List, Optional, Tuple
@@ -122,7 +126,7 @@ DEFAULT_TEMPLATES = [
 
 # ---------- Helper Functions ----------
 def _now_iso() -> str:
-    return datetime.utcnow().isoformat() + "Z"
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 def _parse_time(t_str: str) -> dtime:
     return datetime.strptime(t_str, "%H:%M").time()
@@ -265,13 +269,13 @@ class NotificationService:
             return {"success": True, "message_id": None, "status": "skipped"}
 
         # Quiet hours check
-        now_time = datetime.utcnow().time()
+        now_time = datetime.now(timezone.utc).time()
         if _in_quiet_hours(
             pref["quiet_hours_start"], pref["quiet_hours_end"], now_time
         ):
             # Queue for end of quiet hours
             end_time = _parse_time(pref["quiet_hours_end"])
-            today = datetime.utcnow().date()
+            today = datetime.now(timezone.utc).date()
             if pref["quiet_hours_start"] > pref["quiet_hours_end"]:  # wraps midnight
                 # End is tomorrow
                 target_dt = datetime.combine(today + timedelta(days=1), end_time)

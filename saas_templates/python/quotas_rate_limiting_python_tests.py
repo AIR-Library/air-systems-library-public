@@ -1,3 +1,7 @@
+# Tests updated with the fix 2026-11-03: the tests use the spec's storage units.
+# Why: the suite failed on CI (it was listed in ci/baseline.json). Fixed by a free model from a
+# continuity handoff, then reviewed by Claude. 2026-11-03, session c6ee9a72.
+# Touches: SQLite only.
 """
 quotas_rate_limiting_python_tests.py
 
@@ -182,7 +186,7 @@ class TestStorageQuota(TestQuotaEngineBase):
         """Team tier allows 100 GB storage."""
         user = User(user_id="s3", tier="team", ip="10.0.0.12")
 
-        # Simulate 99 GB used
+        # Simulate 99 GB used (decimal GB, matching the spec's 100e9 limit)
         month = self.engine._current_month()
         conn = self.engine._get_conn()
         conn.execute(
@@ -190,12 +194,12 @@ class TestStorageQuota(TestQuotaEngineBase):
             INSERT INTO usage_metrics (user_id, month, call_count, storage_bytes, updated_at)
             VALUES (?, ?, 0, ?, ?)
             """,
-            ("s3", month, 99 * 1024 * 1024 * 1024, datetime.now(timezone.utc).isoformat()),
+            ("s3", month, 99 * 1_000_000_000, datetime.now(timezone.utc).isoformat()),
         )
         conn.commit()
 
         # Upload 1 GB (total 100 GB, exactly at limit)
-        file_size = 1024 * 1024 * 1024
+        file_size = 1_000_000_000
         decision = self.engine.check_request(user, endpoint="/v1/upload", incoming_file_size=file_size)
         self.assertTrue(decision.allowed)
 
@@ -231,9 +235,11 @@ class TestRateLimitPerUser(TestQuotaEngineBase):
         """✓ rate_limit_per_user PASS → < 100/min allowed"""
         user = User(user_id="r1", tier="solo", ip="10.0.0.20")
 
-        # Record 50 API calls
+        # Record 50 API calls, each from a different IP so the per-IP
+        # rate limit (10/sec) does not fire before the per-user check.
         for i in range(50):
-            self.engine.record_api_call(user, endpoint=f"/v1/data/{i}", status_code=200)
+            call_user = User(user_id="r1", tier="solo", ip=f"10.0.1.{i}")
+            self.engine.record_api_call(call_user, endpoint=f"/v1/data/{i}", status_code=200)
 
         # 51st call should pass
         decision = self.engine.check_request(user, endpoint="/v1/data/50")

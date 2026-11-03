@@ -1,18 +1,26 @@
+# Repaired 2026-11-03: an in-memory logger keeps one connection, so every call sees the same database (each call
+#   used to open a new, empty one).
+# Why: the suite failed on CI (it was listed in ci/baseline.json). Fixed by a free model from a
+# continuity handoff, then reviewed by Claude. 2026-11-03, session c6ee9a72.
+# Touches: SQLite only.
 import sqlite3
 import json
 import uuid
 import datetime
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, List
 
 class AuditLogger:
     def __init__(self, db_path: str = ":memory:"):
         self.db_path = db_path
+        # One shared connection so every call reaches the same store.
+        # With ":memory:" databases, sqlite3.connect(":memory:") creates a NEW
+        # empty database on every call.
+        self.conn = sqlite3.connect(db_path)
+        self.conn.row_factory = sqlite3.Row
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+        return self.conn
 
     def _init_db(self) -> None:
         with self._get_connection() as conn:
@@ -38,18 +46,20 @@ class AuditLogger:
                 ON audit_log(actor_id, action, resource_type, timestamp);
             """)
             # Immutability Triggers
+            # Using RAISE(ABORT, ...) ensures a sqlite3.IntegrityError is raised,
+            # which is the standard behavior for constraint/trigger violations in Python's sqlite3.
             conn.execute("""
                 CREATE TRIGGER IF NOT EXISTS audit_log_no_update
                 BEFORE UPDATE ON audit_log
                 BEGIN
-                    SELECT RAISE(FAIL, 'Audit logs are immutable and cannot be updated.');
+                    SELECT RAISE(ABORT, 'Audit logs are immutable and cannot be updated.');
                 END;
             """)
             conn.execute("""
                 CREATE TRIGGER IF NOT EXISTS audit_log_no_delete
                 BEFORE DELETE ON audit_log
                 BEGIN
-                    SELECT RAISE(FAIL, 'Audit logs are immutable and cannot be deleted.');
+                    SELECT RAISE(ABORT, 'Audit logs are immutable and cannot be deleted.');
                 END;
             """)
             conn.commit()
