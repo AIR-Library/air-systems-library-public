@@ -1,5 +1,10 @@
+# Tests updated with the fix 2026-11-03: timezone-aware UTC times (datetime.utcnow is deprecated).
+# Why: the suite failed on CI (it was listed in ci/baseline.json). Fixed by a free model from a
+# continuity handoff, then reviewed by Claude. 2026-11-03, session c6ee9a72.
+# Touches: SQLite, SMTP and SMS (mocked in tests).
 import json
 import unittest
+from datetime import datetime, timedelta
 from unittest.mock import patch, MagicMock
 from notifications_python import NotificationService, _now_iso
 

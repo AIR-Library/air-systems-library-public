@@ -1,5 +1,13 @@
+# Tests updated with the fix 2026-11-03: users belong to an organization (org_id, ON DELETE CASCADE, foreign keys on), so deleting an
+#   organization removes its users, keys and sessions, as the spec says; each cascade's audit row
+#   is written inside its transaction and kept or rolled back with the delete; counts are per org.
+# Why: the suite failed on CI (it was listed in ci/baseline.json). Fixed by a free model from a
+# continuity handoff, then reviewed by Claude. 2026-11-03, session c6ee9a72.
+# Touches: SQLite only.
+import json
 import pytest
 import time
+from typing import Optional
 from permissions_rbac_python import (
     conn,
     set_current_user,
@@ -10,6 +18,7 @@ from permissions_rbac_python import (
     delete_deployment,
     delete_organization,
     json_error,
+    set_cascade_failure_hook,
 )
 
 
@@ -52,10 +61,14 @@ def reset_db():
     )
     conn.commit()
     set_current_user(None)
+    set_cascade_failure_hook(None)
 
 
-def create_user(username: str, tier: str) -> int:
-    cur = conn.execute("INSERT INTO users (username, tier) VALUES (?, ?)", (username, tier))
+def create_user(username: str, tier: str, org_id: Optional[int] = None) -> int:
+    if org_id is not None:
+        cur = conn.execute("INSERT INTO users (username, tier, org_id) VALUES (?, ?, ?)", (username, tier, org_id))
+    else:
+        cur = conn.execute("INSERT INTO users (username, tier) VALUES (?, ?)", (username, tier))
     conn.commit()
     return cur.lastrowid
 
@@ -136,7 +149,7 @@ def test_cascade_delete_org():
     dep_id = conn.execute(
         "INSERT INTO deployments (org_id, name) VALUES (?, ?)", (org_id, "DepA")
     ).lastrowid
-    user_id = create_user("frank", "member")
+    user_id = create_user("frank", "member", org_id=org_id)
     conn.execute("INSERT INTO sessions (user_id, token) VALUES (?, ?)", (user_id, "tok2"))
     conn.execute("INSERT INTO api_keys (user_id, key) VALUES (?, ?)", (user_id, "key2"))
     conn.commit()
@@ -146,31 +159,44 @@ def test_cascade_delete_org():
     # Verify organization and its deployments are removed
     assert conn.execute("SELECT COUNT(*) FROM organizations WHERE id=?", (org_id,)).fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM deployments WHERE org_id=?", (org_id,)).fetchone()[0] == 0
-    # Users are NOT automatically removed by the current implementation; ensure they still exist
-    assert conn.execute("SELECT COUNT(*) FROM users WHERE id=?", (user_id,)).fetchone()[0] == 1
-    # Sessions and API keys for the user should still exist (since user wasn't deleted)
-    assert conn.execute("SELECT COUNT(*) FROM sessions WHERE user_id=?", (user_id,)).fetchone()[0] == 1
-    assert conn.execute("SELECT COUNT(*) FROM api_keys WHERE user_id=?", (user_id,)).fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM users WHERE id=?", (user_id,)).fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM sessions WHERE user_id=?", (user_id,)).fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM api_keys WHERE user_id=?", (user_id,)).fetchone()[0] == 0
 
 
 def test_cascade_on_error_rollback():
-    # Force an error during user deletion to test transaction rollback
-    original_execute = conn.execute
-
-    def failing_execute(*args, **kwargs):
-        if "DELETE FROM users" in args[0]:
+    def failing_hook(table: str):
+        if table == 'users':
             raise Exception("forced failure")
-        return original_execute(*args, **kwargs)
-
-    conn.execute = failing_execute
+    
+    set_cascade_failure_hook(failing_hook)
     uid = create_user("grace", "member")
     set_current_user({"id": uid, "username": "grace", "tier": "member"})
     resp = delete_user(uid)
     assert resp["error"] == "cascade_failure"
     # Ensure the user was not partially deleted
     assert conn.execute("SELECT COUNT(*) FROM users WHERE id=?", (uid,)).fetchone()[0] == 1
-    # Restore original method
-    conn.execute = original_execute
+    # ... and no audit row claims a cascade that was rolled back
+    assert conn.execute(
+        "SELECT COUNT(*) FROM audit_log WHERE action='user_deleted_cascade' AND user_id=?", (uid,)
+    ).fetchone()[0] == 0
+    set_cascade_failure_hook(None)
+
+
+def test_cascade_delete_is_audited_and_committed():
+    # The cascade's audit row is written in the same transaction as the delete and is committed with it
+    # (2026-11-03: a buffered version lost this row when nothing flushed it).
+    uid = create_user("henry", "member")
+    conn.execute("INSERT INTO sessions (user_id, token) VALUES (?, ?)", (uid, "tok3"))
+    conn.commit()
+    set_current_user({"id": uid, "username": "henry", "tier": "member"})
+    assert delete_user(uid)["status"] == "success"
+    assert not conn.in_transaction
+    row = conn.execute(
+        "SELECT details FROM audit_log WHERE action='user_deleted_cascade' AND user_id=?", (uid,)
+    ).fetchone()
+    assert row is not None
+    assert json.loads(row[0])["sessions"] == 1
 
 
 def test_permission_audit_logged():

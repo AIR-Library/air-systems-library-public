@@ -1,7 +1,12 @@
+# Repaired 2026-11-03: users belong to an organization (org_id, ON DELETE CASCADE, foreign keys on), so deleting an
+#   organization removes its users, keys and sessions, as the spec says; each cascade's audit row
+#   is written inside its transaction and kept or rolled back with the delete; counts are per org.
+# Why: the suite failed on CI (it was listed in ci/baseline.json). Fixed by a free model from a
+# continuity handoff, then reviewed by Claude. 2026-11-03, session c6ee9a72.
+# Touches: SQLite only.
 import sqlite3
 import json
 import time
-import threading
 from contextvars import ContextVar
 from typing import Callable, Any, Dict, Optional
 
@@ -10,15 +15,22 @@ from typing import Callable, Any, Dict, Optional
 DB_PATH = ':memory:'
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 conn.row_factory = sqlite3.Row
+conn.execute('PRAGMA foreign_keys = ON')
 cursor = conn.cursor()
 
 def init_db() -> None:
     """Create all tables required for RBAC and cascade operations."""
     schema = """
+    CREATE TABLE IF NOT EXISTS organizations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT NOT NULL UNIQUE,
-        tier TEXT NOT NULL CHECK(tier IN ('owner','admin','member','public','service'))
+        tier TEXT NOT NULL CHECK(tier IN ('owner','admin','member','public','service')),
+        org_id INTEGER,
+        FOREIGN KEY(org_id) REFERENCES organizations(id) ON DELETE CASCADE
     );
     CREATE TABLE IF NOT EXISTS sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,7 +60,8 @@ def init_db() -> None:
     CREATE TABLE IF NOT EXISTS deployments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         org_id INTEGER NOT NULL,
-        name TEXT NOT NULL
+        name TEXT NOT NULL,
+        FOREIGN KEY(org_id) REFERENCES organizations(id) ON DELETE CASCADE
     );
     CREATE TABLE IF NOT EXISTS dns_records (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,10 +80,6 @@ def init_db() -> None:
         deployment_id INTEGER NOT NULL,
         log TEXT NOT NULL,
         FOREIGN KEY(deployment_id) REFERENCES deployments(id) ON DELETE CASCADE
-    );
-    CREATE TABLE IF NOT EXISTS organizations (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS audit_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,13 +120,17 @@ def audit_log(action: str,
               user_tier: Optional[str] = None,
               decision: Optional[str] = None,
               details: Optional[Dict[str, Any]] = None) -> None:
+    """Write one audit row. Inside an open transaction (a cascade delete) the row joins it, so it is kept or
+    rolled back together with the delete it records; otherwise it is committed at once."""
     ts = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    in_tx = conn.in_transaction
     conn.execute(
         "INSERT INTO audit_log (timestamp, action, user_id, endpoint, required_tier, user_tier, decision, details) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (ts, action, user_id, endpoint, required_tier, user_tier, decision, json.dumps(details) if details else None)
     )
-    conn.commit()
+    if not in_tx:
+        conn.commit()
 
 # Tier hierarchy for checks
 _TIER_RANK = {
@@ -187,6 +200,13 @@ require_authenticated = _permission_decorator("public", "authentication_required
 
 # ---------- Cascade Delete Implementations ----------
 
+# For testing: allow injection of a failure hook
+_cascade_failure_hook: Optional[Callable[[str], None]] = None
+
+def set_cascade_failure_hook(hook: Optional[Callable[[str], None]]) -> None:
+    global _cascade_failure_hook
+    _cascade_failure_hook = hook
+
 def delete_user(user_id: int) -> Dict[str, Any]:
     try:
         conn.execute('BEGIN')
@@ -195,17 +215,21 @@ def delete_user(user_id: int) -> Dict[str, Any]:
         key_cnt = conn.execute('SELECT COUNT(*) FROM api_keys WHERE user_id=?', (user_id,)).fetchone()[0]
         file_cnt = conn.execute('SELECT COUNT(*) FROM files WHERE user_id=?', (user_id,)).fetchone()[0]
         pref_cnt = conn.execute('SELECT COUNT(*) FROM preferences WHERE user_id=?', (user_id,)).fetchone()[0]
-        # Delete user (ON DELETE CASCADE will remove related rows)
+        
+        if _cascade_failure_hook:
+            _cascade_failure_hook('users')
+        
         conn.execute('DELETE FROM users WHERE id=?', (user_id,))
-        conn.execute('COMMIT')
         audit_log(
             action="user_deleted_cascade",
             user_id=user_id,
             details={"sessions": sess_cnt, "keys": key_cnt, "files": file_cnt, "preferences": pref_cnt}
         )
+        conn.execute('COMMIT')
         return {"status": "success"}
     except Exception as e:
-        conn.execute('ROLLBACK')
+        if conn.in_transaction:
+            conn.execute('ROLLBACK')
         return json_error("cascade_failure", str(e), 500)
 
 def delete_deployment(deployment_id: int) -> Dict[str, Any]:
@@ -214,42 +238,45 @@ def delete_deployment(deployment_id: int) -> Dict[str, Any]:
         dns_cnt = conn.execute('SELECT COUNT(*) FROM dns_records WHERE deployment_id=?', (deployment_id,)).fetchone()[0]
         theme_cnt = conn.execute('SELECT COUNT(*) FROM theme_configs WHERE deployment_id=?', (deployment_id,)).fetchone()[0]
         log_cnt = conn.execute('SELECT COUNT(*) FROM deployment_logs WHERE deployment_id=?', (deployment_id,)).fetchone()[0]
-        # Simulate archive to S3 – here we just note it in audit details
+        
+        if _cascade_failure_hook:
+            _cascade_failure_hook('deployments')
+        
         conn.execute('DELETE FROM deployments WHERE id=?', (deployment_id,))
-        conn.execute('COMMIT')
         audit_log(
             action="deployment_deleted_cascade",
             user_id=get_current_user().get('id') if get_current_user() else None,
             details={"dns": dns_cnt, "themes": theme_cnt, "logs": log_cnt, "archived": True}
         )
+        conn.execute('COMMIT')
         return {"status": "success"}
     except Exception as e:
-        conn.execute('ROLLBACK')
+        if conn.in_transaction:
+            conn.execute('ROLLBACK')
         return json_error("cascade_failure", str(e), 500)
 
 def delete_organization(org_id: int) -> Dict[str, Any]:
     try:
         conn.execute('BEGIN')
         dep_cnt = conn.execute('SELECT COUNT(*) FROM deployments WHERE org_id=?', (org_id,)).fetchone()[0]
-        user_cnt = conn.execute('SELECT COUNT(*) FROM users WHERE tier != "service" AND id IN (SELECT user_id FROM sessions WHERE user_id = users.id)')  # placeholder, not accurate but counts all users for demo
-        # For simplicity, count all users linked via deployments (not perfect)
-        user_cnt = conn.execute('SELECT COUNT(DISTINCT user_id) FROM sessions WHERE user_id IN (SELECT id FROM users)')
-        user_cnt = user_cnt.fetchone()[0]
-        key_cnt = conn.execute('SELECT COUNT(*) FROM api_keys WHERE user_id IN (SELECT id FROM users)')
-        key_cnt = key_cnt.fetchone()[0]
-        sess_cnt = conn.execute('SELECT COUNT(*) FROM sessions WHERE user_id IN (SELECT id FROM users)')
-        sess_cnt = sess_cnt.fetchone()[0]
-        # Delete organization (cascades will delete deployments, users, etc.)
+        user_cnt = conn.execute('SELECT COUNT(*) FROM users WHERE org_id=?', (org_id,)).fetchone()[0]
+        key_cnt = conn.execute('SELECT COUNT(*) FROM api_keys WHERE user_id IN (SELECT id FROM users WHERE org_id=?)', (org_id,)).fetchone()[0]
+        sess_cnt = conn.execute('SELECT COUNT(*) FROM sessions WHERE user_id IN (SELECT id FROM users WHERE org_id=?)', (org_id,)).fetchone()[0]
+        
+        if _cascade_failure_hook:
+            _cascade_failure_hook('organizations')
+        
         conn.execute('DELETE FROM organizations WHERE id=?', (org_id,))
-        conn.execute('COMMIT')
         audit_log(
             action="org_deleted_cascade",
             user_id=get_current_user().get('id') if get_current_user() else None,
             details={"deployments": dep_cnt, "users": user_cnt, "api_keys": key_cnt, "sessions": sess_cnt}
         )
+        conn.execute('COMMIT')
         return {"status": "success"}
     except Exception as e:
-        conn.execute('ROLLBACK')
+        if conn.in_transaction:
+            conn.execute('ROLLBACK')
         return json_error("cascade_failure", str(e), 500)
 
 # ---------- Example Endpoints (for testing) ----------

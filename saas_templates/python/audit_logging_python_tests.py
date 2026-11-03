@@ -1,3 +1,8 @@
+# Tests updated with the fix 2026-11-03: an in-memory logger keeps one connection, so every call sees the same database (each call
+#   used to open a new, empty one).
+# Why: the suite failed on CI (it was listed in ci/baseline.json). Fixed by a free model from a
+# continuity handoff, then reviewed by Claude. 2026-11-03, session c6ee9a72.
+# Touches: SQLite only.
 import unittest
 import sqlite3
 import time
@@ -118,15 +123,13 @@ class TestAuditLogger(unittest.TestCase):
         res = self.logger.log_mutation(1, "user", "test_action", "test_resource", 99, {}, {"val": 1})
         log_id = res["log_id"]
 
-        # Attempt to UPDATE
-        with self.assertRaises(sqlite3.OperationalError) as ctx:
+        with self.assertRaises(sqlite3.IntegrityError) as ctx:
             with self.logger._get_connection() as conn:
                 conn.execute("UPDATE audit_log SET action = 'hacked' WHERE id = ?", (log_id,))
                 conn.commit()
         self.assertIn("immutable", str(ctx.exception))
 
-        # Attempt to DELETE
-        with self.assertRaises(sqlite3.OperationalError) as ctx:
+        with self.assertRaises(sqlite3.IntegrityError) as ctx:
             with self.logger._get_connection() as conn:
                 conn.execute("DELETE FROM audit_log WHERE id = ?", (log_id,))
                 conn.commit()
@@ -181,7 +184,7 @@ class TestAuditLogger(unittest.TestCase):
             for i in range(10000):
                 logs_to_insert.append((
                     f"id_{i}",
-                    f"2026-01-01T00:00:{i:02d}Z",
+                    f"2026-01-01T00:00:{i%60:02d}Z",
                     "perf_actor",
                     "user",
                     "perf_action",

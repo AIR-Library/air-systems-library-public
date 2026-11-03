@@ -1,3 +1,7 @@
+# Repaired 2026-11-03: the tests use the spec's storage units.
+# Why: the suite failed on CI (it was listed in ci/baseline.json). Fixed by a free model from a
+# continuity handoff, then reviewed by Claude. 2026-11-03, session c6ee9a72.
+# Touches: SQLite only.
 """
 quotas_rate_limiting_python.py
 

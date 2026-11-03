@@ -1,3 +1,8 @@
+# Repaired 2026-11-03: the device check counts OTHER accounts on the device (a device already tied to this account
+#   no longer passes by itself); the ledger row records its user_id; timezone-aware UTC times.
+# Why: the suite failed on CI (it was listed in ci/baseline.json). Fixed by a free model from a
+# continuity handoff, then reviewed by Claude. 2026-11-03, session c6ee9a72.
+# Touches: SQLite only.
 import sqlite3
 import datetime
 import hashlib
@@ -170,7 +175,7 @@ class TrialAbusePrevention:
 
     # Gate 3: IP_SIGNUP_RATE_LIMIT
     def check_ip_signup_rate_limit(self, ip: str) -> Dict[str, Any]:
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.timezone.utc)
         cutoff = now - datetime.timedelta(hours=24)
         count = self._fetchone(
             """
@@ -200,29 +205,19 @@ class TrialAbusePrevention:
     # Gate 4: DEVICE_FINGERPRINT
     def check_device_fingerprint(self, user_id: int, device: Dict[str, str]) -> Dict[str, Any]:
         device_hash = self._hash_device(device)
-        # Count distinct users with this device_hash
+        # Count distinct OTHER users with this device_hash
         count = self._fetchone(
             """
             SELECT COUNT(DISTINCT user_id) as cnt FROM device_fingerprints
-            WHERE device_hash = ?
+            WHERE device_hash = ? AND user_id != ?
             """,
-            (device_hash,),
+            (device_hash, user_id),
         )
         matching_users = count["cnt"] if count else 0
 
-        # Check if device already belongs to this user
-        own_device = self._fetchone(
-            """
-            SELECT 1 FROM device_fingerprints
-            WHERE user_id = ? AND device_hash = ?
-            """,
-            (user_id, device_hash),
-        )
-        if own_device:
+        if matching_users < 2:
             decision = "PASS"
-        elif matching_users < 2:
-            decision = "PASS"
-        elif 2 <= matching_users <= 5:
+        elif matching_users <= 5:
             decision = "CHALLENGE"
         else:
             decision = "FAIL"
@@ -249,13 +244,18 @@ class TrialAbusePrevention:
             return {"decision": "FAIL", "reason": "user_not_found"}
 
         trial_start = datetime.datetime.fromisoformat(user["trial_started_at"])
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.timezone.utc)
+        # Ensure trial_start is timezone-aware for subtraction
+        if trial_start.tzinfo is None:
+            trial_start = trial_start.replace(tzinfo=datetime.timezone.utc)
         days_elapsed = (now - trial_start).days
 
         payment_added = user["payment_added_date"]
         payment_added_date = (
             datetime.datetime.fromisoformat(payment_added) if payment_added else None
         )
+        if payment_added_date and payment_added_date.tzinfo is None:
+            payment_added_date = payment_added_date.replace(tzinfo=datetime.timezone.utc)
 
         if payment_added_date and payment_added_date > trial_start:
             if days_elapsed < TRIAL_DAYS + 5:
@@ -333,8 +333,8 @@ class TrialAbusePrevention:
             return {"error": "too_many_signups_from_ip", "code": 429, "retry_after": CHALLENGE_RETRY_AFTER}
 
         # Create user record
-        now = datetime.datetime.utcnow().isoformat()
-        self._execute(
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        cur = self._execute(
             """
             INSERT INTO trial_abuse_ledger
             (email, ip, signup_date, trial_started_at, subscription_status, gate_flags)
@@ -349,7 +349,12 @@ class TrialAbusePrevention:
                 json.dumps({"email": email_gate["decision"], "ip": ip_gate["decision"]}),
             ),
         )
-        user_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        user_id = cur.lastrowid
+        # Set user_id column to match the primary key id
+        self._execute(
+            "UPDATE trial_abuse_ledger SET user_id = ? WHERE id = ?",
+            (user_id, user_id),
+        )
 
         # Record signup for IP rate limiting
         self._execute(
@@ -407,7 +412,7 @@ class TrialAbusePrevention:
         if chargeback_gate["decision"] == "FAIL":
             return {"error": "chargeback_history_requires_prepayment", "code": 403}
 
-        now = datetime.datetime.utcnow().isoformat()
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         # Update ledger
         self._execute(
             """
