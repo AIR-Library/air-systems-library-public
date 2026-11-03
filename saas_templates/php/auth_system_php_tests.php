@@ -1,6 +1,12 @@
 <?php
+// Tests updated with the fix 2026-10-08: the token secret comes from AUTH_JWT_SECRET (it was hard-coded), MFA codes are really
+//   checked (any code was accepted), and sign-up/login limits live in the database (static arrays
+//   reset on every request).
+// Why: the suite failed on CI (it was listed in ci/baseline.json). Reviewed by Claude; session c6ee9a72 (2026-11-03).
+// Touches: the database, the AUTH_JWT_SECRET environment variable.
 declare(strict_types=1);
 require_once 'auth_system_php.php';
+putenv('AUTH_JWT_SECRET=' . bin2hex(random_bytes(32)));
 
 class TestRunner {
     private int $passed = 0;
@@ -37,6 +43,7 @@ class TestRunner {
     private function resetDB(): void {
         $db = Database::get();
         $db->exec('DELETE FROM users');
+        $db->exec('DELETE FROM auth_attempts');
         $db->exec('DELETE FROM sessions');
         $db->exec('DELETE FROM audit_log');
         $db->exec('DELETE FROM verification_codes');
@@ -73,7 +80,7 @@ class TestRunner {
         $this->resetDB();
         $signup = AuthSystem::signup('verify@example.com','StrongPassword123456','Name');
         $db = Database::get();
-        $stmt = $db->prepare('SELECT code FROM verification_codes WHERE type="email"');
+        $stmt = $db->prepare('SELECT code FROM verification_codes WHERE type=\'email\'');
         $stmt->execute();
         $code = $stmt->fetchColumn();
         $res = AuthSystem::verify_email('verify@example.com',$code);
@@ -84,7 +91,7 @@ class TestRunner {
         $this->resetDB();
         $signup = AuthSystem::signup('expire@example.com','StrongPassword123456','Name');
         $db = Database::get();
-        $stmt = $db->prepare('SELECT id FROM verification_codes WHERE type="email"');
+        $stmt = $db->prepare('SELECT id FROM verification_codes WHERE type=\'email\'');
         $stmt->execute();
         $id = $stmt->fetchColumn();
         // Expire it
@@ -118,7 +125,7 @@ class TestRunner {
         // Verify email
         $stmt = $db->prepare('UPDATE users SET email_verified_at=?,mfa_enabled=1,mfa_secret=? WHERE id=?');
         $secret = 'JBSWY3DPEHPK3PXP'; // base32
-        $stmt->execute([AuthSystem::now(),1,$secret,$userId]);
+        $stmt->execute([AuthSystem::now(),$secret,$userId]);
         $res = AuthSystem::login('mfa@example.com','StrongPassword123456','device1','127.0.0.1');
         $this->assertEqual($res['status_code'],202,'mfa required status');
         $this->assertEqual($res['body']['status'],'mfa_required','mfa required text');
@@ -164,7 +171,7 @@ class TestRunner {
         $userId = $stmt->fetchColumn();
         $stmt = $db->prepare('UPDATE users SET email_verified_at=?,mfa_enabled=1,mfa_secret=? WHERE id=?');
         $secret = 'JBSWY3DPEHPK3PXP';
-        $stmt->execute([AuthSystem::now(),1,$secret,$userId]);
+        $stmt->execute([AuthSystem::now(),$secret,$userId]);
         // Create challenge
         $challenge_id = AuthSystem::randomString(32);
         $expires = gmdate('c', time()+300);
@@ -184,7 +191,7 @@ class TestRunner {
         $userId = $stmt->fetchColumn();
         $stmt = $db->prepare('UPDATE users SET email_verified_at=?,mfa_enabled=1,mfa_secret=? WHERE id=?');
         $secret = 'JBSWY3DPEHPK3PXP';
-        $stmt->execute([AuthSystem::now(),1,$secret,$userId]);
+        $stmt->execute([AuthSystem::now(),$secret,$userId]);
         $challenge_id = AuthSystem::randomString(32);
         $expires = gmdate('c', time()+300);
         $stmt = $db->prepare('INSERT INTO verification_codes (id,user_id,code,created_at,expires_at,type) VALUES (?,?,?,?,?,?)');
@@ -218,7 +225,7 @@ class TestRunner {
         $stmt = $db->prepare('SELECT id FROM users');
         $stmt->execute();
         $userId = $stmt->fetchColumn();
-        $stmt = $db->prepare('UPDATE users SET email_verified_at=?,status="banned" WHERE id=?');
+        $stmt = $db->prepare('UPDATE users SET email_verified_at=?,status=\'banned\' WHERE id=?');
         $stmt->execute([AuthSystem::now(),$userId]);
         $login = AuthSystem::login('ban@example.com','StrongPassword123456','device1','127.0.0.1');
         $session_id = $login['body']['session_id'];

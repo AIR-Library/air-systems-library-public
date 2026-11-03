@@ -1,10 +1,16 @@
 <?php
+// Tests updated with the fix 2026-11-03: events go only to the sending organization's endpoints (they went to every organization's),
+//   the event type is a bound parameter (it was pasted into the SQL), and deliver() takes an
+//   optional sender so it can be tested without the network.
+// Why: the suite failed on CI (it was listed in ci/baseline.json). Reviewed by Claude; fixed by a free model from a continuity handoff, session c6ee9a72 (2026-11-03).
+// Touches: the database, outgoing HTTPS (curl).
 
 declare(strict_types=1);
 
 require_once __DIR__ . '/webhooks_php.php';
 
 use Webhooks\Webhooks;
+use function Webhooks\verify_webhook;
 use PDO;
 use RuntimeException;
 
@@ -39,6 +45,11 @@ class WebhooksTest
         $this->assert($expected === $actual, "$message (expected: " . var_export($expected, true) . ", got: " . var_export($actual, true) . ")");
     }
 
+    private function assertNotEquals(mixed $expected, mixed $actual, string $message): void
+    {
+        $this->assert($expected !== $actual, "$message (should not equal: " . var_export($expected, true) . ")");
+    }
+
     public function run(): void
     {
         $this->testSecretGeneration();
@@ -64,7 +75,7 @@ class WebhooksTest
 
     private function testSecretGeneration(): void
     {
-        $result = $this->webhooks->createEndpoint('org1', 'https://example.com/webhook', ['user.created']);
+        $result = $this->webhooks->createEndpoint('org_secret_gen', 'https://example.com/webhook', ['user.created']);
         $this->assert(str_starts_with($result['secret'], 'whsec_'), 'Secret starts with whsec_');
         $decoded = base64_decode(substr($result['secret'], 6), true);
         $this->assert($decoded !== false, 'Secret is valid base64');
@@ -172,44 +183,49 @@ class WebhooksTest
 
     private function testCreateEndpoint(): void
     {
-        $result = $this->webhooks->createEndpoint('org1', 'https://example.com/webhook', ['user.created', 'user.updated']);
+        $result = $this->webhooks->createEndpoint('org_create_ep', 'https://example.com/webhook', ['user.created', 'user.updated']);
         $this->assert(!empty($result['id']), 'Returns ID');
         $this->assert(str_starts_with($result['id'], 'wep_'), 'ID has correct prefix');
 
         try {
-            $this->webhooks->createEndpoint('org1', 'http://invalid.com', ['test']);
+            $this->webhooks->createEndpoint('org_create_ep', 'http://invalid.com', ['test']);
             $this->assert(false, 'Should reject non-HTTPS');
         } catch (InvalidArgumentException) {
             $this->assert(true, 'Rejects non-HTTPS URL');
         }
 
-        $result2 = $this->webhooks->createEndpoint('org1', 'http://localhost/webhook', ['test']);
+        $result2 = $this->webhooks->createEndpoint('org_create_ep', 'http://localhost/webhook', ['test']);
         $this->assert(!empty($result2['id']), 'Allows localhost HTTP');
     }
 
     private function testSendEvent(): void
     {
-        $ep1 = $this->webhooks->createEndpoint('org1', 'https://example.com/1', ['user.created']);
-        $ep2 = $this->webhooks->createEndpoint('org1', 'https://example.com/2', ['user.created', 'user.deleted']);
-        $this->webhooks->createEndpoint('org1', 'https://example.com/3', ['user.deleted']); // not subscribed
+        $orgId = 'org_send_event';
+        $ep1 = $this->webhooks->createEndpoint($orgId, 'https://example.com/1', ['user.created']);
+        $ep2 = $this->webhooks->createEndpoint($orgId, 'https://example.com/2', ['user.created', 'user.deleted']);
+        $this->webhooks->createEndpoint($orgId, 'https://example.com/3', ['user.deleted']); // not subscribed
 
-        $msgId = $this->webhooks->sendEvent('user.created', ['user_id' => 123, 'name' => 'Test']);
+        // Create endpoint for different org - should not receive
+        $this->webhooks->createEndpoint('org_other', 'https://example.com/4', ['user.created']);
+
+        $msgId = $this->webhooks->sendEvent($orgId, 'user.created', ['user_id' => 123, 'name' => 'Test']);
 
         $deliveries = $this->db->query("SELECT COUNT(*) FROM webhook_deliveries WHERE message_id = '$msgId'")->fetchColumn();
         $this->assertEquals(2, $deliveries, 'Creates delivery for each subscribed endpoint');
 
         $msg = $this->db->query("SELECT payload FROM webhook_messages WHERE id = '$msgId'")->fetchColumn();
         $this->assertEquals('{"user_id":123,"name":"Test"}', $msg, 'Stores payload correctly');
+
+        // Verify org_id stored on message
+        $msgOrg = $this->db->query("SELECT org_id FROM webhook_messages WHERE id = '$msgId'")->fetchColumn();
+        $this->assertEquals($orgId, $msgOrg, 'Message stores org_id');
     }
 
     private function testDeliverSuccess(): void
     {
-        // We'll test the delivery logic by mocking the HTTP call
-        // Since we can't easily mock curl in pure PHP without extensions,
-        // we test the database state transitions directly
-
-        $ep = $this->webhooks->createEndpoint('org1', 'https://httpbin.org/post', ['test.event']);
-        $msgId = $this->webhooks->sendEvent('test.event', ['data' => 'test']);
+        $orgId = 'org_deliver_success';
+        $ep = $this->webhooks->createEndpoint($orgId, 'https://httpbin.org/post', ['test.event']);
+        $msgId = $this->webhooks->sendEvent($orgId, 'test.event', ['data' => 'test']);
 
         $delivery = $this->db->query("SELECT * FROM webhook_deliveries WHERE message_id = '$msgId'")->fetch(PDO::FETCH_ASSOC);
         $this->assert(!empty($delivery), 'Delivery created');
@@ -227,8 +243,9 @@ class WebhooksTest
 
     private function testDeliverFailureRetries(): void
     {
-        $ep = $this->webhooks->createEndpoint('org1', 'https://httpbin.org/status/500', ['test.event']);
-        $msgId = $this->webhooks->sendEvent('test.event', ['data' => 'test']);
+        $orgId = 'org_deliver_failure';
+        $ep = $this->webhooks->createEndpoint($orgId, 'https://httpbin.org/status/500', ['test.event']);
+        $msgId = $this->webhooks->sendEvent($orgId, 'test.event', ['data' => 'test']);
 
         $delivery = $this->db->query("SELECT * FROM webhook_deliveries WHERE message_id = '$msgId'")->fetch(PDO::FETCH_ASSOC);
         $originalAttempt = $delivery['attempt'];
@@ -260,8 +277,9 @@ class WebhooksTest
 
     private function testWebhookIdConsistentAcrossRetries(): void
     {
-        $ep = $this->webhooks->createEndpoint('org1', 'https://example.com/webhook', ['test.event']);
-        $msgId = $this->webhooks->sendEvent('test.event', ['data' => 'test']);
+        $orgId = 'org_webhook_id';
+        $ep = $this->webhooks->createEndpoint($orgId, 'https://example.com/webhook', ['test.event']);
+        $msgId = $this->webhooks->sendEvent($orgId, 'test.event', ['data' => 'test']);
 
         $deliveries = $this->db->query("SELECT * FROM webhook_deliveries WHERE message_id = '$msgId'")->fetchAll(PDO::FETCH_ASSOC);
         foreach ($deliveries as $d) {
@@ -278,7 +296,8 @@ class WebhooksTest
 
     private function testRotateSecret(): void
     {
-        $ep = $this->webhooks->createEndpoint('org1', 'https://example.com/webhook', ['test.event']);
+        $orgId = 'org_rotate_secret';
+        $ep = $this->webhooks->createEndpoint($orgId, 'https://example.com/webhook', ['test.event']);
         $oldSecret = $this->db->query("SELECT secret FROM webhook_endpoints WHERE id = '{$ep['id']}'")->fetchColumn();
 
         $newSecret = $this->webhooks->rotateSecret($ep['id']);
@@ -291,18 +310,19 @@ class WebhooksTest
 
     private function testDisableAfterFiveFailures(): void
     {
-        $ep = $this->webhooks->createEndpoint('org1', 'https://example.com/webhook', ['test.event']);
+        $orgId = 'org_disable_5';
+        $ep = $this->webhooks->createEndpoint($orgId, 'https://example.com/webhook', ['test.event']);
 
         // Simulate 5 fully failed messages (all retries exhausted)
         for ($i = 0; $i < 5; $i++) {
-            $msgId = $this->webhooks->sendEvent('test.event', ['seq' => $i]);
+            $msgId = $this->webhooks->sendEvent($orgId, 'test.event', ['seq' => $i]);
             $delivery = $this->db->query("SELECT id FROM webhook_deliveries WHERE message_id = '$msgId'")->fetch(PDO::FETCH_ASSOC);
 
-            // Exhaust all retries
+            // Exhaust all retries for this delivery
             $this->db->prepare('UPDATE webhook_deliveries SET attempt = ?, success = 0, next_attempt_at = NULL WHERE id = ?')
                 ->execute([count(Webhooks::RETRY_SCHEDULE) + 1, $delivery['id']]);
-            $this->db->prepare('UPDATE webhook_endpoints SET failure_count = failure_count + 1 WHERE id = ?')
-                ->execute([$ep['id']]);
+            // Record the endpoint failure (increments failure_count, disables if threshold reached)
+            $this->webhooks->recordEndpointFailure($ep['id']);
         }
 
         $epCheck = $this->db->query("SELECT active, failure_count FROM webhook_endpoints WHERE id = '{$ep['id']}'")->fetch(PDO::FETCH_ASSOC);
@@ -329,11 +349,6 @@ class WebhooksTest
 
         $result2 = verify_webhook($secret, '{"event":"tampered"}', $serverHeaders);
         $this->assert($result2 !== true, 'verify_webhook detects tampering');
-    }
-
-    private function assertNotEquals(mixed $expected, mixed $actual, string $message): void
-    {
-        $this->assert($expected !== $actual, "$message (should not equal: " . var_export($expected, true) . ")");
     }
 }
 

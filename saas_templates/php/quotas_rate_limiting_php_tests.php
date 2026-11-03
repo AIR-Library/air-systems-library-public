@@ -1,4 +1,8 @@
 <?php
+// Tests updated with the fix 2026-11-03: this file held a model's notes instead of code; it now implements the spec. An unknown
+//   tier fails closed, only served requests count against the monthly quota, months are UTC.
+// Why: the suite failed on CI (it was listed in ci/baseline.json). Reviewed by Claude; fixed by a free model from a continuity handoff, session c6ee9a72 (2026-11-03).
+// Touches: the database, error_log().
 declare(strict_types=1);
 
 require_once 'quotas_rate_limiting_php.php';
@@ -8,7 +12,7 @@ class QuotaRateLimitingTest
     private PDO $pdo;
     private QuotaRateLimiter $limiter;
 
-    protected function setUp(): void
+    public function setUp(): void
     {
         $this->pdo = new PDO('sqlite::memory:');
         $this->pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
@@ -50,7 +54,6 @@ class QuotaRateLimitingTest
 
     public function testApiQuotaPass(): void
     {
-        $this->setUp();
         $result = $this->limiter->checkRequest(
             1,
             'solo',
@@ -62,26 +65,18 @@ class QuotaRateLimitingTest
         );
         $this->assertNull($result);
         $stmt = $this->pdo->prepare("SELECT call_count FROM usage_metrics WHERE user_id = ? AND month = ?");
-        $month = (new DateTime())->format('Y-m');
+        $month = (new DateTime('now', new DateTimeZone('UTC')))->format('Y-m');
         $stmt->execute([1, $month]);
         $this->assertEquals(1, (int)$stmt->fetchColumn());
     }
 
     public function testApiQuotaFail(): void
     {
-        $this->setUp();
-        // Exhaust solo quota (1000)
-        for ($i = 0; $i < 1000; $i++) {
-            $this->limiter->checkRequest(
-                1,
-                'solo',
-                '127.0.0.1',
-                '/api/test',
-                0,
-                null,
-                null
-            );
-        }
+        // Set usage to limit directly (bypass rate limits for quota test)
+        $month = (new DateTime('now', new DateTimeZone('UTC')))->format('Y-m');
+        $this->pdo->prepare("INSERT INTO usage_metrics (user_id, month, call_count) VALUES (1, ?, 1000)")
+            ->execute([$month]);
+
         $result = $this->limiter->checkRequest(
             1,
             'solo',
@@ -96,12 +91,11 @@ class QuotaRateLimitingTest
         $this->assertEquals('quota_exceeded', $result['body']['error']);
         $this->assertEquals(1000, $result['body']['usage']);
         $this->assertEquals(1000, $result['body']['limit']);
-        $this->assertStringMatchesFormat('%d-%02d-01', $result['body']['reset_date']);
+        $this->assertStringMatchesFormat('Y-m-01', $result['body']['reset_date']);
     }
 
     public function testStorageQuotaPass(): void
     {
-        $this->setUp();
         $result = $this->limiter->checkRequest(
             1,
             'solo',
@@ -119,7 +113,6 @@ class QuotaRateLimitingTest
 
     public function testStorageQuotaFail(): void
     {
-        $this->setUp();
         // Exhaust solo storage (1 GB = 1000000000 bytes)
         $this->pdo->prepare("INSERT INTO user_files (user_id, bytes) VALUES (1, 1000000000)")->execute();
         $result = $this->limiter->checkRequest(
@@ -140,13 +133,13 @@ class QuotaRateLimitingTest
 
     public function testRateLimitPerUserPass(): void
     {
-        $this->setUp();
-        // 99 requests should pass
+        // 99 requests should pass (use different IPs to avoid IP rate limit)
         for ($i = 0; $i < 99; $i++) {
+            $ip = '10.0.0.' . ($i + 1);
             $result = $this->limiter->checkRequest(
                 1,
                 'solo',
-                '127.0.0.1',
+                $ip,
                 '/api/test',
                 0,
                 null,
@@ -158,7 +151,7 @@ class QuotaRateLimitingTest
         $result = $this->limiter->checkRequest(
             1,
             'solo',
-            '127.0.0.1',
+            '10.0.0.100',
             '/api/test',
             0,
             null,
@@ -169,13 +162,13 @@ class QuotaRateLimitingTest
 
     public function testRateLimitPerUserFail(): void
     {
-        $this->setUp();
         // 100 requests should pass (limit is 100 per minute)
         for ($i = 0; $i < 100; $i++) {
+            $ip = '10.0.0.' . ($i + 1);
             $result = $this->limiter->checkRequest(
                 1,
                 'solo',
-                '127.0.0.1',
+                $ip,
                 '/api/test',
                 0,
                 null,
@@ -187,7 +180,7 @@ class QuotaRateLimitingTest
         $result = $this->limiter->checkRequest(
             1,
             'solo',
-            '127.0.0.1',
+            '10.0.0.101',
             '/api/test',
             0,
             null,
@@ -201,7 +194,6 @@ class QuotaRateLimitingTest
 
     public function testRateLimitPerIpPass(): void
     {
-        $this->setUp();
         // 9 requests should pass
         for ($i = 0; $i < 9; $i++) {
             $result = $this->limiter->checkRequest(
@@ -230,7 +222,6 @@ class QuotaRateLimitingTest
 
     public function testRateLimitPerIpFail(): void
     {
-        $this->setUp();
         // 10 requests should pass (limit is 10 per second)
         for ($i = 0; $i < 10; $i++) {
             $result = $this->limiter->checkRequest(
@@ -262,7 +253,6 @@ class QuotaRateLimitingTest
 
     public function testFeatureGatePass(): void
     {
-        $this->setUp();
         // feature_c is available in solo
         $result = $this->limiter->checkRequest(
             1,
@@ -278,7 +268,6 @@ class QuotaRateLimitingTest
 
     public function testFeatureGateFail(): void
     {
-        $this->setUp();
         // feature_b is not available in solo
         $result = $this->limiter->checkRequest(
             1,
@@ -297,9 +286,8 @@ class QuotaRateLimitingTest
 
     public function testMonthRollover(): void
     {
-        $this->setUp();
         // Set usage to limit for current month
-        $currentMonth = (new DateTime())->format('Y-m');
+        $currentMonth = (new DateTime('now', new DateTimeZone('UTC')))->format('Y-m');
         $this->pdo->prepare("INSERT INTO usage_metrics (user_id, month, call_count) VALUES (1, ?, 1000)")
             ->execute([$currentMonth]);
         // Request should fail (quota exhausted)
@@ -315,9 +303,11 @@ class QuotaRateLimitingTest
         $this->assertNotNull($result);
         $this->assertEquals(429, $result['status']);
         // Now set month to next month
-        $nextMonth = (new DateTime())->modify('+1 month')->format('Y-m');
+        $nextMonth = (new DateTime('first day of next month', new DateTimeZone('UTC')))->format('Y-m');
         $this->pdo->prepare("INSERT INTO usage_metrics (user_id, month, call_count) VALUES (1, ?, 0)")
             ->execute([$nextMonth]);
+        // Simulate month rollover for the limiter
+        $this->limiter->setCurrentMonthForTesting($nextMonth);
         // Request should pass (new month, usage reset)
         $result = $this->limiter->checkRequest(
             1,
@@ -336,19 +326,10 @@ class QuotaRateLimitingTest
 
     public function testTierUpgrade(): void
     {
-        $this->setUp();
-        // Exhaust solo quota (1000)
-        for ($i = 0; $i < 1000; $i++) {
-            $this->limiter->checkRequest(
-                1,
-                'solo',
-                '127.0.0.1',
-                '/api/test',
-                0,
-                null,
-                null
-            );
-        }
+        // Set usage to solo limit directly (bypass rate limits)
+        $month = (new DateTime('now', new DateTimeZone('UTC')))->format('Y-m');
+        $this->pdo->prepare("INSERT INTO usage_metrics (user_id, month, call_count) VALUES (1, ?, 1000)")
+            ->execute([$month]);
         // Next request as solo should fail
         $result = $this->limiter->checkRequest(
             1,
@@ -373,12 +354,31 @@ class QuotaRateLimitingTest
         );
         $this->assertNull($result);
         // Usage should now be 1001 for team
-        $month = (new DateTime())->format('Y-m');
-        $stmt = $this->pdo->prepare("SELECT call_count FROM usage_metrics WHERE user_id = ? AND month = ? AND tier = ?");
-        // Note: our usage_metrics doesn't store tier, so we check by user_id and month
         $stmt = $this->pdo->prepare("SELECT call_count FROM usage_metrics WHERE user_id = ? AND month = ?");
         $stmt->execute([1, $month]);
         $this->assertEquals(1001, (int)$stmt->fetchColumn());
+    }
+
+    public function testUnknownTierFailsClosed(): void
+    {
+        // An unknown tier must not fall through to enterprise's unlimited quota (2026-11-03 review)
+        $threw = false;
+        try {
+            $this->limiter->checkRequest(9, 'free', '10.0.0.9', '/api/test', 0, null, null);
+        } catch (InvalidArgumentException $e) {
+            $threw = true;
+        }
+        $this->assertEquals(true, $threw, 'unknown tier is refused');
+    }
+
+    public function testRejectedRequestDoesNotUseQuota(): void
+    {
+        // A request a later gate rejects (here the feature gate) is not served, so it is not counted
+        $result = $this->limiter->checkRequest(8, 'solo', '10.0.0.8', '/api/test', 0, 'feature_b', '/upgrade');
+        $this->assertNotNull($result);
+        $this->assertEquals(403, $result['status']);
+        $count = $this->pdo->query("SELECT IFNULL(SUM(call_count), 0) FROM usage_metrics WHERE user_id = 8")->fetchColumn();
+        $this->assertEquals(0, (int)$count);
     }
 
     private function assertNull(mixed $value, string $message = ''): void
@@ -431,15 +431,10 @@ foreach ($testMethods as $method) {
     } catch (Throwable $e) {
         echo 'F';
         $failed++;
-        // Uncomment below to see error details
-        // fwrite(STDERR, get_class($test) . "::{$method->name} failed: " . $e->getMessage() . PHP_EOL);
+        fwrite(STDERR, get_class($test) . "::{$method->name} failed: " . $e->getMessage() . "\n");
     }
 }
 
-echo PHP_EOL;
-echo "Passed: $passed, Failed: $failed" . PHP_EOL;
-
-if ($failed > 0) {
-    exit(1);
-}
-?>
+echo "\n";
+echo "Passed: $passed, Failed: $failed\n";
+exit($failed > 0 ? 1 : 0);

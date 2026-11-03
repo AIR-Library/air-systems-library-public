@@ -1,4 +1,7 @@
 <?php
+// Repaired 2026-11-03: foreign keys are switched on, so cascades really delete; one audit row per cascade.
+// Why: the suite failed on CI (it was listed in ci/baseline.json). Reviewed by Claude; fixed by a free model from a continuity handoff, session c6ee9a72 (2026-11-03).
+// Touches: the database only.
 declare(strict_types=1);
 
 class Database
@@ -9,6 +12,7 @@ class Database
     {
         $this->pdo = new PDO($dsn);
         $this->pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $this->pdo->exec('PRAGMA foreign_keys = ON');
         $this->migrate();
     }
 
@@ -224,10 +228,6 @@ class CascadeDelete
 
             $this->pdo->commit();
 
-            $this->audit->log($userId, 'delete_user', 'owner', 'owner', 'PASS');
-            $this->audit->log(null, 'audit_log', 'owner', 'owner', 'PASS'); // placeholder for audit log entry
-
-            // Log cascade
             $this->audit->log($userId, 'user_deleted_cascade', 'owner', 'owner', 'PASS');
             // For simplicity, we skip storing deleted_items in audit_log
 
@@ -272,7 +272,6 @@ class CascadeDelete
             // Count related items
             $counts = [
                 'deployments' => $this->countRows('deployments', ['org_id' => $orgId]),
-                'users' => $this->countRows('users', ['id' => null]), // placeholder, actual logic would involve org_user mapping
             ];
 
             // Delete organization (cascade will delete deployments and their cascades)

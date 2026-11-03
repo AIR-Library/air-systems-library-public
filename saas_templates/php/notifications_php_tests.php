@@ -1,10 +1,16 @@
 <?php
+// Tests updated with the fix 2026-11-03: a test mode captures e-mail and SMS instead of sending them, so the tests need neither
+//   runkit nor a mail server.
+// Why: the suite failed on CI (it was listed in ci/baseline.json). Reviewed by Claude; fixed by a free model from a continuity handoff, session c6ee9a72 (2026-11-03).
+// Touches: the database, mail() and the SMS API (not in test mode).
 declare(strict_types=1);
+
+require_once __DIR__ . '/notifications_php.php';
 
 use PHPUnit\Framework\TestCase;
 use NotificationSystem\NotificationService;
-use NotificationSystem\seedTemplates;
-use NotificationSystem\runMigrations;
+use function NotificationSystem\seedTemplates;
+use function NotificationSystem\runMigrations;
 
 final class NotificationServiceTest extends TestCase
 {
@@ -16,6 +22,7 @@ final class NotificationServiceTest extends TestCase
         $this->pdo = new PDO('sqlite::memory:');
         $this->pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
         $this->service = new NotificationService($this->pdo, [], []);
+        $this->service->enableTestMode();
         seedTemplates($this->pdo);
     }
 
@@ -32,6 +39,10 @@ final class NotificationServiceTest extends TestCase
         $this->assertTrue($result['success']);
         $this->assertEquals('sent', $result['status']);
         $this->assertNotNull($result['message_id']);
+
+        $emailData = $this->service->getLastEmailData();
+        $this->assertStringContainsString('3', $emailData['message']);
+        $this->assertStringContainsString('Trial ending soon', $emailData['subject']);
     }
 
     public function testSendSms(): void
@@ -46,6 +57,9 @@ final class NotificationServiceTest extends TestCase
         $result = $this->service->endpointSend($payload);
         $this->assertTrue($result['success']);
         $this->assertEquals('sent', $result['status']);
+
+        $smsData = $this->service->getLastSmsData();
+        $this->assertStringContainsString('TestApp', $smsData['body']);
     }
 
     public function testSendInAppStoresInDb(): void
@@ -65,6 +79,7 @@ final class NotificationServiceTest extends TestCase
         $stmt->execute([':id' => $result['message_id']]);
         $log = $stmt->fetch(PDO::FETCH_ASSOC);
         $this->assertEquals('sent', $log['status']);
+        $this->assertEquals('in_app', $log['channel']);
     }
 
     public function testBatchSendLargeNumber(): void
@@ -88,11 +103,14 @@ final class NotificationServiceTest extends TestCase
 
     public function testQuietHoursSkipAndQueue(): void
     {
-        // Set quiet hours covering current UTC time
+        $now = new DateTimeImmutable('now', new DateTimeZone('UTC'));
+        $start = $now->modify('-1 hour')->format('H:i');
+        $end = $now->modify('+2 hours')->format('H:i');
+
         $prefStmt = $this->pdo->prepare('INSERT INTO user_notification_preferences (user_id, do_not_disturb, quiet_hours_start, quiet_hours_end, channels_enabled) VALUES (100, 0, :start, :end, :ch)');
         $prefStmt->execute([
-            ':start' => (new DateTimeImmutable('now', new DateTimeZone('UTC')))->modify('-1 hour')->format('H:i'),
-            ':end'   => (new DateTimeImmutable('now', new DateTimeZone('UTC')))->modify('+1 hour')->format('H:i'),
+            ':start' => $start,
+            ':end'   => $end,
             ':ch'    => json_encode(['email'=>true,'sms'=>true,'in_app'=>true])
         ]);
 
@@ -145,25 +163,30 @@ final class NotificationServiceTest extends TestCase
         $track = $this->service->endpointTrack((string)$msgId);
         $this->assertEquals('sent', $track['status']);
         $this->assertNotNull($track['sent_at']);
+        $this->assertEquals(5, $track['user_id']);
+        $this->assertEquals('welcome_email', $track['template_key']);
     }
 
     public function testRetryOnFailure(): void
     {
-        // Override sendEmail to force failure first two attempts
-        $service = $this->getMockBuilder(NotificationService::class)
-            ->setConstructorArgs([$this->pdo, [], []])
-            ->onlyMethods(['sendEmail'])
-            ->getMock();
-
-        $service->expects($this->exactly(3))
-            ->method('sendEmail')
-            ->will($this->onConsecutiveCalls(
-                $this->throwException(new Exception('SMTP error')),
-                $this->throwException(new Exception('SMTP error')),
-                $this->returnValue(null)
-            ));
-
-        // Seed templates again for the mock
+        $service = new class($this->pdo) extends NotificationService {
+            private int $attempt = 0;
+            protected function sendEmail(int $userId, string $subject, string $textBody, string $htmlBody): void
+            {
+                $this->attempt++;
+                if ($this->attempt < 3) {
+                    throw new Exception('SMTP error');
+                }
+                // Third attempt succeeds - store data but don't throw
+                $this->lastEmailData = [
+                    'to' => "user{$userId}@example.com",
+                    'subject' => $subject,
+                    'message' => $htmlBody,
+                    'headers' => 'test'
+                ];
+            }
+        };
+        $service->enableTestMode();
         seedTemplates($this->pdo);
 
         $payload = [
@@ -180,15 +203,6 @@ final class NotificationServiceTest extends TestCase
 
     public function testUnsubscribeLinkIncludedInEmail(): void
     {
-        // Capture output of mail() using a custom stream wrapper
-        $mailLog = '';
-        $originalMail = function_exists('mail') ? 'mail' : null;
-        // Override mail function within this test scope
-        runkit_function_redefine('mail', '$to,$subject,$message,$headers', '
-            global $mailLog;
-            $mailLog = $message;
-            return true;
-        ');
         $payload = [
             'user_id' => 7,
             'template_key' => 'welcome_email',
@@ -198,8 +212,11 @@ final class NotificationServiceTest extends TestCase
         ];
         $result = $this->service->endpointSend($payload);
         $this->assertTrue($result['success']);
-        $this->assertStringContainsString('unsubscribe', $mailLog);
-        // Restore original mail if needed (skip for brevity)
+
+        $emailData = $this->service->getLastEmailData();
+        $this->assertStringContainsString('unsubscribe', strtolower($emailData['message']));
+        $this->assertStringContainsString('example.com/unsubscribe', $emailData['message']);
+        $this->assertStringContainsString('uid=7', $emailData['message']);
     }
 
     public function testUserPreferencesHonored(): void
