@@ -61,10 +61,25 @@ def count_tests(lang: str, code: str) -> int:
 
 
 def sh(cmd: list[str], cwd: Path, timeout: int = TIMEOUT, env: dict | None = None) -> tuple[int, str]:
-    """Run a command; return (exit code, combined output). 124 = timeout, 127 = tool missing."""
+    """Run a command; return (exit code, combined output). 124 = timeout, 127 = tool missing.
+
+    [2026-11-03, session c6ee9a72] On Windows the first word is looked up through PATH and PATHEXT
+    before running: npm, mvn and composer, and the shims in node_modules/.bin, are .cmd/.bat files
+    there, which subprocess cannot start by their bare name. cmd.exe then runs those files and reads
+    ^ & | < > ( ) in a bare argument as its own syntax (phpunit:^11 lost its caret and resolved to the
+    advisory-blocked 11.0.0; jest's "(js|ts)" became a pipe), so such arguments are double-quoted.
+    Linux (CI) is unchanged."""
     full_env = dict(os.environ, NO_COLOR="1", FORCE_COLOR="0", PYTHONDONTWRITEBYTECODE="1",
                     DOTNET_CLI_TELEMETRY_OPTOUT="1", DOTNET_NOLOGO="1", DOTNET_CLI_USE_MSBUILD_SERVER="0",
                     MSBUILDDISABLENODEREUSE="1", **(env or {}))
+    if os.name == "nt":
+        exe = shutil.which(cmd[0], path=full_env.get("PATH"))
+        if exe:
+            cmd = [exe, *cmd[1:]]
+            if exe.lower().endswith((".bat", ".cmd")):
+                cmd = " ".join([subprocess.list2cmdline([exe])] + [
+                    '"' + a.replace('"', '""') + '"' if re.search(r'[\s^&|<>()%!"]', a) else a
+                    for a in cmd[1:]])
     try:
         r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout,
                            env=full_env, encoding="utf-8", errors="replace")
@@ -102,7 +117,8 @@ PY_REQ = ["pytest", "bcrypt", "PyJWT", "pyotp", "SQLAlchemy>=2.0,<2.1", "fastapi
 
 def setup_python() -> Path:
     venv = DEPS / "python" / "venv"
-    py = venv / "bin" / "python"
+    # [2026-11-03, session c6ee9a72] a Windows venv keeps its interpreter in Scripts\, not bin/
+    py = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     if not py.exists():
         (DEPS / "python").mkdir(parents=True, exist_ok=True)
         subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
