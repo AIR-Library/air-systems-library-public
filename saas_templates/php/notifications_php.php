@@ -1,4 +1,8 @@
 <?php
+// Repaired 2026-11-03: a test mode captures e-mail and SMS instead of sending them, so the tests need neither
+//   runkit nor a mail server.
+// Why: the suite failed on CI (it was listed in ci/baseline.json). Reviewed by Claude; fixed by a free model from a continuity handoff, session c6ee9a72 (2026-11-03).
+// Touches: the database, mail() and the SMS API (not in test mode).
 declare(strict_types=1);
 
 namespace NotificationSystem;
@@ -33,7 +37,7 @@ CREATE TABLE IF NOT EXISTS notification_logs (
     clicked_at DATETIME,
     bounced INTEGER DEFAULT 0,
     error TEXT,
-    status VARCHAR(20) NOT NULL DEFAULT 'queued' -- queued, sent, skipped, failed, opened, clicked, bounced
+    status VARCHAR(20) NOT NULL DEFAULT 'queued'
 );
 
 CREATE TABLE IF NOT EXISTS user_notification_preferences (
@@ -67,6 +71,9 @@ class NotificationService
     private array $emailConfig;
     private array $smsConfig;
     private int $maxRetries = 3;
+    protected array $lastEmailData = [];
+    protected array $lastSmsData = [];
+    protected bool $testMode = false;
 
     public function __construct(PDO $pdo, array $emailConfig = [], array $smsConfig = [])
     {
@@ -74,6 +81,21 @@ class NotificationService
         $this->emailConfig = $emailConfig;
         $this->smsConfig = $smsConfig;
         runMigrations($this->pdo);
+    }
+
+    public function enableTestMode(): void
+    {
+        $this->testMode = true;
+    }
+
+    public function getLastEmailData(): array
+    {
+        return $this->lastEmailData;
+    }
+
+    public function getLastSmsData(): array
+    {
+        return $this->lastSmsData;
     }
 
     /**
@@ -348,7 +370,7 @@ class NotificationService
     /**
      * Internal: send email via PHP's mail() (placeholder for real SMTP).
      */
-    private function sendEmail(int $userId, string $subject, string $textBody, string $htmlBody): void
+    protected function sendEmail(int $userId, string $subject, string $textBody, string $htmlBody): void
     {
         // Retrieve user email from a hypothetical users table (not defined). For demo, use placeholder.
         $to = "user{$userId}@example.com";
@@ -359,6 +381,18 @@ class NotificationService
         $unsubscribeLink = "https://example.com/unsubscribe?uid={$userId}&tid=" . urlencode($subject);
         $htmlBody .= "<br><br><a href=\"{$unsubscribeLink}\">Unsubscribe</a>";
         $message = $htmlBody ?: nl2br($textBody);
+
+        $this->lastEmailData = [
+            'to' => $to,
+            'subject' => $subject,
+            'message' => $message,
+            'headers' => $headers
+        ];
+
+        if ($this->testMode) {
+            return;
+        }
+
         $sent = mail($to, $subject, $message, $headers);
         if (!$sent) {
             throw new Exception('Email sending failed');
@@ -368,7 +402,7 @@ class NotificationService
     /**
      * Internal: send SMS via Twilio REST API (simplified).
      */
-    private function sendSms(int $userId, string $text): void
+    protected function sendSms(int $userId, string $text): void
     {
         // Retrieve user phone from a hypothetical users table. Placeholder:
         $to = "+1555000" . str_pad((string)$userId, 4, '0', STR_PAD_LEFT);
@@ -382,6 +416,17 @@ class NotificationService
             'From' => $from,
             'Body' => $text
         ]);
+
+        $this->lastSmsData = [
+            'to' => $to,
+            'from' => $from,
+            'body' => $text,
+            'url' => $url
+        ];
+
+        if ($this->testMode) {
+            return;
+        }
 
         $ch = curl_init($url);
         curl_setopt($ch, CURLOPT_USERPWD, $accountSid . ':' . $authToken);
@@ -533,4 +578,4 @@ if (php_sapi_name() === 'cli' && isset($argv[1]) && $argv[1] === 'init') {
     seedTemplates($pdo);
     echo "Database initialized.\n";
 }
-?> 
+?>

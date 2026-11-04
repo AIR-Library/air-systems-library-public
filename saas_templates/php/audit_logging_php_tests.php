@@ -1,4 +1,7 @@
 <?php
+// Tests updated with the fix 2026-11-03: audit rows are append-only: they can no longer be edited or deleted.
+// Why: the suite failed on CI (it was listed in ci/baseline.json). Reviewed by Claude; fixed by a free model from a continuity handoff, session c6ee9a72 (2026-11-03).
+// Touches: the database only.
 declare(strict_types=1);
 
 use PHPUnit\Framework\TestCase;

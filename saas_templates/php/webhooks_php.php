@@ -1,11 +1,15 @@
 <?php
+// Repaired 2026-11-03: events go only to the sending organization's endpoints (they went to every organization's),
+//   the event type is a bound parameter (it was pasted into the SQL), and deliver() takes an
+//   optional sender so it can be tested without the network.
+// Why: the suite failed on CI (it was listed in ci/baseline.json). Reviewed by Claude; fixed by a free model from a continuity handoff, session c6ee9a72 (2026-11-03).
+// Touches: the database, outgoing HTTPS (curl).
 
 declare(strict_types=1);
 
 namespace Webhooks;
 
 use PDO;
-use PDOException;
 use RuntimeException;
 use InvalidArgumentException;
 
@@ -19,7 +23,7 @@ final class Webhooks
     private const SECRET_BYTES_MIN = 24;
     private const SECRET_BYTES_MAX = 64;
     private const MAX_FAILURES_BEFORE_DISABLE = 5;
-    private const RETRY_SCHEDULE = [5, 300, 1800, 7200, 18000, 36000, 36000]; // seconds
+    public const RETRY_SCHEDULE = [5, 300, 1800, 7200, 18000, 36000, 36000]; // seconds
 
     public function __construct(PDO $db)
     {
@@ -46,6 +50,7 @@ CREATE TABLE IF NOT EXISTS webhook_endpoints (
 
 CREATE TABLE IF NOT EXISTS webhook_messages (
     id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL,
     event_type TEXT NOT NULL,
     payload TEXT NOT NULL,
     created_at INTEGER NOT NULL
@@ -68,6 +73,7 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
 CREATE INDEX IF NOT EXISTS idx_deliveries_pending ON webhook_deliveries(next_attempt_at) WHERE success = 0 AND next_attempt_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_endpoints_org ON webhook_endpoints(org_id);
 CREATE INDEX IF NOT EXISTS idx_messages_event ON webhook_messages(event_type);
+CREATE INDEX IF NOT EXISTS idx_messages_org ON webhook_messages(org_id);
 SQL;
         $this->db->exec($sql);
     }
@@ -99,9 +105,9 @@ SQL;
     }
 
     /**
-     * Send an event to all subscribed endpoints
+     * Send an event to all subscribed endpoints of the given org
      */
-    public function sendEvent(string $eventType, array $payload): string
+    public function sendEvent(string $orgId, string $eventType, array $payload): string
     {
         $messageId = 'msg_' . bin2hex(random_bytes(16));
         $now = time();
@@ -110,21 +116,24 @@ SQL;
         $this->db->beginTransaction();
         try {
             $stmt = $this->db->prepare(
-                'INSERT INTO webhook_messages (id, event_type, payload, created_at) VALUES (?, ?, ?, ?)'
+                'INSERT INTO webhook_messages (id, org_id, event_type, payload, created_at) VALUES (?, ?, ?, ?, ?)'
             );
-            $stmt->execute([$messageId, $eventType, $payloadJson, $now]);
+            $stmt->execute([$messageId, $orgId, $eventType, $payloadJson, $now]);
 
-            $endpoints = $this->db->query(
+            $endpoints = $this->db->prepare(
                 "SELECT id FROM webhook_endpoints
                  WHERE active = 1
-                 AND json_extract(event_types, '\$') LIKE '%\"$eventType\"%'"
-            )->fetchAll(PDO::FETCH_COLUMN);
+                 AND org_id = ?
+                 AND json_extract(event_types, '\$') LIKE '%\"' || ? || '\"%'"
+            );
+            $endpoints->execute([$orgId, $eventType]);
+            $endpointIds = $endpoints->fetchAll(PDO::FETCH_COLUMN);
 
             $deliveryStmt = $this->db->prepare(
                 'INSERT INTO webhook_deliveries (id, message_id, endpoint_id, attempt, next_attempt_at)
                  VALUES (?, ?, ?, 1, ?)'
             );
-            foreach ($endpoints as $endpointId) {
+            foreach ($endpointIds as $endpointId) {
                 $deliveryId = 'dlv_' . bin2hex(random_bytes(16));
                 $deliveryStmt->execute([$deliveryId, $messageId, $endpointId, $now]);
             }
@@ -154,9 +163,10 @@ SQL;
 
     /**
      * Deliver a single webhook delivery
+     * @param ?callable $sender Function(string $url, array $headers, string $body): int
      * @return array{success: bool, status_code: int|null, error: string|null}
      */
-    public function deliver(array $delivery): array
+    public function deliver(array $delivery, ?callable $sender = null): array
     {
         $stmt = $this->db->prepare(
             'SELECT wm.id as msg_id, wm.payload, wm.created_at, we.url, we.secret, we.id as endpoint_id
@@ -175,28 +185,47 @@ SQL;
         $timestamp = time();
         $signature = self::sign($row['secret'], $row['msg_id'], $timestamp, $row['payload']);
 
-        $ch = curl_init($row['url']);
-        curl_setopt_array($ch, [
-            CURLOPT_POST => true,
-            CURLOPT_POSTFIELDS => $row['payload'],
-            CURLOPT_HTTPHEADER => [
-                'Content-Type: application/json',
-                'webhook-id: ' . $row['msg_id'],
-                'webhook-timestamp: ' . $timestamp,
-                'webhook-signature: ' . $signature,
-            ],
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => 10,
-            CURLOPT_SSL_VERIFYPEER => true,
-        ]);
+        $headers = [
+            'Content-Type: application/json',
+            'webhook-id: ' . $row['msg_id'],
+            'webhook-timestamp: ' . $timestamp,
+            'webhook-signature: ' . $signature,
+        ];
 
-        $response = curl_exec($ch);
-        $statusCode = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-        $curlError = curl_error($ch);
-        curl_close($ch);
+        $statusCode = 0;
+        $curlError = '';
+        $success = false;
 
-        $success = $statusCode >= 200 && $statusCode < 300 && $curlError === '';
-        $error = $success ? null : ($curlError ?: "HTTP $statusCode");
+        if ($sender !== null) {
+            try {
+                $statusCode = $sender($row['url'], $headers, $row['payload']);
+                $success = $statusCode >= 200 && $statusCode < 300;
+                $curlError = $success ? '' : "HTTP $statusCode";
+            } catch (\Throwable $e) {
+                $success = false;
+                $statusCode = 0;
+                $curlError = $e->getMessage();
+            }
+        } else {
+            $ch = curl_init($row['url']);
+            curl_setopt_array($ch, [
+                CURLOPT_POST => true,
+                CURLOPT_POSTFIELDS => $row['payload'],
+                CURLOPT_HTTPHEADER => $headers,
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_TIMEOUT => 10,
+                CURLOPT_SSL_VERIFYPEER => true,
+            ]);
+
+            $response = curl_exec($ch);
+            $statusCode = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+            $curlError = curl_error($ch);
+            curl_close($ch);
+
+            $success = $statusCode >= 200 && $statusCode < 300 && $curlError === '';
+            $curlError = $success ? null : ($curlError ?: "HTTP $statusCode");
+        }
+
         $now = time();
 
         $this->db->beginTransaction();
@@ -216,19 +245,10 @@ SQL;
                 }
                 $this->db->prepare(
                     'UPDATE webhook_deliveries SET attempt = ?, status_code = ?, error = ?, next_attempt_at = ? WHERE id = ?'
-                )->execute([$attempt, $statusCode, $error, $nextAttempt, $delivery['id']]);
+                )->execute([$attempt, $statusCode, $curlError, $nextAttempt, $delivery['id']]);
 
                 if ($nextAttempt === null) {
-                    $this->db->prepare(
-                        'UPDATE webhook_endpoints SET failure_count = failure_count + 1 WHERE id = ?'
-                    )->execute([$row['endpoint_id']]);
-
-                    $epStmt = $this->db->prepare('SELECT failure_count FROM webhook_endpoints WHERE id = ?');
-                    $epStmt->execute([$row['endpoint_id']]);
-                    if (($epStmt->fetchColumn() ?? 0) >= self::MAX_FAILURES_BEFORE_DISABLE) {
-                        $this->db->prepare('UPDATE webhook_endpoints SET active = 0 WHERE id = ?')
-                            ->execute([$row['endpoint_id']]);
-                    }
+                    $this->recordEndpointFailure($row['endpoint_id']);
                 }
             }
             $this->db->commit();
@@ -237,7 +257,25 @@ SQL;
             throw $e;
         }
 
-        return ['success' => $success, 'status_code' => $statusCode, 'error' => $error];
+        return ['success' => $success, 'status_code' => $statusCode, 'error' => $curlError];
+    }
+
+    /**
+     * Record a delivery exhaustion for an endpoint (increment failure count, disable if threshold reached)
+     */
+    public function recordEndpointFailure(string $endpointId): void
+    {
+        $this->db->prepare(
+            'UPDATE webhook_endpoints SET failure_count = failure_count + 1 WHERE id = ?'
+        )->execute([$endpointId]);
+
+        $epStmt = $this->db->prepare('SELECT failure_count, active FROM webhook_endpoints WHERE id = ?');
+        $epStmt->execute([$endpointId]);
+        $row = $epStmt->fetch(PDO::FETCH_ASSOC);
+        if ($row && $row['failure_count'] >= self::MAX_FAILURES_BEFORE_DISABLE && $row['active'] == 1) {
+            $this->db->prepare('UPDATE webhook_endpoints SET active = 0 WHERE id = ?')
+                ->execute([$endpointId]);
+        }
     }
 
     /**

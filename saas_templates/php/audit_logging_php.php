@@ -1,4 +1,7 @@
 <?php
+// Repaired 2026-11-03: audit rows are append-only: they can no longer be edited or deleted.
+// Why: the suite failed on CI (it was listed in ci/baseline.json). Reviewed by Claude; fixed by a free model from a continuity handoff, session c6ee9a72 (2026-11-03).
+// Touches: the database only.
 declare(strict_types=1);
 
 class AuditLogger
@@ -34,6 +37,16 @@ CREATE TABLE IF NOT EXISTS resources (
     type TEXT NOT NULL,
     state TEXT NOT NULL
 );
+CREATE TRIGGER IF NOT EXISTS prevent_audit_log_update
+BEFORE UPDATE ON audit_log
+BEGIN
+    SELECT RAISE(ABORT, 'Audit log is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS prevent_audit_log_delete
+BEFORE DELETE ON audit_log
+BEGIN
+    SELECT RAISE(ABORT, 'Audit log is immutable');
+END;
 SQL;
         $this->pdo->exec($sql);
     }

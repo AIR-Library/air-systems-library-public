@@ -1,5 +1,10 @@
 <?php
+// Tests updated with the fix 2026-11-03: foreign keys are switched on, so cascades really delete; one audit row per cascade.
+// Why: the suite failed on CI (it was listed in ci/baseline.json). Reviewed by Claude; fixed by a free model from a continuity handoff, session c6ee9a72 (2026-11-03).
+// Touches: the database only.
 declare(strict_types=1);
+
+require_once __DIR__ . '/permissions_rbac_php.php';
 
 use PHPUnit\Framework\TestCase;
 
@@ -120,19 +125,33 @@ final class PermissionsRBACTest extends TestCase
 
     public function testCascadeOnErrorRollback(): void
     {
-        // Temporarily create a constraint violation
-        $this->pdo->exec('CREATE TABLE temp (id INTEGER PRIMARY KEY, ref_id INTEGER NOT NULL)');
-        $this->pdo->exec('INSERT INTO temp (id, ref_id) VALUES (1, 999)'); // 999 does not exist
+        // Create a trigger that prevents session deletion to force rollback
+        $this->pdo->exec("CREATE TRIGGER prevent_session_delete BEFORE DELETE ON sessions BEGIN SELECT RAISE(ABORT, 'cannot delete sessions'); END;");
 
         // Attempt to delete user; should rollback
         $user = $this->getUser('owner');
+        // Verify user has sessions
+        $stmt = $this->pdo->prepare('SELECT COUNT(*) FROM sessions WHERE user_id = :id');
+        $stmt->execute([':id' => $user->id]);
+        $this->assertEquals(1, $stmt->fetchColumn());
+
+        // Attempt to delete user; should rollback due to trigger
         $result = $this->cascade->deleteUser($user->id);
         $this->assertEquals(500, $result['code']);
+        $this->assertEquals('cascade_error', $result['error']);
 
         // Verify user still exists
         $stmt = $this->pdo->prepare('SELECT COUNT(*) FROM users WHERE id = :id');
         $stmt->execute([':id' => $user->id]);
         $this->assertEquals(1, $stmt->fetchColumn());
+
+        // Verify sessions still exist
+        $stmt = $this->pdo->prepare('SELECT COUNT(*) FROM sessions WHERE user_id = :id');
+        $stmt->execute([':id' => $user->id]);
+        $this->assertEquals(1, $stmt->fetchColumn());
+
+        // Clean up trigger
+        $this->pdo->exec("DROP TRIGGER prevent_session_delete");
     }
 
     public function testPermissionAuditLogged(): void

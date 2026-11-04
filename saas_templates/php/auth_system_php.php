@@ -1,4 +1,9 @@
 <?php
+// Repaired 2026-10-08: the token secret comes from AUTH_JWT_SECRET (it was hard-coded), MFA codes are really
+//   checked (any code was accepted), and sign-up/login limits live in the database (static arrays
+//   reset on every request).
+// Why: the suite failed on CI (it was listed in ci/baseline.json). Reviewed by Claude; session c6ee9a72 (2026-11-03).
+// Touches: the database, the AUTH_JWT_SECRET environment variable.
 declare(strict_types=1);
 
 class Database {
@@ -51,14 +56,35 @@ CREATE TABLE IF NOT EXISTS verification_codes (
     type TEXT NOT NULL,
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
+CREATE TABLE IF NOT EXISTS auth_attempts (
+    bucket TEXT NOT NULL,
+    at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_auth_attempts_bucket ON auth_attempts(bucket, at);
 SQL;
         self::$pdo->exec($sql);
     }
 }
 
 class AuthSystem {
-    private static array $signupAttempts = [];
-    private static array $loginAttempts = [];
+    /**
+     * Counts attempts in a sliding window in the database and records this one. Returns how many
+     * attempts (including this one) fall inside the window. 2026-10-08 fix: the original kept these
+     * counters in static arrays, which PHP resets on every request, so no limit ever held in
+     * production, and in tests they never reset, so later tests were blocked.
+     */
+    private static function attempt(string $bucket, int $windowSeconds, bool $record = true): int
+    {
+        $db = Database::get();
+        $now = time();
+        $db->prepare('DELETE FROM auth_attempts WHERE at < ?')->execute([$now - 86400]);
+        if ($record) {
+            $db->prepare('INSERT INTO auth_attempts (bucket, at) VALUES (?, ?)')->execute([$bucket, $now]);
+        }
+        $stmt = $db->prepare('SELECT COUNT(*) FROM auth_attempts WHERE bucket = ? AND at > ?');
+        $stmt->execute([$bucket, $now - $windowSeconds]);
+        return (int) $stmt->fetchColumn();
+    }
     private static array $commonPasswords = [
         '123456', 'password', '12345678', 'qwerty', '123456789', '12345', '1234', '111111',
         '1234567', 'dragon', '123123', 'baseball', 'abc123', 'football', 'monkey',
@@ -77,14 +103,26 @@ class AuthSystem {
         '123456x', '123456y', '123456z'
     ];
     private const SERVICE_NAME = 'authsystem';
-    private const JWT_SECRET = 'supersecretkey';
+    /**
+     * 2026-10-08 fix: was a hard-coded 'supersecretkey', which lets anyone forge access tokens. The
+     * secret now comes from the AUTH_JWT_SECRET environment variable (at least 32 bytes) and the module
+     * refuses to sign or verify without it.
+     */
+    private static function jwtSecret(): string
+    {
+        $secret = (string) getenv('AUTH_JWT_SECRET');
+        if (strlen($secret) < 32) {
+            throw new RuntimeException('AUTH_JWT_SECRET must be set to at least 32 random bytes');
+        }
+        return $secret;
+    }
     private const JWT_ALG = 'HS256';
     private const ACCESS_TOKEN_EXPIRES = 900; // 15 minutes
     private const REFRESH_TOKEN_EXPIRES = 2592000; // 30 days
 
     // Utility
-    private static function now(): string { return gmdate('c'); }
-    private static function randomString(int $len): string { return bin2hex(random_bytes($len)); }
+    public static function now(): string { return gmdate('c'); }
+    public static function randomString(int $len): string { return bin2hex(random_bytes($len)); }
     private static function sendEmail(string $email, string $subject, string $body): void {
         // Placeholder: In production, integrate with email service
     }
@@ -113,7 +151,7 @@ class AuthSystem {
         }
         return $bytes;
     }
-    private static function totp(string $secret, int $time = null, int $step = 30, int $digits = 6): string {
+    public static function totp(string $secret, ?int $time = null, int $step = 30, int $digits = 6): string {
         $time = $time ?? time();
         $counter = floor($time / $step);
         $key = self::base32Decode($secret);
@@ -128,7 +166,7 @@ class AuthSystem {
         $base64Url = function($data){ return rtrim(strtr(base64_encode($data), '+/', '-_'), '='); };
         $headerB64 = $base64Url(json_encode($header));
         $payloadB64 = $base64Url(json_encode($payload));
-        $signature = hash_hmac('sha256', "$headerB64.$payloadB64", self::JWT_SECRET, true);
+        $signature = hash_hmac('sha256', "$headerB64.$payloadB64", self::jwtSecret(), true);
         $signatureB64 = $base64Url($signature);
         return "$headerB64.$payloadB64.$signatureB64";
     }
@@ -139,7 +177,7 @@ class AuthSystem {
         $base64UrlDecode = function($data){ $pad = 4 - (strlen($data) % 4); if ($pad < 4) $data .= str_repeat('=', $pad); return base64_decode(strtr($data, '-_', '+/')); };
         $header = json_decode($base64UrlDecode($headerB64), true);
         if ($header['alg'] !== self::JWT_ALG) throw new Exception('invalid_token');
-        $expectedSig = hash_hmac('sha256', "$headerB64.$payloadB64", self::JWT_SECRET, true);
+        $expectedSig = hash_hmac('sha256', "$headerB64.$payloadB64", self::jwtSecret(), true);
         if (!hash_equals($expectedSig, base64_decode(strtr($signatureB64, '-_', '+/')))) throw new Exception('invalid_token');
         $payload = json_decode($base64UrlDecode($payloadB64), true);
         if (isset($payload['exp']) && time() > $payload['exp']) throw new Exception('token_expired');
@@ -152,8 +190,7 @@ class AuthSystem {
         // Rate limit
         $ip = $_SERVER['REMOTE_ADDR'] ?? '127.0.0.1';
         $now = time();
-        self::$signupAttempts[$ip] = array_filter(self::$signupAttempts[$ip] ?? [], fn($t)=>$t > $now-86400);
-        if (count(self::$signupAttempts[$ip]) >= 5) {
+        if (self::attempt('signup:' . $ip, 86400, false) >= 5) {
             return ['status_code'=>429,'body'=>['error'=>'too_many_signups_from_ip','message'=>'Rate limit exceeded']];
         }
         // Email unique
@@ -185,14 +222,14 @@ class AuthSystem {
         // Logs
         self::logWhy('signup',['email_unique','password_strength','rate_limit_ip_24h']);
         self::auditLog($userId,'user_created',null,$userId);
-        self::$signupAttempts[$ip][] = $now;
+        self::attempt('signup:' . $ip, 86400);
         return ['status_code'=>200,'body'=>['success'=>true,'status'=>'pending_verification','email'=>$email,'message'=>'check email']];
     }
 
     // 2. verify_email
     public static function verify_email(string $email, string $code): array {
         $db = Database::get();
-        $stmt = $db->prepare('SELECT u.id,u.email_verified_at,vc.id as vc_id FROM users u JOIN verification_codes vc ON u.id=vc.user_id WHERE u.email=? AND vc.code=? AND vc.type="email"');
+        $stmt = $db->prepare('SELECT u.id,u.email_verified_at,vc.id as vc_id FROM users u JOIN verification_codes vc ON u.id=vc.user_id WHERE u.email=? AND vc.code=? AND vc.type=\'email\'');
         $stmt->execute([$email,$code]);
         $row = $stmt->fetch(PDO::FETCH_ASSOC);
         if (!$row) return ['status_code'=>400,'body'=>['error'=>'code_invalid','message'=>'Invalid code']];
@@ -220,9 +257,7 @@ class AuthSystem {
             // Rate limit
             $key = $ip.'|'.$email;
             $now = time();
-            self::$loginAttempts[$key] = array_filter(self::$loginAttempts[$key] ?? [], fn($t)=>$t > $now-900);
-            self::$loginAttempts[$key][] = $now;
-            if (count(self::$loginAttempts[$key]) > 5) {
+            if (self::attempt('login:' . $key, 900) > 5) {
                 return ['status_code'=>429,'body'=>['error'=>'too_many_attempts','message'=>'Rate limit exceeded']];
             }
             return ['status_code'=>401,'body'=>['error'=>'invalid_credentials','message'=>'Invalid credentials']];
@@ -288,12 +323,19 @@ class AuthSystem {
     // 5. mfa_challenge
     public static function mfa_challenge(string $challenge_id, string $code): array {
         $db = Database::get();
-        $stmt = $db->prepare('SELECT vc.user_id,vc.expires_at,u.mfa_secret FROM verification_codes vc JOIN users u ON vc.user_id=u.id WHERE vc.id=? AND vc.type="mfa"');
+        $stmt = $db->prepare('SELECT vc.user_id,vc.expires_at,u.mfa_secret FROM verification_codes vc JOIN users u ON vc.user_id=u.id WHERE vc.id=? AND vc.type=\'mfa\'');
         $stmt->execute([$challenge_id]);
         $row = $stmt->fetch(PDO::FETCH_ASSOC);
         if (!$row) return ['status_code'=>400,'body'=>['error'=>'invalid_challenge','message'=>'Challenge not found']];
         if (time() > strtotime($row['expires_at'])) return ['status_code'=>400,'body'=>['error'=>'challenge_expired','message'=>'Challenge expired']];
-        if (!self::totp($row['mfa_secret']) === $code) {
+        // 2026-10-08 fix: was `if (!self::totp(...) === $code)`, which compares false with the code and
+        // therefore accepted ANY code. Constant-time compare, current step plus one step of drift.
+        $now = time();
+        $ok = false;
+        foreach ([$now - 30, $now, $now + 30] as $t) {
+            $ok = $ok || hash_equals(self::totp((string) $row['mfa_secret'], $t), $code);
+        }
+        if (!$ok) {
             return ['status_code'=>401,'body'=>['error'=>'invalid_code','message'=>'Invalid MFA code']];
         }
         // Delete challenge
