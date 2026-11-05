@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS api_keys (
   last_used_at TEXT,
   is_active INTEGER NOT NULL DEFAULT 1,
   rotated_at TEXT,
-  grace_period_ends_at TEXT
+  grace_period_ends_at TEXT,
+  previous_key_secret_hash TEXT
 );
 
 CREATE TABLE IF NOT EXISTS api_key_usage (
@@ -220,6 +221,7 @@ class ApiKeyService {
       is_active: true,
       rotated_at: null,
       grace_period_ends_at: null,
+      previous_key_secret_hash: null,
     };
     this.store.insertKey(record);
 
@@ -256,16 +258,18 @@ class ApiKeyService {
     return { success: true, revoked_at: revokedAt };
   }
 
-  rotateKey(apiKeyId) {
+  async rotateKey(apiKeyId) {
     const rec = this.store.findKey(apiKeyId);
     if (!rec) throw new ApiKeyError(404, 'API key not found', 'NOT_FOUND');
     const nowMs = new Date(this.now()).getTime();
     const oldKeyRevokedAt = this.now();
     const gracePeriodEndsAt = new Date(nowMs + GRACE_PERIOD_MS).toISOString();
     const newKey = generateKey(this.env);
-    const newHash = bcrypt.hashSync(newKey, this.bcryptRounds);
+    const newHash = await bcrypt.hash(newKey, this.bcryptRounds);
+    const oldHash = rec.key_secret_hash;
     this.store.updateKey(apiKeyId, {
       key_secret_hash: newHash,
+      previous_key_secret_hash: oldHash,
       is_active: true,
       rotated_at: oldKeyRevokedAt,
       grace_period_ends_at: gracePeriodEndsAt,
@@ -279,7 +283,6 @@ class ApiKeyService {
 
   async authenticate(apiKey, method, path) {
     if (!apiKey) throw new ApiKeyError(401, 'Missing API key', 'MISSING_KEY');
-    const rec = this.store.findKeyBySecret ? null : null;
     const record = await this._findKeyBySecret(apiKey);
     if (!record) throw new ApiKeyError(401, 'Invalid API key', 'INVALID_KEY');
 
@@ -320,9 +323,17 @@ class ApiKeyService {
 
   async _findKeyBySecret(secret) {
     const all = this.store.listKeys();
+    const nowMs = new Date(this.now()).getTime();
     for (const rec of all) {
       const match = await bcrypt.compare(secret, rec.key_secret_hash);
       if (match) return rec;
+      if (rec.previous_key_secret_hash && rec.grace_period_ends_at) {
+        const graceEndsMs = new Date(rec.grace_period_ends_at).getTime();
+        if (nowMs < graceEndsMs) {
+          const oldMatch = await bcrypt.compare(secret, rec.previous_key_secret_hash);
+          if (oldMatch) return rec;
+        }
+      }
     }
     return null;
   }

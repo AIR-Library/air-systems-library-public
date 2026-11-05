@@ -1,8 +1,10 @@
 import java.time.*;
+import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.*;
 import java.util.stream.Collectors;
+import java.security.SecureRandom;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.core.type.TypeReference;
 import org.mindrot.jbcrypt.BCrypt;
@@ -115,6 +117,8 @@ public class ApiKeysServiceAccounts {
 
         @Override
         public Optional<ApiKey> findBySecret(String secret) {
+            // Every key is checked with bcrypt, which is slow. In production, put a key id in the secret
+            // (sk_live_<id>_<random>) so one lookup finds the key.
             return store.values().stream()
                     .filter(k -> BCrypt.checkpw(secret, k.keySecretHash))
                     .findFirst();
@@ -184,13 +188,34 @@ public class ApiKeysServiceAccounts {
         private final Duration window = Duration.ofHours(1);
 
         public boolean allow(String keyId, int limit) {
-            String counterKey = keyId + ":" + LocalDateTime.now().truncatedTo(ChronoUnit.HOURS);
-            AtomicInteger counter = counters.computeIfAbsent(counterKey, k -> new AtomicInteger(0));
+            String hourKey = keyId + ":" + LocalDateTime.now().truncatedTo(ChronoUnit.HOURS);
+            AtomicInteger counter = counters.computeIfAbsent(hourKey, k -> new AtomicInteger(0));
             int current = counter.incrementAndGet();
+            // Opportunistic cleanup of stale hour buckets (older than 2 hours)
+            if (ThreadLocalRandom.current().nextInt(100) == 0) {
+                cleanupStaleBuckets();
+            }
             return current <= limit;
         }
 
-        public void reset() {
+        private void cleanupStaleBuckets() {
+            LocalDateTime cutoff = LocalDateTime.now().minusHours(2);
+            counters.entrySet().removeIf(entry -> {
+                String[] parts = entry.getKey().split(":", 2);
+                if (parts.length == 2) {
+                    try {
+                        LocalDateTime bucketTime = LocalDateTime.parse(parts[1]);
+                        return bucketTime.isBefore(cutoff);
+                    } catch (Exception e) {
+                        return true; // Remove malformed keys
+                    }
+                }
+                return true;
+            });
+        }
+
+        // Package-private for testing only; not part of public API
+        void resetForTesting() {
             counters.clear();
         }
     }
@@ -201,7 +226,7 @@ public class ApiKeysServiceAccounts {
         private final ApiKeyUsageRepository usageRepo;
         private final RateLimiter rateLimiter;
         private final ObjectMapper mapper = new ObjectMapper();
-        private final Random random = new SecureRandom();
+        private final SecureRandom random = new SecureRandom();
 
         public ApiKeyService(ApiKeyRepository keyRepo,
                              ApiKeyUsageRepository usageRepo,
@@ -223,7 +248,7 @@ public class ApiKeysServiceAccounts {
             keyRepo.save(key);
             Map<String, Object> resp = new HashMap<>();
             resp.put("api_key_id", key.id);
-            resp.put("key", secret);
+            resp.put("key", secret); // Only shown once per spec
             resp.put("created_at", key.createdAt.toString());
             resp.put("expires_at", key.expiresAt != null ? key.expiresAt.toString() : null);
             resp.put("rate_limit", key.rateLimit);
@@ -279,13 +304,13 @@ public class ApiKeysServiceAccounts {
             keyRepo.save(newKey);
 
             Map<String, Object> resp = new HashMap<>();
-            resp.put("new_key", secret);
+            resp.put("new_key", secret); // Only shown once per spec
             resp.put("old_key_revoked_at", oldKey.revokedAt.toString());
             resp.put("grace_period_ends_at", oldKey.gracePeriodEndsAt.toString());
             return resp;
         }
 
-        /* Use API key (validate and log) */
+        /* Use API key (validate and log) - atomic rate-limit check + usage logging */
         public Map<String, Object> useKey(String secret, String endpoint,
                                           String method, int status) {
             ApiKey key = keyRepo.findBySecret(secret)
@@ -305,16 +330,22 @@ public class ApiKeysServiceAccounts {
             if (!key.scopes.contains("*") && !key.scopes.contains(action)) {
                 throw new IllegalArgumentException("Insufficient scope");
             }
-            // Rate limit
-            if (!rateLimiter.allow(String.valueOf(key.id), key.rateLimit)) {
-                throw new IllegalStateException("Rate limit exceeded");
+            // Atomic rate-limit check and usage logging per key
+            synchronized (String.valueOf(key.id).intern()) {
+                if (!rateLimiter.allow(String.valueOf(key.id), key.rateLimit)) {
+                    // Log the rate-limited attempt
+                    ApiKeyUsage usage = new ApiKeyUsage(0, key.id, endpoint, method, 429,
+                            LocalDateTime.now());
+                    usageRepo.save(usage);
+                    throw new IllegalStateException("Rate limit exceeded");
+                }
+                // Log usage
+                ApiKeyUsage usage = new ApiKeyUsage(0, key.id, endpoint, method, status,
+                        LocalDateTime.now());
+                usageRepo.save(usage);
+                key.lastUsedAt = LocalDateTime.now();
+                keyRepo.save(key);
             }
-            // Log usage
-            ApiKeyUsage usage = new ApiKeyUsage(0, key.id, endpoint, method, status,
-                    LocalDateTime.now());
-            usageRepo.save(usage);
-            key.lastUsedAt = LocalDateTime.now();
-            keyRepo.save(key);
 
             Map<String, Object> resp = new HashMap<>();
             resp.put("status", status);
@@ -347,10 +378,19 @@ public class ApiKeysServiceAccounts {
             return resp;
         }
 
-        /* Admin audit */
-        public Map<String, Object> listAllKeysForAudit(Long userId, Boolean isActive) {
-            List<ApiKey> keys = keyRepo.findByUserIdAndStatus(
-                    userId != null ? userId : 0, isActive);
+        /* Admin audit - requires isAdmin=true; null userId means all users */
+        public Map<String, Object> listAllKeysForAudit(Long userId, Boolean isActive, boolean isAdmin) {
+            if (!isAdmin) {
+                throw new SecurityException("Admin access required");
+            }
+            List<ApiKey> keys;
+            if (userId != null) {
+                keys = keyRepo.findByUserIdAndStatus(userId, isActive);
+            } else {
+                keys = keyRepo.findAll().stream()
+                        .filter(k -> isActive == null || k.isActive == isActive)
+                        .collect(Collectors.toList());
+            }
             List<Map<String, Object>> list = keys.stream().map(k -> {
                 Map<String, Object> m = new HashMap<>();
                 m.put("api_key_id", k.id);
@@ -372,7 +412,7 @@ public class ApiKeysServiceAccounts {
         private String generateSecret() {
             byte[] bytes = new byte[24];
             random.nextBytes(bytes);
-            return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+            return "sk_live_" + Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
         }
     }
 }

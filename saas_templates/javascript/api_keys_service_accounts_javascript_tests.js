@@ -150,12 +150,26 @@ async function main() {
       scopes: [SCOPES.READ_DEPLOYMENTS],
       rate_limit: 1000,
     });
-    const rot = svc.rotateKey(created.api_key_id);
+    const base = new Date('2026-09-24T10:00:00.000Z');
+    let t = base.getTime();
+    const svc2 = new ApiKeyService({
+      store: svc.store,
+      env: 'live',
+      now: () => new Date(t).toISOString(),
+    });
+    const rot = await svc2.rotateKey(created.api_key_id);
     assert.ok(rot.new_key.startsWith('sk_live_'));
     assert.ok(rot.old_key_revoked_at);
     assert.ok(rot.grace_period_ends_at);
-    await svc.authenticate(rot.new_key, 'GET', '/deployments');
-    await expectStatus(svc.authenticate(created.key, 'GET', '/deployments'), 401);
+    await svc2.authenticate(rot.new_key, 'GET', '/deployments');
+    t = base.getTime() + 25 * 60 * 60 * 1000;
+    const svc3 = new ApiKeyService({
+      store: svc.store,
+      env: 'live',
+      now: () => new Date(t).toISOString(),
+    });
+    await expectStatus(svc3.authenticate(created.key, 'GET', '/deployments'), 401);
+    await svc3.authenticate(rot.new_key, 'GET', '/deployments');
   });
 
   await test('rotate: old key still works within grace period', async () => {
@@ -172,7 +186,7 @@ async function main() {
       env: 'live',
       now: () => new Date(t).toISOString(),
     });
-    const rot = svc2.rotateKey(created.api_key_id);
+    const rot = await svc2.rotateKey(created.api_key_id);
     t = base.getTime() + 12 * 60 * 60 * 1000;
     const svc3 = new ApiKeyService({
       store: svc.store,
@@ -232,7 +246,8 @@ async function main() {
   });
 
   await test('usage stats: requests counted per endpoint with errors and rate hits', async () => {
-    const { svc } = makeService();
+    const fixedNow = () => '2026-09-15T12:00:00.000Z';
+    const { svc } = makeService({ now: fixedNow });
     const created = await svc.createKey('user_1', {
       name: 'Int',
       scopes: [SCOPES.READ_DEPLOYMENTS, SCOPES.WEBHOOK_MANAGE],
@@ -252,7 +267,7 @@ async function main() {
     const stats = svc.getUsageStats(created.api_key_id, '2026-09-01', '2026-09-24');
     assert.strictEqual(stats.api_key_id, created.api_key_id);
     assert.strictEqual(stats.total_requests, 53);
-    assert.strictEqual(stats.requests_by_endpoint['GET /deployments'], 42);
+    assert.strictEqual(stats.requests_by_endpoint['GET /deployments'], 43);
     assert.strictEqual(stats.requests_by_endpoint['POST /webhooks'], 10);
     assert.strictEqual(stats.rate_limit_hits, 1);
     assert.strictEqual(stats.errors['404'], 1);

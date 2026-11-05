@@ -38,9 +38,9 @@ type SearchResult struct {
 }
 
 type SearchResponse struct {
-	Results []SearchResult          `json:"results"`
-	Total   int                     `json:"total"`
-	HasMore bool                    `json:"has_more"`
+	Results []SearchResult           `json:"results"`
+	Total   int                      `json:"total"`
+	HasMore bool                     `json:"has_more"`
 	Facets  map[string]map[string]int `json:"facets,omitempty"`
 }
 
@@ -57,6 +57,13 @@ var globalIndex = &Index{
 	stopWords: map[string]struct{}{
 		"a": {}, "an": {}, "the": {}, "and": {}, "or": {}, "but": {}, "is": {}, "are": {}, "was": {}, "were": {}, "in": {}, "on": {}, "at": {}, "by": {}, "for": {}, "with": {}, "without": {}, "to": {}, "from": {},
 	},
+}
+
+func (idx *Index) Reset() {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	idx.docs = make(map[int]Document)
+	idx.inverted = make(map[string]map[int]struct{})
 }
 
 func tokenize(text string) []string {
@@ -107,60 +114,69 @@ func (idx *Index) UnindexDocument(docType string, docID int) error {
 	return nil
 }
 
-func relevanceScore(term, token string) float64 {
-	if term == token {
-		return 1.0
-	}
-	if strings.Contains(token, term) {
-		return 0.8
-	}
-	if strings.HasPrefix(token, term) {
-		return 0.5
-	}
-	return 0.0
-}
-
 func (idx *Index) Search(query string, docType string, limit, offset int, filters map[string]string, facets []string) ([]SearchResult, int, bool, map[string]map[string]int, error) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
+
 	terms := tokenize(query)
+	if len(terms) == 0 {
+		return []SearchResult{}, 0, false, nil, nil
+	}
+
 	docScores := make(map[int]float64)
+
 	for _, term := range terms {
-		if ids, ok := idx.inverted[term]; ok {
-			for id := range ids {
-				doc := idx.docs[id]
-				if docType != "" && doc.DocumentType != docType {
-					continue
-				}
-				// filter check
-				matched := true
-				for fkey, fval := range filters {
-					if v, ok := doc.Metadata[fkey]; ok {
-						if fmt.Sprintf("%v", v) != fval {
+		for indexToken, docIDs := range idx.inverted {
+			matchType := 0 // 0=no match, 1=prefix, 2=contains, 3=exact
+			if indexToken == term {
+				matchType = 3
+			} else if strings.Contains(indexToken, term) {
+				matchType = 2
+			} else if strings.HasPrefix(indexToken, term) {
+				matchType = 1
+			}
+
+			if matchType > 0 {
+				for docID := range docIDs {
+					doc := idx.docs[docID]
+					if docType != "" && doc.DocumentType != docType {
+						continue
+					}
+					matched := true
+					for fkey, fval := range filters {
+						if v, ok := doc.Metadata[fkey]; ok {
+							if fmt.Sprintf("%v", v) != fval {
+								matched = false
+								break
+							}
+						} else {
 							matched = false
 							break
 						}
-					} else {
-						matched = false
-						break
 					}
-				}
-				if !matched {
-					continue
-				}
-				// relevance
-				tokens := tokenize(doc.Content)
-				var score float64
-				for _, t := range tokens {
-					score += relevanceScore(term, t)
-				}
-				if score > docScores[id] {
-					docScores[id] = score
+					if !matched {
+						continue
+					}
+
+					var score float64
+					switch matchType {
+					case 3:
+						score = 1.0
+					case 2:
+						score = 0.8
+					case 1:
+						score = 0.5
+					}
+					docScores[docID] += score
 				}
 			}
 		}
 	}
-	// collect results
+
+	if len(docScores) == 0 {
+		return []SearchResult{}, 0, false, nil, nil
+	}
+
 	type kv struct {
 		id    int
 		score float64
@@ -170,10 +186,15 @@ func (idx *Index) Search(query string, docType string, limit, offset int, filter
 		kvs = append(kvs, kv{id: id, score: s})
 	}
 	sort.Slice(kvs, func(i, j int) bool {
-		return kvs[i].score > kvs[j].score
+		if kvs[i].score != kvs[j].score {
+			return kvs[i].score > kvs[j].score
+		}
+		return kvs[i].id < kvs[j].id
 	})
+
 	total := len(kvs)
 	hasMore := offset+limit < total
+
 	var results []SearchResult
 	for i := offset; i < offset+limit && i < total; i++ {
 		doc := idx.docs[kvs[i].id]
@@ -184,7 +205,7 @@ func (idx *Index) Search(query string, docType string, limit, offset int, filter
 			Metadata:     doc.Metadata,
 		})
 	}
-	// facets
+
 	facetMap := make(map[string]map[string]int)
 	if len(facets) > 0 {
 		for _, f := range facets {
@@ -199,6 +220,7 @@ func (idx *Index) Search(query string, docType string, limit, offset int, filter
 			}
 		}
 	}
+
 	return results, total, hasMore, facetMap, nil
 }
 
@@ -278,7 +300,7 @@ func unindexHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) < 4 {
+	if len(parts) < 5 {
 		http.Error(w, "invalid path", http.StatusBadRequest)
 		return
 	}

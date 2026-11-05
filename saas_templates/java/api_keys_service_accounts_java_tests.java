@@ -26,6 +26,9 @@ public class ApiKeysServiceAccountsTests {
         assertNotNull(resp.get("api_key_id"));
         assertNotNull(resp.get("key"));
         assertEquals(1000, resp.get("rate_limit"));
+        // Key should be sk_live_ prefixed
+        String key = (String) resp.get("key");
+        assertTrue(key.startsWith("sk_live_"));
     }
 
     @Test
@@ -63,6 +66,11 @@ public class ApiKeysServiceAccountsTests {
         Exception e = assertThrows(IllegalStateException.class,
                 () -> service.useKey(key, "/deployments", "GET", 200));
         assertTrue(e.getMessage().contains("Rate limit exceeded"));
+        // Verify rate limit hit was logged
+        long keyId = (long) create.get("api_key_id");
+        Map<String, Object> stats = service.getUsageStats(keyId,
+                LocalDateTime.now().minusHours(1), LocalDateTime.now().plusHours(1));
+        assertEquals(1, stats.get("rate_limit_hits"));
     }
 
     @Test
@@ -96,6 +104,8 @@ public class ApiKeysServiceAccountsTests {
         Exception e = assertThrows(IllegalArgumentException.class,
                 () -> service.useKey(oldKey, "/deployments", "GET", 200));
         assertTrue(e.getMessage().contains("revoked"));
+        // New key still works after grace period
+        service.useKey(newKey, "/deployments", "GET", 200);
     }
 
     @Test
@@ -135,9 +145,50 @@ public class ApiKeysServiceAccountsTests {
         List<String> scopes = Arrays.asList("GET /deployments");
         service.createKey(1L, "Key1", scopes, null, 1000);
         service.createKey(2L, "Key2", scopes, null, 1000);
-        Map<String, Object> audit = service.listAllKeysForAudit(1L, true);
+        // Admin audit with userId filter
+        Map<String, Object> audit = service.listAllKeysForAudit(1L, true, true);
         assertEquals(1, audit.get("total"));
         List<Map<String, Object>> keys = (List<Map<String, Object>>) audit.get("keys");
         assertEquals(1L, keys.get(0).get("user_id"));
+        // Admin audit without userId filter (all users)
+        Map<String, Object> auditAll = service.listAllKeysForAudit(null, true, true);
+        assertEquals(2, auditAll.get("total"));
+        // Non-admin should fail
+        Exception e = assertThrows(SecurityException.class,
+                () -> service.listAllKeysForAudit(1L, true, false));
+        assertTrue(e.getMessage().contains("Admin access required"));
+    }
+
+    @Test
+    public void testRateLimitAtomicWithUsageLogging() {
+        // Verify that rate-limited requests are logged with status 429
+        List<String> scopes = Arrays.asList("GET /test");
+        Map<String, Object> create = service.createKey(1L, "Test", scopes, null, 2);
+        String key = (String) create.get("key");
+        long keyId = (long) create.get("api_key_id");
+        // Two successful requests
+        service.useKey(key, "/test", "GET", 200);
+        service.useKey(key, "/test", "GET", 200);
+        // Third request hits rate limit
+        assertThrows(IllegalStateException.class, () -> service.useKey(key, "/test", "GET", 200));
+        // Check usage stats include the 429
+        Map<String, Object> stats = service.getUsageStats(keyId,
+                LocalDateTime.now().minusHours(1), LocalDateTime.now().plusHours(1));
+        assertEquals(3, stats.get("total_requests"));
+        assertEquals(1, stats.get("rate_limit_hits"));
+        Map<Integer, Integer> errors = (Map<Integer, Integer>) stats.get("errors");
+        assertEquals(1, errors.get(429));
+    }
+
+    @Test
+    public void testWildcardScope() {
+        List<String> scopes = Arrays.asList("*");
+        Map<String, Object> create = service.createKey(1L, "Admin Key", scopes, null, 1000);
+        String key = (String) create.get("key");
+        // Should allow any action
+        service.useKey(key, "/deployments", "GET", 200);
+        service.useKey(key, "/deployments", "POST", 200);
+        service.useKey(key, "/users", "DELETE", 200);
+        service.useKey(key, "/billing", "PUT", 200);
     }
 }

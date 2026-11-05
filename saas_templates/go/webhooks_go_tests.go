@@ -1,32 +1,30 @@
 package webhooks
 
 import (
-	"bytes"
-	"encoding/json"
+	"encoding/base64"
 	"net/http"
-	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
-
-	_ "github.com/mattn/go-sqlite3"
 )
 
+func newTestWebhook() *Webhook {
+	store := NewInMemoryStore()
+	if err := store.InitSchema(); err != nil {
+		panic(err)
+	}
+	return NewWebhook(store)
+}
+
 func TestWebhook_SignVerifyRoundtrip(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := InitSchema(db); err != nil {
-		t.Fatal(err)
-	}
-	w := NewWebhook(db)
-	// create endpoint to get a valid secret
+	w := newTestWebhook()
 	_, secret, err := w.CreateEndpoint(1, "https://example.com", []string{"test"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	msgID := "msg_123"
-	timestamp := int64(1700000000)
+	timestamp := time.Now().Unix()
 	body := []byte(`{"foo":1}`)
 	sig, err := Sign(secret, msgID, timestamp, body)
 	if err != nil {
@@ -46,20 +44,13 @@ func TestWebhook_SignVerifyRoundtrip(t *testing.T) {
 }
 
 func TestWebhook_VerifyFailsOnChangedBody(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := InitSchema(db); err != nil {
-		t.Fatal(err)
-	}
-	w := NewWebhook(db)
+	w := newTestWebhook()
 	_, secret, err := w.CreateEndpoint(1, "https://example.com", []string{"test"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	msgID := "msg_456"
-	timestamp := int64(1700000000)
+	timestamp := time.Now().Unix()
 	body := []byte(`{"foo":1}`)
 	sig, _ := Sign(secret, msgID, timestamp, body)
 	// tamper body
@@ -78,20 +69,13 @@ func TestWebhook_VerifyFailsOnChangedBody(t *testing.T) {
 }
 
 func TestWebhook_VerifyFailsOnChangedTimestamp(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := InitSchema(db); err != nil {
-		t.Fatal(err)
-	}
-	w := NewWebhook(db)
+	w := newTestWebhook()
 	_, secret, err := w.CreateEndpoint(1, "https://example.com", []string{"test"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	msgID := "msg_789"
-	timestamp := int64(1700000000)
+	timestamp := time.Now().Unix()
 	body := []byte(`{"foo":1}`)
 	sig, _ := Sign(secret, msgID, timestamp, body)
 	header := http.Header{}
@@ -108,14 +92,7 @@ func TestWebhook_VerifyFailsOnChangedTimestamp(t *testing.T) {
 }
 
 func TestWebhook_VerifyRejectsOldTimestamp(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := InitSchema(db); err != nil {
-		t.Fatal(err)
-	}
-	w := NewWebhook(db)
+	w := newTestWebhook()
 	_, secret, err := w.CreateEndpoint(1, "https://example.com", []string{"test"})
 	if err != nil {
 		t.Fatal(err)
@@ -139,14 +116,7 @@ func TestWebhook_VerifyRejectsOldTimestamp(t *testing.T) {
 }
 
 func TestWebhook_VerifyAcceptsOneOfMultipleSignatures(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := InitSchema(db); err != nil {
-		t.Fatal(err)
-	}
-	w := NewWebhook(db)
+	w := newTestWebhook()
 	_, secret1, err := w.CreateEndpoint(1, "https://example.com", []string{"test"})
 	if err != nil {
 		t.Fatal(err)
@@ -156,7 +126,7 @@ func TestWebhook_VerifyAcceptsOneOfMultipleSignatures(t *testing.T) {
 		t.Fatal(err)
 	}
 	msgID := "msg_multi"
-	timestamp := int64(1700000000)
+	timestamp := time.Now().Unix()
 	body := []byte(`{}`)
 	sig1, _ := Sign(secret1, msgID, timestamp, body)
 	sig2, _ := Sign(secret2, msgID, timestamp, body)
@@ -164,7 +134,6 @@ func TestWebhook_VerifyAcceptsOneOfMultipleSignatures(t *testing.T) {
 	header.Set("webhook-id", msgID)
 	header.Set("webhook-timestamp", strconv.FormatInt(timestamp, 10))
 	header.Set("webhook-signature", sig1+" "+sig2) // space-separated
-	// verify with secret1 should succeed
 	ok, err := Verify(secret1, header, body, 300)
 	if err != nil {
 		t.Fatal(err)
@@ -183,165 +152,207 @@ func TestWebhook_VerifyAcceptsOneOfMultipleSignatures(t *testing.T) {
 }
 
 func TestWebhook_DeliverSuccessAndRetry(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
+	w := newTestWebhook()
+
+	// Success case: sender returns 200
+	successSender := func(url string, headers http.Header, body []byte) (int, error) {
+		return http.StatusOK, nil
+	}
+	epID, _, err := w.CreateEndpoint(1, "https://example.com/success", []string{"ev1"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := InitSchema(db); err != nil {
-		t.Fatal(err)
-	}
-	w := NewWebhook(db)
-	// endpoint that will return 200
-	ts := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		rw.WriteHeader(http.StatusOK)
-	}))
-	defer ts.Close()
-	// endpoint that will return 500
-	tf := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		rw.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer tf.Close()
-	// success case
-	epID, _, err := w.CreateEndpoint(1, ts.URL, []string{"ev1"})
+	msgID, err := w.SendEvent(1, "ev1", map[string]string{"hello": "world"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	msgID, err := w.SendEvent("ev1", map[string]string{"hello": "world"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// get delivery ID
 	var deliveryID int64
-	err = db.QueryRow(`SELECT id FROM webhook_deliveries WHERE message_id = ? AND endpoint_id = ?`, msgID, epID).Scan(&deliveryID)
-	if err != nil {
-		t.Fatal(err)
+	// Get delivery ID from store directly since we're using in-memory
+	store := w.store.(*InMemoryStore)
+	store.mu.RLock()
+	for id, d := range store.deliveries {
+		if d.MessageID == msgID && d.EndpointID == epID {
+			deliveryID = id
+			break
+		}
 	}
-	ok, err := w.Deliver(deliveryID)
+	store.mu.RUnlock()
+	if deliveryID == 0 {
+		t.Fatal("delivery not found")
+	}
+	ok, err := w.Deliver(deliveryID, successSender)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !ok {
 		t.Error("expected delivery to succeed")
 	}
-	// check that failure_count reset and no next attempt
-	var failureCount int64
-	var nextAttempt sql.NullTime
-	err = db.QueryRow(`SELECT failure_count, next_attempt_at FROM webhook_endpoints WHERE id = ?`, epID).Scan(&failureCount, &nextAttempt)
+	ep, err := w.store.GetEndpoint(epID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if failureCount != 0 {
+	if ep.FailureCount != 0 {
 		t.Error("expected failure_count to be 0 after success")
 	}
-	if nextAttempt.Valid {
-		t.Error("expected no next attempt after success")
-	}
-	// failure case
-	epID2, _, err := w.CreateEndpoint(2, tf.URL, []string{"ev1"})
+	d, err := w.store.GetDelivery(deliveryID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	msgID2, err := w.SendEvent("ev1", map[string]string{"hello": "world"})
+	if d.NextAttemptAt != nil {
+		t.Error("expected no next attempt after success")
+	}
+
+	// Failure case: sender returns 500
+	failSender := func(url string, headers http.Header, body []byte) (int, error) {
+		return http.StatusInternalServerError, nil
+	}
+	epID2, _, err := w.CreateEndpoint(2, "https://example.com/fail", []string{"ev1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgID2, err := w.SendEvent(2, "ev1", map[string]string{"hello": "world"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var deliveryID2 int64
-	err = db.QueryRow(`SELECT id FROM webhook_deliveries WHERE message_id = ? AND endpoint_id = ?`, msgID2, epID2).Scan(&deliveryID2)
-	if err != nil {
-		t.Fatal(err)
+	store.mu.RLock()
+	for id, d := range store.deliveries {
+		if d.MessageID == msgID2 && d.EndpointID == epID2 {
+			deliveryID2 = id
+			break
+		}
 	}
-	ok, err = w.Deliver(deliveryID2)
+	store.mu.RUnlock()
+	if deliveryID2 == 0 {
+		t.Fatal("delivery not found")
+	}
+	ok, err = w.Deliver(deliveryID2, failSender)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if ok {
 		t.Error("expected delivery to fail")
 	}
-	// check failure count incremented and next attempt set
-	var fc int64
-	var na sql.NullTime
-	err = db.QueryRow(`SELECT failure_count, next_attempt_at FROM webhook_endpoints WHERE id = ?`, epID2).Scan(&fc, &na)
+	ep2, err := w.store.GetEndpoint(epID2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fc != 1 {
+	if ep2.FailureCount != 1 {
 		t.Error("expected failure_count to be 1 after first failure")
 	}
-	if !na.Valid {
+	d2, err := w.store.GetDelivery(deliveryID2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d2.NextAttemptAt == nil {
 		t.Error("expected next attempt to be scheduled")
 	}
-	// ensure webhook-id same across retries (we'll test via mock server capturing header)
+
+	// Test 301, 400 also schedule retry
+	for _, code := range []int{http.StatusMovedPermanently, http.StatusBadRequest} {
+		code := code
+		sender := func(url string, headers http.Header, body []byte) (int, error) {
+			return code, nil
+		}
+		epID3, _, err := w.CreateEndpoint(3, "https://example.com/code", []string{"ev1"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		msgID3, err := w.SendEvent(3, "ev1", map[string]string{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var deliveryID3 int64
+		store.mu.RLock()
+		for id, d := range store.deliveries {
+			if d.MessageID == msgID3 && d.EndpointID == epID3 {
+				deliveryID3 = id
+				break
+			}
+		}
+		store.mu.RUnlock()
+		if deliveryID3 == 0 {
+			t.Fatal("delivery not found")
+		}
+		ok, err = w.Deliver(deliveryID3, sender)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			t.Errorf("expected delivery to fail for status %d", code)
+		}
+		ep3, err := w.store.GetEndpoint(epID3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ep3.FailureCount != 1 {
+			t.Errorf("expected failure_count 1 for status %d", code)
+		}
+		d3, err := w.store.GetDelivery(deliveryID3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d3.NextAttemptAt == nil {
+			t.Errorf("expected next attempt scheduled for status %d", code)
+		}
+	}
 }
 
 func TestWebhook_DeliverWebhookIDConsistent(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := InitSchema(db); err != nil {
-		t.Fatal(err)
-	}
-	w := NewWebhook(db)
-	// mock server to capture header
-	var capturedID string
-	var mu bytes.Buffer
-	ts := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		capturedID = r.Header.Get("webhook-id")
-		// first call fail, second succeed
-		if len(capturedID) == 0 {
-			rw.WriteHeader(http.StatusInternalServerError)
-		} else {
-			rw.WriteHeader(http.StatusOK)
+	w := newTestWebhook()
+
+	var capturedIDs []string
+	sender := func(url string, headers http.Header, body []byte) (int, error) {
+		capturedIDs = append(capturedIDs, headers.Get("webhook-id"))
+		if len(capturedIDs) == 1 {
+			return http.StatusInternalServerError, nil
 		}
-	}))
-	defer ts.Close()
-	epID, _, err := w.CreateEndpoint(1, ts.URL, []string{"ev2"})
+		return http.StatusOK, nil
+	}
+	epID, _, err := w.CreateEndpoint(1, "https://example.com", []string{"ev2"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	msgID, err := w.SendEvent("ev2", map[string]int{"n": 5})
+	msgID, err := w.SendEvent(1, "ev2", map[string]int{"n": 5})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var deliveryID int64
-	err = db.QueryRow(`SELECT id FROM webhook_deliveries WHERE message_id = ? AND endpoint_id = ?`, msgID, epID).Scan(&deliveryID)
+	store := w.store.(*InMemoryStore)
+	store.mu.RLock()
+	for id, d := range store.deliveries {
+		if d.MessageID == msgID && d.EndpointID == epID {
+			deliveryID = id
+			break
+		}
+	}
+	store.mu.RUnlock()
+	if deliveryID == 0 {
+		t.Fatal("delivery not found")
+	}
+	// First attempt (fails)
+	_, err = w.Deliver(deliveryID, sender)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// first attempt (should fail)
-	_, err = w.Deliver(deliveryID)
+	// Second attempt (succeeds)
+	_, err = w.Deliver(deliveryID, sender)
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstID := capturedID
-	// reset capturedID for second call
-	capturedID = ""
-	// second attempt (should succeed)
-	_, err = w.Deliver(deliveryID)
-	if err != nil {
-		t.Fatal(err)
+	if len(capturedIDs) != 2 {
+		t.Error("expected two captured webhook-ids")
 	}
-	secondID := capturedID
-	if firstID == "" || secondID == "" {
-		t.Error("failed to capture webhook-id")
-	}
-	if firstID != secondID {
+	if capturedIDs[0] != capturedIDs[1] {
 		t.Error("webhook-id differed between retries")
 	}
-	if firstID != msgID {
+	if capturedIDs[0] != msgID {
 		t.Error("webhook-id does not match message id")
 	}
 }
 
 func TestWebhook_SecretGeneration(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := InitSchema(db); err != nil {
-		t.Fatal(err)
-	}
-	w := NewWebhook(db)
+	w := newTestWebhook()
 	_, secret, err := w.CreateEndpoint(999, "https://example.com", []string{"any"})
 	if err != nil {
 		t.Fatal(err)
@@ -360,14 +371,7 @@ func TestWebhook_SecretGeneration(t *testing.T) {
 }
 
 func TestWebhook_RotateSecret(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := InitSchema(db); err != nil {
-		t.Fatal(err)
-	}
-	w := NewWebhook(db)
+	w := newTestWebhook()
 	epID, oldSecret, err := w.CreateEndpoint(1, "https://example.com", []string{"evx"})
 	if err != nil {
 		t.Fatal(err)
@@ -379,12 +383,77 @@ func TestWebhook_RotateSecret(t *testing.T) {
 	if newSecret == oldSecret {
 		t.Error("rotate_secret did not change secret")
 	}
-	var cur string
-	err = db.QueryRow(`SELECT secret FROM webhook_endpoints WHERE id = ?`, epID).Scan(&cur)
+	ep, err := w.store.GetEndpoint(epID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cur != newSecret {
+	if ep.Secret != newSecret {
 		t.Error("secret not persisted after rotation")
+	}
+}
+
+func TestWebhook_OrgIsolation(t *testing.T) {
+	w := newTestWebhook()
+
+	// Org 1 endpoint subscribed to "ev1"
+	epID1, _, err := w.CreateEndpoint(1, "https://org1.example.com", []string{"ev1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Org 2 endpoint subscribed to "ev1"
+	epID2, _, err := w.CreateEndpoint(2, "https://org2.example.com", []string{"ev1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Send event for org 1
+	msgID, err := w.SendEvent(1, "ev1", map[string]string{"data": "org1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Check deliveries: only org 1's endpoint should have a delivery
+	store := w.store.(*InMemoryStore)
+	store.mu.RLock()
+	count1 := 0
+	count2 := 0
+	for _, d := range store.deliveries {
+		if d.MessageID == msgID && d.EndpointID == epID1 {
+			count1++
+		}
+		if d.MessageID == msgID && d.EndpointID == epID2 {
+			count2++
+		}
+	}
+	store.mu.RUnlock()
+	if count1 != 1 {
+		t.Error("expected 1 delivery for org 1 endpoint")
+	}
+	if count2 != 0 {
+		t.Error("expected 0 deliveries for org 2 endpoint")
+	}
+
+	// Send event for org 2
+	msgID2, err := w.SendEvent(2, "ev1", map[string]string{"data": "org2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.mu.RLock()
+	count1 = 0
+	count2 = 0
+	for _, d := range store.deliveries {
+		if d.MessageID == msgID2 && d.EndpointID == epID1 {
+			count1++
+		}
+		if d.MessageID == msgID2 && d.EndpointID == epID2 {
+			count2++
+		}
+	}
+	store.mu.RUnlock()
+	if count1 != 0 {
+		t.Error("expected 0 deliveries for org 1 endpoint on org 2 event")
+	}
+	if count2 != 1 {
+		t.Error("expected 1 delivery for org 2 endpoint on org 2 event")
 	}
 }

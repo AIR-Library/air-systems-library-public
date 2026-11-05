@@ -91,39 +91,60 @@ function auditLog(entry) {
   });
 }
 
+function logPermissionCheck(req, requiredTier, userTier, decision) {
+  auditLog({
+    action: 'permission_check',
+    userId: req.user?.id,
+    endpoint: req.path || req.url || req.originalUrl || 'unknown',
+    required_tier: requiredTier,
+    user_tier: userTier,
+    decision
+  });
+}
+
 function require_authenticated(req, res, next) {
   if (!req.user) {
+    logPermissionCheck(req, 'authenticated', undefined, 'FAIL');
     return res.status(401).json({ error: 'authentication_required', message: 'Authentication required', code: 401 });
   }
+  logPermissionCheck(req, 'authenticated', req.user.tier, 'PASS');
   next();
 }
 
 function require_admin(req, res, next) {
   if (!req.user) {
+    logPermissionCheck(req, ['admin', 'owner'], undefined, 'FAIL');
     return res.status(401).json({ error: 'authentication_required', message: 'Authentication required', code: 401 });
   }
   if (!['admin', 'owner'].includes(req.user.tier)) {
+    logPermissionCheck(req, ['admin', 'owner'], req.user.tier, 'FAIL');
     return res.status(403).json({ error: 'admin_only', message: 'Admin only', code: 403 });
   }
+  logPermissionCheck(req, ['admin', 'owner'], req.user.tier, 'PASS');
   next();
 }
 
 function require_owner(req, res, next) {
   if (!req.user) {
+    logPermissionCheck(req, 'owner', undefined, 'FAIL');
     return res.status(401).json({ error: 'authentication_required', message: 'Authentication required', code: 401 });
   }
   if (req.user.tier !== 'owner') {
+    logPermissionCheck(req, 'owner', req.user.tier, 'FAIL');
     return res.status(403).json({ error: 'owner_only', message: 'Owner only', code: 403 });
   }
+  logPermissionCheck(req, 'owner', req.user.tier, 'PASS');
   next();
 }
 
 function deleteUser(userId) {
+  const userToDelete = db.users.find(u => u.id === userId);
   const sessionsToDelete = db.sessions.filter(s => s.userId === userId);
   const apiKeysToDelete = db.apiKeys.filter(k => k.userId === userId);
   const filesToDelete = db.files.filter(f => f.userId === userId);
   const preferenceToDelete = db.preferences.find(p => p.userId === userId);
 
+  let deletedUser = null;
   let deletedSessions = [];
   let deletedApiKeys = [];
   let deletedFiles = [];
@@ -162,11 +183,20 @@ function deleteUser(userId) {
       }
     }
 
+    if (userToDelete) {
+      const index = db.users.indexOf(userToDelete);
+      if (index !== -1) {
+        db.users.splice(index, 1);
+        deletedUser = userToDelete;
+      }
+    }
+
     const deletedItems = {
       sessions: deletedSessions.length,
       apiKeys: deletedApiKeys.length,
       files: deletedFiles.length,
-      preferences: deletedPreference ? 1 : 0
+      preferences: deletedPreference ? 1 : 0,
+      users: deletedUser ? 1 : 0
     };
 
     auditLog({
@@ -177,6 +207,9 @@ function deleteUser(userId) {
 
     return { success: true, deletedItems };
   } catch (error) {
+    if (deletedUser) {
+      db.users.push(deletedUser);
+    }
     if (deletedPreference) {
       db.preferences.push(deletedPreference);
     }
@@ -340,6 +373,7 @@ function getSessionById(id) {
 }
 
 module.exports = {
+  db,
   require_owner,
   require_admin,
   require_authenticated,

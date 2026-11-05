@@ -30,9 +30,9 @@ public class PermissionsRbacSystemTest {
     @Test
     @DisplayName("require_owner: non-owner user receives 403")
     void testRequireOwnerNonOwner() {
-        User member = rbac.createUser("member@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
-        User admin = rbac.createUser("admin@test.com", PermissionsRbacSystem.Tier.ADMIN, "org-1");
-        User publicUser = rbac.createUser("public@test.com", PermissionsRbacSystem.Tier.PUBLIC, null);
+        PermissionsRbacSystem.User member = rbac.createUser("member@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
+        PermissionsRbacSystem.User admin = rbac.createUser("admin@test.com", PermissionsRbacSystem.Tier.ADMIN, "org-1");
+        PermissionsRbacSystem.User publicUser = rbac.createUser("public@test.com", PermissionsRbacSystem.Tier.PUBLIC, null);
 
         PermissionsRbacSystem.PermissionResult result1 = rbac.requireOwner(member, "/api/admin/create-user");
         assertFalse(result1.allowed);
@@ -53,7 +53,7 @@ public class PermissionsRbacSystemTest {
     @Test
     @DisplayName("require_owner: owner user receives 200")
     void testRequireOwnerOwner() {
-        User owner = rbac.createUser("owner@test.com", PermissionsRbacSystem.Tier.OWNER, "org-1");
+        PermissionsRbacSystem.User owner = rbac.createUser("owner@test.com", PermissionsRbacSystem.Tier.OWNER, "org-1");
 
         PermissionsRbacSystem.PermissionResult result = rbac.requireOwner(owner, "/api/admin/create-user");
         assertTrue(result.allowed);
@@ -64,8 +64,8 @@ public class PermissionsRbacSystemTest {
     @Test
     @DisplayName("require_admin: member user receives 403")
     void testRequireAdminMember() {
-        User member = rbac.createUser("member@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
-        User publicUser = rbac.createUser("public@test.com", PermissionsRbacSystem.Tier.PUBLIC, null);
+        PermissionsRbacSystem.User member = rbac.createUser("member@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
+        PermissionsRbacSystem.User publicUser = rbac.createUser("public@test.com", PermissionsRbacSystem.Tier.PUBLIC, null);
 
         PermissionsRbacSystem.PermissionResult result1 = rbac.requireAdmin(member, "/api/admin/list-customers");
         assertFalse(result1.allowed);
@@ -81,8 +81,8 @@ public class PermissionsRbacSystemTest {
     @Test
     @DisplayName("require_admin: admin and owner users receive 200")
     void testRequireAdminAdminAndOwner() {
-        User admin = rbac.createUser("admin@test.com", PermissionsRbacSystem.Tier.ADMIN, "org-1");
-        User owner = rbac.createUser("owner@test.com", PermissionsRbacSystem.Tier.OWNER, "org-1");
+        PermissionsRbacSystem.User admin = rbac.createUser("admin@test.com", PermissionsRbacSystem.Tier.ADMIN, "org-1");
+        PermissionsRbacSystem.User owner = rbac.createUser("owner@test.com", PermissionsRbacSystem.Tier.OWNER, "org-1");
 
         PermissionsRbacSystem.PermissionResult result1 = rbac.requireAdmin(admin, "/api/admin/list-customers");
         assertTrue(result1.allowed);
@@ -97,7 +97,7 @@ public class PermissionsRbacSystemTest {
     @Test
     @DisplayName("require_authenticated: public user receives 401")
     void testRequireAuthenticatedPublic() {
-        User publicUser = rbac.createUser("public@test.com", PermissionsRbacSystem.Tier.PUBLIC, null);
+        PermissionsRbacSystem.User publicUser = rbac.createUser("public@test.com", PermissionsRbacSystem.Tier.PUBLIC, null);
 
         PermissionsRbacSystem.PermissionResult result = rbac.requireAuthenticated(publicUser, "/api/profile");
         assertFalse(result.allowed);
@@ -117,9 +117,9 @@ public class PermissionsRbacSystemTest {
     @Test
     @DisplayName("require_authenticated: authenticated users receive 200")
     void testRequireAuthenticatedAuthenticated() {
-        User member = rbac.createUser("member@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
-        User admin = rbac.createUser("admin@test.com", PermissionsRbacSystem.Tier.ADMIN, "org-1");
-        User owner = rbac.createUser("owner@test.com", PermissionsRbacSystem.Tier.OWNER, "org-1");
+        PermissionsRbacSystem.User member = rbac.createUser("member@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
+        PermissionsRbacSystem.User admin = rbac.createUser("admin@test.com", PermissionsRbacSystem.Tier.ADMIN, "org-1");
+        PermissionsRbacSystem.User owner = rbac.createUser("owner@test.com", PermissionsRbacSystem.Tier.OWNER, "org-1");
 
         assertTrue(rbac.requireAuthenticated(member, "/api/profile").allowed);
         assertTrue(rbac.requireAuthenticated(admin, "/api/profile").allowed);
@@ -130,7 +130,7 @@ public class PermissionsRbacSystemTest {
     @Test
     @DisplayName("cascade_delete user: all related records deleted")
     void testCascadeDeleteUser() {
-        User user = rbac.createUser("user@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
+        PermissionsRbacSystem.User user = rbac.createUser("user@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
 
         // Add related records
         rbac.addSession(user.id, "session-1");
@@ -206,8 +206,8 @@ public class PermissionsRbacSystemTest {
         String orgId = "org-1";
 
         // Create users in org
-        User user1 = rbac.createUser("user1@test.com", PermissionsRbacSystem.Tier.MEMBER, orgId);
-        User user2 = rbac.createUser("user2@test.com", PermissionsRbacSystem.Tier.ADMIN, orgId);
+        PermissionsRbacSystem.User user1 = rbac.createUser("user1@test.com", PermissionsRbacSystem.Tier.MEMBER, orgId);
+        PermissionsRbacSystem.User user2 = rbac.createUser("user2@test.com", PermissionsRbacSystem.Tier.ADMIN, orgId);
         rbac.addUserToOrg(orgId, user1.id);
         rbac.addUserToOrg(orgId, user2.id);
 
@@ -271,7 +271,7 @@ public class PermissionsRbacSystemTest {
         // supports rollback by checking that failed cascades don't
         // leave inconsistent state.
 
-        User user = rbac.createUser("user@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
+        PermissionsRbacSystem.User user = rbac.createUser("user@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
         rbac.addSession(user.id, "session-1");
         rbac.addApiKey(user.id, "key-1");
 
@@ -292,8 +292,8 @@ public class PermissionsRbacSystemTest {
     @Test
     @DisplayName("permission audit logged: queries show access patterns")
     void testPermissionAuditLogged() {
-        User owner = rbac.createUser("owner@test.com", PermissionsRbacSystem.Tier.OWNER, "org-1");
-        User member = rbac.createUser("member@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
+        PermissionsRbacSystem.User owner = rbac.createUser("owner@test.com", PermissionsRbacSystem.Tier.OWNER, "org-1");
+        PermissionsRbacSystem.User member = rbac.createUser("member@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
 
         // Perform permission checks
         rbac.requireOwner(owner, "/api/admin/create-user");
@@ -343,10 +343,10 @@ public class PermissionsRbacSystemTest {
     @Test
     @DisplayName("tier hierarchy: member < admin < owner")
     void testTierHierarchy() {
-        User publicUser = rbac.createUser("public@test.com", PermissionsRbacSystem.Tier.PUBLIC, null);
-        User member = rbac.createUser("member@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
-        User admin = rbac.createUser("admin@test.com", PermissionsRbacSystem.Tier.ADMIN, "org-1");
-        User owner = rbac.createUser("owner@test.com", PermissionsRbacSystem.Tier.OWNER, "org-1");
+        PermissionsRbacSystem.User publicUser = rbac.createUser("public@test.com", PermissionsRbacSystem.Tier.PUBLIC, null);
+        PermissionsRbacSystem.User member = rbac.createUser("member@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
+        PermissionsRbacSystem.User admin = rbac.createUser("admin@test.com", PermissionsRbacSystem.Tier.ADMIN, "org-1");
+        PermissionsRbacSystem.User owner = rbac.createUser("owner@test.com", PermissionsRbacSystem.Tier.OWNER, "org-1");
 
         // Public cannot do member actions
         assertFalse(rbac.requireAuthenticated(publicUser, "/api/profile").allowed);
@@ -381,8 +381,8 @@ public class PermissionsRbacSystemTest {
     @Test
     @DisplayName("permission check response time < 10ms")
     void testPermissionCheckPerformance() {
-        User owner = rbac.createUser("owner@test.com", PermissionsRbacSystem.Tier.OWNER, "org-1");
-        User member = rbac.createUser("member@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
+        PermissionsRbacSystem.User owner = rbac.createUser("owner@test.com", PermissionsRbacSystem.Tier.OWNER, "org-1");
+        PermissionsRbacSystem.User member = rbac.createUser("member@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
 
         int iterations = 1000;
         long totalTime = 0;
@@ -408,7 +408,7 @@ public class PermissionsRbacSystemTest {
     @Test
     @DisplayName("error response format matches spec")
     void testErrorResponseFormat() {
-        User member = rbac.createUser("member@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
+        PermissionsRbacSystem.User member = rbac.createUser("member@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
 
         PermissionsRbacSystem.PermissionResult result = rbac.requireOwner(member, "/api/admin/create-user");
         Map<String, Object> errorMap = result.toErrorMap();
@@ -421,7 +421,7 @@ public class PermissionsRbacSystemTest {
     @Test
     @DisplayName("audit log includes cascade delete events")
     void testAuditLogCascadeEvents() {
-        User user = rbac.createUser("user@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
+        PermissionsRbacSystem.User user = rbac.createUser("user@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
         rbac.addSession(user.id, "session-1");
 
         rbac.deleteUserCascade(user.id);
@@ -436,10 +436,10 @@ public class PermissionsRbacSystemTest {
     @Test
     @DisplayName("all permission check types are logged")
     void testAllPermissionCheckTypesLogged() {
-        User owner = rbac.createUser("owner@test.com", PermissionsRbacSystem.Tier.OWNER, "org-1");
-        User admin = rbac.createUser("admin@test.com", PermissionsRbacSystem.Tier.ADMIN, "org-1");
-        User member = rbac.createUser("member@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
-        User publicUser = rbac.createUser("public@test.com", PermissionsRbacSystem.Tier.PUBLIC, null);
+        PermissionsRbacSystem.User owner = rbac.createUser("owner@test.com", PermissionsRbacSystem.Tier.OWNER, "org-1");
+        PermissionsRbacSystem.User admin = rbac.createUser("admin@test.com", PermissionsRbacSystem.Tier.ADMIN, "org-1");
+        PermissionsRbacSystem.User member = rbac.createUser("member@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
+        PermissionsRbacSystem.User publicUser = rbac.createUser("public@test.com", PermissionsRbacSystem.Tier.PUBLIC, null);
 
         // Test all check types
         rbac.requireOwner(owner, "/endpoint1");
@@ -460,7 +460,7 @@ public class PermissionsRbacSystemTest {
     @Test
     @DisplayName("user creation and retrieval works correctly")
     void testUserCreationAndRetrieval() {
-        User user = rbac.createUser("test@test.com", PermissionsRbacSystem.Tier.ADMIN, "org-1");
+        PermissionsRbacSystem.User user = rbac.createUser("test@test.com", PermissionsRbacSystem.Tier.ADMIN, "org-1");
 
         assertNotNull(user.id);
         assertEquals("test@test.com", user.email);
@@ -468,7 +468,7 @@ public class PermissionsRbacSystemTest {
         assertEquals("org-1", user.organizationId);
         assertNotNull(user.createdAt);
 
-        User retrieved = rbac.getUser(user.id);
+        PermissionsRbacSystem.User retrieved = rbac.getUser(user.id);
         assertNotNull(retrieved);
         assertEquals(user.id, retrieved.id);
         assertEquals(user.email, retrieved.email);
@@ -568,7 +568,7 @@ public class PermissionsRbacSystemTest {
     @Test
     @DisplayName("audit log entries have all required fields")
     void testAuditLogEntryFields() {
-        User user = rbac.createUser("user@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
+        PermissionsRbacSystem.User user = rbac.createUser("user@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
         rbac.requireAdmin(user, "/api/admin/test");
 
         PermissionsRbacSystem.AuditLogEntry entry = rbac.getAuditLog().get(0);
@@ -586,7 +586,7 @@ public class PermissionsRbacSystemTest {
     @Test
     @DisplayName("cascade delete results include correct metadata")
     void testCascadeDeleteMetadata() {
-        User user = rbac.createUser("user@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
+        PermissionsRbacSystem.User user = rbac.createUser("user@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
         rbac.addSession(user.id, "session-1");
         rbac.addApiKey(user.id, "key-1");
         rbac.addFile(user.id, "file-1");
@@ -606,8 +606,8 @@ public class PermissionsRbacSystemTest {
     @Test
     @DisplayName("multiple cascade deletes work independently")
     void testMultipleCascadeDeletes() {
-        User user1 = rbac.createUser("user1@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
-        User user2 = rbac.createUser("user2@test.com", PermissionsRbacSystem.Tier.ADMIN, "org-1");
+        PermissionsRbacSystem.User user1 = rbac.createUser("user1@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
+        PermissionsRbacSystem.User user2 = rbac.createUser("user2@test.com", PermissionsRbacSystem.Tier.ADMIN, "org-1");
 
         rbac.addSession(user1.id, "session-1");
         rbac.addSession(user2.id, "session-2");
@@ -624,7 +624,7 @@ public class PermissionsRbacSystemTest {
     @Test
     @DisplayName("permission checks are idempotent")
     void testPermissionChecksIdempotent() {
-        User owner = rbac.createUser("owner@test.com", PermissionsRbacSystem.Tier.OWNER, "org-1");
+        PermissionsRbacSystem.User owner = rbac.createUser("owner@test.com", PermissionsRbacSystem.Tier.OWNER, "org-1");
 
         PermissionsRbacSystem.PermissionResult result1 = rbac.requireOwner(owner, "/api/test");
         PermissionsRbacSystem.PermissionResult result2 = rbac.requireOwner(owner, "/api/test");
@@ -638,7 +638,7 @@ public class PermissionsRbacSystemTest {
     @Test
     @DisplayName("audit log grows with each permission check")
     void testAuditLogGrowth() {
-        User user = rbac.createUser("user@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
+        PermissionsRbacSystem.User user = rbac.createUser("user@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
 
         int initialCount = rbac.getAuditLog().size();
 

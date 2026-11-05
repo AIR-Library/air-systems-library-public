@@ -609,14 +609,15 @@ public class PermissionsRbacSystem {
                 deployments.clear();
             }
 
-            List<String> orgUsers = orgUsers.get(orgId);
-            if (orgUsers != null) {
-                usersDeleted = orgUsers.size();
+            // FIX: rename local variable to avoid shadowing the field 'orgUsers'
+            List<String> orgUserList = orgUsers.get(orgId);
+            if (orgUserList != null) {
+                usersDeleted = orgUserList.size();
                 // Delete each user cascade
-                for (String userId : orgUsers) {
+                for (String userId : orgUserList) {
                     deleteUserCascade(userId);
                 }
-                orgUsers.clear();
+                orgUserList.clear();
             }
 
             List<String> keys = orgApiKeys.get(orgId);
@@ -742,10 +743,12 @@ public class PermissionsRbacSystem {
     }
 
     /**
-     * Validate tier string
+     * Validate tier string - returns true only for known tier names
      */
     public boolean isValidTier(String tier) {
-        return tier != null && Tier.fromString(tier) != null;
+        if (tier == null) return false;
+        String lower = tier.toLowerCase();
+        return lower.equals("public") || lower.equals("member") || lower.equals("admin") || lower.equals("owner") || lower.equals("service");
     }
 
     /**

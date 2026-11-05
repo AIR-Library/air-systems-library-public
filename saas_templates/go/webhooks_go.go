@@ -5,30 +5,240 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
-
-	"database/sql"
 )
 
-// Webhook holds a DB connection and provides the API.
-type Webhook struct {
+// Store defines the storage interface for webhooks.
+type Store interface {
+	InitSchema() error
+	CreateEndpoint(orgID int64, url, secret, eventTypesJSON string) (int64, error)
+	GetEndpoint(id int64) (*Endpoint, error)
+	UpdateEndpointSecret(id int64, secret string) error
+	UpdateEndpointFailureCount(id int64, count int, active bool) error
+	GetActiveEndpointsByOrgAndEvent(orgID int64, eventType string) ([]*Endpoint, error)
+	CreateMessage(id, payload string, orgID int64, eventType string) error
+	GetMessage(id string) (*Message, error)
+	CreateDelivery(messageID string, endpointID int64) (int64, error)
+	GetDelivery(id int64) (*Delivery, error)
+	UpdateDelivery(deliveryID int64, statusCode int, success bool, errMsg string, deliveredAt time.Time, nextAttemptAt *time.Time, nextAttemptNum int) error
+}
+
+// Endpoint represents a webhook endpoint.
+type Endpoint struct {
+	ID            int64
+	OrgID         int64
+	URL           string
+	Secret        string
+	EventTypes    []string
+	Active        bool
+	FailureCount  int
+	CreatedAt     time.Time
+}
+
+// Message represents a webhook message.
+type Message struct {
+	ID        string
+	OrgID     int64
+	EventType string
+	Payload   []byte
+	CreatedAt time.Time
+}
+
+// Delivery represents a webhook delivery attempt.
+type Delivery struct {
+	ID             int64
+	MessageID      string
+	EndpointID     int64
+	Attempt        int
+	StatusCode     *int
+	Success        *bool
+	Error          *string
+	NextAttemptAt  *time.Time
+	DeliveredAt    *time.Time
+	CreatedAt      time.Time
+}
+
+// InMemoryStore is an in-memory implementation of Store for testing.
+type InMemoryStore struct {
+	mu             sync.RWMutex
+	endpoints      map[int64]*Endpoint
+	messages       map[string]*Message
+	deliveries     map[int64]*Delivery
+	nextEndpointID int64
+	nextDeliveryID int64
+}
+
+func NewInMemoryStore() *InMemoryStore {
+	return &InMemoryStore{
+		endpoints:  make(map[int64]*Endpoint),
+		messages:   make(map[string]*Message),
+		deliveries: make(map[int64]*Delivery),
+	}
+}
+
+func (s *InMemoryStore) InitSchema() error {
+	return nil
+}
+
+func (s *InMemoryStore) CreateEndpoint(orgID int64, url, secret, eventTypesJSON string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nextEndpointID++
+	id := s.nextEndpointID
+	var eventTypes []string
+	if err := json.Unmarshal([]byte(eventTypesJSON), &eventTypes); err != nil {
+		return 0, err
+	}
+	ep := &Endpoint{
+		ID:           id,
+		OrgID:        orgID,
+		URL:          url,
+		Secret:       secret,
+		EventTypes:   eventTypes,
+		Active:       true,
+		FailureCount: 0,
+		CreatedAt:    time.Now(),
+	}
+	s.endpoints[id] = ep
+	return id, nil
+}
+
+func (s *InMemoryStore) GetEndpoint(id int64) (*Endpoint, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ep, ok := s.endpoints[id]
+	if !ok {
+		return nil, errors.New("endpoint not found")
+	}
+	return ep, nil
+}
+
+func (s *InMemoryStore) UpdateEndpointSecret(id int64, secret string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ep, ok := s.endpoints[id]
+	if !ok {
+		return errors.New("endpoint not found")
+	}
+	ep.Secret = secret
+	return nil
+}
+
+func (s *InMemoryStore) UpdateEndpointFailureCount(id int64, count int, active bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ep, ok := s.endpoints[id]
+	if !ok {
+		return errors.New("endpoint not found")
+	}
+	ep.FailureCount = count
+	ep.Active = active
+	return nil
+}
+
+func (s *InMemoryStore) GetActiveEndpointsByOrgAndEvent(orgID int64, eventType string) ([]*Endpoint, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var result []*Endpoint
+	for _, ep := range s.endpoints {
+		if ep.OrgID == orgID && ep.Active {
+			for _, t := range ep.EventTypes {
+				if t == eventType {
+					result = append(result, ep)
+					break
+				}
+			}
+		}
+	}
+	return result, nil
+}
+
+func (s *InMemoryStore) CreateMessage(id, payload string, orgID int64, eventType string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	msg := &Message{
+		ID:        id,
+		OrgID:     orgID,
+		EventType: eventType,
+		Payload:   []byte(payload),
+		CreatedAt: time.Now(),
+	}
+	s.messages[id] = msg
+	return nil
+}
+
+func (s *InMemoryStore) GetMessage(id string) (*Message, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	msg, ok := s.messages[id]
+	if !ok {
+		return nil, errors.New("message not found")
+	}
+	return msg, nil
+}
+
+func (s *InMemoryStore) CreateDelivery(messageID string, endpointID int64) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nextDeliveryID++
+	id := s.nextDeliveryID
+	d := &Delivery{
+		ID:         id,
+		MessageID:  messageID,
+		EndpointID: endpointID,
+		Attempt:    1,
+		CreatedAt:  time.Now(),
+	}
+	s.deliveries[id] = d
+	return id, nil
+}
+
+func (s *InMemoryStore) GetDelivery(id int64) (*Delivery, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	d, ok := s.deliveries[id]
+	if !ok {
+		return nil, errors.New("delivery not found")
+	}
+	return d, nil
+}
+
+func (s *InMemoryStore) UpdateDelivery(deliveryID int64, statusCode int, success bool, errMsg string, deliveredAt time.Time, nextAttemptAt *time.Time, nextAttemptNum int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, ok := s.deliveries[deliveryID]
+	if !ok {
+		return errors.New("delivery not found")
+	}
+	d.StatusCode = &statusCode
+	d.Success = &success
+	if errMsg != "" {
+		d.Error = &errMsg
+	}
+	d.DeliveredAt = &deliveredAt
+	d.NextAttemptAt = nextAttemptAt
+	d.Attempt = nextAttemptNum
+	return nil
+}
+
+// SQLStore is a production SQL implementation of Store using database/sql.
+type SQLStore struct {
 	db *sql.DB
 }
 
-// NewWebhook creates a Webhook instance with the given DB.
-func NewWebhook(db *sql.DB) *Webhook {
-	return &Webhook{db: db}
+func NewSQLStore(db *sql.DB) *SQLStore {
+	return &SQLStore{db: db}
 }
 
-// InitSchema creates the required tables if they do not exist.
-func InitSchema(db *sql.DB) error {
+func (s *SQLStore) InitSchema() error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS webhook_endpoints (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,6 +252,7 @@ func InitSchema(db *sql.DB) error {
 		);`,
 		`CREATE TABLE IF NOT EXISTS webhook_messages (
 			id TEXT PRIMARY KEY,
+			org_id INTEGER NOT NULL,
 			event_type TEXT NOT NULL,
 			payload TEXT NOT NULL,
 			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -60,15 +271,167 @@ func InitSchema(db *sql.DB) error {
 			FOREIGN KEY (endpoint_id) REFERENCES webhook_endpoints(id)
 		);`,
 	}
-	for _, s := range stmts {
-		if _, err := db.Exec(s); err != nil {
+	for _, stmt := range stmts {
+		if _, err := s.db.Exec(stmt); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// generateSecret creates a whsec_ prefixed base64-encoded 32‑byte secret.
+func (s *SQLStore) CreateEndpoint(orgID int64, url, secret, eventTypesJSON string) (int64, error) {
+	res, err := s.db.Exec(
+		`INSERT INTO webhook_endpoints (org_id, url, secret, event_types, active, failure_count) VALUES (?, ?, ?, ?, 1, 0)`,
+		orgID, url, secret, eventTypesJSON,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+func (s *SQLStore) GetEndpoint(id int64) (*Endpoint, error) {
+	var ep Endpoint
+	var eventTypesJSON string
+	err := s.db.QueryRow(
+		`SELECT id, org_id, url, secret, event_types, active, failure_count, created_at FROM webhook_endpoints WHERE id = ?`,
+		id,
+	).Scan(&ep.ID, &ep.OrgID, &ep.URL, &ep.Secret, &eventTypesJSON, &ep.Active, &ep.FailureCount, &ep.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal([]byte(eventTypesJSON), &ep.EventTypes); err != nil {
+		return nil, err
+	}
+	return &ep, nil
+}
+
+func (s *SQLStore) UpdateEndpointSecret(id int64, secret string) error {
+	_, err := s.db.Exec(`UPDATE webhook_endpoints SET secret = ? WHERE id = ?`, secret, id)
+	return err
+}
+
+func (s *SQLStore) UpdateEndpointFailureCount(id int64, count int, active bool) error {
+	_, err := s.db.Exec(`UPDATE webhook_endpoints SET failure_count = ?, active = ? WHERE id = ?`, count, active, id)
+	return err
+}
+
+func (s *SQLStore) GetActiveEndpointsByOrgAndEvent(orgID int64, eventType string) ([]*Endpoint, error) {
+	rows, err := s.db.Query(`SELECT id, org_id, url, secret, event_types, active, failure_count, created_at FROM webhook_endpoints WHERE active = 1 AND org_id = ?`, orgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []*Endpoint
+	for rows.Next() {
+		var ep Endpoint
+		var eventTypesJSON string
+		if err := rows.Scan(&ep.ID, &ep.OrgID, &ep.URL, &ep.Secret, &eventTypesJSON, &ep.Active, &ep.FailureCount, &ep.CreatedAt); err != nil {
+			continue
+		}
+		if err := json.Unmarshal([]byte(eventTypesJSON), &ep.EventTypes); err != nil {
+			continue
+		}
+		for _, t := range ep.EventTypes {
+			if t == eventType {
+				result = append(result, &ep)
+				break
+			}
+		}
+	}
+	return result, rows.Err()
+}
+
+func (s *SQLStore) CreateMessage(id, payload string, orgID int64, eventType string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO webhook_messages (id, org_id, event_type, payload) VALUES (?, ?, ?, ?)`,
+		id, orgID, eventType, payload,
+	)
+	return err
+}
+
+func (s *SQLStore) GetMessage(id string) (*Message, error) {
+	var msg Message
+	var payloadJSON string
+	err := s.db.QueryRow(`SELECT id, org_id, event_type, payload, created_at FROM webhook_messages WHERE id = ?`, id).
+		Scan(&msg.ID, &msg.OrgID, &msg.EventType, &payloadJSON, &msg.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	msg.Payload = []byte(payloadJSON)
+	return &msg, nil
+}
+
+func (s *SQLStore) CreateDelivery(messageID string, endpointID int64) (int64, error) {
+	res, err := s.db.Exec(
+		`INSERT INTO webhook_deliveries (message_id, endpoint_id, attempt, status_code, success, error, next_attempt_at, delivered_at) VALUES (?, ?, 1, NULL, NULL, NULL, NULL, NULL)`,
+		messageID, endpointID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+func (s *SQLStore) GetDelivery(id int64) (*Delivery, error) {
+	var d Delivery
+	var statusCode, success sql.NullInt64
+	var errMsg, nextAttemptAt, deliveredAt sql.NullString
+	err := s.db.QueryRow(
+		`SELECT id, message_id, endpoint_id, attempt, status_code, success, error, next_attempt_at, delivered_at FROM webhook_deliveries WHERE id = ?`,
+		id,
+	).Scan(&d.ID, &d.MessageID, &d.EndpointID, &d.Attempt, &statusCode, &success, &errMsg, &nextAttemptAt, &deliveredAt)
+	if err != nil {
+		return nil, err
+	}
+	if statusCode.Valid {
+		v := int(statusCode.Int64)
+		d.StatusCode = &v
+	}
+	if success.Valid {
+		v := success.Int64 == 1
+		d.Success = &v
+	}
+	if errMsg.Valid {
+		d.Error = &errMsg.String
+	}
+	if nextAttemptAt.Valid {
+		if t, err := time.Parse(time.RFC3339, nextAttemptAt.String); err == nil {
+			d.NextAttemptAt = &t
+		}
+	}
+	if deliveredAt.Valid {
+		if t, err := time.Parse(time.RFC3339, deliveredAt.String); err == nil {
+			d.DeliveredAt = &t
+		}
+	}
+	return &d, nil
+}
+
+func (s *SQLStore) UpdateDelivery(deliveryID int64, statusCode int, success bool, errMsg string, deliveredAt time.Time, nextAttemptAt *time.Time, nextAttemptNum int) error {
+	var nextAttemptStr *string
+	if nextAttemptAt != nil {
+		s := nextAttemptAt.Format(time.RFC3339)
+		nextAttemptStr = &s
+	}
+	_, err := s.db.Exec(
+		`UPDATE webhook_deliveries SET status_code = ?, success = ?, error = ?, delivered_at = ?, next_attempt_at = ?, attempt = ? WHERE id = ?`,
+		statusCode, success, errMsg, deliveredAt.Format(time.RFC3339), nextAttemptStr, nextAttemptNum, deliveryID,
+	)
+	return err
+}
+
+// Webhook holds a Store and provides the API.
+type Webhook struct {
+	store Store
+}
+
+// NewWebhook creates a Webhook instance with the given store.
+func NewWebhook(store Store) *Webhook {
+	return &Webhook{store: store}
+}
+
+// generateSecret creates a whsec_ prefixed base64-encoded 32-byte secret.
 func generateSecret() (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
@@ -77,7 +440,7 @@ func generateSecret() (string, error) {
 	return "whsec_" + base64.StdEncoding.EncodeToString(b), nil
 }
 
-// generateMessageID creates a msg_ prefixed URL‑safe base64 random ID.
+// generateMessageID creates a msg_ prefixed URL-safe base64 random ID.
 func generateMessageID() (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
@@ -87,6 +450,7 @@ func generateMessageID() (string, error) {
 }
 
 // Sign returns a v1,base64(hmac-sha256) signature.
+// The content signed is exactly "msg_id.timestamp.payload" (raw body bytes).
 func Sign(secret string, msgID string, timestamp int64, body []byte) (string, error) {
 	if len(secret) < 7 || !strings.HasPrefix(secret, "whsec_") {
 		return "", errors.New("invalid secret format")
@@ -125,7 +489,10 @@ func Verify(secret string, header http.Header, rawBody []byte, toleranceSeconds 
 	}
 	now := time.Now().Unix()
 	if now-timestamp > int64(toleranceSeconds) || timestamp-now > int64(toleranceSeconds) {
-		return false, errors.New("timestamp outside tolerance")
+		return false, nil
+	}
+	if len(secret) < 7 || !strings.HasPrefix(secret, "whsec_") {
+		return false, errors.New("invalid secret format")
 	}
 	keyB64 := secret[6:]
 	key, err := base64.StdEncoding.DecodeString(keyB64)
@@ -171,22 +538,15 @@ func (w *Webhook) CreateEndpoint(orgID int64, url string, eventTypes []string) (
 	if err != nil {
 		return 0, "", err
 	}
-	res, err := w.db.Exec(
-		`INSERT INTO webhook_endpoints (org_id, url, secret, event_types, active, failure_count) VALUES (?, ?, ?, ?, 1, 0)`,
-		orgID, url, secret, string(eventTypesJSON),
-	)
-	if err != nil {
-		return 0, "", err
-	}
-	id, err := res.LastInsertId()
+	id, err := w.store.CreateEndpoint(orgID, url, secret, string(eventTypesJSON))
 	if err != nil {
 		return 0, "", err
 	}
 	return id, secret, nil
 }
 
-// SendEvent creates a message and a pending delivery for each active endpoint subscribed to eventType.
-func (w *Webhook) SendEvent(eventType string, payload interface{}) (string, error) {
+// SendEvent creates a message and a pending delivery for each active endpoint subscribed to eventType for the given org.
+func (w *Webhook) SendEvent(orgID int64, eventType string, payload interface{}) (string, error) {
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		return "", err
@@ -195,57 +555,15 @@ func (w *Webhook) SendEvent(eventType string, payload interface{}) (string, erro
 	if err != nil {
 		return "", err
 	}
-	res, err := w.db.Exec(
-		`INSERT INTO webhook_messages (id, event_type, payload) VALUES (?, ?, ?)`,
-		msgID, eventType, string(payloadBytes),
-	)
+	if err := w.store.CreateMessage(msgID, string(payloadBytes), orgID, eventType); err != nil {
+		return "", err
+	}
+	endpoints, err := w.store.GetActiveEndpointsByOrgAndEvent(orgID, eventType)
 	if err != nil {
 		return "", err
 	}
-	if _, err = res.LastInsertId(); err != nil {
-		return "", err
-	}
-	// Find active endpoints that subscribe to eventType
-	rows, err := w.db.Query(`SELECT id, org_id, url, secret, event_types, active, failure_count FROM webhook_endpoints WHERE active = 1`)
-	if err != nil {
-		return "", err
-	}
-	defer rows.Close()
-	var endpointIDs []int64
-	for rows.Next() {
-		var ep struct {
-			ID int64
-			// OrgID int64
-			URL       string
-			Secret    string
-			EventTypesJSON string
-			// Active bool
-			// FailureCount int
-		}
-		if err := rows.Scan(&ep.ID, nil, &ep.URL, &ep.Secret, &ep.EventTypesJSON, nil, nil); err != nil {
-			continue
-		}
-		var et []string
-		if err := json.Unmarshal([]byte(ep.EventTypesJSON), &et); err != nil {
-			continue
-		}
-		for _, t := range et {
-			if t == eventType {
-				endpointIDs = append(endpointIDs, ep.ID)
-				break
-			}
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return "", err
-	}
-	// Insert pending deliveries
-	for _, eid := range endpointIDs {
-		_, err = w.db.Exec(
-			`INSERT INTO webhook_deliveries (message_id, endpoint_id, attempt, status_code, success, error, next_attempt_at, delivered_at) VALUES (?, ?, 1, NULL, NULL, NULL, NULL, NULL)`,
-			msgID, eid,
-		)
-		if err != nil {
+	for _, ep := range endpoints {
+		if _, err := w.store.CreateDelivery(msgID, ep.ID); err != nil {
 			return "", err
 		}
 	}
@@ -258,126 +576,64 @@ func (w *Webhook) RotateSecret(endpointID int64) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	_, err = w.db.Exec(`UPDATE webhook_endpoints SET secret = ? WHERE id = ?`, secret, endpointID)
-	if err != nil {
+	if err := w.store.UpdateEndpointSecret(endpointID, secret); err != nil {
 		return "", err
 	}
 	return secret, nil
 }
 
-// Deliver attempts a single delivery for the given delivery record.
-// Returns true on success, false on failure (with retry scheduled).
-func (w *Webhook) Deliver(deliveryID int64) (bool, error) {
-	tx, err := w.db.Begin()
+// Deliver attempts a single delivery for the given delivery record using the provided sender.
+// Sender signature: func(url string, headers http.Header, body []byte) (statusCode int, err error)
+// Returns true on success (2xx), false on failure (with retry scheduled).
+func (w *Webhook) Deliver(deliveryID int64, sender func(string, http.Header, []byte) (int, error)) (bool, error) {
+	delivery, err := w.store.GetDelivery(deliveryID)
 	if err != nil {
 		return false, err
 	}
-	var d struct {
-		ID          int64
-		MessageID   string
-		EndpointID  int64
-		Attempt     int
-	}
-	var messageID string
-	var endpointID int64
-	err = tx.QueryRow(
-		`SELECT id, message_id, endpoint_id, attempt FROM webhook_deliveries WHERE id = ?`,
-		deliveryID,
-	).Scan(&d.ID, &messageID, &endpointID, &d.Attempt)
+	endpoint, err := w.store.GetEndpoint(delivery.EndpointID)
 	if err != nil {
-		tx.Rollback()
 		return false, err
 	}
-	var ep struct {
-		ID        int64
-		URL       string
-		Secret    string
-		Active    bool
-		FailureCount int
-	}
-	var eventTypesJSON string
-	err = tx.QueryRow(
-		`SELECT id, url, secret, event_types, active, failure_count FROM webhook_endpoints WHERE id = ?`,
-		endpointID,
-	).Scan(&ep.ID, &ep.URL, &ep.Secret, &eventTypesJSON, &ep.Active, &ep.FailureCount)
-	if err != nil {
-		tx.Rollback()
-		return false, err
-	}
-	if !ep.Active {
-		tx.Rollback()
+	if !endpoint.Active {
 		return false, errors.New("endpoint inactive")
 	}
-	var msg struct {
-		ID     string
-		Payload []byte
-	}
-	var payloadJSON string
-	err = tx.QueryRow(
-		`SELECT id, payload FROM webhook_messages WHERE id = ?`,
-		messageID,
-	).Scan(&msg.ID, &payloadJSON)
+	msg, err := w.store.GetMessage(delivery.MessageID)
 	if err != nil {
-		tx.Rollback()
 		return false, err
 	}
-	msg.Payload = []byte(payloadJSON)
 	timestamp := time.Now().Unix()
-	signature, err := Sign(ep.Secret, msg.ID, timestamp, msg.Payload)
+	signature, err := Sign(endpoint.Secret, msg.ID, timestamp, msg.Payload)
 	if err != nil {
-		tx.Rollback()
 		return false, err
 	}
-	req, err := http.NewRequest("POST", ep.URL, bytes.NewReader(msg.Payload))
-	if err != nil {
-		tx.Rollback()
-		return false, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("webhook-id", msg.ID)
-	req.Header.Set("webhook-timestamp", strconv.FormatInt(timestamp, 10))
-	req.Header.Set("webhook-signature", signature)
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	var statusCode int
+	headers := http.Header{}
+	headers.Set("Content-Type", "application/json")
+	headers.Set("webhook-id", msg.ID)
+	headers.Set("webhook-timestamp", strconv.FormatInt(timestamp, 10))
+	headers.Set("webhook-signature", signature)
+	statusCode, err := sender(endpoint.URL, headers, msg.Payload)
 	var errMsg string
 	if err != nil {
 		statusCode = 0
 		errMsg = err.Error()
-	} else {
-		statusCode = resp.StatusCode
-		resp.Body.Close()
 	}
 	success := statusCode >= 200 && statusCode <= 299
 	now := time.Now()
-	_, err = tx.Exec(
-		`UPDATE webhook_deliveries SET status_code = ?, success = ?, error = ?, delivered_at = ? WHERE id = ?`,
-		statusCode, success, errMsg, now, deliveryID,
-	)
-	if err != nil {
-		tx.Rollback()
+	if err := w.store.UpdateDelivery(deliveryID, statusCode, success, errMsg, now, nil, delivery.Attempt); err != nil {
 		return false, err
 	}
 	if success {
-		_, err = tx.Exec(`UPDATE webhook_endpoints SET failure_count = 0 WHERE id = ?`, endpointID)
-		if err != nil {
-			tx.Rollback()
+		if err := w.store.UpdateEndpointFailureCount(delivery.EndpointID, 0, true); err != nil {
 			return false, err
 		}
-		tx.Commit()
 		return true, nil
 	}
-	newFailureCount := ep.FailureCount + 1
-	newActive := ep.Active
+	newFailureCount := endpoint.FailureCount + 1
+	newActive := endpoint.Active
 	if newFailureCount >= 5 {
 		newActive = false
 	}
-	_, err = tx.Exec(
-		`UPDATE webhook_endpoints SET failure_count = ?, active = ? WHERE id = ?`,
-		newFailureCount, newActive, endpointID,
-	)
-	if err != nil {
-		tx.Rollback()
+	if err := w.store.UpdateEndpointFailureCount(delivery.EndpointID, newFailureCount, newActive); err != nil {
 		return false, err
 	}
 	backoff := []time.Duration{
@@ -389,23 +645,15 @@ func (w *Webhook) Deliver(deliveryID int64) (bool, error) {
 		10 * time.Hour,
 		10 * time.Hour,
 	}
-	var nextAttemptAt time.Time
-	idx := d.Attempt // attempt number already made (starting at 1)
-	if idx < len(backoff) {
-		nextAttemptAt = now.Add(backoff[idx])
+	var nextAttemptAt *time.Time
+	idx := delivery.Attempt - 1
+	if idx >= 0 && idx < len(backoff) {
+		t := now.Add(backoff[idx])
+		nextAttemptAt = &t
 	}
-	var nextAttemptAtNull sql.NullTime
-	if !nextAttemptAt.IsZero() {
-		nextAttemptAtNull = sql.NullTime{Time: nextAttemptAt, Valid: true}
-	}
-	_, err = tx.Exec(
-		`UPDATE webhook_deliveries SET next_attempt_at = ?, attempt = ? WHERE id = ?`,
-		nextAttemptAtNull, d.Attempt+1, deliveryID,
-	)
-	if err != nil {
-		tx.Rollback()
+	nextAttemptNum := delivery.Attempt + 1
+	if err := w.store.UpdateDelivery(deliveryID, statusCode, success, errMsg, now, nextAttemptAt, nextAttemptNum); err != nil {
 		return false, err
 	}
-	tx.Commit()
 	return false, nil
 }

@@ -257,28 +257,34 @@ func TestMonthRollover(t *testing.T) {
 	l := newTestLimiter(t)
 	ctx := context.Background()
 
-	if err := l.IncrementAPIUsage(ctx, "user9"); err != nil {
-		t.Fatalf("IncrementAPIUsage: %v", err)
+	// user9's usage is moved into a past month; user10's stays in this one. 2026-11-05, session f3daac6e: this test
+	// used to expect this month's usage to vanish, which is the opposite of a rollover.
+	for _, user := range []string{"user9", "user10"} {
+		if err := l.IncrementAPIUsage(ctx, user); err != nil {
+			t.Fatalf("IncrementAPIUsage: %v", err)
+		}
 	}
-
-	callCount, _, err := l.GetCurrentUsage(ctx, "user9")
-	if err != nil {
-		t.Fatalf("GetCurrentUsage: %v", err)
-	}
-	if callCount != 1 {
-		t.Fatalf("expected call_count=1 before rollover, got %d", callCount)
+	if _, err := l.db.ExecContext(ctx, `UPDATE usage_metrics SET month = '2000-01' WHERE user_id = ?`, "user9"); err != nil {
+		t.Fatalf("move usage to a past month: %v", err)
 	}
 
 	if err := l.HandleMonthRollover(ctx); err != nil {
 		t.Fatalf("HandleMonthRollover: %v", err)
 	}
 
-	callCount, _, err = l.GetCurrentUsage(ctx, "user9")
+	var pastRows int
+	if err := l.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM usage_metrics WHERE month = '2000-01'`).Scan(&pastRows); err != nil {
+		t.Fatalf("count past rows: %v", err)
+	}
+	if pastRows != 0 {
+		t.Fatalf("expected past months to be deleted, found %d rows", pastRows)
+	}
+	callCount, _, err := l.GetCurrentUsage(ctx, "user10")
 	if err != nil {
 		t.Fatalf("GetCurrentUsage after rollover: %v", err)
 	}
-	if callCount != 0 {
-		t.Fatalf("expected call_count=0 after rollover, got %d", callCount)
+	if callCount != 1 {
+		t.Fatalf("expected this month's call_count to survive a rollover, got %d", callCount)
 	}
 }
 

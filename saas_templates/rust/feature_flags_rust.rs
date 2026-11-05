@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::RwLock;
 
 // Allowed crates: serde, serde_json, hmac, sha2, base64, rand, uuid, thiserror
@@ -65,14 +64,8 @@ pub struct Context {
     pub attributes: HashMap<String, Value>,
 }
 
-#[derive(Debug, Clone)]
-struct Condition {
-    attribute: String,
-    operator: Operator,
-    value: Value,
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum Operator {
     Equals,
     NotEquals,
@@ -80,17 +73,24 @@ enum Operator {
     EndsWith,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
+struct Condition {
+    attribute: String,
+    operator: Operator,
+    value: Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct Rollout {
+    percentage: u8,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct Rule {
     conditions: Vec<Condition>,
     variant: String,
     value: Value,
     rollout: Option<Rollout>,
-}
-
-#[derive(Debug, Clone)]
-struct Rollout {
-    percentage: u8,
 }
 
 #[derive(Debug, Error)]
@@ -335,10 +335,7 @@ impl<S: FeatureFlagStore> FeatureFlagClient<S> {
                     // Need targeting_key for bucket hash
                     let targeting_key = match &context.targeting_key {
                         Some(tk) => tk.clone(),
-                        None => {
-                            // Without targeting_key, we cannot compute bucket -> rule does not apply
-                            continue;
-                        }
+                        None => continue,
                     };
                     let bucket = self.compute_bucket(key, &targeting_key);
                     bucket < rollout.percentage
@@ -415,8 +412,8 @@ impl<S: FeatureFlagStore> FeatureFlagClient<S> {
     fn evaluate_condition(&self, condition: &Condition, context: &Context) -> bool {
         let attr_value = self.lookup_attribute(&condition.attribute, context);
         match &condition.operator {
-            Operator::Equals => attr_value == Some(&condition.value),
-            Operator::NotEquals => attr_value != Some(&condition.value),
+            Operator::Equals => attr_value.as_ref() == Some(&condition.value),
+            Operator::NotEquals => attr_value.as_ref() != Some(&condition.value),
             Operator::InList => {
                 if let Value::Array(list) = &condition.value {
                     attr_value
@@ -427,32 +424,22 @@ impl<S: FeatureFlagStore> FeatureFlagClient<S> {
                 }
             }
             Operator::EndsWith => {
-                if let (Some(Value::String(s)), Some(Value::String(suffix))) =
-                    (attr_value.as_ref(), condition.value.as_str())
-                {
-                    s.ends_with(suffix)
-                } else {
-                    false
+                match (attr_value.as_ref(), condition.value.as_str()) {
+                    (Some(Value::String(s)), Some(suffix)) => s.ends_with(suffix),
+                    _ => false,
                 }
             }
         }
     }
 
-    fn lookup_attribute<'a>(
-        &self,
-        attribute: &str,
-        context: &'a Context,
-    ) -> Option<&'a Value> {
+    fn lookup_attribute(&self, attribute: &str, context: &Context) -> Option<Value> {
         match attribute {
-            "targeting_key" => context
-                .targeting_key
-                .as_ref()
-                .map(|s| Value::String(s.clone())),
+            "targeting_key" => context.targeting_key.as_ref().map(|s| Value::String(s.clone())),
             "user_id" => context.user_id.as_ref().map(|s| Value::String(s.clone())),
             "org_id" => context.org_id.as_ref().map(|s| Value::String(s.clone())),
             "tier" => context.tier.as_ref().map(|s| Value::String(s.clone())),
             "email" => context.email.as_ref().map(|s| Value::String(s.clone())),
-            _ => context.attributes.get(attribute),
+            _ => context.attributes.get(attribute).cloned(),
         }
     }
 
@@ -505,7 +492,7 @@ mod tests {
 
     #[test]
     fn test_disabled_flag_returns_default() {
-        let mut store = InMemoryStore::new();
+        let store = InMemoryStore::new();
         store.init().unwrap();
         store.set_flag(
             "admin",
@@ -526,7 +513,7 @@ mod tests {
 
     #[test]
     fn test_matching_rule_returns_value() {
-        let mut store = InMemoryStore::new();
+        let store = InMemoryStore::new();
         store.init().unwrap();
         store.set_flag(
             "admin",
@@ -560,7 +547,7 @@ mod tests {
 
     #[test]
     fn test_non_matching_rule_does_not_apply() {
-        let mut store = InMemoryStore::new();
+        let store = InMemoryStore::new();
         store.init().unwrap();
         store.set_flag(
             "admin",
@@ -594,7 +581,7 @@ mod tests {
 
     #[test]
     fn test_rollout_deterministic() {
-        let mut store = InMemoryStore::new();
+        let store = InMemoryStore::new();
         store.init().unwrap();
         store.set_flag(
             "admin",
@@ -640,7 +627,7 @@ mod tests {
 
     #[test]
     fn test_rollout_falls_through() {
-        let mut store = InMemoryStore::new();
+        let store = InMemoryStore::new();
         store.init().unwrap();
         store.set_flag(
             "admin",
@@ -694,7 +681,7 @@ mod tests {
 
     #[test]
     fn test_corrupt_rules_returns_default() {
-        let mut store = InMemoryStore::new();
+        let store = InMemoryStore::new();
         store.init().unwrap();
         store.set_flag(
             "admin",
@@ -715,10 +702,7 @@ mod tests {
 
     #[test]
     fn test_set_flag_writes_audit() {
-        // This test would require checking the audit table, but since we are using in-memory store
-        // and the audit is not implemented in the store, we skip the detailed audit check.
-        // However, we can at least check that the flag is set.
-        let mut store = InMemoryStore::new();
+        let store = InMemoryStore::new();
         store.init().unwrap();
         assert!(store.get_flag("flag1").is_none());
         store.set_flag(

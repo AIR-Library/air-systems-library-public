@@ -238,67 +238,75 @@ class QuotaManager {
     return { pass: true, current: current + incomingBytes, limit };
   }
 
-  checkRateLimitPerUser(userId, ip, endpoint) {
+  checkRateLimitPerUser(userId, ip, endpoint, record = true) {
     const now = this.now();
     const since = new Date(now.getTime() - 60 * 1000);
     const count = this.store.countCallsForUserSince(userId, since.toISOString());
     const pass = count < RATE_LIMIT_PER_USER;
 
     if (!pass) {
-      this.store.recordCall({
-        userId,
-        ip,
-        endpoint,
-        timestamp: now,
-        statusCode: 429,
-        responseTimeMs: 0,
-      });
+      if (record) {
+        this.store.recordCall({
+          userId,
+          ip,
+          endpoint,
+          timestamp: now,
+          statusCode: 429,
+          responseTimeMs: 0,
+        });
+      }
       throw new QuotaError(429, {
         error: 'rate_limit_exceeded',
         reset_seconds: 60,
       });
     }
 
-    this.store.recordCall({
-      userId,
-      ip,
-      endpoint,
-      timestamp: now,
-      statusCode: 200,
-      responseTimeMs: 0,
-    });
+    if (record) {
+      this.store.recordCall({
+        userId,
+        ip,
+        endpoint,
+        timestamp: now,
+        statusCode: 200,
+        responseTimeMs: 0,
+      });
+    }
     return { pass: true, count: count + 1, limit: RATE_LIMIT_PER_USER };
   }
 
-  checkRateLimitPerIp(ip, userId, endpoint) {
+  checkRateLimitPerIp(ip, userId, endpoint, record = true) {
     const now = this.now();
     const since = new Date(now.getTime() - 1000);
     const count = this.store.countCallsForIpSince(ip, since.toISOString());
     const pass = count < RATE_LIMIT_PER_IP;
 
     if (!pass) {
-      this.store.recordCall({
-        userId,
-        ip,
-        endpoint,
-        timestamp: now,
-        statusCode: 429,
-        responseTimeMs: 0,
-      });
+      if (record) {
+        this.store.recordCall({
+          userId,
+          ip,
+          endpoint,
+          timestamp: now,
+          statusCode: 429,
+          responseTimeMs: 0,
+        });
+      }
       throw new QuotaError(429, {
         error: 'ip_rate_limit_exceeded',
         reset_seconds: 1,
       });
     }
 
-    this.store.recordCall({
-      userId,
-      ip,
-      endpoint,
-      timestamp: now,
-      statusCode: 200,
-      responseTimeMs: 0,
-    });
+    if (record) {
+      this.store.recordCall({
+        userId,
+        ip,
+        endpoint,
+        timestamp: now,
+        statusCode: 200,
+        responseTimeMs: 0,
+      });
+    }
     return { pass: true, count: count + 1, limit: RATE_LIMIT_PER_IP };
   }
 
@@ -334,10 +342,33 @@ class QuotaManager {
   }
 
   handleApiRequest({ userId, ip, endpoint, tier }) {
-    this.checkRateLimitPerIp(ip, userId, endpoint);
-    this.checkRateLimitPerUser(userId, ip, endpoint);
-    this.checkApiCallQuota(userId, tier);
-    return { status: 200, body: { ok: true } };
+    const now = this.now();
+    try {
+      this.checkRateLimitPerIp(ip, userId, endpoint, false);
+      this.checkRateLimitPerUser(userId, ip, endpoint, false);
+      this.checkApiCallQuota(userId, tier);
+      this.store.recordCall({
+        userId,
+        ip,
+        endpoint,
+        timestamp: now,
+        statusCode: 200,
+        responseTimeMs: 0,
+      });
+      return { status: 200, body: { ok: true } };
+    } catch (e) {
+      if (e instanceof QuotaError) {
+        this.store.recordCall({
+          userId,
+          ip,
+          endpoint,
+          timestamp: now,
+          statusCode: e.statusCode,
+          responseTimeMs: 0,
+        });
+      }
+      throw e;
+    }
   }
 
   handleFileUpload({ userId, tier, fileName, size }) {

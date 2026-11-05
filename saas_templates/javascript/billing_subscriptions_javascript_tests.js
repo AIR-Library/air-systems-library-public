@@ -67,7 +67,8 @@ const createMockDb = () => {
       const log = { id: auditLog.length + 1, ...auditData };
       auditLog.push(log);
       return log;
-    }
+    },
+    getAuditLog: () => auditLog
   };
 };
 
@@ -104,8 +105,10 @@ describe('Billing System', function() {
       assert.strictEqual(sub.tier, 'solo');
       assert.strictEqual(sub.status, 'active');
       
-      const auditLog = await db.createAuditLog.call(null, {});
-      assert.strictEqual(auditLog.action, 'subscription_created');
+      const auditLog = db.getAuditLog();
+      const createdLog = auditLog.find(log => log.action === 'subscription_created');
+      assert.ok(createdLog);
+      assert.strictEqual(createdLog.action, 'subscription_created');
       
       stripeStub.restore();
     });
@@ -148,10 +151,12 @@ describe('Billing System', function() {
       assert.strictEqual(sub.tier, 'team');
       assert.strictEqual(sub.status, 'active');
       
-      const auditLog = await db.createAuditLog.call(null, {});
-      assert.strictEqual(auditLog.action, 'plan_changed');
-      assert.strictEqual(auditLog.old_tier, 'solo');
-      assert.strictEqual(auditLog.new_tier, 'team');
+      const auditLog = db.getAuditLog();
+      const planChangedLog = auditLog.find(log => log.action === 'plan_changed');
+      assert.ok(planChangedLog);
+      assert.strictEqual(planChangedLog.action, 'plan_changed');
+      assert.strictEqual(planChangedLog.old_tier, 'solo');
+      assert.strictEqual(planChangedLog.new_tier, 'team');
       
       stripeStub.restore();
     });
@@ -187,10 +192,12 @@ describe('Billing System', function() {
       assert.strictEqual(refund.amount, '50.00');
       assert.strictEqual(refund.reason, 'Customer request');
       
-      const auditLog = await db.createAuditLog.call(null, {});
-      assert.strictEqual(auditLog.action, 'refund_queued');
-      assert.strictEqual(auditLog.amount, '50.00');
-      assert.strictEqual(auditLog.reason, 'Customer request');
+      const auditLog = db.getAuditLog();
+      const refundQueuedLog = auditLog.find(log => log.action === 'refund_queued');
+      assert.ok(refundQueuedLog);
+      assert.strictEqual(refundQueuedLog.action, 'refund_queued');
+      assert.strictEqual(refundQueuedLog.amount, '50.00');
+      assert.strictEqual(refundQueuedLog.reason, 'Customer request');
     });
 
     it('should return refund_exceeds_invoice when amount exceeds invoice', async () => {
@@ -256,9 +263,11 @@ describe('Billing System', function() {
       assert.strictEqual(invoice.status, 'succeeded');
       assert.strictEqual(invoice.amount, '9.99');
       
-      const auditLog = await db.createAuditLog.call(null, {});
-      assert.strictEqual(auditLog.action, 'payment_succeeded');
-      assert.strictEqual(auditLog.amount, '9.99');
+      const auditLog = db.getAuditLog();
+      const paymentSucceededLog = auditLog.find(log => log.action === 'payment_succeeded');
+      assert.ok(paymentSucceededLog);
+      assert.strictEqual(paymentSucceededLog.action, 'payment_succeeded');
+      assert.strictEqual(paymentSucceededLog.amount, '9.99');
       
       stripeStub.restore();
     });
@@ -334,10 +343,12 @@ describe('Billing System', function() {
       assert.strictEqual(sub.tier, 'team');
       assert.strictEqual(sub.status, 'active');
       
-      const auditLog = await db.createAuditLog.call(null, {});
-      assert.strictEqual(auditLog.action, 'subscription_updated');
-      assert.strictEqual(auditLog.old_tier, 'solo');
-      assert.strictEqual(auditLog.new_tier, 'team');
+      const auditLog = db.getAuditLog();
+      const subscriptionUpdatedLog = auditLog.find(log => log.action === 'subscription_updated');
+      assert.ok(subscriptionUpdatedLog);
+      assert.strictEqual(subscriptionUpdatedLog.action, 'subscription_updated');
+      assert.strictEqual(subscriptionUpdatedLog.old_tier, 'solo');
+      assert.strictEqual(subscriptionUpdatedLog.new_tier, 'team');
       
       stripeStub.restore();
     });

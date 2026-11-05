@@ -1,5 +1,5 @@
 use audit_logging_rust::{AuditLogger, LogMutationRequest, QueryLogsParams};
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use serde_json::json;
 use std::time::Instant;
 
@@ -291,7 +291,9 @@ fn test_performance() {
             let timestamp = "2026-10-15T14:30:00.000Z".to_string();
             let actor_id = Some(format!("actor_{}", i % 10));
             let actor_type = "user".to_string();
-            let action = if i % 2 == 0 { "user_created" } else { "billing_changed" };
+            // Use (i / 10) % 2 so action is independent of actor_id modulo,
+            // giving ~500 user_created entries per actor (10000 / 10 / 2 = 500).
+            let action = if (i / 10) % 2 == 0 { "user_created" } else { "billing_changed" };
             let resource_type = "user".to_string();
             let resource_id = format!("res_{}", i);
             let old_value = "{}";
@@ -328,7 +330,7 @@ fn test_performance() {
     }).unwrap();
 
     let duration = start.elapsed();
-    
+
     assert_eq!(query_res.total, 500); // 10000 / 10 actors / 2 actions = 500
     assert!(duration.as_millis() < 100, "Query took too long: {}ms", duration.as_millis());
 }
