@@ -204,7 +204,7 @@ func (tap *TrialAbusePrevention) CheckEmailTrialHistory(ctx context.Context, ema
 		Decision: decision,
 		Reason:   reason,
 		Code:     code,
-		Meta:     map[string]any{"email": email, "prior_count": count},
+		Meta:     map[string]any{"email": email, "prior_count": int64(count)},
 	}
 }
 
@@ -240,7 +240,7 @@ func (tap *TrialAbusePrevention) CheckPaymentMethodHistory(ctx context.Context, 
 		Decision: decision,
 		Reason:   reason,
 		Code:     code,
-		Meta:     map[string]any{"payment_method_id": paymentMethodID, "prior_count": count},
+		Meta:     map[string]any{"payment_method_id": paymentMethodID, "prior_count": int64(count)},
 	}
 }
 
@@ -276,7 +276,7 @@ func (tap *TrialAbusePrevention) CheckIPSignupRateLimit(ctx context.Context, ip 
 		Decision: decision,
 		Reason:   reason,
 		Code:     code,
-		Meta:     map[string]any{"ip": ip, "count": count, "limit": 5, "retry_after": 86400},
+		Meta:     map[string]any{"ip": ip, "count": int64(count), "limit": 5, "retry_after": 86400},
 	}
 }
 
@@ -322,7 +322,7 @@ func (tap *TrialAbusePrevention) CheckDeviceFingerprint(ctx context.Context, use
 		Decision: decision,
 		Reason:   reason,
 		Code:     code,
-		Meta:     map[string]any{"device_hash": deviceHash, "matching_users": count, "is_known_device": isKnownDevice},
+		Meta:     map[string]any{"device_hash": deviceHash, "matching_users": int64(count), "is_known_device": isKnownDevice},
 	}
 }
 
@@ -381,18 +381,8 @@ func (tap *TrialAbusePrevention) CheckTrialPaymentTiming(ctx context.Context, us
 }
 
 func (tap *TrialAbusePrevention) CheckChargebackHistory(ctx context.Context, userID, stripeCustomerID string) GateResult {
-	var stripeChargebacks, refundChargebacks int
-
-	err := tap.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM trial_abuse_ledger WHERE user_id = ? AND chargeback_count > 0`,
-		userID).Scan(&stripeChargebacks)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return GateResult{Gate: "chargeback_history", Decision: DecisionFail, Reason: "database error", Code: 500}
-	}
-
-	// Also check refunds table if it exists (simplified: use ledger's chargeback_count)
 	var totalChargebacks int
-	err = tap.db.QueryRowContext(ctx,
+	err := tap.db.QueryRowContext(ctx,
 		`SELECT COALESCE(SUM(chargeback_count), 0) FROM trial_abuse_ledger WHERE user_id = ?`,
 		userID).Scan(&totalChargebacks)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -422,7 +412,7 @@ func (tap *TrialAbusePrevention) CheckChargebackHistory(ctx context.Context, use
 		Decision: decision,
 		Reason:   reason,
 		Code:     code,
-		Meta:     map[string]any{"chargebacks": totalChargebacks, "stripe_customer_id": stripeCustomerID},
+		Meta:     map[string]any{"chargebacks": int64(totalChargebacks), "stripe_customer_id": stripeCustomerID},
 	}
 }
 
