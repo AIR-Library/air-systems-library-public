@@ -4,14 +4,19 @@ import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.stream.Collectors;
-import java.security.SecureRandom;
+import java.security.*;
+import java.security.spec.InvalidKeySpecException;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 
 import com.auth0.jwt.JWT;
 import com.auth0.jwt.algorithms.Algorithm;
 import com.auth0.jwt.interfaces.DecodedJWT;
+import com.auth0.jwt.exceptions.JWTVerificationException;
+import com.auth0.jwt.exceptions.TokenExpiredException;
 import org.mindrot.jbcrypt.BCrypt;
-import com.eatthepath.otp.TimeBasedOneTimePasswordGenerator;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.core.type.TypeReference;
 
@@ -39,11 +44,11 @@ public class AuthSystem {
                 "tier VARCHAR(50) DEFAULT 'basic', status VARCHAR(20), email_verified_at TIMESTAMP, " +
                 "mfa_secret VARCHAR(255), mfa_enabled BOOLEAN DEFAULT FALSE, name VARCHAR(255))";
         String sessions = "CREATE TABLE IF NOT EXISTS sessions (" +
-                "id IDENTITY PRIMARY KEY, user_id BIGINT, refresh_token VARCHAR(255), " +
+                "id VARCHAR(255) PRIMARY KEY, user_id BIGINT, refresh_token VARCHAR(255), " +
                 "created_at TIMESTAMP, expires_at TIMESTAMP, ip VARCHAR(45), device_id VARCHAR(255))";
         String audit = "CREATE TABLE IF NOT EXISTS audit_log (" +
                 "timestamp TIMESTAMP, actor_id BIGINT, action VARCHAR(255), resource_type VARCHAR(50), " +
-                "resource_id BIGINT, old_value VARCHAR(255), new_value VARCHAR(255))";
+                "resource_id VARCHAR(255), old_value VARCHAR(255), new_value VARCHAR(255))";
         String verCodes = "CREATE TABLE IF NOT EXISTS verification_codes (" +
                 "id IDENTITY PRIMARY KEY, user_id BIGINT, code VARCHAR(255), created_at TIMESTAMP, " +
                 "expires_at TIMESTAMP, type VARCHAR(10))";
@@ -64,11 +69,15 @@ public class AuthSystem {
     private static final DateTimeFormatter iso = DateTimeFormatter.ISO_INSTANT;
     private static final ObjectMapper mapper = new ObjectMapper();
     private static final Algorithm jwtAlg = Algorithm.HMAC256("secret");
-    private static final TimeBasedOneTimePasswordGenerator totpGen =
-            new TimeBasedOneTimePasswordGenerator(30, 6, java.security.MessageDigest.getInstance("SHA-1"));
+    private static final int TOTP_TIME_STEP = 30;
+    private static final int TOTP_DIGITS = 6;
 
     private static final Set<String> commonPasswords = Set.of(
-            "123456", "password", "12345678", "qwerty", "123456789", "12345", "1234", "111111", "1234567"
+            "123456", "password", "12345678", "qwerty", "123456789", "12345", "1234", "111111", "1234567",
+            "1234567890", "abc123", "password123", "password123456", "admin", "letmein", "welcome", "monkey", "dragon",
+            "master", "hello", "freedom", "whatever", "qazwsx", "trustno1", "654321", "jordan23",
+            "harley", "password1", "123123", "superman", "iloveyou", "sunshine", "princess", "football",
+            "baseball", "shadow", "michael", "ninja", "mustang", "jennifer", "hunter", "2000", "tigger"
     );
 
     /* ---------- Rate Limiter ---------- */
@@ -88,6 +97,58 @@ public class AuthSystem {
     private static boolean isRateLimited(ConcurrentHashMap<String, List<Instant>> map, String key, int max, Duration window) {
         List<Instant> list = map.getOrDefault(key, List.of());
         return list.size() >= max;
+    }
+
+    /* ---------- TOTP Implementation (RFC 6238) ---------- */
+    private static int generateTotp(byte[] key, Instant time, int timeStep, int digits) {
+        long counter = time.getEpochSecond() / timeStep;
+        byte[] counterBytes = new byte[8];
+        for (int i = 7; i >= 0; i--) {
+            counterBytes[i] = (byte)(counter & 0xFF);
+            counter >>= 8;
+        }
+
+        try {
+            Mac mac = Mac.getInstance("HmacSHA1");
+            mac.init(new SecretKeySpec(key, "HmacSHA1"));
+            byte[] hash = mac.doFinal(counterBytes);
+
+            int offset = hash[hash.length - 1] & 0xF;
+            int binary = ((hash[offset] & 0x7F) << 24) |
+                         ((hash[offset + 1] & 0xFF) << 16) |
+                         ((hash[offset + 2] & 0xFF) << 8) |
+                         (hash[offset + 3] & 0xFF);
+
+            int otp = binary % (int)Math.pow(10, digits);
+            return otp;
+        } catch (Exception e) {
+            throw new RuntimeException("TOTP generation failed", e);
+        }
+    }
+
+    private static boolean verifyTotp(byte[] key, String code, Instant time) {
+        int expected = generateTotp(key, time, TOTP_TIME_STEP, TOTP_DIGITS);
+        String expectedStr = String.format("%0" + TOTP_DIGITS + "d", expected);
+        return MessageDigest.isEqual(expectedStr.getBytes(StandardCharsets.US_ASCII), code.getBytes(StandardCharsets.US_ASCII));
+    }
+
+    public static boolean verifyTotp(String secret, String code) {
+        try {
+            byte[] key = Base64.getDecoder().decode(secret);
+            return verifyTotp(key, code, Instant.now());
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    public static String generateTotpCode(String secret) {
+        try {
+            byte[] key = Base64.getDecoder().decode(secret);
+            int totp = generateTotp(key, Instant.now(), TOTP_TIME_STEP, TOTP_DIGITS);
+            return String.format("%0" + TOTP_DIGITS + "d", totp);
+        } catch (Exception e) {
+            throw new RuntimeException("TOTP generation failed", e);
+        }
     }
 
     /* ---------- Auth Service ---------- */
@@ -111,7 +172,7 @@ public class AuthSystem {
             String pwReason = passwordStrengthCheck(password, email, name);
             if (pwReason != null) {
                 decisions.add("password_strength");
-                return error("password_too_weak", pwReason);
+                return error("password_rejected", pwReason);
             }
 
             // Create user
@@ -125,7 +186,7 @@ public class AuthSystem {
             sendEmail(email, code);
 
             logWhy("signup", decisions);
-            auditLog(userId, "user_created", "users", userId, null, null);
+            auditLog(userId, "user_created", "users", String.valueOf(userId), null, null);
             return success(Map.of(
                     "status", "pending_verification",
                     "email", email,
@@ -156,7 +217,7 @@ public class AuthSystem {
             decisions.add("email_verified");
 
             logWhy("verify_email", decisions);
-            auditLog(userId, "email_verified", "users", userId, null, null);
+            auditLog(userId, "email_verified", "users", String.valueOf(userId), null, null);
             return success(Map.of(
                     "status", "verified",
                     "user_id", userId,
@@ -205,32 +266,7 @@ public class AuthSystem {
             }
 
             // Create session
-            String sessionId = UUID.randomUUID().toString();
-            String refreshToken = UUID.randomUUID().toString();
-            Instant now = Instant.now();
-            Instant exp = now.plus(Duration.ofHours(1));
-            insertSession(sessionId, userId, refreshToken, now, exp, ip, deviceId);
-            decisions.add("session_created");
-
-            String token = JWT.create()
-                    .withClaim("user_id", userId)
-                    .withClaim("tier", getTier(userId))
-                    .withExpiresAt(Date.from(exp))
-                    .sign(jwtAlg);
-
-            logWhy("login", decisions);
-            auditLog(userId, "session_created", "sessions", sessionId, null, null);
-            return success(Map.of(
-                    "status", "authenticated",
-                    "session_id", sessionId,
-                    "token", token,
-                    "expires_in", exp.getEpochSecond() - now.getEpochSecond(),
-                    "user", Map.of(
-                            "id", userId,
-                            "email", email,
-                            "tier", getTier(userId)
-                    )
-            ));
+            return createSessionAndToken(userId, email, ip, deviceId, decisions, "login", "session_created");
         } catch (Exception e) {
             return error("internal_error", e.getMessage());
         }
@@ -271,31 +307,7 @@ public class AuthSystem {
             decisions.add("oauth_linked");
 
             // Create session
-            String sessionId = UUID.randomUUID().toString();
-            String refreshToken = UUID.randomUUID().toString();
-            Instant now = Instant.now();
-            Instant exp = now.plus(Duration.ofHours(1));
-            insertSession(sessionId, userId, refreshToken, now, exp, null, null);
-            decisions.add("session_created");
-
-            String token = JWT.create()
-                    .withClaim("user_id", userId)
-                    .withClaim("tier", getTier(userId))
-                    .withExpiresAt(Date.from(exp))
-                    .sign(jwtAlg);
-
-            logWhy("oauth_callback", decisions);
-            auditLog(userId, "oauth_login", "sessions", sessionId, null, null);
-            return success(Map.of(
-                    "status", "authenticated",
-                    "session_id", sessionId,
-                    "token", token,
-                    "user", Map.of(
-                            "id", userId,
-                            "email", email,
-                            "tier", getTier(userId)
-                    )
-            ));
+            return createSessionAndToken(userId, email, null, null, decisions, "oauth_callback", "oauth_login");
         } catch (Exception e) {
             return error("internal_error", e.getMessage());
         }
@@ -304,7 +316,7 @@ public class AuthSystem {
     public static Map<String, Object> mfaChallenge(String challengeId, String code) {
         List<String> decisions = new ArrayList<>();
         try {
-            VerificationCode vc = getVerificationCodeById(challengeId, "mfa");
+            VerificationCode vc = getVerificationCodeByCode(challengeId, "mfa");
             if (vc == null) {
                 decisions.add("challenge_valid");
                 return error("invalid_code", "Challenge not found or expired");
@@ -329,31 +341,7 @@ public class AuthSystem {
             decisions.add("challenge_verified");
 
             // Create session
-            String sessionId = UUID.randomUUID().toString();
-            String refreshToken = UUID.randomUUID().toString();
-            Instant now = Instant.now();
-            Instant exp = now.plus(Duration.ofHours(1));
-            insertSession(sessionId, userId, refreshToken, now, exp, null, null);
-            decisions.add("session_created");
-
-            String token = JWT.create()
-                    .withClaim("user_id", userId)
-                    .withClaim("tier", getTier(userId))
-                    .withExpiresAt(Date.from(exp))
-                    .sign(jwtAlg);
-
-            logWhy("mfa_challenge", decisions);
-            auditLog(userId, "mfa_verified", "sessions", sessionId, null, null);
-            return success(Map.of(
-                    "status", "authenticated",
-                    "session_id", sessionId,
-                    "token", token,
-                    "user", Map.of(
-                            "id", userId,
-                            "email", getEmail(userId),
-                            "tier", getTier(userId)
-                    )
-            ));
+            return createSessionAndToken(userId, getEmail(userId), null, null, decisions, "mfa_challenge", "mfa_verified");
         } catch (Exception e) {
             return error("internal_error", e.getMessage());
         }
@@ -385,7 +373,7 @@ public class AuthSystem {
             String token = JWT.create()
                     .withClaim("user_id", userId)
                     .withClaim("tier", getTier(userId))
-                    .withExpiresAt(Date.from(Instant.now().plus(Duration.ofHours(1))))
+                    .withExpiresAt(java.util.Date.from(Instant.now().plus(Duration.ofHours(1))))
                     .sign(jwtAlg);
 
             decisions.add("token_issued");
@@ -399,6 +387,73 @@ public class AuthSystem {
         } catch (Exception e) {
             return error("internal_error", e.getMessage());
         }
+    }
+
+    public static Map<String, Object> verifyAccessToken(String token) {
+        List<String> decisions = new ArrayList<>();
+        try {
+            // java-jwt checks the signature before the expiry, so only a genuine token can report that it expired.
+            DecodedJWT jwt = JWT.require(jwtAlg).build().verify(token);
+            decisions.add("signature_valid");
+            decisions.add("not_expired");
+
+            Long userId = jwt.getClaim("user_id").asLong();
+            if (userId == null) {
+                return error("invalid_token", "Token missing user_id");
+            }
+
+            if (isUserBanned(userId)) {
+                decisions.add("user_active");
+                return error("user_banned", "User is banned");
+            }
+            decisions.add("user_active");
+
+            logWhy("verify_access_token", decisions);
+            return success(Map.of(
+                    "status", "ok",
+                    "user", Map.of(
+                            "id", userId,
+                            "email", getEmail(userId),
+                            "tier", getTier(userId)
+                    )
+            ));
+        } catch (TokenExpiredException e) {
+            return error("token_expired", "Token has expired");
+        } catch (JWTVerificationException e) {
+            return error("invalid_token", "Invalid token signature");
+        } catch (Exception e) {
+            return error("internal_error", e.getMessage());
+        }
+    }
+
+    private static Map<String, Object> createSessionAndToken(long userId, String email, String ip, String deviceId,
+            List<String> decisions, String flow, String auditAction) throws SQLException {
+        String sessionId = UUID.randomUUID().toString();
+        String refreshToken = UUID.randomUUID().toString();
+        Instant now = Instant.now();
+        Instant exp = now.plus(Duration.ofHours(1));
+        insertSession(sessionId, userId, refreshToken, now, exp, ip, deviceId);
+        decisions.add("session_created");
+
+        String token = JWT.create()
+                .withClaim("user_id", userId)
+                .withClaim("tier", getTier(userId))
+                .withExpiresAt(java.util.Date.from(exp))
+                .sign(jwtAlg);
+
+        logWhy(flow, decisions);
+        auditLog(userId, auditAction, "sessions", sessionId, null, null);
+        return success(Map.of(
+                "status", "authenticated",
+                "session_id", sessionId,
+                "token", token,
+                "expires_in", exp.getEpochSecond() - now.getEpochSecond(),
+                "user", Map.of(
+                        "id", userId,
+                        "email", email,
+                        "tier", getTier(userId)
+                )
+        ));
     }
 
     /* ---------- Helper Methods ---------- */
@@ -462,7 +517,7 @@ public class AuthSystem {
 
     private static void updateEmailVerifiedAt(long userId) throws SQLException {
         try (PreparedStatement ps = conn.prepareStatement("UPDATE users SET email_verified_at = ? WHERE id = ?")) {
-            ps.setTimestamp(1, Timestamp.from(Instant.now()));
+            ps.setTimestamp(1, java.sql.Timestamp.from(Instant.now()));
             ps.setLong(2, userId);
             ps.executeUpdate();
         }
@@ -498,13 +553,6 @@ public class AuthSystem {
         }
     }
 
-    private static boolean verifyTotp(String secret, String code) throws Exception {
-        byte[] key = Base64.getDecoder().decode(secret);
-        Instant now = Instant.now();
-        int totp = totpGen.generateOneTimePassword(key, now);
-        return String.format("%06d", totp).equals(code);
-    }
-
     private static void insertSession(String sessionId, long userId, String refreshToken,
                                       Instant createdAt, Instant expiresAt, String ip, String deviceId) throws SQLException {
         try (PreparedStatement ps = conn.prepareStatement(
@@ -512,8 +560,8 @@ public class AuthSystem {
             ps.setString(1, sessionId);
             ps.setLong(2, userId);
             ps.setString(3, refreshToken);
-            ps.setTimestamp(4, Timestamp.from(createdAt));
-            ps.setTimestamp(5, Timestamp.from(expiresAt));
+            ps.setTimestamp(4, java.sql.Timestamp.from(createdAt));
+            ps.setTimestamp(5, java.sql.Timestamp.from(expiresAt));
             ps.setString(6, ip);
             ps.setString(7, deviceId);
             ps.executeUpdate();
@@ -545,7 +593,7 @@ public class AuthSystem {
             ResultSet rs = ps.executeQuery();
             if (rs.next()) {
                 String status = rs.getString(1);
-                return status.equals("suspended") || status.equals("banned");
+                return status != null && (status.equals("suspended") || status.equals("banned"));
             }
             return false;
         }
@@ -574,8 +622,8 @@ public class AuthSystem {
                 "INSERT INTO verification_codes (user_id, code, created_at, expires_at, type) VALUES (?, ?, ?, ?, ?)")) {
             ps.setLong(1, userId);
             ps.setString(2, code);
-            ps.setTimestamp(3, Timestamp.from(now));
-            ps.setTimestamp(4, Timestamp.from(exp));
+            ps.setTimestamp(3, java.sql.Timestamp.from(now));
+            ps.setTimestamp(4, java.sql.Timestamp.from(exp));
             ps.setString(5, type);
             ps.executeUpdate();
         }
@@ -604,10 +652,10 @@ public class AuthSystem {
         }
     }
 
-    private static VerificationCode getVerificationCodeById(String id, String type) throws SQLException {
+    private static VerificationCode getVerificationCodeByCode(String code, String type) throws SQLException {
         try (PreparedStatement ps = conn.prepareStatement(
-                "SELECT id, user_id, code, created_at, expires_at, type FROM verification_codes WHERE id = ? AND type = ?")) {
-            ps.setString(1, id);
+                "SELECT id, user_id, code, created_at, expires_at, type FROM verification_codes WHERE code = ? AND type = ?")) {
+            ps.setString(1, code);
             ps.setString(2, type);
             ResultSet rs = ps.executeQuery();
             if (rs.next()) {
@@ -634,12 +682,19 @@ public class AuthSystem {
     }
 
     private static String passwordStrengthCheck(String password, String email, String name) {
-        if (password.length() < 15) return "too_short";
-        if (password.length() > 64) return "too_long";
-        if (!password.chars().allMatch(c -> Character.isISOControl(c) == false)) return "invalid_chars";
-        if (commonPasswords.contains(password.toLowerCase())) return "blocklisted";
+        // Check blocklist first (includes common passwords, email, name, service name)
+        String lower = password.toLowerCase();
+        if (commonPasswords.contains(lower)) return "blocklisted";
         if (password.equalsIgnoreCase(email) || password.equalsIgnoreCase(name) || password.equalsIgnoreCase("auth_system"))
             return "blocklisted";
+
+        // Then check length
+        if (password.length() < 15) return "too_short";
+        if (password.length() > 64) return "too_long";
+
+        // Allow all printable ASCII, spaces, and Unicode - just reject control characters
+        if (password.codePoints().anyMatch(c -> Character.isISOControl(c))) return "invalid_chars";
+
         return null;
     }
 
@@ -652,15 +707,15 @@ public class AuthSystem {
         System.out.println("why_chain(flow=\"" + flow + "\", decision_points=" + decisions + ")");
     }
 
-    private static void auditLog(Long actorId, String action, String resourceType, Long resourceId,
+    private static void auditLog(Long actorId, String action, String resourceType, String resourceId,
                                  String oldValue, String newValue) {
         try (PreparedStatement ps = conn.prepareStatement(
                 "INSERT INTO audit_log (timestamp, actor_id, action, resource_type, resource_id, old_value, new_value) VALUES (?, ?, ?, ?, ?, ?, ?)")) {
-            ps.setTimestamp(1, Timestamp.from(Instant.now()));
+            ps.setTimestamp(1, java.sql.Timestamp.from(Instant.now()));
             ps.setObject(2, actorId);
             ps.setString(3, action);
             ps.setString(4, resourceType);
-            ps.setObject(5, resourceId);
+            ps.setString(5, resourceId);
             ps.setString(6, oldValue);
             ps.setString(7, newValue);
             ps.executeUpdate();
