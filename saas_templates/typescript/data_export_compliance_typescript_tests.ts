@@ -462,17 +462,6 @@ async function runTests() {
   });
 
   // Run all tests and report
-  await test('Export: JSON and CSV formats both work', async () => {});
-  await test('Export: All data categories included', async () => {});
-  await test('Export: Email sent with download link', async () => {});
-  await test('Export: Signed URL works, expires after 7 days', async () => {});
-  await test('Deletion: 30-day grace period enforced', async () => {});
-  await test('Deletion: User can cancel within grace period', async () => {});
-  await test('Deletion: Cascade delete works', async () => {});
-  await test('Deletion: Audit log preserved (not deleted with user)', async () => {});
-  await test('Deletion: User confirmed via email token', async () => {});
-  await test('Admin: Can see all export/deletion requests', async () => {});
-  await test('Audit: All requests logged with why_chain support', async () => {});
 
   console.log(`\n--- Results: ${passed} passed, ${failed} failed ---`);
   if (failed > 0) {
