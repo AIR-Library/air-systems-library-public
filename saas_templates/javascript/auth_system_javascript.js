@@ -23,6 +23,11 @@ const dbPromise = open({
   driver: sqlite3.Database
 });
 
+const rateLimits = {
+  signup: new Map(), // ip -> [{ts}]
+  loginFail: new Map() // key(ip+user) -> [{ts}]
+};
+
 async function initDB() {
   const db = await dbPromise;
   await db.exec(`
@@ -67,25 +72,18 @@ async function initDB() {
   `);
 }
 
-const rateLimits = {
-  signup: new Map(), // ip -> [{ts}]
-  loginFail: new Map() // key(ip+user) -> [{ts}]
-};
-
 function now() { return new Date().toISOString(); }
 
 function logWhyChain(flow, decisionPoints) {
   // placeholder for logging decision chain
 }
 
-function logAudit({ actor_id, action, resource_type, resource_id, old_value, new_value }) {
-  const db = dbPromise;
-  db.then(db => {
-    db.run(`
-      INSERT INTO audit_log (timestamp, actor_id, action, resource_type, resource_id, old_value, new_value)
-      VALUES (?,?,?,?,?,?,?)`,
-      now(), actor_id, action, resource_type, resource_id, old_value, new_value);
-  });
+async function logAudit({ actor_id, action, resource_type, resource_id, old_value, new_value }) {
+  const db = await dbPromise;
+  await db.run(`
+    INSERT INTO audit_log (timestamp, actor_id, action, resource_type, resource_id, old_value, new_value)
+    VALUES (?,?,?,?,?,?,?)`,
+    now(), actor_id, action, resource_type, resource_id, old_value, new_value);
 }
 
 async function hashPassword(pw) {
@@ -102,7 +100,7 @@ function generateCode() {
 }
 
 function generateToken(user) {
-  return jwt.sign({ user_id: user.id, tier: user.tier }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_EXPIRES });
+  return jwt.sign({ user_id: user.id, tier: user.tier }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_EXPIRES, algorithm: 'HS256' });
 }
 
 function generateRefreshToken() {
@@ -110,16 +108,16 @@ function generateRefreshToken() {
 }
 
 async function createSession(user, ip, device_id) {
-  const db = dbPromise;
+  const db = await dbPromise;
   const session_id = uuidv4();
   const refresh_token = generateRefreshToken();
   const created_at = now();
   const expires_at = new Date(Date.now() + REFRESH_TOKEN_EXPIRES_DAYS * 24 * 60 * 60 * 1000).toISOString();
-  await db.then(db => db.run(`
+  await db.run(`
     INSERT INTO sessions (id, user_id, refresh_token, created_at, expires_at, ip, device_id)
     VALUES (?,?,?,?,?,?,?)`,
-    session_id, user.id, refresh_token, created_at, expires_at, ip, device_id));
-  logAudit({ actor_id: user.id, action: 'session_created', resource_type: 'session', resource_id: session_id, old_value: null, new_value: null });
+    session_id, user.id, refresh_token, created_at, expires_at, ip, device_id);
+  await logAudit({ actor_id: user.id, action: 'session_created', resource_type: 'session', resource_id: session_id, old_value: null, new_value: null });
   return { session_id, token: generateToken(user), expires_in: 900, refresh_token };
 }
 
@@ -154,11 +152,11 @@ function clearLoginFail(ip, userId) {
 }
 
 async function signup(email, password, name, ip) {
-  const db = dbPromise;
+  const db = await dbPromise;
   if (isRateLimitedSignup(ip)) {
     return { error: 'too_many_signups_from_ip', message: 'Rate limit exceeded' };
   }
-  const existing = await db.then(db => db.get(`SELECT id FROM users WHERE email = ?`, email));
+  const existing = await db.get(`SELECT id FROM users WHERE email = ?`, email);
   if (existing) {
     return { error: 'email_already_exists', message: 'Email already registered' };
   }
@@ -174,47 +172,47 @@ async function signup(email, password, name, ip) {
   }
   const hash = await hashPassword(password);
   const user_id = uuidv4();
-  await db.then(db => db.run(`
+  await db.run(`
     INSERT INTO users (id, email, password_hash, tier, status, mfa_enabled)
     VALUES (?,?,?,?,?,?)`,
-    user_id, email, hash, 'free', 'unverified', 0));
+    user_id, email, hash, 'free', 'unverified', 0);
   logWhyChain('signup', ['email_unique', 'password_strength', 'rate_limit_ip_24h']);
-  logAudit({ actor_id: user_id, action: 'user_created', resource_type: 'user', resource_id: user_id, old_value: null, new_value: null });
+  await logAudit({ actor_id: user_id, action: 'user_created', resource_type: 'user', resource_id: user_id, old_value: null, new_value: null });
   // create verification code
   const code = generateCode();
   const code_id = uuidv4();
   const created_at = now();
   const expires_at = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-  await db.then(db => db.run(`
+  await db.run(`
     INSERT INTO verification_codes (id, user_id, code, created_at, expires_at, type)
     VALUES (?,?,?,?,?,?)`,
-    code_id, user_id, code, created_at, expires_at, 'email'));
+    code_id, user_id, code, created_at, expires_at, 'email');
   // simulate email send by storing code
   return { success: true, status: 'pending_verification', email, message: 'check email' };
 }
 
 async function verify_email(email, code) {
-  const db = dbPromise;
-  const user = await db.then(db => db.get(`SELECT * FROM users WHERE email = ?`, email));
+  const db = await dbPromise;
+  const user = await db.get(`SELECT * FROM users WHERE email = ?`, email);
   if (!user) return { error: 'invalid_code', message: 'Invalid code' };
   if (user.email_verified_at) return { error: 'already_verified', message: 'Already verified' };
-  const record = await db.then(db => db.get(`
+  const record = await db.get(`
     SELECT * FROM verification_codes WHERE user_id = ? AND code = ? AND type = 'email'`,
-    user.id, code));
+    user.id, code);
   if (!record) return { error: 'invalid_code', message: 'Invalid code' };
   if (new Date(record.expires_at) < new Date()) {
     return { error: 'code_expired', message: 'Code expired' };
   }
-  await db.then(db => db.run(`UPDATE users SET email_verified_at = ? WHERE id = ?`, now(), user.id));
-  await db.then(db => db.run(`DELETE FROM verification_codes WHERE id = ?`, record.id));
+  await db.run(`UPDATE users SET email_verified_at = ? WHERE id = ?`, now(), user.id);
+  await db.run(`DELETE FROM verification_codes WHERE id = ?`, record.id);
   logWhyChain('verify_email', ['code_valid', 'user_unverified']);
-  logAudit({ actor_id: user.id, action: 'email_verified', resource_type: 'user', resource_id: user.id, old_value: null, new_value: null });
+  await logAudit({ actor_id: user.id, action: 'email_verified', resource_type: 'user', resource_id: user.id, old_value: null, new_value: null });
   return { success: true, status: 'verified', user_id: user.id, message: 'ready to login' };
 }
 
 async function login(email, password, device_id, ip) {
-  const db = dbPromise;
-  const user = await db.then(db => db.get(`SELECT * FROM users WHERE email = ?`, email));
+  const db = await dbPromise;
+  const user = await db.get(`SELECT * FROM users WHERE email = ?`, email);
   if (!user || !user.email_verified_at) {
     return { error: 'invalid_credentials', message: 'Invalid credentials' };
   }
@@ -231,12 +229,12 @@ async function login(email, password, device_id, ip) {
     const code = speakeasy.totp({ secret: user.mfa_secret, encoding: 'base32' });
     const created_at = now();
     const expires_at = new Date(Date.now() + 5 * 60 * 1000).toISOString();
-    await db.then(db => db.run(`
+    await db.run(`
       INSERT INTO verification_codes (id, user_id, code, created_at, expires_at, type)
       VALUES (?,?,?,?,?,?)`,
-      challenge_id, user.id, code, created_at, expires_at, 'mfa'));
+      challenge_id, user.id, code, created_at, expires_at, 'mfa');
     logWhyChain('login', ['user_exists', 'password_correct', 'mfa_gate', 'rate_limit']);
-    logAudit({ actor_id: user.id, action: 'mfa_challenge_created', resource_type: 'challenge', resource_id: challenge_id, old_value: null, new_value: null });
+    await logAudit({ actor_id: user.id, action: 'mfa_challenge_created', resource_type: 'challenge', resource_id: challenge_id, old_value: null, new_value: null });
     return { success: true, status: 'mfa_required', challenge_id };
   }
   const session = await createSession(user, ip, device_id);
@@ -245,32 +243,32 @@ async function login(email, password, device_id, ip) {
 }
 
 async function oauth_callback(provider, code, state, ip, device_id) {
-  const db = dbPromise;
+  const db = await dbPromise;
   // For simplicity, assume provider returns email in code (mock)
   const email = code; // in real case, exchange code for token and get email
-  const user = await db.then(db => db.get(`SELECT * FROM users WHERE email = ?`, email));
+  const user = await db.get(`SELECT * FROM users WHERE email = ?`, email);
   let user_id;
   if (!user) {
     user_id = uuidv4();
-    await db.then(db => db.run(`
+    await db.run(`
       INSERT INTO users (id, email, tier, status, mfa_enabled)
       VALUES (?,?,?,?,?)`,
-      user_id, email, 'free', 'verified', 0));
-    logAudit({ actor_id: user_id, action: 'user_created', resource_type: 'user', resource_id: user_id, old_value: null, new_value: null });
+      user_id, email, 'free', 'verified', 0);
+    await logAudit({ actor_id: user_id, action: 'user_created', resource_type: 'user', resource_id: user_id, old_value: null, new_value: null });
   } else {
     user_id = user.id;
   }
   // link provider - omitted for brevity
   const session = await createSession({ id: user_id, tier: 'free' }, ip, device_id);
   logWhyChain('oauth_callback', ['state_valid', 'email_verified']);
-  logAudit({ actor_id: user_id, action: 'oauth_login', resource_type: 'user', resource_id: user_id, old_value: null, new_value: null });
+  await logAudit({ actor_id: user_id, action: 'oauth_login', resource_type: 'user', resource_id: user_id, old_value: null, new_value: null });
   return { success: true, status: 'authenticated', session_id: session.session_id, token: session.token, user: { id: user_id, email, tier: 'free' } };
 }
 
 async function mfa_challenge(challenge_id, code, ip, device_id) {
-  const db = dbPromise;
-  const record = await db.then(db => db.get(`
-    SELECT * FROM verification_codes WHERE id = ? AND type = 'mfa'`, challenge_id));
+  const db = await dbPromise;
+  const record = await db.get(`
+    SELECT * FROM verification_codes WHERE id = ? AND type = 'mfa'`, challenge_id);
   if (!record) return { error: 'invalid_code', message: 'Invalid challenge' };
   if (new Date(record.expires_at) < new Date()) {
     return { error: 'code_expired', message: 'Challenge expired' };
@@ -278,30 +276,54 @@ async function mfa_challenge(challenge_id, code, ip, device_id) {
   if (record.code !== code) {
     return { error: 'invalid_code', message: 'Invalid code' };
   }
-  const user = await db.then(db => db.get(`SELECT * FROM users WHERE id = ?`, record.user_id));
-  await db.then(db => db.run(`DELETE FROM verification_codes WHERE id = ?`, challenge_id));
+  const user = await db.get(`SELECT * FROM users WHERE id = ?`, record.user_id);
+  await db.run(`DELETE FROM verification_codes WHERE id = ?`, challenge_id);
   const session = await createSession(user, ip, device_id);
   logWhyChain('mfa_challenge', ['challenge_valid', 'code_correct']);
-  logAudit({ actor_id: user.id, action: 'mfa_verified', resource_type: 'user', resource_id: user.id, old_value: null, new_value: null });
+  await logAudit({ actor_id: user.id, action: 'mfa_verified', resource_type: 'user', resource_id: user.id, old_value: null, new_value: null });
   return { success: true, status: 'authenticated', session_id: session.session_id, token: session.token, expires_in: session.expires_in, user: { id: user.id, email: user.email, tier: user.tier } };
 }
 
 async function token_refresh(refresh_token) {
-  const db = dbPromise;
-  const session = await db.then(db => db.get(`
-    SELECT * FROM sessions WHERE refresh_token = ?`, refresh_token));
+  const db = await dbPromise;
+  const session = await db.get(`
+    SELECT * FROM sessions WHERE refresh_token = ?`, refresh_token);
   if (!session) return { error: 'invalid_token', message: 'Invalid refresh token' };
   if (new Date(session.expires_at) < new Date()) {
     return { error: 'token_expired', message: 'Refresh token expired' };
   }
-  const user = await db.then(db => db.get(`SELECT * FROM users WHERE id = ?`, session.user_id));
+  const user = await db.get(`SELECT * FROM users WHERE id = ?`, session.user_id);
   if (!user || ['suspended', 'banned'].includes(user.status)) {
     return { error: 'user_banned', message: 'User banned' };
   }
   const newToken = generateToken(user);
   logWhyChain('token_refresh', ['token_valid', 'user_active']);
-  logAudit({ actor_id: user.id, action: 'token_refreshed', resource_type: 'session', resource_id: session.id, old_value: null, new_value: null });
+  await logAudit({ actor_id: user.id, action: 'token_refreshed', resource_type: 'session', resource_id: session.id, old_value: null, new_value: null });
   return { success: true, status: 'ok', token: newToken, expires_in: 900 };
+}
+
+async function verify_access_token(token) {
+  let payload;
+  try {
+    payload = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
+  } catch (e) {
+    if (e.name === 'TokenExpiredError') {
+      return { error: 'token_expired', message: 'Token expired' };
+    }
+    return { error: 'invalid_token', message: 'Invalid token' };
+  }
+  const db = await dbPromise;
+  const user = await db.get(`SELECT * FROM users WHERE id = ?`, payload.user_id);
+  if (!user || ['suspended', 'banned'].includes(user.status)) {
+    return { error: 'user_banned', message: 'User banned' };
+  }
+  logWhyChain('verify_access_token', ['signature_valid', 'not_expired', 'user_active']);
+  return { success: true, status: 'ok', user: { id: user.id, email: user.email, tier: user.tier } };
+}
+
+function resetRateLimits() {
+  rateLimits.signup.clear();
+  rateLimits.loginFail.clear();
 }
 
 module.exports = {
@@ -312,5 +334,8 @@ module.exports = {
   oauth_callback,
   mfa_challenge,
   token_refresh,
-  dbPromise
+  verify_access_token,
+  dbPromise,
+  rateLimits,
+  resetRateLimits
 };
