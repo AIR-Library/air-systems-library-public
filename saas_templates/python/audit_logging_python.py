@@ -3,6 +3,10 @@
 # Why: the suite failed on CI (it was listed in ci/baseline.json). Fixed by a free model from a
 # continuity handoff, then reviewed by Claude. 2026-11-03, session c6ee9a72.
 # Touches: SQLite only.
+# Repaired 2026-11-04: query performance optimization for large datasets.
+#   - Changed index column order to (actor_id, action, timestamp, resource_type) so ORDER BY timestamp
+#     can be satisfied by the index after filtering on actor_id + action.
+#   - Count query now uses the same WHERE clause without subquery wrapper, avoiding temp table creation.
 import sqlite3
 import json
 import uuid
@@ -40,10 +44,12 @@ class AuditLogger:
                     metadata TEXT
                 );
             """)
-            # Indexing for fast queries
+            # Indexing for fast queries: (actor_id, action, timestamp, resource_type)
+            # This order allows the index to be used for both WHERE (actor_id, action)
+            # and ORDER BY timestamp DESC without a filesort.
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_audit_log_query 
-                ON audit_log(actor_id, action, resource_type, timestamp);
+                ON audit_log(actor_id, action, timestamp, resource_type);
             """)
             # Immutability Triggers
             # Using RAISE(ABORT, ...) ensures a sqlite3.IntegrityError is raised,
@@ -118,38 +124,41 @@ class AuditLogger:
         date_from: Optional[str] = None,
         date_to: Optional[str] = None
     ) -> Dict[str, Any]:
-        query = "SELECT * FROM audit_log WHERE 1=1"
+        # Build WHERE clause and parameters
+        where_clauses = ["1=1"]
         params: List[Any] = []
 
         if actor_id is not None:
-            query += " AND actor_id = ?"
+            where_clauses.append("actor_id = ?")
             params.append(str(actor_id))
 
         if action is not None:
             if "*" in action:
-                query += " AND action LIKE ?"
+                where_clauses.append("action LIKE ?")
                 params.append(action.replace("*", "%"))
             else:
-                query += " AND action = ?"
+                where_clauses.append("action = ?")
                 params.append(action)
 
         if resource_type is not None:
-            query += " AND resource_type = ?"
+            where_clauses.append("resource_type = ?")
             params.append(resource_type)
 
         if date_from is not None:
-            query += " AND timestamp >= ?"
+            where_clauses.append("timestamp >= ?")
             params.append(date_from)
 
         if date_to is not None:
-            query += " AND timestamp <= ?"
+            where_clauses.append("timestamp <= ?")
             params.append(date_to)
 
-        # Count total matching records
-        count_query = f"SELECT COUNT(*) as total FROM ({query})"
+        where_sql = " AND ".join(where_clauses)
+
+        # Count total matching records - use same WHERE clause without subquery
+        count_query = f"SELECT COUNT(*) as total FROM audit_log WHERE {where_sql}"
         
-        # Order and paginate
-        query += " ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?"
+        # Main query with ordering and pagination
+        query = f"SELECT * FROM audit_log WHERE {where_sql} ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?"
         params_with_pagination = params + [limit, offset]
 
         with self._get_connection() as conn:
