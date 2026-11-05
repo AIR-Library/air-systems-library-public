@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run every test suite for one language and report PASS / FAIL / MISSING per system.
+"""Run every test suite for one language and report PASS / FAIL / MISSING / BROKEN per system.
 
 LIFESPAN: permanent -- this is the CI entry point (see .github/workflows/ci.yml).
 
@@ -12,12 +12,20 @@ How it works
   * Results are compared with a baseline of KNOWN-FAILING suites (ci/baseline.json). Only a
     REGRESSION fails the run: a suite that is not in the baseline and does not pass. Suites that
     pass but are still listed in the baseline are reported as "newly passing" so the list can shrink.
+  * Some things no baseline can excuse, because people copy these files (2026-11-05, session
+    f3daac6e; AIR record finding:2026-11-05:3a00300d16: one empty file, six cut-off files and a
+    missing test file sat here unnoticed):
+      MISSING  the implementation or the tests file does not exist.
+      BROKEN   a file does not parse: every template is parsed first, with the language's own parser.
+    Either one fails the run even when the suite is listed in the baseline. A suite that exits
+    cleanly without running a single test is a plain FAIL, not a PASS.
 
 Usage
   python tools/run_suites.py --lang python                     # all systems, one language
   python tools/run_suites.py --lang go --systems webhooks      # a subset
   python tools/run_suites.py --lang rust --baseline ci/baseline.json --json out.json --summary out.md
   python tools/run_suites.py --lang python --update-baseline ci/baseline.json   # rewrite baseline
+  python tools/run_suites.py --lang java --parse-only          # only parse every template
 
 Exit code: 0 = no regressions, 1 = at least one regression, 2 = usage / setup error.
 """
@@ -42,6 +50,7 @@ EXT = {"python": "py", "javascript": "js", "typescript": "ts", "go": "go", "php"
        "java": "java", "csharp": "cs", "rust": "rs"}
 TIMEOUT = 300
 BUDGET_SECONDS = 75 * 60   # stop starting new suites after this, so the summary and JSON are always written
+NEVER_EXCUSED = {"MISSING", "BROKEN"}   # these fail the run even for a suite listed in the baseline
 
 # One test = one function the contract names (test*/Test*), used when a framework gives no count.
 TEST_FN = {
@@ -138,7 +147,7 @@ def run_python(impl: Path, tests: Path, tmp: Path, ctx: Path) -> dict:
 
 # ----------------------------------------------------------------------- javascript / typescript
 NODE_PKGS = {
-    "express": "^4.19.2", "body-parser": "^1.20.2", "cookie-parser": "^1.4.6", "csurf": "^1.11.0",
+    "express": "^4.19.2", "express-rate-limit": "^7.4.1", "body-parser": "^1.20.2", "cookie-parser": "^1.4.6", "csurf": "^1.11.0",
     "supertest": "^7.0.0", "stripe": "^16.0.0", "sqlite3": "^5.1.7", "sqlite": "^5.1.1",
     "better-sqlite3": "^11.0.0", "knex": "^3.1.0", "nodemailer": "^6.9.13",
     "@aws-sdk/client-s3": "^3.588.0", "@aws-sdk/s3-request-presigner": "^3.588.0", "uuid": "^9.0.1",
@@ -238,7 +247,8 @@ def setup_php() -> Path:
 def run_php(impl: Path, tests: Path, tmp: Path, ctx: Path) -> dict:
     shutil.copy(impl, tmp / impl.name)
     code = tests.read_text(encoding="utf-8", errors="replace")
-    n = count_tests("php", code)
+    # A self-running script has no test functions: each check is one $runner->assert...() call (2026-11-05, session f3daac6e).
+    n = count_tests("php", code) or len(re.findall(r"->assert\w*\(", code))
     m = re.search(r"^\s*(?:final\s+)?class\s+(\w+)\s+extends\s+\\?(?:PHPUnit\\Framework\\)?TestCase", code, re.M)
     if m:  # PHPUnit style
         shutil.copy(tests, tmp / f"{m.group(1)}.php")
@@ -437,10 +447,154 @@ LANGS = {
 }
 
 
+# ------------------------------------------------------------------------------ parsing
+JAVA_PARSE_ONLY = """
+import com.sun.source.util.JavacTask;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+import javax.tools.*;
+
+public class ParseOnly {
+    public static void main(String[] files) throws Exception {
+        JavaCompiler javac = ToolProvider.getSystemJavaCompiler();
+        DiagnosticCollector<JavaFileObject> found = new DiagnosticCollector<>();
+        try (StandardJavaFileManager fm = javac.getStandardFileManager(found, null, StandardCharsets.UTF_8)) {
+            ((JavacTask) javac.getTask(null, fm, found, List.of("-proc:none"), null, fm.getJavaFileObjects(files))).parse();
+        }
+        for (Diagnostic<? extends JavaFileObject> d : found.getDiagnostics()) {
+            if (d.getKind() == Diagnostic.Kind.ERROR) {
+                System.out.println(d.getSource().getName() + "\\t" + d.getLineNumber() + ": " + d.getMessage(null));
+            }
+        }
+    }
+}
+"""
+TS_PARSE_ONLY = """
+const esbuild = require(process.argv[2]);
+const fs = require('fs');
+for (const f of process.argv.slice(3)) {
+  try {
+    esbuild.transformSync(fs.readFileSync(f, 'utf8'), { loader: 'ts', logLevel: 'silent' });
+  } catch (e) {
+    const m = e.errors && e.errors[0];
+    console.log(f + '\\t' + (m ? `${m.location ? m.location.line : '?'}: ${m.text}` : String(e)));
+  }
+}
+"""
+
+
+def first_line(text: str) -> str:
+    """The first non-empty line of a tool's output, kept short for a report."""
+    return next((l.strip() for l in text.splitlines() if l.strip()), "no message")[:200]
+
+
+def need_tool(rc: int, out: str, tool: str) -> None:
+    """Stop the run when a parser is not installed: a check that cannot run must never read as a pass."""
+    if rc == 127:
+        raise RuntimeError(f"{tool} is needed to parse the templates: {out}")
+
+
+def csharp_compiler() -> Path:
+    """The Roslyn compiler inside the newest installed .NET SDK. Raises RuntimeError when there is none."""
+    rc, out = sh(["dotnet", "--list-sdks"], ROOT)
+    need_tool(rc, out, "dotnet")
+    sdks = re.findall(r"^(\S+) \[(.+)\]\s*$", out, re.M)
+    if not sdks:
+        raise RuntimeError(f"no .NET SDK found: {out}")
+    version, root = sdks[-1]
+    return Path(root) / version / "Roslyn" / "bincore" / "csc.dll"
+
+
+def parse_failures(lang: str, files: list[Path], ctx: Path) -> dict[str, str]:
+    """Parse each file with the language's own parser, without compiling or running it.
+
+    Why: a cut-off file can hide behind a suite that already fails for another reason, and a suite
+    in the baseline is never looked at. Reading each file's last line found six such files on
+    2026-11-05; this finds them every run. Session f3daac6e, AIR record finding:2026-11-05:3a00300d16.
+    In: the language, the files, the language's .deps folder (TypeScript's parser lives there).
+    Out: {file name: first error}, empty when all of them parse. Raises RuntimeError when the
+    parser is not installed. Touches: temp files only; runs the parsers, never the code.
+    """
+    bad: dict[str, str] = {}
+    tmp = Path(tempfile.mkdtemp(prefix=f"aoi_parse_{lang}_"))
+    try:
+        if lang == "python":
+            for f in files:
+                try:
+                    compile(f.read_bytes(), f.name, "exec", dont_inherit=True)
+                except (SyntaxError, ValueError) as e:
+                    bad[f.name] = f"{getattr(e, 'lineno', '?')}: {getattr(e, 'msg', e)}"
+        elif lang == "javascript":
+            for f in files:
+                rc, out = sh(["node", "--check", str(f)], tmp)
+                need_tool(rc, out, "node")
+                if rc != 0:
+                    bad[f.name] = next((l.strip() for l in out.splitlines() if "Error" in l), first_line(out))[:200]
+        elif lang == "typescript":
+            script = tmp / "parse_only.cjs"
+            script.write_text(TS_PARSE_ONLY, encoding="utf-8")
+            rc, out = sh(["node", str(script), str(ctx / "node_modules" / "esbuild"), *map(str, files)], tmp)
+            need_tool(rc, out, "node")
+            if rc != 0:
+                raise RuntimeError("the TypeScript parser did not run:\n" + tail(out, [tmp], 10))
+            for line in out.splitlines():
+                if "\t" in line:
+                    name, message = line.split("\t", 1)
+                    bad.setdefault(Path(name).name, message[:200])
+        elif lang == "go":
+            for f in files:
+                rc, out = sh(["gofmt", "-e", "-l", str(f)], tmp)
+                need_tool(rc, out, "gofmt")
+                if rc != 0:
+                    bad[f.name] = first_line(out.replace(str(f) + ":", ""))
+        elif lang == "php":
+            for f in files:
+                rc, out = sh(["php", "-l", str(f)], tmp)
+                need_tool(rc, out, "php")
+                if rc != 0:
+                    bad[f.name] = first_line(out.replace(str(f), f.name))
+        elif lang == "java":
+            script = tmp / "ParseOnly.java"
+            script.write_text(JAVA_PARSE_ONLY, encoding="utf-8")
+            rc, out = sh(["java", str(script), *map(str, files)], tmp)
+            need_tool(rc, out, "java")
+            if rc != 0:
+                raise RuntimeError("the Java parser did not run:\n" + tail(out, [tmp], 10))
+            for line in out.splitlines():
+                if "\t" in line:
+                    name, message = line.split("\t", 1)
+                    bad.setdefault(Path(name).name, message[:200])
+        elif lang == "csharp":
+            csc = csharp_compiler()
+            for f in files:
+                # With no standard library the compiler always stops at CS0518 once parsing is done,
+                # and it never reaches that point when the file has a syntax error.
+                rc, out = sh(["dotnet", str(csc), "-nologo", "-noconfig", "-nostdlib+", "-t:library",
+                              f"-out:{tmp / 'parse.dll'}", str(f)], tmp)
+                need_tool(rc, out, "dotnet")
+                errors = re.findall(r"error (CS\d+): (.*)", out)
+                if errors and not any(code == "CS0518" for code, _ in errors):
+                    line = re.search(r"\((\d+),\d+\): error", out)
+                    bad[f.name] = f"{line.group(1) if line else '?'}: {errors[0][0]} {errors[0][1]}"[:200]
+        elif lang == "rust":
+            for f in files:
+                rc, out = sh(["rustfmt", "--edition", "2021", "--emit", "stdout", str(f)], tmp)
+                need_tool(rc, out, "rustfmt")
+                if rc != 0:
+                    bad[f.name] = next((l.strip() for l in out.splitlines() if l.startswith("error")), first_line(out))[:200]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return bad
+
+
 # ----------------------------------------------------------------------------------- reporting
 def systems_for(lang: str) -> list[str]:
+    """Every system with an implementation or a tests file. In: a language. Out: sorted names.
+    Both kinds count, so a tests file whose implementation is gone shows as MISSING too (2026-11-05, session f3daac6e)."""
     ext = EXT[lang]
-    return sorted({p.name[: -len(f"_{lang}.{ext}")] for p in (TEMPLATES / lang).glob(f"*_{lang}.{ext}")})
+    names = {p.name[: -len(f"_{lang}.{ext}")] for p in (TEMPLATES / lang).glob(f"*_{lang}.{ext}")}
+    names |= {p.name[: -len(f"_{lang}_tests.{ext}")] for p in (TEMPLATES / lang).glob(f"*_{lang}_tests.{ext}")}
+    return sorted(names)
 
 
 def key(lang: str, system: str) -> str:
@@ -448,7 +602,7 @@ def key(lang: str, system: str) -> str:
 
 
 def render_summary(lang: str, res: dict, baseline: set[str], regress: list[str], fixed: list[str]) -> str:
-    icon = {"PASS": "✅", "FAIL": "❌", "MISSING": "➖"}
+    icon = {"PASS": "✅", "FAIL": "❌", "MISSING": "⛔", "BROKEN": "⛔"}
     rows = ["| system | status | tests | known failing |", "|---|---|---|---|"]
     for system, r in sorted(res.items()):
         rows.append(f"| {system} | {icon.get(r['status'], '❔')} {r['status']} | {r['tests']} | "
@@ -456,7 +610,8 @@ def render_summary(lang: str, res: dict, baseline: set[str], regress: list[str],
     npass = sum(1 for r in res.values() if r["status"] == "PASS")
     out = [f"### {lang}: {npass}/{len(res)} suites pass", "", *rows, ""]
     if regress:
-        out += ["**Regressions (not in the baseline, not passing):** " + ", ".join(regress), ""]
+        out += ["**Regressions (not passing, and either not in the baseline or MISSING/BROKEN, which it cannot "
+                "excuse):** " + ", ".join(regress), ""]
     if fixed:
         out += ["**Newly passing (remove from `ci/baseline.json`):** " + ", ".join(fixed), ""]
     return "\n".join(out)
@@ -470,29 +625,41 @@ def main() -> int:
     ap.add_argument("--update-baseline", help="rewrite this baseline file from this run's failures")
     ap.add_argument("--json", help="write per-suite results here")
     ap.add_argument("--summary", help="append a markdown table here (e.g. $GITHUB_STEP_SUMMARY)")
+    ap.add_argument("--parse-only", action="store_true", help="only parse every template; exit 1 if one does not parse")
     a = ap.parse_args()
 
     setup, run = LANGS[a.lang]
     names = systems_for(a.lang)
     if a.systems:
         names = [s for s in names if s in set(a.systems.split(","))]
+    ext = EXT[a.lang]
     try:
         ctx = setup()
+        # [2026-11-05, session f3daac6e] every template is parsed, also those of a --systems subset
+        broken = parse_failures(a.lang, sorted((TEMPLATES / a.lang).glob(f"*.{ext}")), ctx)
     except Exception as e:  # setup problems are infrastructure errors, not test results
         print(f"SETUP ERROR ({a.lang}): {e}", file=sys.stderr)
         return 2
+    if a.parse_only:
+        for name, why in sorted(broken.items()):
+            print(f"BROKEN {name}: {why}")
+        print(f"{a.lang}: {len(broken)} of {len(list((TEMPLATES / a.lang).glob(f'*.{ext}')))} files do not parse")
+        return 1 if broken else 0
 
     baseline: set[str] = set()
     if a.baseline and Path(a.baseline).is_file():
         baseline = set(json.loads(Path(a.baseline).read_text())["known_failing"])
     started = time.monotonic()
-    ext = EXT[a.lang]
     res: dict[str, dict] = {}
     for s in names:
         impl = TEMPLATES / a.lang / f"{s}_{a.lang}.{ext}"
         tests = TEMPLATES / a.lang / f"{s}_{a.lang}_tests.{ext}"
-        if not tests.is_file():
-            r = result("MISSING", 0, "tests file is not in the library")
+        absent = [p.name for p in (impl, tests) if not p.is_file()]
+        unparsed = [f"{p.name}: {broken[p.name]}" for p in (impl, tests) if p.name in broken]
+        if absent:
+            r = result("MISSING", 0, "not in the library: " + ", ".join(absent))
+        elif unparsed:
+            r = result("BROKEN", 0, "does not parse: " + "; ".join(unparsed))
         elif time.monotonic() - started > BUDGET_SECONDS:
             r = result("FAIL", 0, "skipped: run time budget exhausted")
         else:
@@ -507,13 +674,16 @@ def main() -> int:
                     r = result("FAIL", 0, f"runner error: {e!r}")
                 finally:
                     shutil.rmtree(tmp, ignore_errors=True)
+                if r["status"] == "PASS" and r["tests"] == 0:
+                    r = result("FAIL", 0, "exited cleanly without running a single test")
                 if r["status"] == "PASS":
                     break
         res[s] = r
         print(f"{s:<28} {r['status']:<8} tests={r['tests']:<3} "
               f"{r['detail'].splitlines()[0][:80] if r['detail'] else ''}", flush=True)
 
-    regress = [s for s, r in res.items() if r["status"] != "PASS" and key(a.lang, s) not in baseline]
+    regress = [s for s, r in res.items()
+               if r["status"] in NEVER_EXCUSED or (r["status"] != "PASS" and key(a.lang, s) not in baseline)]
     fixed = [s for s, r in res.items() if r["status"] == "PASS" and key(a.lang, s) in baseline]
 
     if a.json:
@@ -525,7 +695,7 @@ def main() -> int:
         p = Path(a.update_baseline)
         keep = set(json.loads(p.read_text())["known_failing"]) if p.is_file() else set()
         keep = {k for k in keep if not k.endswith(f"/{a.lang}")}
-        keep |= {key(a.lang, s) for s, r in res.items() if r["status"] != "PASS"}
+        keep |= {key(a.lang, s) for s, r in res.items() if r["status"] == "FAIL"}   # MISSING and BROKEN are never listed
         p.write_text(json.dumps({"known_failing": sorted(keep)}, indent=2) + "\n")
     print(f"\n{a.lang}: {sum(r['status'] == 'PASS' for r in res.values())}/{len(res)} pass; "
           f"regressions={len(regress)}; newly passing={len(fixed)}")
