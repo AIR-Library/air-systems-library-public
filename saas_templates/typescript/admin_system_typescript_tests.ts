@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   AdminSystem,
   AdminError,
+  ConsoleEmailService,
   StripeClient,
   EmailService,
   AdminContext,
@@ -86,7 +87,7 @@ class MockPool {
     }
 
     // SELECT id, email, tier, status FROM users WHERE id = ?
-    if (normalized.startsWith('SELECT id, email, tier, status FROM users WHERE id')) {
+    if (normalized.startsWith('SELECT id, email, tier, status FROM users WHERE id') || normalized.startsWith('SELECT id, tier, status FROM users WHERE id')) {
       const id = params[0] as number;
       const user = this.users.find((u) => u.id === id);
       if (!user) return [[], undefined];
@@ -592,4 +593,203 @@ describe('AdminSystem', () => {
       const result = await admin.changeRole(ownerCtx, 'valid-csrf-token', { user_id: 2, new_tier: 'enterprise' });
 
       expect(result.success).toBe(true);
-      const res =
+      expect(result.old_tier).toBe('pro');
+      expect(result.new_tier).toBe('enterprise');
+      expect(pool.getAuditLog().some((entry) => entry.action === 'role_changed')).toBe(true);
+    });
+
+    it('own account returns 400 cannot_change_own_role', async () => {
+      await expect(
+        admin.changeRole(ownerCtx, 'valid-csrf-token', { user_id: 1, new_tier: 'basic' })
+      ).rejects.toMatchObject({ code: 'cannot_change_own_role', status: 400 });
+    });
+  });
+
+  describe('suspendUser', () => {
+    it('happy path: user suspended + audit logged', async () => {
+      const result = await admin.suspendUser(ownerCtx, 'valid-csrf-token', { user_id: 3, reason: 'abuse' });
+
+      expect(result).toMatchObject({ success: true, user_id: 3, suspended: true });
+      expect(pool.getAuditLog().length).toBeGreaterThan(0);
+    });
+
+    it('own account returns 400 cannot_suspend_yourself', async () => {
+      await expect(
+        admin.suspendUser(ownerCtx, 'valid-csrf-token', { user_id: 1, reason: 'test' })
+      ).rejects.toMatchObject({ code: 'cannot_suspend_yourself', status: 400 });
+    });
+  });
+
+  // -- CUSTOMERS DOMAIN -----------------------------------------------------
+
+  describe('customers', () => {
+    it('list: pagination works and all fields are present', async () => {
+      pool.seedCustomer({ email: 'one@example.com', name: 'One', tier: 'pro' });
+      pool.seedCustomer({ email: 'two@example.com', name: 'Two', tier: 'basic' });
+      pool.seedCustomer({ email: 'three@example.com', name: 'Three', tier: 'free' });
+
+      const page = await admin.listCustomers(adminCtx, { limit: 2, offset: 0 });
+
+      expect(page.total).toBe(3);
+      expect(page.limit).toBe(2);
+      expect(page.items).toHaveLength(2);
+      expect(Object.keys(page.items[0])).toEqual(
+        expect.arrayContaining(['customer_id', 'email', 'name', 'tier', 'signup_date', 'invoice_count', 'status'])
+      );
+      const rest = await admin.listCustomers(adminCtx, { limit: 2, offset: 2 });
+      expect(rest.items).toHaveLength(1);
+    });
+
+    it('list refuses a user who is neither owner nor admin', async () => {
+      await expect(admin.listCustomers(userCtx, {})).rejects.toBeInstanceOf(AdminError);
+    });
+
+    it('detail: all fields are present', async () => {
+      const id = pool.seedCustomer({ email: 'one@example.com', name: 'One', tier: 'pro' });
+
+      const detail = await admin.getCustomer(adminCtx, id);
+
+      expect(detail).toMatchObject({ success: true, customer_id: id, email: 'one@example.com', tier: 'pro' });
+    });
+
+    it('changePlan: Stripe is called and the change is audited', async () => {
+      const id = pool.seedCustomer({
+        email: 'one@example.com', name: 'One', tier: 'basic', stripe_subscription_id: 'sub_123',
+      });
+
+      const result = await admin.changePlan(ownerCtx, 'valid-csrf-token', id, { new_tier: 'pro' });
+
+      expect(result).toMatchObject({ success: true, customer_id: id, old_tier: 'basic', new_tier: 'pro' });
+      expect(stripe.calls).toHaveLength(1);
+      expect(stripe.calls[0].subscriptionId).toBe('sub_123');
+      expect(stripe.calls[0].params.items[0].price).toBe('price_pro');
+      expect(pool.getAuditLog().length).toBeGreaterThan(0);
+    });
+
+    it('queueRefund: a refund record is created with status queued', async () => {
+      const customerId = pool.seedCustomer({ email: 'one@example.com', name: 'One', tier: 'pro' });
+      const invoiceId = pool.seedInvoice({ customer_id: customerId, amount: 100, status: 'succeeded' });
+
+      const result = await admin.queueRefund(ownerCtx, 'valid-csrf-token', customerId, {
+        invoice_id: invoiceId, amount: 50, reason: 'duplicate charge',
+      });
+
+      expect(result).toMatchObject({ success: true, status: 'queued', amount: 50 });
+      expect(result.refund_id).toBeDefined();
+    });
+  });
+
+  // -- DEPLOYMENTS DOMAIN ---------------------------------------------------
+
+  describe('deployments', () => {
+    it('createDeployment: the deployment and its config are created', async () => {
+      const customerId = pool.seedCustomer({ email: 'one@example.com', name: 'One', tier: 'pro' });
+
+      const result = await admin.createDeployment(ownerCtx, 'valid-csrf-token', {
+        customer_id: customerId, domain: 'one.example.com', tier: 'pro', theme_id: 1,
+      });
+
+      expect(result).toMatchObject({ success: true, domain: 'one.example.com', tier: 'pro' });
+      expect(result.deployment_id).toBeDefined();
+    });
+
+    it('publishDeployment: the double gate is checked and the status becomes live', async () => {
+      const customerId = pool.seedCustomer({ email: 'one@example.com', name: 'One', tier: 'pro' });
+      const id = pool.seedDeployment({
+        customer_id: customerId, domain: 'one.example.com', tier: 'pro', domain_verified: 1, theme_id: 1,
+      });
+
+      const result = await admin.publishDeployment(ownerCtx, 'valid-csrf-token', { deployment_id: id });
+
+      expect(result).toMatchObject({ success: true, deployment_id: id, status: 'live' });
+    });
+
+    it('publishDeployment refuses when the safety flag is off', async () => {
+      const blocked: AdminContext = { ...ownerCtx, safetyFlags: { can_publish: false } };
+
+      await expect(
+        admin.publishDeployment(blocked, 'valid-csrf-token', { deployment_id: 1 })
+      ).rejects.toMatchObject({ code: 'publish_not_allowed', status: 403 });
+    });
+  });
+
+  // -- GOVERNANCE DOMAIN ----------------------------------------------------
+
+  describe('decideGovernanceAction', () => {
+    const seedAction = () =>
+      pool.seedGovernanceAction({ action_type: 'refund', actor: 2, target_resource_id: 1, reason: 'requested' });
+
+    it('approve: the action is executed and its status changes', async () => {
+      const id = seedAction();
+
+      const result = await admin.decideGovernanceAction(ownerCtx, 'valid-csrf-token', id, 'approve', {});
+
+      expect(result).toMatchObject({ success: true, action_id: id, status: 'approved' });
+    });
+
+    it('reject: the action is rejected and the reason is kept', async () => {
+      const id = seedAction();
+
+      const result = await admin.decideGovernanceAction(ownerCtx, 'valid-csrf-token', id, 'reject', {
+        reason: 'not allowed',
+      });
+
+      expect(result).toMatchObject({ success: true, action_id: id, status: 'rejected' });
+    });
+
+    it('a decided action cannot be decided again', async () => {
+      const id = seedAction();
+      await admin.decideGovernanceAction(ownerCtx, 'valid-csrf-token', id, 'approve', {});
+
+      await expect(
+        admin.decideGovernanceAction(ownerCtx, 'valid-csrf-token', id, 'reject', { reason: 'late' })
+      ).rejects.toMatchObject({ code: 'action_not_pending', status: 400 });
+    });
+  });
+
+  // -- AUDIT DOMAIN ---------------------------------------------------------
+
+  describe('searchAuditLog', () => {
+    it('applies its filters and pagination', async () => {
+      await admin.suspendUser(ownerCtx, 'valid-csrf-token', { user_id: 3, reason: 'abuse' });
+      await admin.changeRole(ownerCtx, 'valid-csrf-token', { user_id: 2, new_tier: 'basic' });
+      const everything = await admin.searchAuditLog(adminCtx, {});
+      expect(everything.total).toBeGreaterThanOrEqual(2);
+
+      const filtered = await admin.searchAuditLog(adminCtx, { action_type: 'role_changed', limit: 1, offset: 0 });
+
+      expect(filtered.limit).toBe(1);
+      expect(filtered.items).toHaveLength(1);
+      expect(filtered.items[0].action).toBe('role_changed');
+    });
+  });
+
+  // -- SAFETY ---------------------------------------------------------------
+
+  describe('invited users', () => {
+    it('the one-time password is stored with a slow, salted hash, never in plain form', async () => {
+      await admin.createUser(ownerCtx, 'valid-csrf-token', {
+        email: 'invited@example.com', name: 'Invited', tier: 'basic', notify: true,
+      });
+
+      const stored = (pool as unknown as { users: MockRow[] }).users.find((u) => u.email === 'invited@example.com');
+      const hash = String(stored?.password_hash ?? '');
+      const sent = email.invites[email.invites.length - 1];
+      expect(hash.startsWith('scrypt$')).toBe(true);
+      expect(hash).not.toContain(sent.otp);
+    });
+
+    it('the console e-mail service never prints a password or a reset link', async () => {
+      const printed = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+      const service = new ConsoleEmailService();
+      await service.sendInvite('a@example.com', 'A', 'the-secret-password');
+      await service.sendPasswordReset('a@example.com', 'https://example.com/reset?token=the-secret-token');
+
+      const output = printed.mock.calls.flat().join(' ');
+      printed.mockRestore();
+      expect(output).toContain('a@example.com');
+      expect(output).not.toContain('the-secret');
+    });
+  });
+});

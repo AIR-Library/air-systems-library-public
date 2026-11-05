@@ -1,4 +1,5 @@
-import { randomUUID, randomBytes, createHash } from 'crypto';
+import { randomUUID, randomBytes, scrypt } from 'crypto';
+import { promisify } from 'util';
 import {
   createConnection,
   Connection,
@@ -159,6 +160,20 @@ function requireString(value: unknown, field: string): string {
   return value.trim();
 }
 
+const scryptAsync = promisify(scrypt) as (password: string, salt: Buffer, length: number) => Promise<Buffer>;
+
+/**
+ * Hashes a password for storage with scrypt, a deliberately slow hash, and a random salt per password.
+ * In: the password. Out: "scrypt$<salt hex>$<hash hex>", the salt kept beside the hash so it can be checked later.
+ * Why: a fast hash such as SHA-256 lets a stolen table be guessed at billions of tries a second. Code scanning
+ * alert js/insufficient-password-hash, 2026-11-05, session f3daac6e. Touches: CPU only.
+ */
+async function hashPassword(password: string): Promise<string> {
+  const salt = randomBytes(16);
+  const hash = await scryptAsync(password, salt, 32);
+  return `scrypt$${salt.toString('hex')}$${hash.toString('hex')}`;
+}
+
 function requireNumber(value: unknown, field: string): number {
   const n = typeof value === 'string' ? Number(value) : value;
   if (typeof n !== 'number' || !Number.isFinite(n)) {
@@ -234,13 +249,18 @@ export interface EmailService {
   sendPasswordReset(email: string, resetLink: string): Promise<void>;
 }
 
+/**
+ * Development stand-in for a mail provider: it prints that a mail would go out, never what is in it.
+ * A one-time password and a reset link are secrets, and logs are kept, shipped and read by many people.
+ * Why: code scanning alert js/clear-text-logging, 2026-11-05, session f3daac6e. Touches: the console only.
+ */
 export class ConsoleEmailService implements EmailService {
-  async sendInvite(email: string, name: string, oneTimePassword: string): Promise<void> {
-    console.log(`[EMAIL] Invite sent to ${email} (${name}). One-time password: ${oneTimePassword}`);
+  async sendInvite(email: string, name: string, _oneTimePassword: string): Promise<void> {
+    console.log(`[EMAIL] Invite sent to ${email} (${name}).`);
   }
 
-  async sendPasswordReset(email: string, resetLink: string): Promise<void> {
-    console.log(`[EMAIL] Password reset link sent to ${email}: ${resetLink}`);
+  async sendPasswordReset(email: string, _resetLink: string): Promise<void> {
+    console.log(`[EMAIL] Password reset link sent to ${email}.`);
   }
 }
 
@@ -448,7 +468,7 @@ export class AdminSystem {
     }
 
     const oneTimePassword = randomBytes(16).toString('hex');
-    const passwordHash = createHash('sha256').update(oneTimePassword).digest('hex');
+    const passwordHash = await hashPassword(oneTimePassword);
 
     const [result] = await this.pool.execute<ResultSetHeader>(
       'INSERT INTO users (email, name, tier, status, password_hash) VALUES (?, ?, ?, ?, ?)',

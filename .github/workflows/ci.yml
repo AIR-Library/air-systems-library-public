@@ -1,6 +1,7 @@
 # Runs every system's tests for each language (tools/run_suites.py).
-# The run fails only on a REGRESSION: a suite that is not listed in ci/baseline.json and does not pass.
+# The run fails on a REGRESSION: a suite that is not listed in ci/baseline.json and does not pass.
 # Known-failing suites are listed there so main is not permanently red; fix one, then delete its line.
+# A missing file (MISSING) or a file that does not parse (BROKEN) fails the run even for a suite listed there.
 # [2026-10-01 06:50 UTC] Actions moved to their Node 24 majors (GitHub retires Node 20 for actions), setup-go's own
 # cache turned off (no go.sum here; .deps is cached below), and the runner pinned to ubuntu-24.04 so the
 # 2026-10-19 move of ubuntu-latest to Ubuntu 26 cannot turn main red on its own: bump it on purpose.
@@ -52,6 +53,7 @@ jobs:
         with: {dotnet-version: "8.0.x"}
       - uses: dtolnay/rust-toolchain@stable
         if: matrix.lang == 'rust'
+        with: {components: rustfmt}   # tools/run_suites.py parses every template with it
 
       # Third-party packages are downloaded into .deps/ and cached per language.
       - uses: actions/cache@v5

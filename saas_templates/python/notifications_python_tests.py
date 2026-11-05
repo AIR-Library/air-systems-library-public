@@ -4,7 +4,7 @@
 # Touches: SQLite, SMTP and SMS (mocked in tests).
 import json
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch, MagicMock
 from notifications_python import NotificationService, _now_iso
 
@@ -13,10 +13,13 @@ class TestNotificationService(unittest.TestCase):
         self.service = NotificationService()
         # Ensure a clean user
         self.user_id = 1
+        # A quiet window that never covers the moment the tests run. It was a fixed 22:00 to 08:00 UTC, so the suite
+        # failed whenever it ran at night, which turned main red on 2026-11-04 at 05:56 UTC. 2026-11-05, session f3daac6e.
+        now = datetime.now(timezone.utc)
         self.service.update_user_preferences(self.user_id, {
             "do_not_disturb": False,
-            "quiet_hours_start": "22:00",
-            "quiet_hours_end": "08:00",
+            "quiet_hours_start": (now + timedelta(hours=2)).strftime("%H:%M"),
+            "quiet_hours_end": (now + timedelta(hours=3)).strftime("%H:%M"),
             "channels_enabled": {"email": True, "sms": True, "in_app": True}
         })
 

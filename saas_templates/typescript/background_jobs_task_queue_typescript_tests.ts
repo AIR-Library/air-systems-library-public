@@ -1,546 +1,893 @@
-import { Pool } from 'pg';
-import Redis from 'ioredis';
-import { v4 as uuidv4 } from 'uuid';
-import {
-  enqueueJob,
-  getJobStatus,
-  listJobs,
-  cancelJob,
-  retryJob,
-  getJobResults,
-  initializeJobManager,
-  JobStatus,
-  BackgroundJobError
-} from './background_jobs_task_queue_typescript';
+import { BackgroundJobError, JobStatus } from './background_jobs_task_queue_typescript';
 
-// In-memory database tables to simulate PostgreSQL
-let jobsTable: any[] = [];
-let jobRunsTable: any[] = [];
-let usersTable: any[] = [];
-let notificationsTable: any[] = [];
-let webhooksTable: any[] = [];
-let webhookAttemptsTable: any[] = [];
-let dataExportsTable: any[] = [];
-let exportRecordsTable: any[] = [];
-let dailyReportsTable: any[] = [];
-let userSessionsTable: any[] = [];
-let stripeInvoicesTable: any[] = [];
-let deploymentArchivesTable: any[] = [];
-let deploymentsTable: any[] = [];
-let archiveEntriesTable: any[] = [];
-
-// In-memory Redis store
-let redisQueue: string[] = [];
-let redisScheduled: Record<string, string> = {};
-
-// Mock pg Pool
+/**
+ * Tests for the background job manager, with the database and Redis replaced by shared fakes.
+ *
+ * Why the fakes are built this way: the implementation opens its connections when the module loads, and these tests
+ * reload the module before each test. A plain jest.mock('pg') gives every reload a new mock class, so the fakes set up
+ * in beforeEach were never the ones in use. Here each mock is a factory that always hands back the same object.
+ * 2026-11-05, session f3daac6e (AIR record finding:2026-11-05:3a00300d16: this suite had been pasted onto the end of the
+ * implementation file, and this file stopped in its first test). Touches: memory only.
+ */
 jest.mock('pg', () => {
-  const mockClient = {
-    query: jest.fn((sql: string, params: any[] = []) => mockQuery(sql, params)),
-    release: jest.fn(),
-  };
-
-  return {
-    Pool: jest.fn().mockImplementation(() => ({
-      query: jest.fn((sql: string, params: any[] = []) => mockQuery(sql, params)),
-      connect: jest.fn().mockResolvedValue(mockClient),
-    })),
-  };
+  const g = globalThis as any;
+  g.__mockDb = g.__mockDb ?? { query: jest.fn(), connect: jest.fn() };
+  return { Pool: jest.fn(() => g.__mockDb) };
 });
-
-// Mock ioredis
 jest.mock('ioredis', () => {
-  return jest.fn().mockImplementation(() => ({
-    setex: jest.fn().mockImplementation(async (key: string, seconds: number, value: string) => {
-      redisScheduled[key] = value;
-      return 'OK';
-    }),
-    lpush: jest.fn().mockImplementation(async (key: string, value: string) => {
-      redisQueue.unshift(value);
-      return 1;
-    }),
-    lrange: jest.fn().mockImplementation(async (key: string, start: number, stop: number) => {
-      return redisQueue.slice(start, stop + 1);
-    }),
-    lrem: jest.fn().mockImplementation(async (key: string, count: number, value: string) => {
-      redisQueue = redisQueue.filter(v => v !== value);
-      return 1;
-    }),
-    keys: jest.fn().mockImplementation(async (pattern: string) => {
-      return Object.keys(redisScheduled);
-    }),
-    get: jest.fn().mockImplementation(async (key: string) => {
-      return redisScheduled[key] || null;
-    }),
-    del: jest.fn().mockImplementation(async (key: string) => {
-      delete redisScheduled[key];
-      return 1;
-    }),
-    pipeline: jest.fn().mockImplementation(() => ({
-      lrem: jest.fn().mockImplementation((key: string, count: number, value: string) => {
-        redisQueue = redisQueue.filter(v => v !== value);
-      }),
-      exec: jest.fn().mockResolvedValue([]),
-    })),
-  }));
-});
-
-// Mock uuid to return predictable IDs if needed, or fallback to real uuid
-jest.mock('uuid', () => {
-  const actual = jest.requireActual('uuid');
-  let counter = 0;
-  return {
-    v4: jest.fn().mockImplementation(() => {
-      counter++;
-      return `mock-uuid-${counter}-${actual.v4().slice(0, 8)}`;
-    }),
+  const g = globalThis as any;
+  g.__mockRedis = g.__mockRedis ?? {
+    setex: jest.fn(), lpush: jest.fn(), lrange: jest.fn(), lrem: jest.fn(), keys: jest.fn(), del: jest.fn(),
+    pipeline: jest.fn(),
   };
+  return { __esModule: true, default: jest.fn(() => g.__mockRedis) };
 });
+jest.mock('uuid', () => ({ v4: jest.fn(() => 'test-uuid-123') }));
 
-// Mock query engine to simulate database operations
-async function mockQuery(sql: string, params: any[] = []): Promise<{ rows: any[]; count?: number }> {
-  const normalized = sql.replace(/\s+/g, ' ').trim();
+const mockDb = (globalThis as any).__mockDb;
+const mockRedis = (globalThis as any).__mockRedis;
 
-  if (normalized.startsWith('CREATE TABLE') || normalized.startsWith('CREATE INDEX')) {
-    return { rows: [] };
-  }
-
-  if (normalized.startsWith('INSERT INTO jobs')) {
-    const job = {
-      id: params[0],
-      task_type: params[1],
-      params: typeof params[2] === 'string' ? JSON.parse(params[2]) : params[2],
-      status: params[3],
-      created_at: params[4] || new Date(),
-      scheduled_at: params[5],
-      max_retries: params[6],
-      retry_count: params[7],
-      next_retry_at: params[8],
-      started_at: null,
-      completed_at: null,
-      progress: null,
-      result: null,
-      error: null,
-    };
-    jobsTable.push(job);
-    return { rows: [job] };
-  }
-
-  if (normalized.startsWith('SELECT * FROM jobs WHERE id = $1')) {
-    const job = jobsTable.find(j => j.id === params[0]);
-    return { rows: job ? [job] : [] };
-  }
-
-  if (normalized.startsWith('SELECT * FROM jobs WHERE 1=1')) {
-    let filtered = [...jobsTable];
-    let paramIdx = 1;
-    if (normalized.includes('status = $')) {
-      const statusVal = params[paramIdx - 1];
-      filtered = filtered.filter(j => j.status === statusVal);
-      paramIdx++;
-    }
-    if (normalized.includes('task_type = $')) {
-      const taskTypeVal = params[paramIdx - 1];
-      filtered = filtered.filter(j => j.task_type === taskTypeVal);
-      paramIdx++;
-    }
-    const limit = params[params.length - 1] || 10;
-    filtered = filtered.slice(0, limit);
-    return { rows: filtered };
-  }
-
-  if (normalized.startsWith('SELECT COUNT(*) FROM jobs WHERE 1=1')) {
-    let filtered = [...jobsTable];
-    let paramIdx = 1;
-    if (normalized.includes('status = $')) {
-      const statusVal = params[paramIdx - 1];
-      filtered = filtered.filter(j => j.status === statusVal);
-      paramIdx++;
-    }
-    if (normalized.includes('task_type = $')) {
-      const taskTypeVal = params[paramIdx - 1];
-      filtered = filtered.filter(j => j.task_type === taskTypeVal);
-      paramIdx++;
-    }
-    return { rows: [{ count: filtered.length.toString() }] };
-  }
-
-  if (normalized.startsWith('UPDATE jobs SET status = $1, error = $2, completed_at = $3 WHERE id = $4 AND status = $5')) {
-    const job = jobsTable.find(j => j.id === params[3] && j.status === params[4]);
-    if (job) {
-      job.status = params[0];
-      job.error = params[1];
-      job.completed_at = params[2];
-      return { rows: [job] };
-    }
-    return { rows: [] };
-  }
-
-  if (normalized.startsWith('UPDATE jobs SET status = $1, started_at = $2 WHERE id = $3')) {
-    const job = jobsTable.find(j => j.id === params[2]);
-    if (job) {
-      job.status = params[0];
-      job.started_at = params[1];
-    }
-    return { rows: [] };
-  }
-
-  if (normalized.startsWith('UPDATE jobs SET status = $1, completed_at = $2, result = $3, progress = $4 WHERE id = $5')) {
-    const job = jobsTable.find(j => j.id === params[4]);
-    if (job) {
-      job.status = params[0];
-      job.completed_at = params[1];
-      job.result = typeof params[2] === 'string' ? JSON.parse(params[2]) : params[2];
-      job.progress = params[3];
-    }
-    return { rows: [] };
-  }
-
-  if (normalized.startsWith('UPDATE jobs SET progress = $1 WHERE id = $2')) {
-    const job = jobsTable.find(j => j.id === params[1]);
-    if (job) {
-      job.progress = params[0];
-    }
-    return { rows: [] };
-  }
-
-  if (normalized.startsWith('INSERT INTO job_runs')) {
-    const run = {
-      id: params[0],
-      job_id: params[1],
-      status: params[2],
-      started_at: params[3],
-      completed_at: null,
-      result: null,
-    };
-    jobRunsTable.push(run);
-    return { rows: [run] };
-  }
-
-  if (normalized.startsWith('UPDATE job_runs SET status = $1, completed_at = $2, result = $3 WHERE id = $4')) {
-    const run = jobRunsTable.find(r => r.id === params[3]);
-    if (run) {
-      run.status = params[0];
-      run.completed_at = params[1];
-      run.result = typeof params[2] === 'string' ? JSON.parse(params[2]) : params[2];
-    }
-    return { rows: [] };
-  }
-
-  if (normalized.startsWith('UPDATE job_runs SET status = $1, completed_at = $2 WHERE job_id = $3 AND status = $4')) {
-    const run = jobRunsTable.find(r => r.job_id === params[2] && r.status === params[3]);
-    if (run) {
-      run.status = params[0];
-      run.completed_at = params[1];
-    }
-    return { rows: [] };
-  }
-
-  if (normalized.startsWith('SELECT COUNT(*) FROM users WHERE trial_days_left <= $1')) {
-    const count = usersTable.filter(u => u.trial_days_left <= params[0]).length;
-    return { rows: [{ count: count.toString() }] };
-  }
-
-  if (normalized.startsWith('SELECT id FROM users WHERE trial_days_left <= $1 LIMIT $2 OFFSET $3')) {
-    const filtered = usersTable.filter(u => u.trial_days_left <= params[0]);
-    const limit = params[1];
-    const offset = params[2];
-    const sliced = filtered.slice(offset, offset + limit).map(u => ({ id: u.id }));
-    return { rows: sliced };
-  }
-
-  if (normalized.startsWith('INSERT INTO notifications')) {
-    const notif = {
-      user_id: params[0],
-      type: params[1],
-      template_key: params[2],
-      status: params[3],
-    };
-    notificationsTable.push(notif);
-    return { rows: [notif] };
-  }
-
-  if (normalized.startsWith('SELECT * FROM webhooks WHERE id = $1')) {
-    const wh = webhooksTable.find(w => w.id === params[0]);
-    return { rows: wh ? [wh] : [] };
-  }
-
-  if (normalized.startsWith('SELECT * FROM webhook_attempts WHERE webhook_id = $1 ORDER BY created_at DESC LIMIT 1')) {
-    const attempts = webhookAttemptsTable.filter(a => a.webhook_id === params[0]);
-    attempts.sort((a, b) => b.created_at.getTime() - a.created_at.getTime());
-    return { rows: attempts.length > 0 ? [attempts[0]] : [] };
-  }
-
-  if (normalized.startsWith('INSERT INTO webhook_attempts')) {
-    const attempt = {
-      webhook_id: params[0],
-      status: params[1],
-      retry_count: params[2],
-      next_retry_at: params[3],
-      error: params[4],
-      created_at: new Date(),
-    };
-    webhookAttemptsTable.push(attempt);
-    return { rows: [attempt] };
-  }
-
-  if (normalized.startsWith('INSERT INTO data_exports')) {
-    const de = {
-      id: params[0],
-      type: params[1],
-      status: params[2],
-      created_at: params[3],
-      filters: typeof params[4] === 'string' ? JSON.parse(params[4]) : params[4],
-      user_id: params[5],
-    };
-    dataExportsTable.push(de);
-    return { rows: [de] };
-  }
-
-  if (normalized.startsWith('SELECT COUNT(*) FROM users WHERE created_at >= $1')) {
-    const count = usersTable.filter(u => u.created_at >= params[0]).length;
-    return { rows: [{ count: count.toString() }] };
-  }
-
-  if (normalized.startsWith('SELECT COUNT(*) FROM orders WHERE created_at >= $1')) {
-    return { rows: [{ count: '5' }] };
-  }
-
-  if (normalized.startsWith('SELECT * FROM users WHERE created_at >= $1 LIMIT $2 OFFSET $3')) {
-    const filtered = usersTable.filter(u => u.created_at >= params[0]);
-    const sliced = filtered.slice(params[2], params[2] + params[1]);
-    return { rows: sliced };
-  }
-
-  if (normalized.startsWith('INSERT INTO export_records')) {
-    const er = {
-      export_id: params[0],
-      record_type: params[1],
-      record_id: params[2],
-      data: typeof params[3] === 'string' ? JSON.parse(params[3]) : params[3],
-      status: params[4],
-    };
-    exportRecordsTable.push(er);
-    return { rows: [er] };
-  }
-
-  if (normalized.startsWith('UPDATE data_exports SET status = $1, completed_at = $2 WHERE id = $3')) {
-    const de = dataExportsTable.find(d => d.id === params[2]);
-    if (de) {
-      de.status = params[0];
-      de.completed_at = params[1];
-    }
-    return { rows: [] };
-  }
-
-  if (normalized.startsWith('SELECT COUNT(*) FROM users WHERE created_at BETWEEN $1 AND $2')) {
-    return { rows: [{ count: '10' }] };
-  }
-
-  if (normalized.startsWith('SELECT COALESCE(SUM(amount), 0) FROM orders WHERE created_at BETWEEN $1 AND $2 AND status = $3')) {
-    return { rows: [{ coalesce: '150.00' }] };
-  }
-
-  if (normalized.startsWith('SELECT COUNT(DISTINCT user_id) FROM user_sessions WHERE last_active BETWEEN $1 AND $2')) {
-    return { rows: [{ count: '3' }] };
-  }
-
-  if (normalized.startsWith('INSERT INTO daily_reports')) {
-    const dr = {
-      date: params[0],
-      total_users: params[1],
-      active_users: params[2],
-      total_revenue: params[3],
-      new_signups: params[4],
-      status: params[5],
-      data: typeof params[6] === 'string' ? JSON.parse(params[6]) : params[6],
-    };
-    dailyReportsTable.push(dr);
-    return { rows: [dr] };
-  }
-
-  if (normalized.startsWith('DELETE FROM user_sessions WHERE last_active < $1 RETURNING user_id')) {
-    const cutoff = params[0];
-    const toDelete = userSessionsTable.filter(s => s.last_active < cutoff);
-    userSessionsTable = userSessionsTable.filter(s => s.last_active >= cutoff);
-    return { rows: toDelete };
-  }
-
-  if (normalized.startsWith('UPDATE users SET last_session_cleanup = $1 WHERE id = ANY($2)')) {
-    const ids = params[1];
-    usersTable.forEach(u => {
-      if (ids.includes(u.id)) {
-        u.last_session_cleanup = params[0];
-      }
-    });
-    return { rows: [] };
-  }
-
-  if (normalized.startsWith('DELETE FROM user_sessions WHERE user_id = $1')) {
-    userSessionsTable = userSessionsTable.filter(s => s.user_id !== params[0]);
-    return { rows: [] };
-  }
-
-  if (normalized.startsWith('DELETE FROM notifications WHERE user_id = $1')) {
-    notificationsTable = notificationsTable.filter(n => n.user_id !== params[0]);
-    return { rows: [] };
-  }
-
-  if (normalized.startsWith('DELETE FROM user_preferences WHERE user_id = $1')) {
-    return { rows: [] };
-  }
-
-  if (normalized.startsWith('DELETE FROM user_activity WHERE user_id = $1')) {
-    return { rows: [] };
-  }
-
-  if (normalized.startsWith('UPDATE users SET status = $1, deleted_at = $2 WHERE id = $3')) {
-    const u = usersTable.find(user => user.id === params[2]);
-    if (u) {
-      u.status = params[0];
-      u.deleted_at = params[1];
-    }
-    return { rows: [] };
-  }
-
-  if (normalized.startsWith('SELECT * FROM stripe_invoices WHERE status = $1 AND created_at >= $2')) {
-    const filtered = stripeInvoicesTable.filter(i => i.status === params[0] && i.created_at >= params[1]);
-    return { rows: filtered };
-  }
-
-  if (normalized.startsWith('SELECT * FROM stripe_invoices WHERE id = $1')) {
-    const inv = stripeInvoicesTable.find(i => i.id === params[0]);
-    return { rows: inv ? [inv] : [] };
-  }
-
-  if (normalized.startsWith('UPDATE stripe_invoices SET last_synced = $1, sync_status = $2 WHERE id = $3')) {
-    const inv = stripeInvoicesTable.find(i => i.id === params[2]);
-    if (inv) {
-      inv.last_synced = params[0];
-      inv.sync_status = params[1];
-    }
-    return { rows: [] };
-  }
-
-  if (normalized.startsWith('INSERT INTO deployment_archives')) {
-    const da = {
-      id: params[0],
-      environment: params[1],
-      services: typeof params[2] === 'string' ? JSON.parse(params[2]) : params[2],
-      status: params[3],
-      created_at: params[4],
-      user_id: params[5],
-    };
-    deploymentArchivesTable.push(da);
-    return { rows: [da] };
-  }
-
-  if (normalized.startsWith('SELECT * FROM deployments WHERE environment = $1')) {
-    let filtered = deploymentsTable.filter(d => d.environment === params[0]);
-    if (normalized.includes('service_name = ANY($2)')) {
-      const services = params[1];
-      filtered = filtered.filter(d => services.includes(d.service_name));
-    }
-    return { rows: filtered };
-  }
-
-  if (normalized.startsWith('INSERT INTO archive_entries')) {
-    const ae = {
-      archive_id: params[0],
-      deployment_id: params[1],
-      deployment_data: typeof params[2] === 'string' ? JSON.parse(params[2]) : params[2],
-      status: params[3],
-    };
-    archiveEntriesTable.push(ae);
-    return { rows: [ae] };
-  }
-
-  if (normalized.startsWith('UPDATE deployment_archives SET status = $1, completed_at = $2 WHERE id = $3')) {
-    const da = deploymentArchivesTable.find(d => d.id === params[2]);
-    if (da) {
-      da.status = params[0];
-      da.completed_at = params[1];
-    }
-    return { rows: [] };
-  }
-
-  if (normalized.startsWith('UPDATE jobs SET status = $1, error = $2, retry_count = $3, next_retry_at = $4 WHERE id = $5')) {
-    const job = jobsTable.find(j => j.id === params[4]);
-    if (job) {
-      job.status = params[0];
-      job.error = params[1];
-      job.retry_count = params[2];
-      job.next_retry_at = params[3];
-    }
-    return { rows: [] };
-  }
-
-  if (normalized.startsWith('UPDATE jobs SET status = $1, error = $2, completed_at = $3, retry_count = $4 WHERE id = $5')) {
-    const job = jobsTable.find(j => j.id === params[4]);
-    if (job) {
-      job.status = params[0];
-      job.error = params[1];
-      job.completed_at = params[2];
-      job.retry_count = params[3];
-    }
-    return { rows: [] };
-  }
-
-  if (normalized.startsWith('BEGIN') || normalized.startsWith('COMMIT') || normalized.startsWith('ROLLBACK')) {
-    return { rows: [] };
-  }
-
-  return { rows: [] };
-}
-
-describe('Background Jobs & Task Queue Tests', () => {
+describe('Background Job Manager', () => {
   let jobManager: any;
+  
+  beforeEach(() => {
+    for (const fake of [...Object.values(mockDb), ...Object.values(mockRedis)]) {
+      (fake as jest.Mock).mockReset();
+    }
 
-  beforeEach(async () => {
-    jobsTable = [];
-    jobRunsTable = [];
-    usersTable = [];
-    notificationsTable = [];
-    webhooksTable = [];
-    webhookAttemptsTable = [];
-    dataExportsTable = [];
-    exportRecordsTable = [];
-    dailyReportsTable = [];
-    userSessionsTable = [];
-    stripeInvoicesTable = [];
-    deploymentArchivesTable = [];
-    deploymentsTable = [];
-    archiveEntriesTable = [];
-    redisQueue = [];
-    redisScheduled = {};
-
-    jest.clearAllMocks();
-
-    // Retrieve the singleton instance
-    const mod = require('./background_jobs_task_queue_typescript');
-    jobManager = mod.JobManager.getInstance();
-    // Prevent the background worker loop from running automatically during tests
+    jobManager = require('./background_jobs_task_queue_typescript').JobManager.getInstance();
     jobManager.workerRunning = false;
   });
-
-  test('✓ Enqueue job, worker picks it up, status becomes running', async () => {
-    // Enqueue a job
-    const enqueueRes = await enqueueJob('cleanup_old_sessions', { days_old: 30 });
-    expect(enqueueRes.success).toBe(true);
-    expect(enqueueRes.status).toBe(JobStatus.ENQUEUED);
-
-    const jobId = enqueueRes.job_id;
-
-    // Verify it is in the database and Redis queue
-    const statusBefore = await getJobStatus(jobId);
-    expect(statusBefore.status).toBe(JobStatus.ENQUEUED);
-    expect(redisQueue).toContain(jobId);
-
-    // Intercept executeJob to pause execution so we can verify the "running" status
-    let resolveExecution: any;
-    const executionPromise = new Promise((resolve) => {
-      resolveExecution = resolve;
+  
+  afterEach(() => {
+    jest.resetModules();
+  });
+  
+  describe('initialize', () => {
+    it('should setup database and start worker', async () => {
+      mockDb.query.mockResolvedValue({ rows: [] });
+      
+      await jobManager.initialize();
+      
+      expect(mockDb.query).toHaveBeenCalledWith(
+        expect.stringContaining('CREATE TABLE IF NOT EXISTS jobs')
+      );
+      expect(mockDb.query).toHaveBeenCalledWith(
+        expect.stringContaining('CREATE TABLE IF NOT EXISTS job_runs')
+      );
     });
-
-    const originalExecuteJob = (jobManager as any).executeJob;
-    jest.spyOn(job
+  });
+  
+  describe('enqueueJob', () => {
+    it('should enqueue a job successfully', async () => {
+      const mockJob = {
+        id: 'test-uuid-123',
+        task_type: 'send_bulk_email',
+        params: { template_key: 'trial_ending_soon' },
+        status: JobStatus.ENQUEUED,
+        created_at: new Date(),
+        scheduled_at: null,
+        max_retries: 3,
+        retry_count: 0,
+        next_retry_at: null
+      };
+      
+      mockDb.query.mockResolvedValue({ rows: [mockJob] });
+      
+      const result = await jobManager.enqueueJob('send_bulk_email', { template_key: 'trial_ending_soon' });
+      
+      expect(result).toEqual({
+        success: true,
+        job_id: 'test-uuid-123',
+        status: JobStatus.ENQUEUED
+      });
+      expect(mockDb.query).toHaveBeenCalledWith(
+        expect.stringContaining('INSERT INTO jobs'),
+        expect.any(Array)
+      );
+    });
+    
+    it('should schedule a job for future execution', async () => {
+      const scheduledAt = new Date(Date.now() + 3600000);
+      const mockJob = {
+        id: 'test-uuid-123',
+        task_type: 'send_bulk_email',
+        params: { template_key: 'trial_ending_soon' },
+        status: JobStatus.ENQUEUED,
+        created_at: new Date(),
+        scheduled_at: scheduledAt,
+        max_retries: 3,
+        retry_count: 0,
+        next_retry_at: null
+      };
+      
+      mockDb.query.mockResolvedValue({ rows: [mockJob] });
+      mockRedis.setex.mockResolvedValue('OK');
+      
+      const result = await jobManager.enqueueJob('send_bulk_email', { template_key: 'trial_ending_soon' }, scheduledAt);
+      
+      expect(mockRedis.setex).toHaveBeenCalledWith(
+        'job:scheduled:test-uuid-123',
+        expect.any(Number),
+        'test-uuid-123'
+      );
+    });
+  });
+  
+  describe('getJobStatus', () => {
+    it('should return job status', async () => {
+      const mockJob = {
+        id: 'test-uuid-123',
+        task_type: 'send_bulk_email',
+        params: { template_key: 'trial_ending_soon' },
+        status: JobStatus.RUNNING,
+        created_at: new Date(),
+        started_at: new Date(),
+        completed_at: null,
+        progress: '50/100',
+        result: null,
+        error: null,
+        retry_count: 0,
+        max_retries: 3,
+        next_retry_at: null,
+        scheduled_at: null
+      };
+      
+      mockDb.query.mockResolvedValue({ rows: [mockJob] });
+      
+      const result = await jobManager.getJobStatus('test-uuid-123');
+      
+      expect(result).toEqual({
+        job_id: 'test-uuid-123',
+        task_type: 'send_bulk_email',
+        status: JobStatus.RUNNING,
+        progress: '50/100',
+        created_at: mockJob.created_at,
+        started_at: mockJob.started_at,
+        result: null,
+        next_retry_at: null
+      });
+    });
+    
+    it('should throw error if job not found', async () => {
+      mockDb.query.mockResolvedValue({ rows: [] });
+      
+      await expect(jobManager.getJobStatus('non-existent')).rejects.toThrow(BackgroundJobError);
+      await expect(jobManager.getJobStatus('non-existent')).rejects.toThrow('Job not found');
+    });
+  });
+  
+  describe('listJobs', () => {
+    it('should list jobs with filters', async () => {
+      const mockJobs = [
+        {
+          id: 'test-uuid-1',
+          task_type: 'send_bulk_email',
+          params: {},
+          status: JobStatus.COMPLETED,
+          created_at: new Date(),
+          started_at: new Date(),
+          completed_at: new Date(),
+          progress: '100/100',
+          result: { sent: 100 },
+          error: null,
+          retry_count: 0,
+          max_retries: 3,
+          next_retry_at: null,
+          scheduled_at: null
+        },
+        {
+          id: 'test-uuid-2',
+          task_type: 'send_bulk_email',
+          params: {},
+          status: JobStatus.RUNNING,
+          created_at: new Date(),
+          started_at: new Date(),
+          completed_at: null,
+          progress: '50/100',
+          result: null,
+          error: null,
+          retry_count: 0,
+          max_retries: 3,
+          next_retry_at: null,
+          scheduled_at: null
+        }
+      ];
+      
+      const mockCount = { rows: [{ count: '2' }] };
+      
+      mockDb.query
+        .mockResolvedValueOnce({ rows: mockJobs })
+        .mockResolvedValueOnce({ rows: mockCount });
+      
+      const result = await jobManager.listJobs(JobStatus.RUNNING, 'send_bulk_email', 10);
+      
+      expect(result.jobs).toHaveLength(2);
+      expect(result.total).toBe(2);
+      expect(mockDb.query).toHaveBeenCalledTimes(2);
+    });
+  });
+  
+  describe('cancelJob', () => {
+    it('should cancel a pending job', async () => {
+      const mockJob = {
+        id: 'test-uuid-123',
+        task_type: 'send_bulk_email',
+        params: {},
+        status: JobStatus.ENQUEUED,
+        created_at: new Date(),
+        started_at: null,
+        completed_at: null,
+        progress: null,
+        result: null,
+        error: null,
+        retry_count: 0,
+        max_retries: 3,
+        next_retry_at: null,
+        scheduled_at: null
+      };
+      
+      mockDb.query.mockResolvedValue({ rows: [mockJob] });
+      
+      const result = await jobManager.cancelJob('test-uuid-123');
+      
+      expect(result).toEqual({
+        success: true,
+        status: JobStatus.CANCELLED
+      });
+      expect(mockRedis.lrem).toHaveBeenCalledWith('job:queue', 0, 'test-uuid-123');
+    });
+    
+    it('should not cancel a running job', async () => {
+      const mockJob = {
+        id: 'test-uuid-123',
+        task_type: 'send_bulk_email',
+        params: {},
+        status: JobStatus.RUNNING,
+        created_at: new Date(),
+        started_at: new Date(),
+        completed_at: null,
+        progress: '50/100',
+        result: null,
+        error: null,
+        retry_count: 0,
+        max_retries: 3,
+        next_retry_at: null,
+        scheduled_at: null
+      };
+      
+      mockDb.query.mockResolvedValue({ rows: [] });
+      
+      await expect(jobManager.cancelJob('test-uuid-123')).rejects.toThrow(BackgroundJobError);
+      await expect(jobManager.cancelJob('test-uuid-123')).rejects.toThrow('Cannot cancel job');
+    });
+  });
+  
+  describe('retryJob', () => {
+    it('should retry a failed job', async () => {
+      const mockJob = {
+        id: 'test-uuid-123',
+        task_type: 'send_bulk_email',
+        params: { template_key: 'trial_ending_soon' },
+        status: JobStatus.FAILED,
+        created_at: new Date(),
+        started_at: new Date(),
+        completed_at: new Date(),
+        progress: null,
+        result: null,
+        error: 'Something went wrong',
+        retry_count: 3,
+        max_retries: 5,
+        next_retry_at: null,
+        scheduled_at: null
+      };
+      
+      const mockNewJob = {
+        ...mockJob,
+        id: 'test-uuid-456',
+        status: JobStatus.ENQUEUED,
+        retry_count: 0,
+        next_retry_at: null
+      };
+      
+      mockDb.query
+        .mockResolvedValueOnce({ rows: [mockJob] })
+        .mockResolvedValueOnce({ rows: [mockNewJob] });
+      
+      const result = await jobManager.retryJob('test-uuid-123');
+      
+      expect(result).toEqual({
+        success: true,
+        new_job_id: 'test-uuid-456',
+        status: JobStatus.ENQUEUED
+      });
+      expect(mockRedis.lpush).toHaveBeenCalledWith('job:queue', 'test-uuid-456');
+    });
+    
+    it('should not retry a non-failed job', async () => {
+      const mockJob = {
+        id: 'test-uuid-123',
+        task_type: 'send_bulk_email',
+        params: {},
+        status: JobStatus.COMPLETED,
+        created_at: new Date(),
+        started_at: new Date(),
+        completed_at: new Date(),
+        progress: '100/100',
+        result: { sent: 100 },
+        error: null,
+        retry_count: 0,
+        max_retries: 3,
+        next_retry_at: null,
+        scheduled_at: null
+      };
+      
+      mockDb.query.mockResolvedValue({ rows: [mockJob] });
+      
+      await expect(jobManager.retryJob('test-uuid-123')).rejects.toThrow(BackgroundJobError);
+      await expect(jobManager.retryJob('test-uuid-123')).rejects.toThrow('Can only retry failed jobs');
+    });
+  });
+  
+  describe('getJobResults', () => {
+    it('should return results for completed job', async () => {
+      const mockJob = {
+        id: 'test-uuid-123',
+        task_type: 'send_bulk_email',
+        params: {},
+        status: JobStatus.COMPLETED,
+        created_at: new Date(),
+        started_at: new Date(),
+        completed_at: new Date(),
+        progress: '100/100',
+        result: { sent: 100, failed: 0 },
+        error: null,
+        retry_count: 0,
+        max_retries: 3,
+        next_retry_at: null,
+        scheduled_at: null
+      };
+      
+      mockDb.query.mockResolvedValue({ rows: [mockJob] });
+      
+      const result = await jobManager.getJobResults('test-uuid-123');
+      
+      expect(result).toEqual({
+        job_id: 'test-uuid-123',
+        status: JobStatus.COMPLETED,
+        result: { sent: 100, failed: 0 },
+        completed_at: mockJob.completed_at
+      });
+    });
+    
+    it('should not return results for non-completed job', async () => {
+      const mockJob = {
+        id: 'test-uuid-123',
+        task_type: 'send_bulk_email',
+        params: {},
+        status: JobStatus.RUNNING,
+        created_at: new Date(),
+        started_at: new Date(),
+        completed_at: null,
+        progress: '50/100',
+        result: null,
+        error: null,
+        retry_count: 0,
+        max_retries: 3,
+        next_retry_at: null,
+        scheduled_at: null
+      };
+      
+      mockDb.query.mockResolvedValue({ rows: [mockJob] });
+      
+      await expect(jobManager.getJobResults('test-uuid-123')).rejects.toThrow(BackgroundJobError);
+      await expect(jobManager.getJobResults('test-uuid-123')).rejects.toThrow('Results only available for completed jobs');
+    });
+  });
+  
+  describe('processJob', () => {
+    it('should process a job successfully', async () => {
+      const mockJob = {
+        id: 'test-uuid-123',
+        task_type: 'send_bulk_email',
+        params: { template_key: 'trial_ending_soon' },
+        status: JobStatus.ENQUEUED,
+        created_at: new Date(),
+        started_at: null,
+        completed_at: null,
+        progress: null,
+        result: null,
+        error: null,
+        retry_count: 0,
+        max_retries: 3,
+        next_retry_at: null,
+        scheduled_at: null
+      };
+      
+      const mockJobRun = {
+        id: 'test-uuid-456',
+        job_id: 'test-uuid-123',
+        status: 'running',
+        started_at: new Date(),
+        completed_at: null,
+        result: null
+      };
+      
+      const mockCount = { rows: [{ count: '100' }] };
+      const mockBatch = { rows: [{ id: 'user-1' }, { id: 'user-2' }] };
+      
+      const mockClient = {
+        query: jest.fn()
+          .mockResolvedValueOnce({ rows: [mockJob] })
+          .mockResolvedValueOnce({ rows: [] })
+          .mockResolvedValueOnce({ rows: [mockJobRun] })
+          .mockResolvedValueOnce({ rows: [] })
+          .mockResolvedValueOnce({ rows: [] })
+          .mockResolvedValueOnce({ rows: mockCount })
+          .mockResolvedValueOnce({ rows: mockBatch })
+          .mockResolvedValueOnce({ rows: [] })
+          .mockResolvedValueOnce({ rows: [] }),
+        release: jest.fn(),
+      };
+      
+      mockDb.connect.mockResolvedValue(mockClient as any);
+      
+      await jobManager.processJob('test-uuid-123');
+      
+      expect(mockClient.query).toHaveBeenCalledWith(
+        'BEGIN'
+      );
+      expect(mockClient.query).toHaveBeenCalledWith(
+        'SELECT * FROM jobs WHERE id = $1 FOR UPDATE',
+        ['test-uuid-123']
+      );
+    });
+  });
+  
+  describe('handleJobError', () => {
+    it('should handle job error and retry', async () => {
+      const mockJob = {
+        id: 'test-uuid-123',
+        task_type: 'send_bulk_email',
+        params: {},
+        status: JobStatus.ENQUEUED,
+        created_at: new Date(),
+        started_at: null,
+        completed_at: null,
+        progress: null,
+        result: null,
+        error: null,
+        retry_count: 0,
+        max_retries: 3,
+        next_retry_at: null,
+        scheduled_at: null
+      };
+      
+      const mockClient = {
+        query: jest.fn()
+          .mockResolvedValueOnce({ rows: [mockJob] })
+          .mockResolvedValueOnce({ rows: [] })
+          .mockResolvedValueOnce({ rows: [] }),
+        release: jest.fn(),
+      };
+      
+      mockDb.connect.mockResolvedValue(mockClient as any);
+      
+      await jobManager.handleJobError('test-uuid-123', new Error('Test error'));
+      
+      expect(mockClient.query).toHaveBeenCalledWith(
+        expect.stringContaining('UPDATE jobs SET'),
+        expect.any(Array)
+      );
+    });
+    
+    it('should mark job as failed after max retries exceeded', async () => {
+      const mockJob = {
+        id: 'test-uuid-123',
+        task_type: 'send_bulk_email',
+        params: {},
+        status: JobStatus.ENQUEUED,
+        created_at: new Date(),
+        started_at: null,
+        completed_at: null,
+        progress: null,
+        result: null,
+        error: null,
+        retry_count: 5,
+        max_retries: 3,
+        next_retry_at: null,
+        scheduled_at: null
+      };
+      
+      const mockClient = {
+        query: jest.fn()
+          .mockResolvedValueOnce({ rows: [mockJob] })
+          .mockResolvedValueOnce({ rows: [] })
+          .mockResolvedValueOnce({ rows: [] }),
+        release: jest.fn(),
+      };
+      
+      mockDb.connect.mockResolvedValue(mockClient as any);
+      
+      await jobManager.handleJobError('test-uuid-123', new Error('Test error'));
+      
+      expect(mockClient.query).toHaveBeenCalledWith(
+        expect.stringContaining('UPDATE jobs SET status = $1'),
+        expect.any(Array)
+      );
+      expect(mockClient.query).toHaveBeenCalledWith(
+        expect.stringContaining('UPDATE job_runs SET status = $1'),
+        expect.any(Array)
+      );
+    });
+  });
+  
+  describe('executeJob', () => {
+    it('should execute send_bulk_email task', async () => {
+      const mockJob = {
+        id: 'test-uuid-123',
+        task_type: 'send_bulk_email',
+        params: { template_key: 'trial_ending_soon' },
+        status: JobStatus.ENQUEUED,
+        created_at: new Date(),
+        started_at: null,
+        completed_at: null,
+        progress: null,
+        result: null,
+        error: null,
+        retry_count: 0,
+        max_retries: 3,
+        next_retry_at: null,
+        scheduled_at: null
+      };
+      
+      const mockCount = { rows: [{ count: '100' }] };
+      const mockBatch = { rows: [{ id: 'user-1' }, { id: 'user-2' }] };
+      
+      mockDb.query
+        .mockResolvedValueOnce({ rows: mockCount })
+        .mockResolvedValueOnce({ rows: mockBatch })
+        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rows: [] });
+      
+      const result = await jobManager.executeJob(mockJob);
+      
+      expect(result).toEqual({
+        sent: 100,
+        failed: 0,
+        template_key: 'trial_ending_soon'
+      });
+    });
+    
+    it('should execute webhook_retry task', async () => {
+      const mockJob = {
+        id: 'test-uuid-123',
+        task_type: 'webhook_retry',
+        params: { webhook_id: 'webhook-123' },
+        status: JobStatus.ENQUEUED,
+        created_at: new Date(),
+        started_at: null,
+        completed_at: null,
+        progress: null,
+        result: null,
+        error: null,
+        retry_count: 0,
+        max_retries: 3,
+        next_retry_at: null,
+        scheduled_at: null
+      };
+      
+      const mockWebhook = {
+        id: 'webhook-123',
+        max_retries: 3
+      };
+      
+      const mockAttempt = {
+        id: 'attempt-123',
+        retry_count: 1
+      };
+      
+      mockDb.query
+        .mockResolvedValueOnce({ rows: [mockWebhook] })
+        .mockResolvedValueOnce({ rows: [mockAttempt] })
+        .mockResolvedValueOnce({ rows: [] });
+      
+      const result = await jobManager.executeJob(mockJob);
+      
+      expect(result).toHaveProperty('webhook_id', 'webhook-123');
+      expect(result).toHaveProperty('status', 'queued');
+    });
+    
+    it('should execute export_generate task', async () => {
+      const mockJob = {
+        id: 'test-uuid-123',
+        task_type: 'export_generate',
+        params: { export_type: 'users' },
+        status: JobStatus.ENQUEUED,
+        created_at: new Date(),
+        started_at: null,
+        completed_at: null,
+        progress: null,
+        result: null,
+        error: null,
+        retry_count: 0,
+        max_retries: 3,
+        next_retry_at: null,
+        scheduled_at: null
+      };
+      
+      const mockCount = { rows: [{ count: '50' }] };
+      const mockBatch = { rows: [{ id: 'user-1' }, { id: 'user-2' }] };
+      const mockExport = {
+        id: 'export-123',
+        type: 'users',
+        status: 'processing',
+        created_at: new Date(),
+        filters: {},
+        user_id: 'user-123'
+      };
+      
+      mockDb.query
+        .mockResolvedValueOnce({ rows: mockCount })
+        .mockResolvedValueOnce({ rows: mockBatch })
+        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rows: [mockExport] });
+      
+      const result = await jobManager.executeJob(mockJob);
+      
+      expect(result).toHaveProperty('export_id', 'export-123');
+      expect(result).toHaveProperty('type', 'users');
+      expect(result).toHaveProperty('total_records', 50);
+    });
+    
+    it('should execute daily_report task', async () => {
+      const mockJob = {
+        id: 'test-uuid-123',
+        task_type: 'daily_report',
+        params: { report_date: '2026-09-25' },
+        status: JobStatus.ENQUEUED,
+        created_at: new Date(),
+        started_at: null,
+        completed_at: null,
+        progress: null,
+        result: null,
+        error: null,
+        retry_count: 0,
+        max_retries: 3,
+        next_retry_at: null,
+        scheduled_at: null
+      };
+      
+      const mockMetrics = {
+        total_users: 100,
+        active_users: 75,
+        total_revenue: 5000.00,
+        new_signups: 10
+      };
+      
+      const mockReport = {
+        id: 'report-123',
+        date: new Date('2026-09-25'),
+        total_users: 100,
+        active_users: 75,
+        total_revenue: 5000.00,
+        new_signups: 10,
+        status: 'completed',
+        data: JSON.stringify(mockMetrics)
+      };
+      
+      mockDb.query
+        .mockResolvedValueOnce({ rows: [mockReport] });
+      
+      const result = await jobManager.executeJob(mockJob);
+      
+      expect(result).toHaveProperty('report_date', '2026-09-25');
+      expect(result.metrics).toEqual(mockMetrics);
+    });
+    
+    it('should execute cleanup_old_sessions task', async () => {
+      const mockJob = {
+        id: 'test-uuid-123',
+        task_type: 'cleanup_old_sessions',
+        params: { days_old: 30 },
+        status: JobStatus.ENQUEUED,
+        created_at: new Date(),
+        started_at: null,
+        completed_at: null,
+        progress: null,
+        result: null,
+        error: null,
+        retry_count: 0,
+        max_retries: 3,
+        next_retry_at: null,
+        scheduled_at: null
+      };
+      
+      const mockSessions = [
+        { user_id: 'user-1' },
+        { user_id: 'user-2' }
+      ];
+      
+      mockDb.query
+        .mockResolvedValueOnce({ rows: mockSessions })
+        .mockResolvedValueOnce({ rows: [] });
+      
+      const result = await jobManager.executeJob(mockJob);
+      
+      expect(result).toHaveProperty('sessions_cleaned', 2);
+      expect(result).toHaveProperty('cutoff_date');
+    });
+    
+    it('should execute delete_user_cascade task', async () => {
+      const mockJob = {
+        id: 'test-uuid-123',
+        task_type: 'delete_user_cascade',
+        params: { user_id: 'user-123' },
+        status: JobStatus.ENQUEUED,
+        created_at: new Date(),
+        started_at: null,
+        completed_at: null,
+        progress: null,
+        result: null,
+        error: null,
+        retry_count: 0,
+        max_retries: 3,
+        next_retry_at: null,
+        scheduled_at: null
+      };
+      
+      const mockClient = {
+        query: jest.fn()
+          .mockResolvedValueOnce({ rows: [] })
+          .mockResolvedValueOnce({ rows: [] })
+          .mockResolvedValueOnce({ rows: [] })
+          .mockResolvedValueOnce({ rows: [] })
+          .mockResolvedValueOnce({ rows: [] })
+          .mockResolvedValueOnce({ rows: [] })
+          .mockResolvedValueOnce({ rows: [] }),
+        release: jest.fn(),
+      };
+      
+      mockDb.connect.mockResolvedValue(mockClient as any);
+      
+      const result = await jobManager.executeJob(mockJob);
+      
+      expect(result).toHaveProperty('user_id', 'user-123');
+      expect(result).toHaveProperty('deleted_at');
+      expect(result).toHaveProperty('items_deleted', 4);
+    });
+    
+    it('should execute sync_stripe_invoices task', async () => {
+      const mockJob = {
+        id: 'test-uuid-123',
+        task_type: 'sync_stripe_invoices',
+        params: { days_back: 7 },
+        status: JobStatus.ENQUEUED,
+        created_at: new Date(),
+        started_at: null,
+        completed_at: null,
+        progress: null,
+        result: null,
+        error: null,
+        retry_count: 0,
+        max_retries: 3,
+        next_retry_at: null,
+        scheduled_at: null
+      };
+      
+      const mockInvoices = [
+        { id: 'invoice-1' },
+        { id: 'invoice-2' }
+      ];
+      
+      mockDb.query
+        .mockResolvedValueOnce({ rows: mockInvoices })
+        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rows: [] });
+      
+      const result = await jobManager.executeJob(mockJob);
+      
+      expect(result).toHaveProperty('invoices_processed', 2);
+      expect(result).toHaveProperty('total_invoices', 2);
+    });
+    
+    it('should execute generate_deployment_archive task', async () => {
+      const mockJob = {
+        id: 'test-uuid-123',
+        task_type: 'generate_deployment_archive',
+        params: { environment: 'production', services: ['web', 'api'] },
+        status: JobStatus.ENQUEUED,
+        created_at: new Date(),
+        started_at: null,
+        completed_at: null,
+        progress: null,
+        result: null,
+        error: null,
+        retry_count: 0,
+        max_retries: 3,
+        next_retry_at: null,
+        scheduled_at: null
+      };
+      
+      const mockDeployments = [
+        { id: 'deploy-1', environment: 'production', service_name: 'web' },
+        { id: 'deploy-2', environment: 'production', service_name: 'api' }
+      ];
+      
+      const mockArchive = {
+        id: 'archive-123',
+        environment: 'production',
+        services: JSON.stringify(['web', 'api']),
+        status: 'creating',
+        created_at: new Date(),
+        user_id: 'user-123'
+      };
+      
+      mockDb.query
+        .mockResolvedValueOnce({ rows: mockDeployments })
+        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rows: [mockArchive] });
+      
+      const result = await jobManager.executeJob(mockJob);
+      
+      expect(result).toHaveProperty('archive_id', 'archive-123');
+      expect(result).toHaveProperty('environment', 'production');
+      expect(result).toHaveProperty('services', ['web', 'api']);
+      expect(result).toHaveProperty('deployments_count', 2);
+    });
+    
+    it('should throw error for unknown task type', async () => {
+      const mockJob = {
+        id: 'test-uuid-123',
+        task_type: 'unknown_task',
+        params: {},
+        status: JobStatus.ENQUEUED,
+        created_at: new Date(),
+        started_at: null,
+        completed_at: null,
+        progress: null,
+        result: null,
+        error: null,
+        retry_count: 0,
+        max_retries: 3,
+        next_retry_at: null,
+        scheduled_at: null
+      };
+      
+      await expect(jobManager.executeJob(mockJob)).rejects.toThrow(BackgroundJobError);
+      await expect(jobManager.executeJob(mockJob)).rejects.toThrow('Unknown task type: unknown_task');
+    });
+  });
+  
+  describe('worker process', () => {
+    it('should process jobs from queue', async () => {
+      mockRedis.lrange.mockResolvedValue(['job-1', 'job-2']);
+      mockRedis.keys.mockResolvedValue([]);
+      mockRedis.pipeline.mockReturnValue({
+        lrem: jest.fn().mockReturnValue({ exec: jest.fn().mockResolvedValue([]) }),
+        exec: jest.fn().mockResolvedValue([])
+      });
+      
+      await jobManager.processJobs();
+      
+      expect(mockRedis.lrange).toHaveBeenCalledWith('job:queue', 0, 9);
+      expect(mockRedis.lrem).toHaveBeenCalledTimes(2);
+    });
+  });
+  
+  describe('API functions', () => {
+    it('should export API functions', async () => {
+      const { enqueueJob, getJobStatus, listJobs, cancelJob, retryJob, getJobResults, initializeJobManager } = 
+        require('./background_jobs_task_queue_typescript');
+      
+      expect(typeof enqueueJob).toBe('function');
+      expect(typeof getJobStatus).toBe('function');
+      expect(typeof listJobs).toBe('function');
+      expect(typeof cancelJob).toBe('function');
+      expect(typeof retryJob).toBe('function');
+      expect(typeof getJobResults).toBe('function');
+      expect(typeof initializeJobManager).toBe('function');
+    });
+  });
+});

@@ -17,6 +17,10 @@ public class OrganizationsTeams {
 
     public static void initSchema(Connection db) throws SQLException {
         db.createStatement().execute(
+            "CREATE TABLE IF NOT EXISTS users (" +
+            "id BIGINT AUTO_INCREMENT PRIMARY KEY, email VARCHAR(255) UNIQUE NOT NULL)"
+        );
+        db.createStatement().execute(
             "CREATE TABLE IF NOT EXISTS organizations (" +
             "id BIGINT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, " +
             "slug VARCHAR(255) UNIQUE NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
@@ -46,6 +50,10 @@ public class OrganizationsTeams {
         return sb.toString();
     }
 
+    public String hashTokenPublic(String rawToken) throws NoSuchAlgorithmException {
+        return hashToken(rawToken);
+    }
+
     private String generateToken() {
         SecureRandom sr = new SecureRandom();
         byte[] token = new byte[32];
@@ -58,31 +66,45 @@ public class OrganizationsTeams {
     }
 
     private boolean isMember(long orgId, long userId) throws SQLException {
-        PreparedStatement ps = db.prepareStatement(
-            "SELECT 1 FROM memberships WHERE org_id=? AND user_id=?");
-        ps.setLong(1, orgId);
-        ps.setLong(2, userId);
-        ResultSet rs = ps.executeQuery();
-        return rs.next();
+        try (PreparedStatement ps = db.prepareStatement(
+            "SELECT 1 FROM memberships WHERE org_id=? AND user_id=?")) {
+            ps.setLong(1, orgId);
+            ps.setLong(2, userId);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        }
+    }
+
+    public boolean isMemberPublic(long orgId, long userId) throws SQLException {
+        return isMember(orgId, userId);
     }
 
     private String getRole(long orgId, long userId) throws SQLException {
-        PreparedStatement ps = db.prepareStatement(
-            "SELECT role FROM memberships WHERE org_id=? AND user_id=?");
-        ps.setLong(1, orgId);
-        ps.setLong(2, userId);
-        ResultSet rs = ps.executeQuery();
-        if (rs.next()) return rs.getString("role");
-        return null;
+        try (PreparedStatement ps = db.prepareStatement(
+            "SELECT role FROM memberships WHERE org_id=? AND user_id=?")) {
+            ps.setLong(1, orgId);
+            ps.setLong(2, userId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) return rs.getString("role");
+                return null;
+            }
+        }
+    }
+
+    public String getRolePublic(long orgId, long userId) throws SQLException {
+        return getRole(orgId, userId);
     }
 
     private int countOwners(long orgId) throws SQLException {
-        PreparedStatement ps = db.prepareStatement(
-            "SELECT COUNT(*) FROM memberships WHERE org_id=? AND role='owner'");
-        ps.setLong(1, orgId);
-        ResultSet rs = ps.executeQuery();
-        rs.next();
-        return rs.getInt(1);
+        try (PreparedStatement ps = db.prepareStatement(
+            "SELECT COUNT(*) FROM memberships WHERE org_id=? AND role='owner'")) {
+            ps.setLong(1, orgId);
+            try (ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                return rs.getInt(1);
+            }
+        }
     }
 
     public Map<String, Object> createOrg(long userId, String name) throws SQLException, NoSuchAlgorithmException {
@@ -92,21 +114,22 @@ public class OrganizationsTeams {
             ps.setString(1, name);
             ps.setString(2, slug);
             ps.executeUpdate();
-            ResultSet rs = ps.getGeneratedKeys();
-            rs.next();
-            long orgId = rs.getLong(1);
-            try (PreparedStatement ms = db.prepareStatement(
-                "INSERT INTO memberships (org_id, user_id, role) VALUES (?, ?, 'owner')")) {
-                ms.setLong(1, orgId);
-                ms.setLong(2, userId);
-                ms.executeUpdate();
+            try (ResultSet rs = ps.getGeneratedKeys()) {
+                rs.next();
+                long orgId = rs.getLong(1);
+                try (PreparedStatement ms = db.prepareStatement(
+                    "INSERT INTO memberships (org_id, user_id, role) VALUES (?, ?, 'owner')")) {
+                    ms.setLong(1, orgId);
+                    ms.setLong(2, userId);
+                    ms.executeUpdate();
+                }
+                Map<String, Object> org = new HashMap<>();
+                org.put("id", orgId);
+                org.put("name", name);
+                org.put("slug", slug);
+                org.put("created_at", Instant.now().toString());
+                return org;
             }
-            Map<String, Object> org = new HashMap<>();
-            org.put("id", orgId);
-            org.put("name", name);
-            org.put("slug", slug);
-            org.put("created_at", Instant.now().toString());
-            return org;
         }
     }
 
@@ -135,20 +158,35 @@ public class OrganizationsTeams {
 
     public Map<String, Object> acceptInvitation(long userId, String rawToken) throws SQLException, NoSuchAlgorithmException {
         String tokenHash = hashToken(rawToken);
-        PreparedStatement ps = db.prepareStatement(
-            "SELECT id, org_id, email, role FROM invitations WHERE token_hash=? AND accepted_at IS NULL AND expires_at > ?");
-        ps.setString(1, tokenHash);
-        ps.setTimestamp(2, Timestamp.from(Instant.now()));
-        ResultSet rs = ps.executeQuery();
-        if (!rs.next()) throw new SecurityException("invalid_or_expired_token");
+        long invId;
+        long orgId;
+        String email;
+        String role;
 
-        long invId = rs.getLong("id");
-        long orgId = rs.getLong("org_id");
-        String email = rs.getString("email");
-        String role = rs.getString("role");
+        try (PreparedStatement ps = db.prepareStatement(
+            "SELECT id, org_id, email, role FROM invitations WHERE token_hash=? AND accepted_at IS NULL AND expires_at > ?")) {
+            ps.setString(1, tokenHash);
+            ps.setTimestamp(2, Timestamp.from(Instant.now()));
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) throw new SecurityException("invalid_or_expired_token");
+                invId = rs.getLong("id");
+                orgId = rs.getLong("org_id");
+                email = rs.getString("email");
+                role = rs.getString("role");
+            }
+        }
 
-        // In real system, verify userId's email matches 'email'. Here we assume caller provides correct user.
-        // For test purposes, we check that the user is not already a member.
+        // Verify user's email matches invitation email
+        String userEmail;
+        try (PreparedStatement ups = db.prepareStatement("SELECT email FROM users WHERE id=?")) {
+            ups.setLong(1, userId);
+            try (ResultSet urs = ups.executeQuery()) {
+                if (!urs.next()) throw new SecurityException("user_not_found");
+                userEmail = urs.getString("email");
+            }
+        }
+        if (!email.equalsIgnoreCase(userEmail)) throw new SecurityException("email_mismatch");
+
         if (isMember(orgId, userId)) throw new SecurityException("already_member");
 
         try (PreparedStatement us = db.prepareStatement(
@@ -233,16 +271,18 @@ public class OrganizationsTeams {
 
     public Map<String, Object> getOrg(long actorId, long orgId) throws SQLException {
         if (!isMember(orgId, actorId)) throw new SecurityException("not_found");
-        PreparedStatement ps = db.prepareStatement(
-            "SELECT id, name, slug, created_at FROM organizations WHERE id=?");
-        ps.setLong(1, orgId);
-        ResultSet rs = ps.executeQuery();
-        if (!rs.next()) throw new SecurityException("not_found");
-        Map<String, Object> org = new HashMap<>();
-        org.put("id", rs.getLong("id"));
-        org.put("name", rs.getString("name"));
-        org.put("slug", rs.getString("slug"));
-        org.put("created_at", rs.getTimestamp("created_at").toInstant().toString());
-        return org;
+        try (PreparedStatement ps = db.prepareStatement(
+            "SELECT id, name, slug, created_at FROM organizations WHERE id=?")) {
+            ps.setLong(1, orgId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) throw new SecurityException("not_found");
+                Map<String, Object> org = new HashMap<>();
+                org.put("id", rs.getLong("id"));
+                org.put("name", rs.getString("name"));
+                org.put("slug", rs.getString("slug"));
+                org.put("created_at", rs.getTimestamp("created_at").toInstant().toString());
+                return org;
+            }
+        }
     }
 }

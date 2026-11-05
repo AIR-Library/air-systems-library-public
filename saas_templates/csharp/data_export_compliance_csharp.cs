@@ -206,7 +206,9 @@ namespace ComplianceModule
 
         public async Task SendEmailAsync(string userEmail, string downloadLink)
         {
-            _logger.LogInformation("Simulated email sent to {Email} with link {Link}", userEmail, downloadLink);
+            // An address is personal data and a download link is a secret, so neither goes into the log.
+            // Code scanning alert cs/exposure-of-sensitive-information, 2026-11-05, session f3daac6e.
+            _logger.LogInformation("Simulated export email sent");
             await Task.CompletedTask;
         }
 
@@ -495,7 +497,9 @@ namespace ComplianceModule
         public async Task SendDeletionConfirmationEmailAsync(string email, string token, CancellationToken cancellationToken)
         {
             var confirmationLink = $"{_configuration["App:BaseUrl"]}/compliance/delete/confirm?token={token}";
-            _logger.LogInformation("Simulated deletion confirmation email sent to {Email} with link {Link}", email, confirmationLink);
+            // The link carries the confirmation token, so it stays out of the log, and so does the address.
+            // Code scanning alert cs/exposure-of-sensitive-information, 2026-11-05, session f3daac6e.
+            _logger.LogInformation("Simulated deletion confirmation email sent");
             await Task.CompletedTask;
         }
     }

@@ -6,6 +6,7 @@ const knexLib = require('knex');
 const stripeLib = require('stripe');
 const { v4: uuidv4 } = require('uuid');
 const moment = require('moment');
+const { rateLimit } = require('express-rate-limit');
 
 // ---------- Configuration ----------
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || 'sk_test_123';
@@ -102,6 +103,19 @@ async function runMigrations() {
 
 // ---------- Middleware ----------
 const app = express();
+/**
+ * Limits how often one address can call the admin API, before any other work is done for the request. Admin routes
+ * read and write the database, so without this one client could flood them. Change the limit with ADMIN_RATE_LIMIT.
+ * Why: nine code scanning alerts js/missing-rate-limiting, 2026-11-05, session f3daac6e. Touches: memory only, one
+ * counter per address. With more than one server, give it a shared store such as Redis.
+ */
+const adminLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: Number(process.env.ADMIN_RATE_LIMIT) || 300,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+});
+app.use(adminLimiter);
 app.use(bodyParser.json());
 app.use(cookieParser());
 app.use(csrf({ cookie: true }));
@@ -153,9 +167,20 @@ async function auditLog({ actor_id, action, resource_type, resource_id, old_valu
 }
 
 // ---------- Helpers ----------
+/**
+ * Checks the shape of an e-mail address: one @, something before it, and a domain with a dot inside it.
+ * In: any value. Out: true or false.
+ * Why: the regular expression this replaces took polynomial time on a long crafted address (code scanning alert
+ * js/polynomial-redos), so a request could tie up the server. This walks the text a fixed number of times and
+ * refuses anything over the 254 characters an address can have. 2026-11-05, session f3daac6e. Touches: nothing.
+ */
 function validateEmail(email) {
-  const re = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  return re.test(email);
+  if (typeof email !== 'string' || email.length > 254 || /\s/.test(email)) return false;
+  const at = email.indexOf('@');
+  if (at < 1 || at !== email.lastIndexOf('@')) return false;
+  const domain = email.slice(at + 1);
+  const dot = domain.lastIndexOf('.');
+  return dot > 0 && dot < domain.length - 1;
 }
 
 function validateName(name) {
