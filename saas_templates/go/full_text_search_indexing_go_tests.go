@@ -12,6 +12,7 @@ import (
 )
 
 func setupServer() *httptest.Server {
+	globalIndex.Reset()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/search/index", indexHandler)
 	mux.HandleFunc("/search", searchHandler)
