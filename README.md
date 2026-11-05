@@ -16,34 +16,35 @@ not production code.
     tools/run_suites.py                                  one test runner for every language
     ci/baseline.json                                     suites known to fail today
 
-18 systems x 8 languages = 144 suites. (Java has no `data_export_compliance` tests yet.)
+18 systems x 8 languages = 144 suites.
 
 ## Status
 
-Last checked 2026-10-01 with `tools/run_suites.py` on Linux. Legend: ✅ passes, ❌ fails, ➖ tests missing. The C# column comes from the first CI run on a
-GitHub runner (the other seven languages were run locally and then confirmed by CI).
+Last checked 2026-11-05 by CI with `tools/run_suites.py`. Legend: ✅ passes, ❌ fails.
+Suites that fail today are listed in `ci/baseline.json`. A missing file or a file that does not parse fails
+CI even for a suite on that list.
 
 | system | csharp | go | java | javascript | php | python | rust | typescript |
 |---|---|---|---|---|---|---|---|---|
-| admin_system | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| admin_system | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ |
 | api_keys_service_accounts | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ |
-| audit_logging | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| auth_system | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| audit_logging | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ |
+| auth_system | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ✅ |
 | background_jobs_task_queue | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| billing_subscriptions | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| data_export_compliance | ❌ | ✅ | ➖ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| billing_subscriptions | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ |
+| data_export_compliance | ❌ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ |
 | feature_flags | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
 | file_uploads | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ✅ |
 | full_text_search_indexing | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | health_checks | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
 | idempotency_keys | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
-| notifications | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| organizations_teams | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ✅ |
-| permissions_rbac | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
-| quotas_rate_limiting | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| trial_abuse_prevention | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ |
-| webhooks | ✅ | ❌ | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ |
-| **passing** | **7/18** | **7/18** | **4/18** | **6/18** | **7/18** | **4/18** | **0/18** | **6/18** |
+| notifications | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ |
+| organizations_teams | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
+| permissions_rbac | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ |
+| quotas_rate_limiting | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ |
+| trial_abuse_prevention | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ |
+| webhooks | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
+| **passing** | **7/18** | **7/18** | **6/18** | **6/18** | **13/18** | **12/18** | **0/18** | **10/18** |
 
 CI's per-suite table (in each job's summary) is the live version of this; this table is refreshed by
 hand and can lag. Some failures depend on the toolchain version: the Python suites were written
@@ -67,7 +68,7 @@ Every ❌ above is a good first issue:
 3. Open one pull request per system and language, with `git commit -s` sign-off.
 4. If the suite now passes, delete its line from `ci/baseline.json`.
 
-CI fails only on **regressions** (a suite that is not in `ci/baseline.json` and does not pass), so
+CI fails on **regressions** (a suite that is not in `ci/baseline.json` and does not pass), so
 `main` stays green while the known failures are worked down. New systems and new languages are welcome:
 open a "New system or feature" issue first so the contract is agreed across languages.
 
