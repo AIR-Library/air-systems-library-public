@@ -20,8 +20,8 @@ class MockDatabase implements Database {
     // No-op for test
   }
 
-  transaction<T>(fn: () => T): T {
-    return fn();
+  transaction<T>(fn: () => T): () => T {
+    return fn;
   }
 }
 
@@ -33,7 +33,7 @@ class MockStatement implements Statement {
     if (this.sql.startsWith('INSERT INTO webhook_endpoints')) {
       this.db.data.endpoint = { id: params[0], secret: params[3] };
     } else if (this.sql.startsWith('INSERT INTO webhook_messages')) {
-      this.db.data.message = { id: params[0], payload: params[3] };
+      this.db.data.message = { id: params[0], payload: params[2] };
     } else if (this.sql.startsWith('INSERT INTO webhook_deliveries')) {
       if (!this.db.data.deliveries) this.db.data.deliveries = [];
       this.db.data.deliveries.push({ id: params[0], message_id: params[1], endpoint_id: params[2] });
@@ -305,5 +305,4 @@ describe('PersistentWebhooks', () => {
     expect(newSecret).not.toBe(oldSecret);
     expect(db.data.endpoint!.secret).toBe(newSecret);
   });
-});
 });
