@@ -1,4 +1,24 @@
+use serde_json::json;
+use std::collections::HashMap;
 use feature_flags_rust::*;
+
+fn create_context(
+    targeting_key: Option<String>,
+    user_id: Option<String>,
+    org_id: Option<String>,
+    tier: Option<String>,
+    email: Option<String>,
+    attributes: HashMap<String, serde_json::Value>,
+) -> Context {
+    Context {
+        targeting_key,
+        user_id,
+        org_id,
+        tier,
+        email,
+        attributes,
+    }
+}
 
 #[test]
 fn test_unknown_flag_returns_default() {
@@ -13,7 +33,7 @@ fn test_unknown_flag_returns_default() {
 
 #[test]
 fn test_disabled_flag_returns_default() {
-    let mut store = InMemoryStore::new();
+    let store = InMemoryStore::new();
     store.init().unwrap();
     store.set_flag(
         "admin",
@@ -34,7 +54,7 @@ fn test_disabled_flag_returns_default() {
 
 #[test]
 fn test_matching_rule_returns_value() {
-    let mut store = InMemoryStore::new();
+    let store = InMemoryStore::new();
     store.init().unwrap();
     store.set_flag(
         "admin",
@@ -68,7 +88,7 @@ fn test_matching_rule_returns_value() {
 
 #[test]
 fn test_non_matching_rule_does_not_apply() {
-    let mut store = InMemoryStore::new();
+    let store = InMemoryStore::new();
     store.init().unwrap();
     store.set_flag(
         "admin",
@@ -102,7 +122,7 @@ fn test_non_matching_rule_does_not_apply() {
 
 #[test]
 fn test_rollout_deterministic() {
-    let mut store = InMemoryStore::new();
+    let store = InMemoryStore::new();
     store.init().unwrap();
     store.set_flag(
         "admin",
@@ -148,7 +168,7 @@ fn test_rollout_deterministic() {
 
 #[test]
 fn test_rollout_falls_through() {
-    let mut store = InMemoryStore::new();
+    let store = InMemoryStore::new();
     store.init().unwrap();
     store.set_flag(
         "admin",
@@ -202,7 +222,7 @@ fn test_rollout_falls_through() {
 
 #[test]
 fn test_corrupt_rules_returns_default() {
-    let mut store = InMemoryStore::new();
+    let store = InMemoryStore::new();
     store.init().unwrap();
     store.set_flag(
         "admin",
@@ -223,7 +243,7 @@ fn test_corrupt_rules_returns_default() {
 
 #[test]
 fn test_set_flag_writes_audit() {
-    let mut store = InMemoryStore::new();
+    let store = InMemoryStore::new();
     store.init().unwrap();
     assert!(store.get_flag("flag1").is_none());
     store.set_flag(
@@ -241,23 +261,4 @@ fn test_set_flag_writes_audit() {
     assert_eq!(flag.default_value, json!(true));
     assert_eq!(flag.enabled, true);
     assert_eq!(flag.rules, json!([]));
-}
-
-// Helper function to create a context (duplicated from implementation for test independence)
-fn create_context(
-    targeting_key: Option<String>,
-    user_id: Option<String>,
-    org_id: Option<String>,
-    tier: Option<String>,
-    email: Option<String>,
-    attributes: HashMap<String, serde_json::Value>,
-) -> crate::Context {
-    crate::Context {
-        targeting_key,
-        user_id,
-        org_id,
-        tier,
-        email,
-        attributes,
-    }
 }
