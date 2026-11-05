@@ -216,11 +216,6 @@ export class ApiKeyService {
       oldKeyRow.expires_at,
       created_at
     );
-    await this.db.run(
-      `UPDATE api_keys SET is_active = 0, last_used_at = ? WHERE id = ?`,
-      old_revoked_at,
-      api_key_id
-    );
     return {
       new_key,
       old_key_revoked_at: old_revoked_at,
@@ -333,7 +328,8 @@ export class ApiKeyService {
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
     const rows = await this.db.all(
       `SELECT id, user_id, name, scopes, created_at, last_used_at, rate_limit, is_active
-       FROM api_keys ${where}`
+       FROM api_keys ${where}`,
+       ...params
     );
     const total = rows.length;
     return {

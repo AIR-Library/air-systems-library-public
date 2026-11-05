@@ -16,12 +16,11 @@ describe('API Key Service', () => {
     });
     jest.spyOn(redisMock, 'expire').mockImplementation(async () => 0);
     service = new ApiKeyService();
-    await service.init(':memory:', { host: '127.0.0.1', port: 6379 });
+    await service.init(':memory:');
     service.redis = redisMock;
   });
 
   afterAll(async () => {
-    await redisMock.quit();
   });
 
   const userId = 'user-123';
@@ -73,12 +72,12 @@ describe('API Key Service', () => {
       user_id: userId,
       name: 'Rate Limit Test',
       scopes,
-      rate_limit: 1000,
+      rate_limit: 2,
     });
     const endpoint = '/deployments';
     const method = 'GET';
     const scope = 'read:deployments';
-    for (let i = 0; i < 1000; i++) {
+    for (let i = 0; i < 2; i++) {
       await service.validateApiKey(key, endpoint, method, scope);
     }
     await expect(
