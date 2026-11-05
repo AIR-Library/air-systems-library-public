@@ -1,18 +1,18 @@
 const rbac = require('./permissions_rbac_javascript');
 
 describe('Permissions & RBAC System', () => {
+  const mockResponse = () => {
+    const res = {};
+    res.status = jest.fn().mockReturnValue(res);
+    res.json = jest.fn().mockReturnValue(res);
+    return res;
+  };
+
   beforeEach(() => {
     rbac.resetDb();
   });
 
   describe('Middleware Functions', () => {
-    const mockResponse = () => {
-      const res = {};
-      res.status = jest.fn().mockReturnValue(res);
-      res.json = jest.fn().mockReturnValue(res);
-      return res;
-    };
-
     describe('require_authenticated', () => {
       test('should return 401 when no user', () => {
         const req = {};
@@ -217,7 +217,8 @@ describe('Permissions & RBAC System', () => {
           sessions: 2,
           apiKeys: 1,
           files: 1,
-          preferences: 1
+          preferences: 1,
+          users: 1
         });
         expect(rbac.db.users.length).toBe(0);
         expect(rbac.db.sessions.length).toBe(0);
@@ -232,7 +233,8 @@ describe('Permissions & RBAC System', () => {
             sessions: 2,
             apiKeys: 1,
             files: 1,
-            preferences: 1
+            preferences: 1,
+            users: 1
           }
         });
       });
