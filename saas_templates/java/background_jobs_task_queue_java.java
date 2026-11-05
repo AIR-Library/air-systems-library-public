@@ -1,6 +1,7 @@
 package com.saas.jobs;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -125,7 +126,6 @@ public class BackgroundJobsTaskQueue implements AutoCloseable {
             for (int i = 0; i < workerCount; i++) {
                 workerPool.submit(this::workerLoop);
             }
-            scheduler.scheduleAtFixedRate(this::pollAndDispatch, 0, pollIntervalMs, TimeUnit.MILLISECONDS);
             scheduler.scheduleAtFixedRate(this::processScheduledJobs, 0, scheduleCheckIntervalMs, TimeUnit.MILLISECONDS);
         }
     }
@@ -304,7 +304,7 @@ public class BackgroundJobsTaskQueue implements AutoCloseable {
     public Map<String, Object> retryJob(String jobId) {
         Job originalJob;
         try (PreparedStatement ps = connection.prepareStatement(
-                "SELECT id, task_type, params, max_retries FROM jobs WHERE id = ?")) {
+                "SELECT id, task_type, params, status, max_retries FROM jobs WHERE id = ?")) {
             ps.setString(1, jobId);
             try (ResultSet rs = ps.executeQuery()) {
                 if (!rs.next()) {
@@ -315,16 +315,16 @@ public class BackgroundJobsTaskQueue implements AutoCloseable {
                         rs.getString("task_type"),
                         rs.getString("params"),
                         rs.getString("status"),
-                        rs.getTimestamp("created_at") != null ? rs.getTimestamp("created_at").toInstant() : null,
-                        rs.getTimestamp("started_at") != null ? rs.getTimestamp("started_at").toInstant() : null,
-                        rs.getTimestamp("completed_at") != null ? rs.getTimestamp("completed_at").toInstant() : null,
-                        rs.getString("progress"),
-                        rs.getString("result"),
-                        rs.getString("error"),
-                        rs.getInt("retry_count"),
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        0,
                         rs.getInt("max_retries"),
-                        rs.getTimestamp("next_retry_at") != null ? rs.getTimestamp("next_retry_at").toInstant() : null,
-                        rs.getTimestamp("scheduled_at") != null ? rs.getTimestamp("scheduled_at").toInstant() : null
+                        null,
+                        null
                 );
             }
         } catch (SQLException e) {
@@ -378,10 +378,10 @@ public class BackgroundJobsTaskQueue implements AutoCloseable {
                     String resultJson = rs.getString("result");
                     if (resultJson != null && !resultJson.isEmpty()) {
                         try {
-                            JsonNode resultNode = objectMapper.readTree(resultJson);
+                            Map<String, Object> resultMap = objectMapper.readValue(resultJson, new TypeReference<Map<String, Object>>() {});
                             Map<String, Object> result = new LinkedHashMap<>();
                             result.put("task_type", rs.getString("task_type"));
-                            resultNode.fields().forEachRemaining(entry -> result.put(entry.getKey(), entry.getValue()));
+                            result.putAll(resultMap);
                             response.put("result", result);
                         } catch (JsonProcessingException e) {
                             response.put("result", resultJson);
@@ -563,11 +563,11 @@ public class BackgroundJobsTaskQueue implements AutoCloseable {
                 throw new RuntimeException("Failed to update job run", e2);
             }
         } else {
-            // Max retries exceeded
+            // Max retries exceeded - set retry_count to maxRetries (not newRetryCount)
             try (PreparedStatement ps = connection.prepareStatement(
                     "UPDATE jobs SET status = 'failed', completed_at = ?, retry_count = ?, error = ? WHERE id = ?")) {
                 ps.setTimestamp(1, Timestamp.from(now));
-                ps.setInt(2, newRetryCount);
+                ps.setInt(2, job.maxRetries);
                 ps.setString(3, errorMessage);
                 ps.setString(4, job.id);
                 ps.executeUpdate();
@@ -908,7 +908,8 @@ public class BackgroundJobsTaskQueue implements AutoCloseable {
         String resultJson = rs.getString("result");
         if (resultJson != null && !resultJson.isEmpty()) {
             try {
-                response.put("result", objectMapper.readTree(resultJson));
+                Map<String, Object> resultMap = objectMapper.readValue(resultJson, new TypeReference<Map<String, Object>>() {});
+                response.put("result", resultMap);
             } catch (JsonProcessingException e) {
                 response.put("result", resultJson);
             }

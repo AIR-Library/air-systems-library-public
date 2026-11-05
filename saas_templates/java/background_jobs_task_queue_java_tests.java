@@ -123,8 +123,8 @@ class BackgroundJobsTaskQueueTests {
         Map<String, Object> enqueueResponse = queue.enqueueJob("test_failing_task", params, null, 3);
         String jobId = (String) enqueueResponse.get("job_id");
 
-        // Wait for retries to happen
-        Thread.sleep(3000);
+        // Wait for retries to happen (backoff: 1s + 2s = 3s + processing time)
+        waitForJobCompletion(jobId, 10000);
 
         Map<String, Object> status = queue.getJobStatus(jobId);
         // After 2 failures, it should succeed on 3rd attempt
@@ -149,7 +149,7 @@ class BackgroundJobsTaskQueueTests {
 
         // Wait for all retries to be exhausted
         // Backoff: 1s, 2s = 3s total
-        Thread.sleep(4000);
+        waitForJobCompletion(jobId, 10000);
 
         Map<String, Object> status = queue.getJobStatus(jobId);
         assertEquals("failed", status.get("status"));
@@ -342,7 +342,7 @@ class BackgroundJobsTaskQueueTests {
         String jobId = (String) enqueueResponse.get("job_id");
 
         // Wait for it to fail
-        Thread.sleep(2000);
+        waitForJobCompletion(jobId, 5000);
 
         Map<String, Object> status = queue.getJobStatus(jobId);
         assertEquals("failed", status.get("status"));
@@ -426,7 +426,6 @@ class BackgroundJobsTaskQueueTests {
     @Order(15)
     void testWebhookRetryTask() throws Exception {
         ObjectNode params = objectMapper.createObjectNode();
-        ObjectNode webhooks = objectMapper.createObjectNode();
         com.fasterxml.jackson.databind.node.ArrayNode webhookArray = objectMapper.createArrayNode();
         for (int i = 0; i < 10; i++) {
             ObjectNode webhook = objectMapper.createObjectNode();
