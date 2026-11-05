@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use rusqlite::{params, Connection, Result as RusqliteResult, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -83,7 +83,7 @@ impl AuditLogger {
 
     pub fn init_db(&self) -> RusqliteResult<()> {
         let conn = self.conn.lock().unwrap();
-        
+
         // Create table
         conn.execute(
             "CREATE TABLE IF NOT EXISTS audit_log (
@@ -104,7 +104,7 @@ impl AuditLogger {
 
         // Create indexes for fast queries
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_audit_log_query 
+            "CREATE INDEX IF NOT EXISTS idx_audit_log_query
              ON audit_log(actor_id, action, resource_type, timestamp);",
             [],
         )?;
@@ -135,7 +135,7 @@ impl AuditLogger {
         let conn = self.conn.lock().unwrap();
         let log_id = Uuid::new_v4().to_string();
         let timestamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        
+
         let old_value_str = serde_json::to_string(&req.old_value).unwrap_or_else(|_| "{}".to_string());
         let new_value_str = serde_json::to_string(&req.new_value).unwrap_or_else(|_| "{}".to_string());
         let metadata_str = serde_json::to_string(&req.metadata.unwrap_or_else(|| serde_json::json!({}))).unwrap_or_else(|_| "{}".to_string());
@@ -166,7 +166,7 @@ impl AuditLogger {
 
     pub fn query_logs(&self, params_filter: QueryLogsParams) -> RusqliteResult<QueryLogsResponse> {
         let conn = self.conn.lock().unwrap();
-        
+
         let mut conditions = Vec::new();
         let mut sql_params: Vec<rusqlite::types::Value> = Vec::new();
 
@@ -216,9 +216,9 @@ impl AuditLogger {
         let offset = params_filter.offset.unwrap_or(0);
 
         let query_sql = format!(
-            "SELECT id, timestamp, actor_id, actor_type, action, resource_type, resource_id, old_value, new_value, why_chain_id, metadata 
-             FROM audit_log {} 
-             ORDER BY timestamp DESC, id DESC 
+            "SELECT id, timestamp, actor_id, actor_type, action, resource_type, resource_id, old_value, new_value, why_chain_id, metadata
+             FROM audit_log {}
+             ORDER BY timestamp DESC, id DESC
              LIMIT ? OFFSET ?",
             where_clause
         );
@@ -248,21 +248,21 @@ impl AuditLogger {
 
     pub fn replay(&self, log_id: &str) -> RusqliteResult<ReplayResponse> {
         let conn = self.conn.lock().unwrap();
-        
+
         // Fetch target log
         let mut stmt = conn.prepare(
-            "SELECT id, timestamp, actor_id, actor_type, action, resource_type, resource_id, old_value, new_value, why_chain_id, metadata 
+            "SELECT id, timestamp, actor_id, actor_type, action, resource_type, resource_id, old_value, new_value, why_chain_id, metadata
              FROM audit_log WHERE id = ?1"
         )?;
-        
+
         let target_log = stmt.query_row([log_id], |row| Self::map_row_to_entry(row))?;
 
         // Check if state has diverged since this log
         // Divergence is defined as: is there any newer log for this resource that has a different state?
         let mut latest_stmt = conn.prepare(
-            "SELECT id, timestamp, new_value 
-             FROM audit_log 
-             WHERE resource_type = ?1 AND resource_id = ?2 
+            "SELECT id, timestamp, new_value
+             FROM audit_log
+             WHERE resource_type = ?1 AND resource_id = ?2
              ORDER BY timestamp DESC, id DESC LIMIT 1"
         )?;
 
@@ -292,8 +292,8 @@ impl AuditLogger {
         let limit_val = limit.unwrap_or(50);
         let search_pattern = format!("%{}%", q);
 
-        let mut query_sql = "SELECT id, timestamp, actor_id, actor_type, action, resource_type, resource_id, old_value, new_value, why_chain_id, metadata 
-                             FROM audit_log 
+        let mut query_sql = "SELECT id, timestamp, actor_id, actor_type, action, resource_type, resource_id, old_value, new_value, why_chain_id, metadata
+                             FROM audit_log
                              WHERE (action LIKE ?1 OR resource_id LIKE ?1 OR old_value LIKE ?1 OR new_value LIKE ?1 OR metadata LIKE ?1)".to_string();
 
         let mut sql_params: Vec<rusqlite::types::Value> = vec![rusqlite::types::Value::Text(search_pattern)];
