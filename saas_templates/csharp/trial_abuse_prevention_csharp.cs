@@ -41,8 +41,10 @@ namespace TrialAbusePrevention
             else decision = GateDecision.Fail;
 
             var reason = $"Email {email} has {priorCount} prior trial(s)";
-            _logger.LogInformation("Gate check: email_trial_history, email={Email}, prior_count={PriorCount}, decision={Decision}", 
-                email, priorCount, decision);
+            // The address stays out of the log: it is personal data, and the count and decision are what an operator needs.
+            // Code scanning alert cs/exposure-of-sensitive-information, 2026-11-05, session f3daac6e.
+            _logger.LogInformation("Gate check: email_trial_history, prior_count={PriorCount}, decision={Decision}",
+                priorCount, decision);
 
             return new GateCheckResult
             {
