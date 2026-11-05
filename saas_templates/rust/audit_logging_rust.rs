@@ -257,13 +257,14 @@ impl AuditLogger {
 
         let target_log = stmt.query_row([log_id], |row| Self::map_row_to_entry(row))?;
 
-        // Check if state has diverged since this log
+        // Check if state has diverged since this log. Two writes can share a millisecond and ids are random,
+        // so rowid, the insertion order, breaks the tie. Found by CI on 2026-11-05, session f3daac6e.
         // Divergence is defined as: is there any newer log for this resource that has a different state?
         let mut latest_stmt = conn.prepare(
             "SELECT id, timestamp, new_value
              FROM audit_log
              WHERE resource_type = ?1 AND resource_id = ?2
-             ORDER BY timestamp DESC, id DESC LIMIT 1"
+             ORDER BY timestamp DESC, rowid DESC LIMIT 1"
         )?;
 
         let latest_log = latest_stmt.query_row(
