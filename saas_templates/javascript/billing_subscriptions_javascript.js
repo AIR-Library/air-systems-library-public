@@ -116,10 +116,12 @@ function createBillingSystem({ stripeSecretKey, webhookSecret, db }) {
     }
 
     try {
-      const subscription = await stripeInstance.subscriptions.retrieve(subscription_id);
-      const old_tier = subscription.items.data[0].price.lookup_key || 
-                      Object.keys(PRICE_IDS).find(key => PRICE_IDS[key] === subscription.items.data[0].price.id) || 
-                      'unknown';
+      // Get old tier from DB — spec calls only stripe.subscriptions.update, not retrieve
+      const existingSub = await db.getSubscriptionByStripeId(subscription_id);
+      if (!existingSub) {
+        return { error: "subscription_not_found", message: `Subscription ${subscription_id} not found` };
+      }
+      const old_tier = existingSub.tier;
 
       const updatedSubscription = await stripeInstance.subscriptions.update(subscription_id, {
         items: [{ price: PRICE_IDS[new_tier] }]
@@ -132,7 +134,7 @@ function createBillingSystem({ stripeSecretKey, webhookSecret, db }) {
         updated_at: now
       });
 
-      // Calculate proration credit (simplified - actual calculation would be more complex)
+      // Calculate proration credit (simplified — actual calculation would be more complex)
       const proration_credit = 0; // Placeholder - in reality would come from Stripe invoice
 
       await db.createAuditLog({
@@ -167,7 +169,7 @@ function createBillingSystem({ stripeSecretKey, webhookSecret, db }) {
       if (invoice.status !== 'succeeded') {
         return { error: "invoice_not_succeeded", message: `Invoice ${invoice_id} is not succeeded` };
       }
-      if (amount > invoice.amount) {
+      if (parseFloat(amount) > parseFloat(invoice.amount)) {
         return { error: "refund_exceeds_invoice", message: `Refund amount ${amount} exceeds invoice amount ${invoice.amount}` };
       }
 
@@ -302,11 +304,13 @@ function createBillingSystem({ stripeSecretKey, webhookSecret, db }) {
     }
   }
 
+  // Expose stripe instance for testing
   return {
     create_subscription,
     change_plan,
     queue_refund,
-    handle_stripe_webhook
+    handle_stripe_webhook,
+    __stripeInstance: stripeInstance
   };
 }
 
