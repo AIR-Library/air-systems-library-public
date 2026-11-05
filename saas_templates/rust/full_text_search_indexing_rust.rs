@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS search_index (
@@ -115,7 +115,6 @@ struct StoredDoc {
     document_type: String,
     document_id: i64,
     content: String,
-    indexed_at: String,
     metadata: HashMap<String, Value>,
 }
 
@@ -132,6 +131,9 @@ impl InvertedIndex {
             for term in tokenize(&old.content) {
                 if let Some(set) = self.postings.get_mut(&term) {
                     set.remove(&key);
+                    if set.is_empty() {
+                        self.postings.remove(&term);
+                    }
                 }
             }
         }
@@ -159,10 +161,6 @@ impl InvertedIndex {
         } else {
             false
         }
-    }
-
-    fn all_docs(&self) -> Vec<StoredDoc> {
-        self.docs.values().cloned().collect()
     }
 }
 
@@ -194,7 +192,6 @@ impl SearchIndex {
             document_type: req.document_type,
             document_id: req.document_id,
             content: req.content,
-            indexed_at: indexed_at.clone(),
             metadata: req.metadata,
         };
         self.inner.lock().unwrap().insert(doc);
@@ -211,38 +208,85 @@ impl SearchIndex {
 
     pub fn search(&self, req: SearchRequest) -> SearchResponse {
         let guard = self.inner.lock().unwrap();
-        let terms = tokenize(&req.q);
+        let query_terms = tokenize(&req.q);
         let filters = parse_filters(&req.filters);
 
         let mut scores: HashMap<(String, i64), f64> = HashMap::new();
-        if terms.is_empty() {
-            for (key, _) in guard.docs.iter() {
+
+        if query_terms.is_empty() {
+            for (key, doc) in guard.docs.iter() {
                 if let Some(dt) = &req.document_type {
                     if key.0 != *dt {
                         continue;
                     }
                 }
+                if !matches_filters(&doc.metadata, &filters) {
+                    continue;
+                }
                 scores.insert(key.clone(), 1.0);
             }
         } else {
-            for term in &terms {
-                let postings = guard.postings.get(term).cloned().unwrap_or_default();
-                for key in postings {
-                    let doc = match guard.docs.get(&key) {
-                        Some(d) => d,
-                        None => continue,
-                    };
-                    if let Some(dt) = &req.document_type {
-                        if doc.document_type != *dt {
+            for qterm in &query_terms {
+                let mut term_scores: HashMap<(String, i64), f64> = HashMap::new();
+                let qterm_len = qterm.len();
+
+                // 1. Exact match - direct hashmap lookup (O(1))
+                if let Some(postings) = guard.postings.get(qterm) {
+                    for key in postings {
+                        let doc = match guard.docs.get(key) {
+                            Some(d) => d,
+                            None => continue,
+                        };
+                        if let Some(dt) = &req.document_type {
+                            if doc.document_type != *dt {
+                                continue;
+                            }
+                        }
+                        if !matches_filters(&doc.metadata, &filters) {
                             continue;
                         }
+                        term_scores.insert(key.clone(), Relevance::Exact.score());
                     }
-                    if !matches_filters(&doc.metadata, &filters) {
-                        continue;
+                }
+
+                // 2. Prefix/partial matches - only scan for short query terms
+                // to avoid O(N) scan on large indexes for long queries
+                let scan_for_partial = qterm_len <= 10;
+                if scan_for_partial {
+                    for (iterm, postings) in &guard.postings {
+                        if iterm == qterm {
+                            continue; // already handled exact match
+                        }
+                        let rel = match_relevance(qterm, iterm);
+                        if rel == Relevance::Prefix && qterm_len < 3 {
+                            continue;
+                        }
+                        if rel == Relevance::Prefix || rel == Relevance::Partial {
+                            let score = rel.score();
+                            for key in postings {
+                                let doc = match guard.docs.get(key) {
+                                    Some(d) => d,
+                                    None => continue,
+                                };
+                                if let Some(dt) = &req.document_type {
+                                    if doc.document_type != *dt {
+                                        continue;
+                                    }
+                                }
+                                if !matches_filters(&doc.metadata, &filters) {
+                                    continue;
+                                }
+                                let entry = term_scores.entry(key.clone()).or_insert(0.0);
+                                *entry = (*entry).max(score);
+                            }
+                        }
                     }
-                    let rel = relevance_for(term, &doc.content);
+                }
+
+                // Combine scores from this query term
+                for (key, score) in term_scores {
                     let entry = scores.entry(key).or_insert(0.0);
-                    *entry = (*entry + rel.score()).min(1.0);
+                    *entry = (*entry + score).min(1.0);
                 }
             }
         }
@@ -270,6 +314,8 @@ impl SearchIndex {
             })
             .collect();
 
+        let page_len = page.len();
+
         let facets = if req.facets.is_empty() {
             None
         } else {
@@ -280,7 +326,7 @@ impl SearchIndex {
                     if let Some(dt) = &req.document_type {
                         if key.0 != *dt {
                             continue;
-                    }
+                        }
                     }
                     let doc = &guard.docs[key];
                     if !matches_filters(&doc.metadata, &filters) {
@@ -299,7 +345,7 @@ impl SearchIndex {
         SearchResponse {
             results: page,
             total,
-            has_more: req.offset + page.len() < total,
+            has_more: req.offset + page_len < total,
             facets,
         }
     }
@@ -334,25 +380,28 @@ const STOP_WORDS: &[&str] = &[
 ];
 
 pub fn tokenize(text: &str) -> Vec<String> {
-    text.to_lowercase()
-        .split_whitespace()
-        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
-        .filter(|w| !w.is_empty() && !STOP_WORDS.contains(&w))
-        .map(|w| w.to_string())
-        .collect()
+    let mut terms = Vec::new();
+    for word in text.split_whitespace() {
+        let trimmed = word.trim_matches(|c: char| !c.is_alphanumeric());
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_lowercase();
+        if STOP_WORDS.contains(&lower.as_str()) {
+            continue;
+        }
+        terms.push(lower);
+    }
+    terms
 }
 
-fn relevance_for(term: &str, content: &str) -> Relevance {
-    let lower = content.to_lowercase();
-    if lower.split_whitespace().any(|w| w == term) {
+fn match_relevance(query_term: &str, indexed_term: &str) -> Relevance {
+    if indexed_term == query_term {
         Relevance::Exact
-    } else if lower.contains(term) {
-        Relevance::Partial
-    } else if lower
-        .split_whitespace()
-        .any(|w| w.starts_with(term))
-    {
+    } else if indexed_term.starts_with(query_term) {
         Relevance::Prefix
+    } else if indexed_term.contains(query_term) {
+        Relevance::Partial
     } else {
         Relevance::Prefix
     }
