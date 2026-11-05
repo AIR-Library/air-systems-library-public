@@ -1,7 +1,7 @@
 import bcrypt from 'bcrypt';
 import speakeasy from 'speakeasy';
 import jwt from 'jsonwebtoken';
-import { randomBytes } from 'crypto';
+import { randomBytes, randomInt } from 'crypto';
 
 const ddl = `
 -- Users table
@@ -130,8 +130,9 @@ class AuthSystem {
     return randomBytes(32).toString('hex');
   }
 
+  /** A six digit code from the secure random source; Math.random can be predicted. 2026-11-05, session f3daac6e. */
   private generateVerificationCode(): string {
-    return Math.floor(100000 + Math.random() * 900000).toString();
+    return randomInt(100000, 1000000).toString();
   }
 
   private verifyTotp(secret: string, token: string): boolean {
@@ -213,7 +214,7 @@ class AuthSystem {
       const userId = result.insertId;
       const code = this.generateVerificationCode();
       await this.db.execute(
-        'INSERT INTO verification_codes (user_id, code, type, expires_at) VALUES ($1, $2, $3, NOW() + INTERVAL \"10 minutes\")',
+        'INSERT INTO verification_codes (user_id, code, type, expires_at) VALUES ($1, $2, $3, NOW() + INTERVAL \'10 minutes\')',
         [userId, code, 'email']
       );
       await this.emailSender.sendVerificationEmail(email, code);
@@ -288,7 +289,7 @@ class AuthSystem {
       if (user[0].mfa_enabled) {
         const challengeId = randomBytes(16).toString('hex');
         await this.db.execute(
-          'INSERT INTO verification_codes (user_id, code, type, expires_at) VALUES ($1, $2, $3, NOW() + INTERVAL \"10 minutes\")',
+          'INSERT INTO verification_codes (user_id, code, type, expires_at) VALUES ($1, $2, $3, NOW() + INTERVAL \'10 minutes\')',
           [user[0].id, challengeId, 'mfa']
         );
         await this.logWhyChain('login', ['user_exists', 'password_correct', 'mfa_gate', 'rate_limit']);
@@ -364,7 +365,7 @@ class AuthSystem {
   async mfa_challenge(challenge_id: string, code: string): Promise<any> {
     try {
       const challenge = await this.db.query(
-        'SELECT user_id FROM verification_codes WHERE id = $1 AND type = \'mfa\' AND expires_at > NOW()',
+        'SELECT user_id FROM verification_codes WHERE code = $1 AND type = \'mfa\' AND expires_at > NOW()',
         [challenge_id]
       );
       if (challenge.length === 0) {
@@ -386,7 +387,7 @@ class AuthSystem {
       }
 
       await this.db.execute(
-        'DELETE FROM verification_codes WHERE id = $1',
+        'DELETE FROM verification_codes WHERE code = $1',
         [challenge_id]
       );
       const sessionId = randomBytes(16).toString('hex');
@@ -399,7 +400,7 @@ class AuthSystem {
       const userDetails = await this.db.query('SELECT id, email, tier FROM users WHERE id = $1', [challenge[0].user_id]);
       const token = this.generateToken(challenge[0].user_id, userDetails[0].tier);
       await this.logWhyChain('mfa_challenge', ['challenge_valid', 'code_correct']);
-      await this.logAudit('mfa_verified', challenge[0].userId);
+      await this.logAudit('mfa_verified', challenge[0].user_id);
       return {
         status: 'authenticated',
         session_id: sessionId,
@@ -430,7 +431,7 @@ class AuthSystem {
       }
       const newToken = this.generateToken(session[0].user_id, session[0].tier);
       await this.logWhyChain('token_refresh', ['token_valid', 'user_active']);
-      await this.logAudit('token_refreshed', session[0].userId);
+      await this.logAudit('token_refreshed', session[0].user_id);
       return { status: 'ok', token: newToken, expires_in: 900 };
     } catch (err) {
       this.logger.error('Token refresh error', { err });
@@ -440,220 +441,3 @@ class AuthSystem {
 }
 
 export default AuthSystem;
-`; === FILE: auth_system_typescript_tests.ts ===
-import AuthSystem from './auth_system_typescript';
-import { Pool } from 'pg';
-import nodemailer from 'nodemailer';
-
-// Mock dependencies
-const mockDb = {
-  query: jest.fn(),
-  execute: jest.fn()
-};
-
-const mockEmailSender = {
-  sendVerificationEmail: jest.fn()
-};
-
-const mockLogger = {
-  info: jest.fn(),
-  error: jest.fn()
-};
-
-const authSystem = new AuthSystem(mockDb as any, mockEmailSender as any, mockLogger as any, {
-  jwtSecret: 'test-secret',
-  bcryptSaltRounds: 10
-});
-
-beforeEach(() => {
-  jest.clearAllMocks();
-});
-
-describe('Auth System', () => {
-  describe('signup', () => {
-    it('should create user and send verification email on valid input', async () => {
-      mockDb.query.mockResolvedValueOnce([]); // No existing user
-      mockDb.execute.mockResolvedValueOnce({ insertId: 1 });
-      mockDb.execute.mockResolvedValueOnce({}); // Insert verification code
-      mockEmailSender.sendVerificationEmail.mockResolvedValue();
-
-      const result = await authSystem.signup('test@example.com', 'AVeryLongPassword123', 'Test User');
-      expect(result).toEqual({
-        status: 'pending_verification',
-        email: 'test@example.com',
-        message: 'check email'
-      });
-      expect(mockEmailSender.sendVerificationEmail).toHaveBeenCalledWith('test@example.com', expect.any(String));
-    });
-
-    it('should return email_already_exists for duplicate email', async () => {
-      mockDb.query.mockResolvedValueOnce([{ id: 1 }]); // Existing user
-
-      const result = await authSystem.signup('test@example.com', 'AVeryLongPassword123', 'Test User');
-      expect(result).toEqual({ error: 'email_already_exists' });
-    });
-
-    it('should return password_too_weak for short password', async () => {
-      mockDb.query.mockResolvedValueOnce([]); // No existing user
-
-      const result = await authSystem.signup('test@example.com', 'short', 'Test User');
-      expect(result).toEqual({ error: 'password_too_weak', reason: 'too_short' });
-    });
-
-    it('should return password_too_weak for blocklisted password', async () => {
-      mockDb.query.mockResolvedValueOnce([]); // No existing user
-
-      const result = await authSystem.signup('test@example.com', 'password', 'Test User');
-      expect(result).toEqual({ error: 'password_too_weak', reason: 'blocklisted' });
-    });
-
-    it('should rate limit signups from IP', async () => {
-      // Mock rate limiter to return false on 6th call
-      jest.spyOn(authSystem as any, 'rateLimitSignup').mockImplementationOnce(() => Promise.resolve(false));
-
-      const result = await authSystem.signup('test@example.com', 'AVeryLongPassword123', 'Test User');
-      expect(result).toEqual({ error: 'too_many_signups_from_ip' });
-    });
-  });
-
-  describe('verify_email', () => {
-    it('should verify email with valid code', async () => {
-      mockDb.query.mockResolvedValueOnce([{ id: 1, email_verified_at: null }]); // User exists and unverified
-      mockDb.query.mockResolvedValueOnce([{ id: 1 }]); // Valid verification code
-      mockDb.execute.mockResolvedValueOnce({}); // Update email_verified_at
-      mockDb.execute.mockResolvedValueOnce({}); // Delete verification code
-
-      const result = await authSystem.verify_email('test@example.com', '123456');
-      expect(result).toEqual({ status: 'verified', user_id: 1, message: 'ready to login' });
-    });
-
-    it('should return code_expired for expired code', async () => {
-      mockDb.query.mockResolvedValueOnce([{ id: 1, email_verified_at: null }]); // User exists and unverified
-      mockDb.query.mockResolvedValueOnce([]); // No valid verification code (expired)
-
-      const result = await authSystem.verify_email('test@example.com', '123456');
-      expect(result).toEqual({ error: 'code_expired' });
-    });
-  });
-
-  describe('login', () => {
-    it('should authenticate user without MFA', async () => {
-      mockDb.query.mockResolvedValueOnce([{
-        id: 1,
-        email: 'test@example.com',
-        password_hash: await bcrypt.hash('AVeryLongPassword123', 10),
-        tier: 'free',
-        mfa_enabled: false,
-        mfa_secret: null
-      }]); // User exists and verified
-      mockDb.query.mockResolvedValueOnce([]); // No rate limit
-      mockDb.execute.mockResolvedValueOnce({}); // Insert session
-
-      const result = await authSystem.login('test@example.com', 'AVeryLongPassword123', 'device1', '1.2.3.4');
-      expect(result.status).toBe('authenticated');
-      expect(result.token).toBeDefined();
-      expect(result.user).toEqual({ id: 1, email: 'test@example.com', tier: 'free' });
-    });
-
-    it('should return mfa_required when MFA is enabled', async () => {
-      mockDb.query.mockResolvedValueOnce([{
-        id: 1,
-        email: 'test@example.com',
-        password_hash: await bcrypt.hash('AVeryLongPassword123', 10),
-        tier: 'free',
-        mfa_enabled: true,
-        mfa_secret: 'JBSWY3DPEHPK3PXP' // Base32 secret
-      }]); // User exists and verified
-      mockDb.query.mockResolvedValueOnce([]); // No rate limit
-      mockDb.execute.mockResolvedValueOnce({}); // Insert verification code for MFA challenge
-
-      const result = await authSystem.login('test@example.com', 'AVeryLongPassword123', 'device1', '1.2.3.4');
-      expect(result).toEqual({
-        status: 'mfa_required',
-        challenge_id: expect.any(String)
-      });
-    });
-
-    it('should return invalid_credentials for wrong password', async () => {
-      mockDb.query.mockResolvedValueOnce([{
-        id: 1,
-        email: 'test@example.com',
-        password_hash: await bcrypt.hash('correct', 10),
-        tier: 'free',
-        mfa_enabled: false,
-        mfa_secret: null
-      }]); // User exists and verified
-
-      const result = await authSystem.login('test@example.com', 'wrong', 'device1', '1.2.3.4');
-      expect(result).toEqual({ error: 'invalid_credentials' });
-    });
-  });
-
-  describe('oauth_callback', () => {
-    it('should create new user and link OAuth', async () => {
-      mockDb.query.mockResolvedValueOnce([]); // No existing user
-      mockDb.execute.mockResolvedValueOnce({ insertId: 1 }); // Insert user
-      mockDb.execute.mockResolvedValueOnce({}); // Insert OAuth link
-
-      const result = await authSystem.oauth_callback('github', 'code123', 'state123');
-      expect(result.status).toBe('authenticated');
-      expect(result.user.email).toBe('user@github.com');
-    });
-
-    it('should link OAuth to existing user', async () => {
-      mockDb.query.mockResolvedValueOnce([{ id: 1, email: 'user@github.com' }]); // Existing user
-      mockDb.execute.mockResolvedValueOnce({}); // Insert OAuth link (no conflict)
-
-      const result = await authSystem.oauth_callback('github', 'code123', 'state123');
-      expect(result.status).toBe('authenticated');
-      expect(result.user.id).toBe(1);
-    });
-  });
-
-  describe('mfa_challenge', () => {
-    it('should authenticate with correct TOTP code', async () => {
-      mockDb.query.mockResolvedValueOnce([{ user_id: 1 }]); // Valid challenge
-      mockDb.query.mockResolvedValueOnce([{ mfa_secret: 'JBSWY3DPEHPK3PXP' }]); // User has MFA secret
-      // Mock speakeasy.totp.verify to return true
-      jest.spyOn(speakeasy.totp, 'verify').mockReturnValueOnce(true);
-      mockDb.execute.mockResolvedValueOnce({}); // Delete verification code
-      mockDb.execute.mockResolvedValueOnce({}); // Insert session
-      mockDb.query.mockResolvedValueOnce([{ id: 1, email: 'test@example.com', tier: 'free' }]); // Get user details
-
-      const result = await authSystem.mfa_challenge('challenge123', '123456');
-      expect(result.status).toBe('authenticated');
-      expect(result.token).toBeDefined();
-    });
-
-    it('should return invalid_code for wrong TOTP code', async () => {
-      mockDb.query.mockResolvedValueOnce([{ user_id: 1 }]); // Valid challenge
-      mockDb.query.mockResolvedValueOnce([{ mfa_secret: 'JBSWY3DPEHPK3PXP' }]); // User has MFA secret
-      // Mock speakeasy.totp.verify to return false
-      jest.spyOn(speakeasy.totp, 'verify').mockReturnValueOnce(false);
-
-      const result = await authSystem.mfa_challenge('challenge123', '000000');
-      expect(result).toEqual({ error: 'invalid_code' });
-    });
-  });
-
-  describe('token_refresh', () => {
-    it('should issue new token for valid refresh token', async () => {
-      mockDb.query.mockResolvedValueOnce([{
-        user_id: 1,
-        tier: 'free',
-        status: 'active'
-      }]); // Valid session
-
-      const result = await authSystem.token_refresh('valid-refresh-token');
-      expect(result.status).toBe('ok');
-      expect(result.token).toBeDefined();
-    });
-
-    it('should return user_banned for banned user', async () => {
-      mockDb.query.mockResolvedValueOnce([{
-        user_id: 1,
-        tier: 'free',
-        status: 'banned'
-      }]); // Banned user
-
-      const result = await authSystem.token_ref
