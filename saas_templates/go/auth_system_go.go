@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/pquerna/otp/totp"
 	"golang.org/x/crypto/bcrypt"
@@ -115,7 +115,7 @@ type rateBucket struct {
 }
 
 var (
-	signupIPBuckets = map[string]*rateBucket{}
+	signupIPBuckets  = map[string]*rateBucket{}
 	loginFailBuckets = map[string]*rateBucket{}
 )
 
@@ -143,6 +143,7 @@ func checkLoginRate(key string) error {
 	}
 	b.count++
 	return nil
+
 }
 
 func resetLoginRate(key string) {
@@ -205,7 +206,7 @@ type AuthSystem struct {
 
 // NewAuthSystem creates a new instance with an in‑memory SQLite DB (useful for tests).
 func NewAuthSystem() (*AuthSystem, error) {
-	db, err := sql.Open("sqlite3", ":memory:")
+	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		return nil, err
 	}
@@ -215,6 +216,22 @@ func NewAuthSystem() (*AuthSystem, error) {
 		}
 	}
 	return &AuthSystem{db: db}, nil
+}
+
+// getLatestVerificationCode is a test helper to retrieve the most recent verification code for a user.
+func (a *AuthSystem) getLatestVerificationCode(ctx context.Context, userID int64, codeType string) (string, error) {
+	var code string
+	err := a.db.QueryRowContext(ctx,
+		`SELECT code FROM verification_codes WHERE user_id = ? AND type = ? ORDER BY id DESC LIMIT 1`,
+		userID, codeType).Scan(&code)
+	return code, err
+}
+
+// getUserIDByEmail retrieves user ID by email (test helper).
+func (a *AuthSystem) getUserIDByEmail(ctx context.Context, email string) (int64, error) {
+	var userID int64
+	err := a.db.QueryRowContext(ctx, `SELECT id FROM users WHERE email = ?`, email).Scan(&userID)
+	return userID, err
 }
 
 // 1. signup
@@ -287,12 +304,13 @@ func (a *AuthSystem) VerifyEmail(ctx context.Context, email, code string) jsonRe
 	decision := []string{}
 	var userID int64
 	var storedCode, expiresAt string
+	var emailVerifiedAt sql.NullString
 	err := a.db.QueryRowContext(ctx,
 		`SELECT vc.user_id, vc.code, vc.expires_at, u.email_verified_at
 		 FROM verification_codes vc
 		 JOIN users u ON u.id = vc.user_id
 		 WHERE u.email = ? AND vc.type = 'email'`,
-		email).Scan(&userID, &storedCode, &expiresAt, new(sql.NullString))
+		email).Scan(&userID, &storedCode, &expiresAt, &emailVerifiedAt)
 	if err != nil {
 		whyChain("verify_email", []string{"code_valid"})
 		return jsonError("code_invalid", "Invalid verification code")
@@ -306,6 +324,10 @@ func (a *AuthSystem) VerifyEmail(ctx context.Context, email, code string) jsonRe
 	if time.Now().After(exp) {
 		whyChain("verify_email", decision)
 		return jsonError("code_expired", "Verification code expired")
+	}
+	if emailVerifiedAt.Valid {
+		whyChain("verify_email", decision)
+		return jsonError("code_invalid", "Email already verified")
 	}
 	decision = append(decision, "user_unverified")
 	_, err = a.db.ExecContext(ctx,
@@ -355,9 +377,14 @@ func (a *AuthSystem) Login(ctx context.Context, email, password, deviceID, ip st
 	resetLoginRate(fmt.Sprintf("%s:%s", ip, email))
 
 	if mfaEnabled == 1 {
-		// create MFA challenge
+		// create MFA challenge using user's mfa_secret
+		var mfaSecret string
+		err := a.db.QueryRowContext(ctx, `SELECT mfa_secret FROM users WHERE id = ?`, userID).Scan(&mfaSecret)
+		if err != nil || mfaSecret == "" {
+			return jsonError("internal_error", "MFA not configured")
+		}
 		challengeID, _ := generateRandomString(12)
-		code, _ := totp.GenerateCodeCustom(pwHash[:6], time.Now(), totp.ValidateOpts{Period: 30, Skew: 1})
+		code, _ := totp.GenerateCodeCustom(mfaSecret, time.Now(), totp.ValidateOpts{Period: 30, Skew: 1})
 		_, _ = a.db.ExecContext(ctx,
 			`INSERT INTO verification_codes (user_id, code, created_at, expires_at, type)
 			 VALUES (?, ?, ?, ?, 'mfa')`,
@@ -528,7 +555,6 @@ func (a *AuthSystem) TokenRefresh(ctx context.Context, refreshToken string) json
 	decision := []string{}
 	var userID int64
 	var expiresAt string
-	var status string
 	err := a.db.QueryRowContext(ctx,
 		`SELECT user_id, expires_at FROM sessions WHERE refresh_token = ?`,
 		refreshToken).Scan(&userID, &expiresAt)
@@ -542,7 +568,8 @@ func (a *AuthSystem) TokenRefresh(ctx context.Context, refreshToken string) json
 		whyChain("token_refresh", decision)
 		return jsonError("token_expired", "Refresh token expired")
 	}
-	err = a.db.QueryRowContext(ctx, "SELECT status, tier FROM users WHERE id = ?", userID).Scan(&status, new(string))
+	var status, tier string
+	err = a.db.QueryRowContext(ctx, "SELECT status, tier FROM users WHERE id = ?", userID).Scan(&status, &tier)
 	if err != nil {
 		return jsonError("internal_error", err.Error())
 	}
@@ -552,8 +579,6 @@ func (a *AuthSystem) TokenRefresh(ctx context.Context, refreshToken string) json
 	}
 	decision = append(decision, "user_active")
 	// issue new access token
-	var tier string
-	_ = a.db.QueryRowContext(ctx, "SELECT tier FROM users WHERE id = ?", userID).Scan(&tier)
 	newToken, err := createAccessToken(userID, tier)
 	if err != nil {
 		return jsonError("internal_error", err.Error())
@@ -563,8 +588,8 @@ func (a *AuthSystem) TokenRefresh(ctx context.Context, refreshToken string) json
 		"token_refreshed", "user", sql.NullInt64{Int64: userID, Valid: true}, "", "")
 
 	return jsonSuccess(map[string]interface{}{
-		"status": "ok",
-		"token":  newToken,
+		"status":     "ok",
+		"token":      newToken,
 		"expires_in": int(accessTokenTTL.Seconds()),
 	})
 }
@@ -572,21 +597,22 @@ func (a *AuthSystem) TokenRefresh(ctx context.Context, refreshToken string) json
 // 7. verify_access_token
 func (a *AuthSystem) VerifyAccessToken(ctx context.Context, tokenStr string) jsonResponse {
 	decision := []string{}
-	parser := jwt.NewParser(jwt.WithValidMethods([]string{"HS256"}))
+	// The library checks the signature before the claims, so only a genuine token can report that it expired.
+	parser := jwt.NewParser(jwt.WithValidMethods([]string{"HS256"}), jwt.WithExpirationRequired())
 	claims := jwt.MapClaims{}
 	_, err := parser.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
 		return []byte(jwtSecret), nil
 	})
+	if errors.Is(err, jwt.ErrTokenExpired) {
+		whyChain("verify_access_token", append(decision, "signature_valid"))
+		return jsonError("token_expired", "Token has expired")
+	}
 	if err != nil {
 		whyChain("verify_access_token", []string{"signature_valid"})
 		return jsonError("invalid_token", "Signature verification failed")
 	}
-	decision = append(decision, "signature_valid")
-	if !claims.VerifyExpiresAt(time.Now().Unix(), true) {
-		whyChain("verify_access_token", decision)
-		return jsonError("token_expired", "Token has expired")
-	}
-	decision = append(decision, "not_expired")
+	decision = append(decision, "signature_valid", "not_expired")
+	
 	uidFloat, ok := claims["user_id"].(float64)
 	if !ok {
 		return jsonError("invalid_token", "Invalid token payload")
