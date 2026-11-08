@@ -720,11 +720,14 @@ describe('AdminSystem', () => {
       pool.seedGovernanceAction({ action_type: 'refund', actor: 2, target_resource_id: 1, reason: 'requested' });
 
     it('approve: the action is executed and its status changes', async () => {
-      const id = seedAction();
+      // suspend_user has a handler, so the test can see the action really run (refund has none). From review.
+      const id = pool.seedGovernanceAction({ action_type: 'suspend_user', actor: 2, target_resource_id: 3, reason: 'abuse' });
 
       const result = await admin.decideGovernanceAction(ownerCtx, 'valid-csrf-token', id, 'approve', {});
 
       expect(result).toMatchObject({ success: true, action_id: id, status: 'approved' });
+      const target = (pool as unknown as { users: MockRow[] }).users.find((u) => u.id === 3);
+      expect(target?.status).toBe('suspended');
     });
 
     it('reject: the action is rejected and the reason is kept', async () => {
