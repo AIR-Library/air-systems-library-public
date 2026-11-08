@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
@@ -227,7 +228,7 @@ public class DataExportComplianceTest {
         assertTrue(body.startsWith("category,key,value\n"));
         assertTrue(body.contains("profile,email,test@example.com\n"));
         assertTrue(body.contains("preferences,notifications.email,true\n"), "nested maps become dotted keys");
-        assertTrue(body.contains("files,size,1024\n"));
+        assertTrue(body.contains("files,[0].size,1024\n"));
         assertEquals("text/csv", storedTypes.get(key));
     }
 
@@ -443,8 +444,65 @@ public class DataExportComplianceTest {
         assertEquals("IOException", auditOf("deletion_failed").details().get("error"));
 
         eraseFails = false;
+        assertEquals(0, compliance.executeScheduledDeletions(), "the failed run's claim still holds");
+        clock.advance(DataExportCompliance.CLAIM_LEASE.plusMinutes(1));
         assertEquals(1, compliance.executeScheduledDeletions());
         assertEquals(DataExportCompliance.DeletionStatus.COMPLETED, deletion(id).status());
+    }
+
+    /** Marks a row as claimed now, the way a worker that then stopped would have left it. */
+    private void claim(String table, String column, UUID id) throws SQLException {
+        try (Connection c = db.getConnection();
+             PreparedStatement ps = c.prepareStatement("UPDATE " + table + " SET " + column + " = ? WHERE id = ?")) {
+            ps.setObject(1, clock.instant().atOffset(ZoneOffset.UTC));
+            ps.setObject(2, id);
+            ps.executeUpdate();
+        }
+    }
+
+    @Test
+    void aStalledExportIsTakenOverOnceItsClaimExpires() throws SQLException {
+        UUID id = compliance.requestDataExport(USER, "json").exportId();
+        claim("export_requests", "claimed_at", id);
+
+        compliance.processExport(id);
+        assertEquals(DataExportCompliance.ExportStatus.PENDING, compliance.getExportStatus(id, USER).status(),
+                "a fresh claim belongs to a worker that may still be running");
+
+        clock.advance(DataExportCompliance.CLAIM_LEASE.plusMinutes(1));
+        compliance.processExport(id);
+        assertEquals(DataExportCompliance.ExportStatus.COMPLETED, compliance.getExportStatus(id, USER).status());
+    }
+
+    @Test
+    void csvKeepsEachListItemApart() {
+        userData.put("sessions", List.of(Map.of("ip", "10.0.0.1"), Map.of("device_info", "Phone")));
+
+        UUID id = requestAndProcessExport("csv");
+
+        String body = new String(stored.get("exports/" + id + ".csv"), StandardCharsets.UTF_8);
+        assertTrue(body.contains("sessions,[0].ip,10.0.0.1\n"));
+        assertTrue(body.contains("sessions,[1].device_info,Phone\n"));
+    }
+
+    @Test
+    void aCancellationCannotWinOnceTheEraseHasStarted() throws SQLException {
+        UUID id = confirmedDeletion();
+        clock.advance(Duration.ofDays(30));   // exactly at the deadline, when a cancellation and the eraser may overlap
+        claim("deletion_requests", "erase_started_at", id);
+
+        assertRefused("cannot_cancel", () -> compliance.cancelDeletion(id, USER));
+        assertEquals(DataExportCompliance.DeletionStatus.APPROVED, deletion(id).status());
+    }
+
+    @Test
+    void aCancellationAtTheDeadlineStopsTheEraser() {
+        UUID id = confirmedDeletion();
+        clock.advance(Duration.ofDays(30));
+
+        assertEquals(DataExportCompliance.DeletionStatus.CANCELLED, compliance.cancelDeletion(id, USER));
+        assertEquals(0, compliance.executeScheduledDeletions());
+        assertTrue(erased.isEmpty());
     }
 
     /* ---------- admin ---------- */
