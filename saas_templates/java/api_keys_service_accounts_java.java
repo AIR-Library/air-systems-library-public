@@ -334,10 +334,10 @@ public class ApiKeysServiceAccounts {
             // String can be taken by unrelated code anywhere in the process (code scanning, 2026-11-08, session f3daac6e, from review).
             synchronized (keyLocks.computeIfAbsent(key.id, id -> new Object())) {
                 if (!rateLimiter.allow(String.valueOf(key.id), key.rateLimit)) {
-                    // Rejected calls are counted per key, hour and endpoint, not stored one by one: a flood of them
+                    // Rejected calls are counted per key, second and endpoint, not stored one by one: a flood of them
                     // would otherwise fill memory while being refused (2026-11-08, session f3daac6e, from review).
                     rejectedCalls.computeIfAbsent(new RejectedBucket(key.id,
-                            LocalDateTime.now().truncatedTo(ChronoUnit.HOURS), method + " " + endpoint),
+                            LocalDateTime.now().truncatedTo(ChronoUnit.SECONDS), method + " " + endpoint),
                             b -> new AtomicInteger()).incrementAndGet();
                     throw new IllegalStateException("Rate limit exceeded");
                 }
@@ -355,8 +355,9 @@ public class ApiKeysServiceAccounts {
         }
 
         /* Get usage stats */
-        /** Rejected calls in one hour for one endpoint of one key; see rejectedCalls. */
-        record RejectedBucket(long apiKeyId, LocalDateTime hour, String endpoint) {}
+        /** Rejected calls in one second for one endpoint of one key; see rejectedCalls. Per second keeps a stats
+         *  time range exact to the second while a flood still costs one counter a second (2026-11-08, session f3daac6e, from review of PR 17). */
+        record RejectedBucket(long apiKeyId, LocalDateTime second, String endpoint) {}
 
         private final ConcurrentHashMap<RejectedBucket, AtomicInteger> rejectedCalls = new ConcurrentHashMap<>();
         private final ConcurrentHashMap<Long, Object> keyLocks = new ConcurrentHashMap<>();
@@ -371,7 +372,7 @@ public class ApiKeysServiceAccounts {
             int rateLimitHits = 0;
             for (Map.Entry<RejectedBucket, AtomicInteger> e : rejectedCalls.entrySet()) {
                 RejectedBucket b = e.getKey();
-                if (b.apiKeyId() != apiKeyId || b.hour().isBefore(from.truncatedTo(ChronoUnit.HOURS)) || b.hour().isAfter(to)) {
+                if (b.apiKeyId() != apiKeyId || b.second().isBefore(from.truncatedTo(ChronoUnit.SECONDS)) || b.second().isAfter(to)) {
                     continue;
                 }
                 int n = e.getValue().get();
