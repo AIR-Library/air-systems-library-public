@@ -95,7 +95,8 @@ function logPermissionCheck(req, requiredTier, userTier, decision) {
   auditLog({
     action: 'permission_check',
     userId: req.user?.id,
-    endpoint: req.path || req.url || req.originalUrl || 'unknown',
+    // The path only: a query string can carry tokens, and audit readers should not see them (from review).
+    endpoint: req.path || String(req.originalUrl || req.url || '').split('?')[0] || 'unknown',
     required_tier: requiredTier,
     user_tier: userTier,
     decision
