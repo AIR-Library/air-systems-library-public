@@ -330,13 +330,15 @@ public class ApiKeysServiceAccounts {
             if (!key.scopes.contains("*") && !key.scopes.contains(action)) {
                 throw new IllegalArgumentException("Insufficient scope");
             }
-            // Atomic rate-limit check and usage logging per key
-            synchronized (String.valueOf(key.id).intern()) {
+            // Atomic rate-limit check and usage logging per key, on a lock object of this key's own: a lock on an interned
+            // String can be taken by unrelated code anywhere in the process (code scanning, 2026-11-08, session f3daac6e, from review).
+            synchronized (keyLocks.computeIfAbsent(key.id, id -> new Object())) {
                 if (!rateLimiter.allow(String.valueOf(key.id), key.rateLimit)) {
-                    // Log the rate-limited attempt
-                    ApiKeyUsage usage = new ApiKeyUsage(0, key.id, endpoint, method, 429,
-                            LocalDateTime.now());
-                    usageRepo.save(usage);
+                    // Rejected calls are counted per key, hour and endpoint, not stored one by one: a flood of them
+                    // would otherwise fill memory while being refused (2026-11-08, session f3daac6e, from review).
+                    rejectedCalls.computeIfAbsent(new RejectedBucket(key.id,
+                            LocalDateTime.now().truncatedTo(ChronoUnit.HOURS), method + " " + endpoint),
+                            b -> new AtomicInteger()).incrementAndGet();
                     throw new IllegalStateException("Rate limit exceeded");
                 }
                 // Log usage
@@ -353,6 +355,12 @@ public class ApiKeysServiceAccounts {
         }
 
         /* Get usage stats */
+        /** Rejected calls in one hour for one endpoint of one key; see rejectedCalls. */
+        record RejectedBucket(long apiKeyId, LocalDateTime hour, String endpoint) {}
+
+        private final ConcurrentHashMap<RejectedBucket, AtomicInteger> rejectedCalls = new ConcurrentHashMap<>();
+        private final ConcurrentHashMap<Long, Object> keyLocks = new ConcurrentHashMap<>();
+
         public Map<String, Object> getUsageStats(long apiKeyId,
                                                  LocalDateTime from,
                                                  LocalDateTime to) {
@@ -361,6 +369,17 @@ public class ApiKeysServiceAccounts {
             Map<String, Integer> byEndpoint = new HashMap<>();
             Map<Integer, Integer> errors = new HashMap<>();
             int rateLimitHits = 0;
+            for (Map.Entry<RejectedBucket, AtomicInteger> e : rejectedCalls.entrySet()) {
+                RejectedBucket b = e.getKey();
+                if (b.apiKeyId() != apiKeyId || b.hour().isBefore(from.truncatedTo(ChronoUnit.HOURS)) || b.hour().isAfter(to)) {
+                    continue;
+                }
+                int n = e.getValue().get();
+                total += n;
+                rateLimitHits += n;
+                byEndpoint.merge(b.endpoint(), n, Integer::sum);
+                errors.merge(429, n, Integer::sum);
+            }
             for (ApiKeyUsage u : usages) {
                 String ep = u.method + " " + u.endpoint;
                 byEndpoint.merge(ep, 1, Integer::sum);
