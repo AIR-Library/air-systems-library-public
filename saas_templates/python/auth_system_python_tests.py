@@ -316,3 +316,12 @@ def test_oauth_callback_refuses_an_unverified_email(auth_system):
     """The provider must vouch for the address before it can sign anyone in. 2026-11-08, from review."""
     auth_system.oauth_profile = lambda provider, code: {'id': 'gh-7', 'email': 'someone@example.com', 'email_verified': False}
     assert auth_system.oauth_callback('github', 'auth_code', 'state') == {'error': 'email_not_verified'}
+
+
+def test_oauth_callback_finds_a_returning_user_by_provider_id(auth_system):
+    """A user whose e-mail changed at the provider still reaches the same account. 2026-11-08, from review."""
+    auth_system.oauth_profile = lambda provider, code: {'id': 'gh-9', 'email': 'old@example.com', 'email_verified': True}
+    first = auth_system.oauth_callback('github', 'code-1', 'state')
+    auth_system.oauth_profile = lambda provider, code: {'id': 'gh-9', 'email': 'new@example.com', 'email_verified': True}
+    second = auth_system.oauth_callback('github', 'code-2', 'state')
+    assert second['user']['id'] == first['user']['id']

@@ -131,6 +131,10 @@ class AuthSystem:
         CREATE INDEX IF NOT EXISTS idx_why_chain_log_timestamp ON why_chain_log(timestamp);
         CREATE INDEX IF NOT EXISTS idx_rate_limit_log_ip_identifier_type_timestamp ON rate_limit_log(ip, identifier, type, timestamp);
         """)
+        # Tables made before 2026-11-08 lack the MFA attempt count; add it so a wrong code still counts.
+        columns = {row[1] for row in cursor.execute("PRAGMA table_info(verification_codes)")}
+        if "attempts" not in columns:
+            cursor.execute("ALTER TABLE verification_codes ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
         self.db.commit()
 
     def _log_why_chain(self, flow: str, decision_points: list):
@@ -388,7 +392,14 @@ class AuthSystem:
         provider_user_id = str(profile["id"])   # the provider's stable id for this person, not a random value
         decision_points.append("email_verified")
         cursor = self.db.cursor()
-        cursor.execute("SELECT id FROM users WHERE email = ?", (email,))
+        # A returning user is found by the provider's id first: their e-mail at the provider may have changed (2026-11-08, session f3daac6e, from review of PR 17).
+        cursor.execute("SELECT user_id FROM oauth_accounts WHERE provider = ? AND provider_user_id = ?",
+                       (provider, provider_user_id))
+        linked = cursor.fetchone()
+        if linked:
+            cursor.execute("SELECT id FROM users WHERE id = ?", (linked[0],))
+        else:
+            cursor.execute("SELECT id FROM users WHERE email = ?", (email,))
         user = cursor.fetchone()
         now_iso = self._now_iso()
         if user:
