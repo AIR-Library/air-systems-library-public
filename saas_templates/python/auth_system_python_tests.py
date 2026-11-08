@@ -325,3 +325,15 @@ def test_oauth_callback_finds_a_returning_user_by_provider_id(auth_system):
     auth_system.oauth_profile = lambda provider, code: {'id': 'gh-9', 'email': 'new@example.com', 'email_verified': True}
     second = auth_system.oauth_callback('github', 'code-2', 'state')
     assert second['user']['id'] == first['user']['id']
+
+
+def test_mfa_challenge_treats_non_ascii_input_as_a_wrong_code(auth_system):
+    """Full-width digits are a wrong code, not a crash. 2026-11-08, from review."""
+    cursor = auth_system.db.cursor()
+    cursor.execute("INSERT INTO users (email, password_hash, tier, status, created_at, updated_at) VALUES "
+                   "('mfa@example.com', NULL, 'free', 'verified', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')")
+    user_id = cursor.lastrowid
+    cursor.execute("INSERT INTO verification_codes (user_id, code, created_at, expires_at, type) VALUES (?, '123456', ?, ?, 'mfa')",
+                   (user_id, '2026-01-01T00:00:00+00:00', '2999-01-01T00:00:00+00:00'))
+    auth_system.db.commit()
+    assert auth_system.mfa_challenge(cursor.lastrowid, '１２３４５６') == {'error': 'invalid_code'}

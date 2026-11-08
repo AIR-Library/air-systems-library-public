@@ -485,7 +485,8 @@ class AuthSystem:
             self._log_why_chain("mfa_challenge", decision_points + ["challenge_exists_and_valid:failed"])
             return {"error": "challenge_expired"}
         decision_points.append("challenge_valid")
-        if not hmac.compare_digest(str(code), str(stored_code)):
+        # Bytes, not str: compare_digest raises TypeError on non-ASCII text such as full-width digits (from review).
+        if not hmac.compare_digest(str(code).encode("utf-8"), str(stored_code).encode("utf-8")):
             # Each wrong code counts; after mfa_max_attempts the challenge is gone and the user signs in again, so a
             # six digit code cannot be guessed (2026-11-08, session f3daac6e, from review).
             cursor.execute("UPDATE verification_codes SET attempts = attempts + 1 WHERE id = ?", (challenge_id,))
