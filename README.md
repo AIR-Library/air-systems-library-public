@@ -68,7 +68,8 @@ Every ❌ above is a good first issue:
 3. Open one pull request per system and language, with `git commit -s` sign-off.
 4. If the suite now passes, delete its line from `ci/baseline.json`.
 
-CI fails on **regressions** (a suite that is not in `ci/baseline.json` and does not pass), so
+CI fails on **regressions** (a suite that does not pass and is not in `ci/baseline.json`, or any suite with a
+missing file or a file that does not parse, listed or not), so
 `main` stays green while the known failures are worked down. New systems and new languages are welcome:
 open a "New system or feature" issue first so the contract is agreed across languages.
 

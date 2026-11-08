@@ -573,7 +573,9 @@ def parse_failures(lang: str, files: list[Path], ctx: Path) -> dict[str, str]:
                               f"-out:{tmp / 'parse.dll'}", str(f)], tmp)
                 need_tool(rc, out, "dotnet")
                 errors = re.findall(r"error (CS\d+): (.*)", out)
-                if errors and not any(code == "CS0518" for code, _ in errors):
+                if not errors:   # without the standard library csc always reports something; silence means it never ran
+                    raise RuntimeError(f"the C# compiler did not run: {first_line(out)}")
+                if not any(code == "CS0518" for code, _ in errors):
                     line = re.search(r"\((\d+),\d+\): error", out)
                     bad[f.name] = f"{line.group(1) if line else '?'}: {errors[0][0]} {errors[0][1]}"[:200]
         elif lang == "rust":
