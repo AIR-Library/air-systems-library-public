@@ -709,8 +709,11 @@ class JobManager {
   }
 
   private async calculateDailyMetrics(date: Date): Promise<any> {
-    const startOfDay = new Date(date.setHours(0, 0, 0, 0));
-    const endOfDay = new Date(date.setHours(23, 59, 59, 999));
+    // Copies, in UTC: setHours changed the caller's date and used the server's own time zone (2026-11-08, session f3daac6e, from review).
+    const startOfDay = new Date(date);
+    startOfDay.setUTCHours(0, 0, 0, 0);
+    const endOfDay = new Date(date);
+    endOfDay.setUTCHours(23, 59, 59, 999);
     
     const [usersResult, ordersResult, signupsResult] = await Promise.all([
       db.query(

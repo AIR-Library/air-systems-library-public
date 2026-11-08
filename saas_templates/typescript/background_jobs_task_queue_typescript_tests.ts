@@ -1,4 +1,4 @@
-import { BackgroundJobError, JobStatus } from './background_jobs_task_queue_typescript';
+import { JobStatus } from './background_jobs_task_queue_typescript';
 
 /**
  * Tests for the background job manager, with the database and Redis replaced by shared fakes.
@@ -29,17 +29,23 @@ const mockRedis = (globalThis as any).__mockRedis;
 
 describe('Background Job Manager', () => {
   let jobManager: any;
+  // Each test reloads the module, and each load defines its own error class: compare against this load's (from review).
+  let BackgroundJobError: any;
   
   beforeEach(() => {
     for (const fake of [...Object.values(mockDb), ...Object.values(mockRedis)]) {
       (fake as jest.Mock).mockReset();
     }
 
-    jobManager = require('./background_jobs_task_queue_typescript').JobManager.getInstance();
+    const loaded = require('./background_jobs_task_queue_typescript');
+    BackgroundJobError = loaded.BackgroundJobError;
+    jobManager = loaded.JobManager.getInstance();
     jobManager.workerRunning = false;
   });
-  
+
   afterEach(() => {
+    // Stop a worker a test started before the module is reloaded, or its loop keeps the test run open (from review).
+    jobManager.workerRunning = false;
     jest.resetModules();
   });
   
@@ -104,7 +110,7 @@ describe('Background Job Manager', () => {
       mockDb.query.mockResolvedValue({ rows: [mockJob] });
       mockRedis.setex.mockResolvedValue('OK');
       
-      const result = await jobManager.enqueueJob('send_bulk_email', { template_key: 'trial_ending_soon' }, scheduledAt);
+      await jobManager.enqueueJob('send_bulk_email', { template_key: 'trial_ending_soon' }, scheduledAt);
       
       expect(mockRedis.setex).toHaveBeenCalledWith(
         'job:scheduled:test-uuid-123',
@@ -198,7 +204,7 @@ describe('Background Job Manager', () => {
       
       mockDb.query
         .mockResolvedValueOnce({ rows: mockJobs })
-        .mockResolvedValueOnce({ rows: mockCount });
+        .mockResolvedValueOnce(mockCount);
       
       const result = await jobManager.listJobs(JobStatus.RUNNING, 'send_bulk_email', 10);
       
@@ -239,22 +245,6 @@ describe('Background Job Manager', () => {
     });
     
     it('should not cancel a running job', async () => {
-      const mockJob = {
-        id: 'test-uuid-123',
-        task_type: 'send_bulk_email',
-        params: {},
-        status: JobStatus.RUNNING,
-        created_at: new Date(),
-        started_at: new Date(),
-        completed_at: null,
-        progress: '50/100',
-        result: null,
-        error: null,
-        retry_count: 0,
-        max_retries: 3,
-        next_retry_at: null,
-        scheduled_at: null
-      };
       
       mockDb.query.mockResolvedValue({ rows: [] });
       
@@ -284,7 +274,7 @@ describe('Background Job Manager', () => {
       
       const mockNewJob = {
         ...mockJob,
-        id: 'test-uuid-456',
+        id: 'test-uuid-123',
         status: JobStatus.ENQUEUED,
         retry_count: 0,
         next_retry_at: null
@@ -298,10 +288,10 @@ describe('Background Job Manager', () => {
       
       expect(result).toEqual({
         success: true,
-        new_job_id: 'test-uuid-456',
+        new_job_id: 'test-uuid-123',
         status: JobStatus.ENQUEUED
       });
-      expect(mockRedis.lpush).toHaveBeenCalledWith('job:queue', 'test-uuid-456');
+      expect(mockRedis.lpush).toHaveBeenCalledWith('job:queue', 'test-uuid-123');
     });
     
     it('should not retry a non-failed job', async () => {
@@ -405,7 +395,7 @@ describe('Background Job Manager', () => {
       };
       
       const mockJobRun = {
-        id: 'test-uuid-456',
+        id: 'test-uuid-123',
         job_id: 'test-uuid-123',
         status: 'running',
         started_at: new Date(),
@@ -418,12 +408,13 @@ describe('Background Job Manager', () => {
       
       const mockClient = {
         query: jest.fn()
+          .mockResolvedValueOnce({ rows: [] })   // BEGIN
           .mockResolvedValueOnce({ rows: [mockJob] })
           .mockResolvedValueOnce({ rows: [] })
           .mockResolvedValueOnce({ rows: [mockJobRun] })
           .mockResolvedValueOnce({ rows: [] })
           .mockResolvedValueOnce({ rows: [] })
-          .mockResolvedValueOnce({ rows: mockCount })
+          .mockResolvedValueOnce(mockCount)
           .mockResolvedValueOnce({ rows: mockBatch })
           .mockResolvedValueOnce({ rows: [] })
           .mockResolvedValueOnce({ rows: [] }),
@@ -465,6 +456,7 @@ describe('Background Job Manager', () => {
       
       const mockClient = {
         query: jest.fn()
+          .mockResolvedValueOnce({ rows: [] })   // BEGIN
           .mockResolvedValueOnce({ rows: [mockJob] })
           .mockResolvedValueOnce({ rows: [] })
           .mockResolvedValueOnce({ rows: [] }),
@@ -501,6 +493,7 @@ describe('Background Job Manager', () => {
       
       const mockClient = {
         query: jest.fn()
+          .mockResolvedValueOnce({ rows: [] })   // BEGIN
           .mockResolvedValueOnce({ rows: [mockJob] })
           .mockResolvedValueOnce({ rows: [] })
           .mockResolvedValueOnce({ rows: [] }),
@@ -545,7 +538,7 @@ describe('Background Job Manager', () => {
       const mockBatch = { rows: [{ id: 'user-1' }, { id: 'user-2' }] };
       
       mockDb.query
-        .mockResolvedValueOnce({ rows: mockCount })
+        .mockResolvedValueOnce(mockCount)
         .mockResolvedValueOnce({ rows: mockBatch })
         .mockResolvedValueOnce({ rows: [] })
         .mockResolvedValueOnce({ rows: [] });
@@ -619,7 +612,7 @@ describe('Background Job Manager', () => {
       const mockCount = { rows: [{ count: '50' }] };
       const mockBatch = { rows: [{ id: 'user-1' }, { id: 'user-2' }] };
       const mockExport = {
-        id: 'export-123',
+        id: 'test-uuid-123',
         type: 'users',
         status: 'processing',
         created_at: new Date(),
@@ -628,14 +621,14 @@ describe('Background Job Manager', () => {
       };
       
       mockDb.query
-        .mockResolvedValueOnce({ rows: mockCount })
+        .mockResolvedValueOnce(mockCount)
         .mockResolvedValueOnce({ rows: mockBatch })
         .mockResolvedValueOnce({ rows: [] })
         .mockResolvedValueOnce({ rows: [mockExport] });
       
       const result = await jobManager.executeJob(mockJob);
       
-      expect(result).toHaveProperty('export_id', 'export-123');
+      expect(result).toHaveProperty('export_id', 'test-uuid-123');
       expect(result).toHaveProperty('type', 'users');
       expect(result).toHaveProperty('total_records', 50);
     });
@@ -676,7 +669,12 @@ describe('Background Job Manager', () => {
         data: JSON.stringify(mockMetrics)
       };
       
+      // calculateDailyMetrics runs four queries before the report is stored (from review).
       mockDb.query
+        .mockResolvedValueOnce({ rows: [{ count: '100' }] })
+        .mockResolvedValueOnce({ rows: [{ coalesce: '5000' }] })
+        .mockResolvedValueOnce({ rows: [{ count: '10' }] })
+        .mockResolvedValueOnce({ rows: [{ count: '75' }] })
         .mockResolvedValueOnce({ rows: [mockReport] });
       
       const result = await jobManager.executeJob(mockJob);
@@ -816,7 +814,7 @@ describe('Background Job Manager', () => {
       ];
       
       const mockArchive = {
-        id: 'archive-123',
+        id: 'test-uuid-123',
         environment: 'production',
         services: JSON.stringify(['web', 'api']),
         status: 'creating',
@@ -831,7 +829,7 @@ describe('Background Job Manager', () => {
       
       const result = await jobManager.executeJob(mockJob);
       
-      expect(result).toHaveProperty('archive_id', 'archive-123');
+      expect(result).toHaveProperty('archive_id', 'test-uuid-123');
       expect(result).toHaveProperty('environment', 'production');
       expect(result).toHaveProperty('services', ['web', 'api']);
       expect(result).toHaveProperty('deployments_count', 2);
@@ -864,15 +862,16 @@ describe('Background Job Manager', () => {
     it('should process jobs from queue', async () => {
       mockRedis.lrange.mockResolvedValue(['job-1', 'job-2']);
       mockRedis.keys.mockResolvedValue([]);
-      mockRedis.pipeline.mockReturnValue({
-        lrem: jest.fn().mockReturnValue({ exec: jest.fn().mockResolvedValue([]) }),
-        exec: jest.fn().mockResolvedValue([])
-      });
-      
+      // processJobs removes the jobs through a pipeline, then processes each with a database client (from review).
+      const pipeline: any = { exec: jest.fn().mockResolvedValue([]) };
+      pipeline.lrem = jest.fn().mockReturnValue(pipeline);
+      mockRedis.pipeline.mockReturnValue(pipeline);
+      mockDb.connect.mockResolvedValue({ query: jest.fn().mockResolvedValue({ rows: [] }), release: jest.fn() });
+
       await jobManager.processJobs();
-      
+
       expect(mockRedis.lrange).toHaveBeenCalledWith('job:queue', 0, 9);
-      expect(mockRedis.lrem).toHaveBeenCalledTimes(2);
+      expect(pipeline.lrem).toHaveBeenCalledTimes(2);
     });
   });
   
