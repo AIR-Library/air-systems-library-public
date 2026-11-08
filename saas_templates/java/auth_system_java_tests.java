@@ -180,7 +180,7 @@ public class AuthSystemTests {
 
     @Test
     public void testVerifyAccessTokenValid() {
-        Map<String, Object> signup = AuthSystem.signup("verifytoken@example.com", "StrongPassword123456", "VerifyToken", "1.2.3.17");
+        AuthSystem.signup("verifytoken@example.com", "StrongPassword123456", "VerifyToken", "1.2.3.17");
         String code = extractCodeFromEmail("verifytoken@example.com");
         AuthSystem.verifyEmail("verifytoken@example.com", code);
         Map<String, Object> loginRes = AuthSystem.login("verifytoken@example.com", "StrongPassword123456", "device8", "1.2.3.17");
@@ -214,7 +214,7 @@ public class AuthSystemTests {
 
     @Test
     public void testVerifyAccessTokenBannedUser() {
-        Map<String, Object> signup = AuthSystem.signup("bantoken@example.com", "StrongPassword123456", "BanToken", "1.2.3.18");
+        AuthSystem.signup("bantoken@example.com", "StrongPassword123456", "BanToken", "1.2.3.18");
         String code = extractCodeFromEmail("bantoken@example.com");
         AuthSystem.verifyEmail("bantoken@example.com", code);
         banUser("bantoken@example.com");
@@ -269,7 +269,7 @@ public class AuthSystemTests {
 
     @Test
     public void testLoginRateLimit() {
-        Map<String, Object> signup = AuthSystem.signup("ratelimit@example.com", "StrongPassword123456", "RateLimit", "1.2.3.25");
+        AuthSystem.signup("ratelimit@example.com", "StrongPassword123456", "RateLimit", "1.2.3.25");
         String code = extractCodeFromEmail("ratelimit@example.com");
         AuthSystem.verifyEmail("ratelimit@example.com", code);
 
@@ -283,6 +283,10 @@ public class AuthSystemTests {
         Map<String, Object> res = AuthSystem.login("ratelimit@example.com", "WrongPassword", "device", "1.2.3.25");
         assertFalse((Boolean)res.get("success"));
         assertEquals("too_many_attempts", res.get("error"));
+
+        // The right password is refused too while the limit holds, or the limit would stop nothing.
+        Map<String, Object> right = AuthSystem.login("ratelimit@example.com", "StrongPassword123456", "device", "1.2.3.25");
+        assertEquals("too_many_attempts", right.get("error"));
     }
 
     /* ---------- Helper Methods for Tests ---------- */

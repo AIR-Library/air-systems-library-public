@@ -243,13 +243,15 @@ public class AuthSystem {
                 return error("email_not_verified", "Email not verified");
             }
 
+            // The limit is checked before the password: checked only after a wrong one, it never stopped the right guess
+            // (2026-11-08, session f3daac6e, from review).
+            if (isRateLimited(loginAttempts, ip + ":" + userId, 5, Duration.ofMinutes(15))) {
+                decisions.add("rate_limit");
+                return error("too_many_attempts", "Too many failed attempts");
+            }
             if (!checkPassword(userId, password)) {
                 decisions.add("password_correct");
                 recordAttempt(loginAttempts, ip + ":" + userId, Duration.ofMinutes(15));
-                if (isRateLimited(loginAttempts, ip + ":" + userId, 5, Duration.ofMinutes(15))) {
-                    decisions.add("rate_limit");
-                    return error("too_many_attempts", "Too many failed attempts");
-                }
                 return error("invalid_credentials", "Invalid credentials");
             }
             decisions.add("password_correct");
