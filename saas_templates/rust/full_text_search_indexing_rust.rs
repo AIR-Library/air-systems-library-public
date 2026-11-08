@@ -20,6 +20,7 @@ CREATE INDEX IF NOT EXISTS idx_search_index_type ON search_index (document_type)
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Relevance {
+    NoMatch,
     Exact,
     Partial,
     Prefix,
@@ -31,6 +32,7 @@ impl Relevance {
             Relevance::Exact => 1.0,
             Relevance::Partial => 0.5,
             Relevance::Prefix => 0.25,
+            Relevance::NoMatch => 0.0,
         }
     }
 }
@@ -403,7 +405,8 @@ fn match_relevance(query_term: &str, indexed_term: &str) -> Relevance {
     } else if indexed_term.contains(query_term) {
         Relevance::Partial
     } else {
-        Relevance::Prefix
+        // This was Prefix, so every word in the index matched every query of 3 to 10 letters (2026-11-08, session f3daac6e, from review).
+        Relevance::NoMatch
     }
 }
 
