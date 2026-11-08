@@ -262,10 +262,21 @@ class ApiKeyService {
     const rec = this.store.findKey(apiKeyId);
     if (!rec) throw new ApiKeyError(404, 'API key not found', 'NOT_FOUND');
     const nowMs = new Date(this.now()).getTime();
+    // A revoked key stays revoked, and one grace period at a time: a second rotation would end the first one's early
+    // for clients still on the original key (2026-11-08, session f3daac6e, from review).
+    if (!rec.is_active) throw new ApiKeyError(409, 'API key is revoked', 'REVOKED');
+    if (rec.grace_period_ends_at && new Date(rec.grace_period_ends_at).getTime() > nowMs) {
+      throw new ApiKeyError(409, 'The previous rotation is still in its grace period', 'ROTATION_IN_PROGRESS');
+    }
     const oldKeyRevokedAt = this.now();
     const gracePeriodEndsAt = new Date(nowMs + GRACE_PERIOD_MS).toISOString();
     const newKey = generateKey(this.env);
     const newHash = await bcrypt.hash(newKey, this.bcryptRounds);
+    // Hashing yields to other requests. If the key was revoked or rotated meanwhile, writing now would undo that.
+    const current = this.store.findKey(apiKeyId);
+    if (!current || !current.is_active || current.key_secret_hash !== rec.key_secret_hash) {
+      throw new ApiKeyError(409, 'API key changed during rotation', 'CONFLICT');
+    }
     const oldHash = rec.key_secret_hash;
     this.store.updateKey(apiKeyId, {
       key_secret_hash: newHash,
