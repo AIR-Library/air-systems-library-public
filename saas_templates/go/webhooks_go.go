@@ -375,7 +375,8 @@ func (s *SQLStore) CreateDelivery(messageID string, endpointID int64) (int64, er
 
 func (s *SQLStore) GetDelivery(id int64) (*Delivery, error) {
 	var d Delivery
-	var statusCode, success sql.NullInt64
+	var statusCode sql.NullInt64
+	var success sql.NullBool // the column is BOOLEAN, which drivers hand back as a bool
 	var errMsg, nextAttemptAt, deliveredAt sql.NullString
 	err := s.db.QueryRow(
 		`SELECT id, message_id, endpoint_id, attempt, status_code, success, error, next_attempt_at, delivered_at FROM webhook_deliveries WHERE id = ?`,
@@ -389,7 +390,7 @@ func (s *SQLStore) GetDelivery(id int64) (*Delivery, error) {
 		d.StatusCode = &v
 	}
 	if success.Valid {
-		v := success.Int64 == 1
+		v := success.Bool
 		d.Success = &v
 	}
 	if errMsg.Valid {
