@@ -148,10 +148,48 @@ public class ApiKeysServiceAccounts {
                                                      LocalDateTime from,
                                                      LocalDateTime to);
         List<ApiKeyUsage> findByApiKeyId(long apiKeyId);
+
+        /** Counts one call the rate limit refused. Refused calls are counted, not stored one by one, so a flood costs one
+         *  counter per second and endpoint (2026-11-08, session f3daac6e, from review of PR 17). */
+        default void countRejected(long apiKeyId, LocalDateTime at, String endpoint) {
+        }
+
+        /** Refused calls of one key in [from, to], per "METHOD /path". */
+        default Map<String, Integer> rejectedByEndpoint(long apiKeyId, LocalDateTime from, LocalDateTime to) {
+            return Map.of();
+        }
     }
 
     public static class InMemoryApiKeyUsageRepository implements ApiKeyUsageRepository {
+        /** How long refused-call counters are kept. Older ones are dropped, so the counters cannot grow forever. */
+        public static final java.time.Duration REJECTED_RETENTION = java.time.Duration.ofDays(31);
+
+        private record RejectedBucket(long apiKeyId, LocalDateTime second, String endpoint) {}
+
+        private final ConcurrentHashMap<RejectedBucket, AtomicInteger> rejected = new ConcurrentHashMap<>();
         private final Map<Long, ApiKeyUsage> store = new ConcurrentHashMap<>();
+
+        @Override
+        public void countRejected(long apiKeyId, LocalDateTime at, String endpoint) {
+            LocalDateTime second = at.truncatedTo(ChronoUnit.SECONDS);
+            AtomicInteger counter = rejected.computeIfAbsent(new RejectedBucket(apiKeyId, second, endpoint), b -> new AtomicInteger());
+            if (counter.incrementAndGet() == 1) {   // a new bucket: a cheap moment to drop expired ones
+                LocalDateTime cutoff = second.minus(REJECTED_RETENTION);
+                rejected.keySet().removeIf(b -> b.second().isBefore(cutoff));
+            }
+        }
+
+        @Override
+        public Map<String, Integer> rejectedByEndpoint(long apiKeyId, LocalDateTime from, LocalDateTime to) {
+            Map<String, Integer> out = new HashMap<>();
+            LocalDateTime start = from.truncatedTo(ChronoUnit.SECONDS);
+            rejected.forEach((b, n) -> {
+                if (b.apiKeyId() == apiKeyId && !b.second().isBefore(start) && !b.second().isAfter(to)) {
+                    out.merge(b.endpoint(), n.get(), Integer::sum);
+                }
+            });
+            return out;
+        }
         private final AtomicLong idGen = new AtomicLong(1);
 
         @Override
@@ -336,9 +374,8 @@ public class ApiKeysServiceAccounts {
                 if (!rateLimiter.allow(String.valueOf(key.id), key.rateLimit)) {
                     // Rejected calls are counted per key, second and endpoint, not stored one by one: a flood of them
                     // would otherwise fill memory while being refused (2026-11-08, session f3daac6e, from review).
-                    rejectedCalls.computeIfAbsent(new RejectedBucket(key.id,
-                            LocalDateTime.now().truncatedTo(ChronoUnit.SECONDS), method + " " + endpoint),
-                            b -> new AtomicInteger()).incrementAndGet();
+                    // Counted by the usage repository, so every service sharing it sees the same numbers.
+                    usageRepo.countRejected(key.id, LocalDateTime.now(), method + " " + endpoint);
                     throw new IllegalStateException("Rate limit exceeded");
                 }
                 // Log usage
@@ -355,11 +392,6 @@ public class ApiKeysServiceAccounts {
         }
 
         /* Get usage stats */
-        /** Rejected calls in one second for one endpoint of one key; see rejectedCalls. Per second keeps a stats
-         *  time range exact to the second while a flood still costs one counter a second (2026-11-08, session f3daac6e, from review of PR 17). */
-        record RejectedBucket(long apiKeyId, LocalDateTime second, String endpoint) {}
-
-        private final ConcurrentHashMap<RejectedBucket, AtomicInteger> rejectedCalls = new ConcurrentHashMap<>();
         private final ConcurrentHashMap<Long, Object> keyLocks = new ConcurrentHashMap<>();
 
         public Map<String, Object> getUsageStats(long apiKeyId,
@@ -370,15 +402,11 @@ public class ApiKeysServiceAccounts {
             Map<String, Integer> byEndpoint = new HashMap<>();
             Map<Integer, Integer> errors = new HashMap<>();
             int rateLimitHits = 0;
-            for (Map.Entry<RejectedBucket, AtomicInteger> e : rejectedCalls.entrySet()) {
-                RejectedBucket b = e.getKey();
-                if (b.apiKeyId() != apiKeyId || b.second().isBefore(from.truncatedTo(ChronoUnit.SECONDS)) || b.second().isAfter(to)) {
-                    continue;
-                }
-                int n = e.getValue().get();
+            for (Map.Entry<String, Integer> e : usageRepo.rejectedByEndpoint(apiKeyId, from, to).entrySet()) {
+                int n = e.getValue();
                 total += n;
                 rateLimitHits += n;
-                byEndpoint.merge(b.endpoint(), n, Integer::sum);
+                byEndpoint.merge(e.getKey(), n, Integer::sum);
                 errors.merge(429, n, Integer::sum);
             }
             for (ApiKeyUsage u : usages) {
