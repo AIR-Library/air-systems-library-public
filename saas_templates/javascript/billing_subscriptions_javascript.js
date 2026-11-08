@@ -170,7 +170,9 @@ function createBillingSystem({ stripeSecretKey, webhookSecret, db }) {
         return { error: "invoice_not_succeeded", message: `Invoice ${invoice_id} is not succeeded` };
       }
       // Number() reads the whole value: parseFloat('1_000') is 1, so the check passed while '1_000' was stored (2026-11-08, session f3daac6e, from review).
-      const refundAmount = Number(amount);
+      // A whole number of cents: '50', '50.5' or '50.00'. Anything else, such as '0.001' or '1_000', is refused.
+      const amountText = String(amount).trim();
+      const refundAmount = /^\d+(\.\d{1,2})?$/.test(amountText) ? Number(amountText) : NaN;
       if (!Number.isFinite(refundAmount) || refundAmount <= 0) {
         return { error: "invalid_amount", message: `Refund amount ${amount} is not a positive number` };
       }
