@@ -83,6 +83,18 @@ func (idx *Index) IndexDocument(doc Document) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	doc.IndexedAt = time.Now()
+	// Re-indexing a document first removes the words of its old content, or searches would still find it by them
+	// (2026-11-08, session f3daac6e, from review).
+	if old, ok := idx.docs[doc.DocumentID]; ok {
+		for _, t := range tokenize(old.Content) {
+			if ids, ok := idx.inverted[t]; ok {
+				delete(ids, doc.DocumentID)
+				if len(ids) == 0 {
+					delete(idx.inverted, t)
+				}
+			}
+		}
+	}
 	idx.docs[doc.DocumentID] = doc
 	tokens := tokenize(doc.Content)
 	for _, t := range tokens {
