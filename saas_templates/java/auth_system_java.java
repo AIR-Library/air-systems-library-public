@@ -95,8 +95,14 @@ public class AuthSystem {
     }
 
     private static boolean isRateLimited(ConcurrentHashMap<String, List<Instant>> map, String key, int max, Duration window) {
-        List<Instant> list = map.getOrDefault(key, List.of());
-        return list.size() >= max;
+        // Only attempts inside the window count. Pruning here as well matters: a blocked caller never records the attempt
+        // that used to prune the list, so the block lasted forever (2026-11-08, session f3daac6e, from review of PR 17).
+        Instant cutoff = Instant.now().minus(window);
+        List<Instant> list = map.computeIfPresent(key, (k, v) -> {
+            v.removeIf(t -> t.isBefore(cutoff));
+            return v;
+        });
+        return list != null && list.size() >= max;
     }
 
     /* ---------- TOTP Implementation (RFC 6238) ---------- */
