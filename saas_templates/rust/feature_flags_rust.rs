@@ -82,7 +82,7 @@ struct Condition {
 
 #[derive(Debug, Clone, Deserialize)]
 struct Rollout {
-    percentage: u8,
+    percentage: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -337,8 +337,12 @@ impl<S: FeatureFlagStore> FeatureFlagClient<S> {
                         Some(tk) => tk.clone(),
                         None => continue,
                     };
+                    // A share outside 0 to 100 is a configuration error, never "everyone" (from review).
+                    if !(0.0..=100.0).contains(&rollout.percentage) {
+                        continue;
+                    }
                     let bucket = self.compute_bucket(key, &targeting_key);
-                    bucket < rollout.percentage
+                    f64::from(bucket) < rollout.percentage
                 }
                 None => true,
             };
@@ -413,7 +417,8 @@ impl<S: FeatureFlagStore> FeatureFlagClient<S> {
         let attr_value = self.lookup_attribute(&condition.attribute, context);
         match &condition.operator {
             Operator::Equals => attr_value.as_ref() == Some(&condition.value),
-            Operator::NotEquals => attr_value.as_ref() != Some(&condition.value),
+            // An absent attribute matches neither equals nor not_equals, as in the other languages (from review).
+            Operator::NotEquals => attr_value.as_ref().map_or(false, |v| v != &condition.value),
             Operator::InList => {
                 if let Value::Array(list) = &condition.value {
                     attr_value
