@@ -181,7 +181,7 @@ function createBillingSystem({ stripeSecretKey, webhookSecret, db }) {
       const now = new Date().toISOString();
       const refund = await db.createRefund({
         invoice_id,
-        amount: String(refundAmount),
+        amount: refundAmount.toFixed(2),   // money keeps two decimals: '50.00'
         status: 'queued',
         reason,
         created_by: 'system', // In real implementation, this would come from auth context
