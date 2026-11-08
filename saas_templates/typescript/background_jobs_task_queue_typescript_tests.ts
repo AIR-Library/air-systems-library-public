@@ -274,7 +274,7 @@ describe('Background Job Manager', () => {
       
       const mockNewJob = {
         ...mockJob,
-        id: 'test-uuid-123',
+        id: 'test-uuid-456',
         status: JobStatus.ENQUEUED,
         retry_count: 0,
         next_retry_at: null
@@ -284,14 +284,16 @@ describe('Background Job Manager', () => {
         .mockResolvedValueOnce({ rows: [mockJob] })
         .mockResolvedValueOnce({ rows: [mockNewJob] });
       
+      // The replacement job gets its own id; it must never reuse the failed job's (from review).
+      require('uuid').v4.mockReturnValueOnce('test-uuid-456');
       const result = await jobManager.retryJob('test-uuid-123');
       
       expect(result).toEqual({
         success: true,
-        new_job_id: 'test-uuid-123',
+        new_job_id: 'test-uuid-456',
         status: JobStatus.ENQUEUED
       });
-      expect(mockRedis.lpush).toHaveBeenCalledWith('job:queue', 'test-uuid-123');
+      expect(mockRedis.lpush).toHaveBeenCalledWith('job:queue', 'test-uuid-456');
     });
     
     it('should not retry a non-failed job', async () => {
@@ -414,14 +416,14 @@ describe('Background Job Manager', () => {
           .mockResolvedValueOnce({ rows: [mockJobRun] })
           .mockResolvedValueOnce({ rows: [] })
           .mockResolvedValueOnce({ rows: [] })
-          .mockResolvedValueOnce(mockCount)
-          .mockResolvedValueOnce({ rows: mockBatch })
           .mockResolvedValueOnce({ rows: [] })
           .mockResolvedValueOnce({ rows: [] }),
         release: jest.fn(),
       };
       
       mockDb.connect.mockResolvedValue(mockClient as any);
+      // The task itself reads through db.query, not the transaction's client (from review).
+      mockDb.query.mockResolvedValueOnce(mockCount).mockResolvedValueOnce(mockBatch).mockResolvedValue({ rows: [] });
       
       await jobManager.processJob('test-uuid-123');
       
@@ -539,7 +541,7 @@ describe('Background Job Manager', () => {
       
       mockDb.query
         .mockResolvedValueOnce(mockCount)
-        .mockResolvedValueOnce({ rows: mockBatch })
+        .mockResolvedValueOnce(mockBatch)
         .mockResolvedValueOnce({ rows: [] })
         .mockResolvedValueOnce({ rows: [] });
       
@@ -620,9 +622,11 @@ describe('Background Job Manager', () => {
         user_id: 'user-123'
       };
       
+      // exportGenerate stores the export row before it counts the records (from review).
       mockDb.query
+        .mockResolvedValueOnce({ rows: [] })
         .mockResolvedValueOnce(mockCount)
-        .mockResolvedValueOnce({ rows: mockBatch })
+        .mockResolvedValueOnce(mockBatch)
         .mockResolvedValueOnce({ rows: [] })
         .mockResolvedValueOnce({ rows: [mockExport] });
       
