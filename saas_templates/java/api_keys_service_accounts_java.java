@@ -167,13 +167,17 @@ public class ApiKeysServiceAccounts {
         private record RejectedBucket(long apiKeyId, LocalDateTime second, String endpoint) {}
 
         private final ConcurrentHashMap<RejectedBucket, AtomicInteger> rejected = new ConcurrentHashMap<>();
+        private volatile long lastPrune;   // epoch second of the last cleanup
         private final Map<Long, ApiKeyUsage> store = new ConcurrentHashMap<>();
 
         @Override
         public void countRejected(long apiKeyId, LocalDateTime at, String endpoint) {
             LocalDateTime second = at.truncatedTo(ChronoUnit.SECONDS);
             AtomicInteger counter = rejected.computeIfAbsent(new RejectedBucket(apiKeyId, second, endpoint), b -> new AtomicInteger());
-            if (counter.incrementAndGet() == 1) {   // a new bucket: a cheap moment to drop expired ones
+            long nowSecond = second.toEpochSecond(java.time.ZoneOffset.UTC);
+            if (counter.incrementAndGet() == 1 && nowSecond - lastPrune >= 60) {
+                // At most once a minute: a scan per new counter would make a flood quadratic (review of PR 17).
+                lastPrune = nowSecond;
                 LocalDateTime cutoff = second.minus(REJECTED_RETENTION);
                 rejected.keySet().removeIf(b -> b.second().isBefore(cutoff));
             }
