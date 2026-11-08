@@ -70,7 +70,7 @@ def test_signup_ip_rate_limit(auth_system):
 
 def test_verify_email_happy_path(auth_system):
     # First signup
-    signup_result = auth_system.signup('test@example.com', 'a' * 16, 'Test User', '127.0.0.1')
+    auth_system.signup('test@example.com', 'a' * 16, 'Test User', '127.0.0.1')
     user_id = None
     cursor = auth_system.db.cursor()
     cursor.execute("SELECT id FROM users WHERE email = 'test@example.com'")
@@ -226,7 +226,7 @@ def test_oauth_callback_existing_user(auth_system):
     code = cursor.fetchone()['code']
     auth_system.verify_email('existing@example.com', code)
     # Now OAuth with the same e-mail, as the provider reports it
-    auth_system.oauth_profile = lambda provider, code: {'email': 'existing@example.com'}
+    auth_system.oauth_profile = lambda provider, code: {'id': 'gh-42', 'email': 'existing@example.com', 'email_verified': True}
     result = auth_system.oauth_callback('github', 'auth_code', 'state')
     assert result['status'] == 'authenticated'
     assert result['user']['id'] == user_id
@@ -309,4 +309,10 @@ def test_token_refresh_happy_path(auth_system):
     auth_system.signup('test@example.com', 'a' * 16, 'Test User', '127.0.0.1')
     cursor = auth_system.db.cursor()
     cursor.execute("SELECT id FROM users WHERE email = 'test@example.com'")
-    user_id = cursor.fetchone()
+    cursor.fetchone()
+
+
+def test_oauth_callback_refuses_an_unverified_email(auth_system):
+    """The provider must vouch for the address before it can sign anyone in. 2026-11-08, from review."""
+    auth_system.oauth_profile = lambda provider, code: {'id': 'gh-7', 'email': 'someone@example.com', 'email_verified': False}
+    assert auth_system.oauth_callback('github', 'auth_code', 'state') == {'error': 'email_not_verified'}
