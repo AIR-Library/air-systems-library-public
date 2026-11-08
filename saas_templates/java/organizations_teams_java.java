@@ -16,30 +16,32 @@ public class OrganizationsTeams {
     }
 
     public static void initSchema(Connection db) throws SQLException {
-        db.createStatement().execute(
-            "CREATE TABLE IF NOT EXISTS users (" +
-            "id BIGINT AUTO_INCREMENT PRIMARY KEY, email VARCHAR(255) UNIQUE NOT NULL)"
-        );
-        db.createStatement().execute(
-            "CREATE TABLE IF NOT EXISTS organizations (" +
-            "id BIGINT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, " +
-            "slug VARCHAR(255) UNIQUE NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
-        );
-        db.createStatement().execute(
-            "CREATE TABLE IF NOT EXISTS memberships (" +
-            "org_id BIGINT NOT NULL, user_id BIGINT NOT NULL, " +
-            "role ENUM('owner','admin','member') NOT NULL, " +
-            "created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, " +
-            "PRIMARY KEY (org_id, user_id))"
-        );
-        db.createStatement().execute(
-            "CREATE TABLE IF NOT EXISTS invitations (" +
-            "id BIGINT AUTO_INCREMENT PRIMARY KEY, org_id BIGINT NOT NULL, " +
-            "email VARCHAR(255) NOT NULL, role ENUM('owner','admin','member') NOT NULL, " +
-            "token_hash VARCHAR(64) NOT NULL UNIQUE, " +
-            "expires_at TIMESTAMP NOT NULL, accepted_at TIMESTAMP NULL, " +
-            "invited_by BIGINT NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
-        );
+        try (Statement s = db.createStatement()) {   // closed on every path (code scanning, 2026-11-08, session f3daac6e, from review)
+            s.execute(
+                "CREATE TABLE IF NOT EXISTS users (" +
+                "id BIGINT AUTO_INCREMENT PRIMARY KEY, email VARCHAR(255) UNIQUE NOT NULL)"
+            );
+            s.execute(
+                "CREATE TABLE IF NOT EXISTS organizations (" +
+                "id BIGINT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, " +
+                "slug VARCHAR(255) UNIQUE NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+            );
+            s.execute(
+                "CREATE TABLE IF NOT EXISTS memberships (" +
+                "org_id BIGINT NOT NULL, user_id BIGINT NOT NULL, " +
+                "role ENUM('owner','admin','member') NOT NULL, " +
+                "created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, " +
+                "PRIMARY KEY (org_id, user_id))"
+            );
+            s.execute(
+                "CREATE TABLE IF NOT EXISTS invitations (" +
+                "id BIGINT AUTO_INCREMENT PRIMARY KEY, org_id BIGINT NOT NULL, " +
+                "email VARCHAR(255) NOT NULL, role ENUM('owner','admin','member') NOT NULL, " +
+                "token_hash VARCHAR(64) NOT NULL UNIQUE, " +
+                "expires_at TIMESTAMP NOT NULL, accepted_at TIMESTAMP NULL, " +
+                "invited_by BIGINT NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+            );
+        }
     }
 
     private String hashToken(String rawToken) throws NoSuchAlgorithmException {
