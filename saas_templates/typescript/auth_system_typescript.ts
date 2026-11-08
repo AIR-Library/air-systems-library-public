@@ -8,6 +8,7 @@ const ddl = `
 CREATE TABLE IF NOT EXISTS users (
   id SERIAL PRIMARY KEY,
   email VARCHAR(255) UNIQUE NOT NULL,
+  name VARCHAR(255),
   password_hash VARCHAR(255),
   tier VARCHAR(50) DEFAULT 'free',
   status VARCHAR(20) DEFAULT 'unverified',
@@ -386,10 +387,16 @@ class AuthSystem {
         return { error: 'invalid_code' };
       }
 
-      await this.db.execute(
+      // Use the challenge up. Only the call that deletes it may sign in, so two at once cannot both get a session
+      // (2026-11-08, session f3daac6e, from review).
+      const consumed = await this.db.execute(
         'DELETE FROM verification_codes WHERE code = $1',
         [challenge_id]
       );
+      if (consumed.affectedRows !== 1) {
+        await this.logWhyChain('mfa_challenge', ['challenge_valid', 'code_correct']);
+        return { error: 'invalid_code' };
+      }
       const sessionId = randomBytes(16).toString('hex');
       const refreshToken = this.generateRefreshToken();
       const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
