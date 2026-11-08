@@ -169,14 +169,19 @@ function createBillingSystem({ stripeSecretKey, webhookSecret, db }) {
       if (invoice.status !== 'succeeded') {
         return { error: "invoice_not_succeeded", message: `Invoice ${invoice_id} is not succeeded` };
       }
-      if (parseFloat(amount) > parseFloat(invoice.amount)) {
+      // Number() reads the whole value: parseFloat('1_000') is 1, so the check passed while '1_000' was stored (2026-11-08, session f3daac6e, from review).
+      const refundAmount = Number(amount);
+      if (!Number.isFinite(refundAmount) || refundAmount <= 0) {
+        return { error: "invalid_amount", message: `Refund amount ${amount} is not a positive number` };
+      }
+      if (refundAmount > Number(invoice.amount)) {
         return { error: "refund_exceeds_invoice", message: `Refund amount ${amount} exceeds invoice amount ${invoice.amount}` };
       }
 
       const now = new Date().toISOString();
       const refund = await db.createRefund({
         invoice_id,
-        amount: amount.toString(),
+        amount: String(refundAmount),
         status: 'queued',
         reason,
         created_by: 'system', // In real implementation, this would come from auth context
