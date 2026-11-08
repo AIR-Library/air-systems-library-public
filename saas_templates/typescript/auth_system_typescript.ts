@@ -47,8 +47,11 @@ CREATE TABLE IF NOT EXISTS verification_codes (
   code VARCHAR(255) NOT NULL,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
-  type VARCHAR(10) CHECK (type IN ('email', 'mfa')) NOT NULL
+  type VARCHAR(10) CHECK (type IN ('email', 'mfa')) NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0
 );
+-- Tables made before 2026-11-08 lack the MFA attempt count.
+ALTER TABLE verification_codes ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0;
 `;
 
 interface Db {
@@ -382,6 +385,10 @@ class AuthSystem {
 
       const isValid = this.verifyTotp(user[0].mfa_secret, code);
       if (!isValid) {
+        // Each wrong code counts; after five the challenge is gone and the user signs in again, so a six digit code
+        // cannot be guessed (2026-11-08, session f3daac6e, from review of PR 17).
+        await this.db.execute('UPDATE verification_codes SET attempts = attempts + 1 WHERE code = $1', [challenge_id]);
+        await this.db.execute('DELETE FROM verification_codes WHERE code = $1 AND attempts >= $2', [challenge_id, 5]);
         await this.logWhyChain('mfa_challenge', ['challenge_valid', 'code_correct']);
         await this.logAudit('mfa_failed', challenge[0].user_id);
         return { error: 'invalid_code' };
