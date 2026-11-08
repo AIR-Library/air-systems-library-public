@@ -27,24 +27,24 @@ CI even for a suite on that list.
 | system | csharp | go | java | javascript | php | python | rust | typescript |
 |---|---|---|---|---|---|---|---|---|
 | admin_system | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ |
-| api_keys_service_accounts | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ |
-| audit_logging | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ |
-| auth_system | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ✅ |
-| background_jobs_task_queue | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| billing_subscriptions | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ |
+| api_keys_service_accounts | ❌ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
+| audit_logging | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ❌ |
+| auth_system | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
+| background_jobs_task_queue | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| billing_subscriptions | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ |
 | data_export_compliance | ❌ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ |
-| feature_flags | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
+| feature_flags | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ |
 | file_uploads | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ✅ |
-| full_text_search_indexing | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| full_text_search_indexing | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ |
 | health_checks | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
 | idempotency_keys | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
 | notifications | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ |
 | organizations_teams | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
-| permissions_rbac | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ |
-| quotas_rate_limiting | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ |
-| trial_abuse_prevention | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ |
-| webhooks | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
-| **passing** | **7/18** | **7/18** | **6/18** | **6/18** | **13/18** | **12/18** | **0/18** | **10/18** |
+| permissions_rbac | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
+| quotas_rate_limiting | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+| trial_abuse_prevention | ❌ | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ |
+| webhooks | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
+| **passing** | **7/18** | **12/18** | **10/18** | **11/18** | **13/18** | **13/18** | **3/18** | **10/18** |
 
 CI's per-suite table (in each job's summary) is the live version of this; this table is refreshed by
 hand and can lag. Some failures depend on the toolchain version: the Python suites were written
