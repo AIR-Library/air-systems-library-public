@@ -193,7 +193,7 @@ function createBillingSystem({ stripeSecretKey, webhookSecret, db }) {
       await db.createAuditLog({
         action: "refund_queued",
         invoice_id,
-        amount: amount.toString(),
+        amount: refundAmount.toFixed(2),
         reason,
         created_at: now
       });
@@ -202,7 +202,7 @@ function createBillingSystem({ stripeSecretKey, webhookSecret, db }) {
         success: true,
         refund_id: refund.id,
         status: "queued",
-        amount: amount.toString(),
+        amount: refundAmount.toFixed(2),
         reason
       };
     } catch (error) {
