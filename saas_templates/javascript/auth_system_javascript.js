@@ -7,7 +7,9 @@ const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
 
 const DB_PATH = ':memory:';
-const JWT_SECRET = 'supersecretkey';
+// The signing key comes from the deployment's own configuration. A key written in public code lets anyone mint tokens.
+// Without one, each start makes a random key, so tokens only last until a restart (2026-11-08, session f3daac6e, from review).
+const JWT_SECRET = process.env.JWT_SECRET || require('crypto').randomBytes(32).toString('hex');
 const ACCESS_TOKEN_EXPIRES = '15m';
 const REFRESH_TOKEN_EXPIRES_DAYS = 30;
 const SERVICE_NAME = 'auth_system';

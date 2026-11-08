@@ -1,4 +1,4 @@
-const { initDB, signup, verify_email, login, oauth_callback, mfa_challenge, token_refresh, verify_access_token, dbPromise, rateLimits, resetRateLimits } = require('./auth_system_javascript');
+const { initDB, signup, verify_email, login, oauth_callback, mfa_challenge, token_refresh, dbPromise, resetRateLimits } = require('./auth_system_javascript');
 const { expect } = require('@jest/globals');
 const speakeasy = require('speakeasy');
 
