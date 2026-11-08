@@ -115,6 +115,11 @@ const adminLimiter = rateLimit({
   standardHeaders: 'draft-7',
   legacyHeaders: false,
 });
+// Behind a reverse proxy, req.ip is the proxy's address unless Express is told how many proxies to trust, and then every
+// client shares one limit. Set TRUST_PROXY to the number of proxies in front of the app, for example 1 (2026-11-08, session f3daac6e, from review).
+if (process.env.TRUST_PROXY) {
+  app.set('trust proxy', Number(process.env.TRUST_PROXY) || process.env.TRUST_PROXY);
+}
 app.use(adminLimiter);
 app.use(bodyParser.json());
 app.use(cookieParser());
