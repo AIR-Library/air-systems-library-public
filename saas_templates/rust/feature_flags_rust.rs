@@ -418,7 +418,9 @@ impl<S: FeatureFlagStore> FeatureFlagClient<S> {
         match &condition.operator {
             Operator::Equals => attr_value.as_ref() == Some(&condition.value),
             // An absent attribute matches neither equals nor not_equals, as in the other languages (from review).
-            Operator::NotEquals => attr_value.as_ref().map_or(false, |v| v != &condition.value),
+            Operator::NotEquals => attr_value.as_ref().map_or(false, |v| {
+                !(v.is_null() || v.is_array() || v.is_object()) && v != &condition.value
+            }),
             Operator::InList => {
                 if let Value::Array(list) = &condition.value {
                     attr_value
