@@ -15,6 +15,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HexFormat;
@@ -153,7 +154,8 @@ public class DataExportCompliance {
          *  preferences, transactions and audit_trail. The profile must carry "email". */
         Map<String, Object> export(UUID userId) throws Exception;
 
-        /** Erases the user from every table except the audit log, which the law requires to be kept. */
+        /** Erases the user from every table except the audit log, which the law requires to be kept. It must be
+         *  safe to run twice: a worker that stalls past CLAIM_LEASE can overlap the one that takes over. */
         void eraseAll(UUID userId) throws Exception;
     }
 
@@ -226,6 +228,8 @@ public class DataExportCompliance {
                         erase_started_at TIMESTAMP WITH TIME ZONE,
                         deleted_at TIMESTAMP WITH TIME ZONE
                     )""");
+            // Tables made before 2026-11-08 lack the erase claim (2026-11-08, session f3daac6e, from review of PR 17).
+            s.execute("ALTER TABLE deletion_requests ADD COLUMN IF NOT EXISTS erase_started_at TIMESTAMP WITH TIME ZONE");
         } catch (SQLException e) {
             throw new ComplianceException("storage_error", e);
         }
@@ -264,7 +268,8 @@ public class DataExportCompliance {
      * @param exportId the export to build
      */
     public void processExport(UUID exportId) {
-        Instant now = clock.instant();
+        // The claim time is also this worker's fence: its final writes only land while the claim is still its own.
+        Instant now = clock.instant().truncatedTo(ChronoUnit.MILLIS);
         int claimed = update("UPDATE export_requests SET claimed_at = ? WHERE id = ? AND status = ?"
                         + " AND (claimed_at IS NULL OR claimed_at < ?)",
                 now, exportId, ExportStatus.PENDING.value(), now.minus(CLAIM_LEASE));
@@ -284,11 +289,17 @@ public class DataExportCompliance {
             url = services.store().signedDownloadUrl(key, DOWNLOAD_LINK_TTL);
             Instant done = clock.instant();
             expiresAt = done.plus(DOWNLOAD_LINK_TTL);
-            update("UPDATE export_requests SET status = ?, file_url = ?, completed_at = ?, expires_at = ? WHERE id = ?",
-                    ExportStatus.COMPLETED.value(), url, done, expiresAt, exportId);
+            int finished = update("UPDATE export_requests SET status = ?, file_url = ?, completed_at = ?, expires_at = ?"
+                            + " WHERE id = ? AND claimed_at = ?",
+                    ExportStatus.COMPLETED.value(), url, done, expiresAt, exportId, now);
+            if (finished == 0) {
+                return;   // another worker took the export over after the lease; it reports the result
+            }
         } catch (Exception e) {
-            update("UPDATE export_requests SET status = ?, completed_at = ? WHERE id = ?",
-                    ExportStatus.FAILED.value(), clock.instant(), exportId);
+            if (update("UPDATE export_requests SET status = ?, completed_at = ? WHERE id = ? AND claimed_at = ?",
+                    ExportStatus.FAILED.value(), clock.instant(), exportId, now) == 0) {
+                return;
+            }
             services.audit().record("data_export_failed", export.userId(),
                     Map.of("export_id", exportId.toString(), "error", e.getClass().getSimpleName()));
             return;
@@ -457,7 +468,7 @@ public class DataExportCompliance {
         int erased = 0;
         for (DeletionView deletion : due) {
             Map<String, String> details = Map.of("deletion_id", deletion.deletionId().toString());
-            Instant claimedAt = clock.instant();
+            Instant claimedAt = clock.instant().truncatedTo(ChronoUnit.MILLIS);
             int claimed = update("UPDATE deletion_requests SET erase_started_at = ? WHERE id = ? AND status = ?"
                             + " AND (erase_started_at IS NULL OR erase_started_at < ?)",
                     claimedAt, deletion.deletionId(), DeletionStatus.APPROVED.value(), claimedAt.minus(CLAIM_LEASE));
@@ -471,8 +482,10 @@ public class DataExportCompliance {
                         Map.of("deletion_id", deletion.deletionId().toString(), "error", e.getClass().getSimpleName()));
                 continue;
             }
-            update("UPDATE deletion_requests SET status = ?, deleted_at = ? WHERE id = ?",
-                    DeletionStatus.COMPLETED.value(), clock.instant(), deletion.deletionId());
+            if (update("UPDATE deletion_requests SET status = ?, deleted_at = ? WHERE id = ? AND erase_started_at = ?",
+                    DeletionStatus.COMPLETED.value(), clock.instant(), deletion.deletionId(), claimedAt) == 0) {
+                continue;   // another worker took this erase over after the lease; it reports the result
+            }
             services.audit().record("deletion_completed", deletion.userId(), details);
             erased++;
         }
