@@ -3,6 +3,8 @@ package auditlogging
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -58,7 +60,7 @@ func TestAuditLogger_HappyPath(t *testing.T) {
 	if resp.Logs[0].Action != "subscription_changed" {
 		t.Errorf("action mismatch: got %s", resp.Logs[0].Action)
 	}
-	if !resp.Logs[0].ActorID.Valid() || *resp.Logs[0].ActorID != "123" {
+	if resp.Logs[0].ActorID == nil || *resp.Logs[0].ActorID != "123" {
 		t.Errorf("actor_id mismatch: got %v", resp.Logs[0].ActorID)
 	}
 }
@@ -157,28 +159,28 @@ func TestAuditLogger_Filtering(t *testing.T) {
 		wantAction string
 	}{
 		{
-			name: "filter by actor_id",
-			req:  QueryLogsRequest{ActorID: strPtr("1"), Limit: 10},
+			name:      "filter by actor_id",
+			req:       QueryLogsRequest{ActorID: strPtr("1"), Limit: 10},
 			wantCount: 3,
 		},
 		{
-			name: "filter by action wildcard user_*",
-			req:  QueryLogsRequest{Action: strPtr("user_*"), Limit: 10},
+			name:      "filter by action wildcard user_*",
+			req:       QueryLogsRequest{Action: strPtr("user_*"), Limit: 10},
 			wantCount: 3,
 		},
 		{
-			name: "filter by resource_type",
-			req:  QueryLogsRequest{ResourceType: strPtr("user"), Limit: 10},
+			name:      "filter by resource_type",
+			req:       QueryLogsRequest{ResourceType: strPtr("user"), Limit: 10},
 			wantCount: 3,
 		},
 		{
-			name: "combined actor_id + action + resource_type",
-			req:  QueryLogsRequest{ActorID: strPtr("1"), Action: strPtr("user_*"), ResourceType: strPtr("user"), Limit: 10},
+			name:      "combined actor_id + action + resource_type",
+			req:       QueryLogsRequest{ActorID: strPtr("1"), Action: strPtr("user_*"), ResourceType: strPtr("user"), Limit: 10},
 			wantCount: 2,
 		},
 		{
-			name: "actor_id=2 only",
-			req:  QueryLogsRequest{ActorID: strPtr("2"), Limit: 10},
+			name:      "actor_id=2 only",
+			req:       QueryLogsRequest{ActorID: strPtr("2"), Limit: 10},
 			wantCount: 1,
 		},
 	}
@@ -432,9 +434,9 @@ func TestAuditLogger_Search(t *testing.T) {
 	}
 
 	searchTests := []struct {
-		name       string
-		req        SearchRequest
-		wantCount  int
+		name      string
+		req       SearchRequest
+		wantCount int
 	}{
 		{"search email", SearchRequest{Query: "alice", Limit: 10}, 1},
 		{"search wildcard", SearchRequest{Query: "exam*", Limit: 10}, 2},
@@ -503,6 +505,30 @@ func strPtr(s string) *string {
 	return &s
 }
 
-func (s *string) Valid() bool {
-	return s != nil
+// A literal _ in a wildcard filter matches only "_": "user_*" must not match "userXcreated".
+func TestAuditLogger_ActionWildcardUnderscoreIsLiteral(t *testing.T) {
+	logger, err := NewAuditLogger(":memory:")
+	if err != nil {
+		t.Fatalf("NewAuditLogger failed: %v", err)
+	}
+	defer logger.Close()
+	ctx := context.Background()
+
+	for _, action := range []string{"user_created", "userXcreated"} {
+		_, err := logger.LogMutation(ctx, LogMutationRequest{
+			ActorID: strPtr("1"), ActorType: "user", Action: action,
+			ResourceType: "user", ResourceID: "u1", NewValue: json.RawMessage(`{}`),
+		})
+		if err != nil {
+			t.Fatalf("LogMutation %s failed: %v", action, err)
+		}
+	}
+
+	resp, err := logger.QueryLogs(ctx, QueryLogsRequest{Action: strPtr("user_*"), Limit: 10})
+	if err != nil {
+		t.Fatalf("QueryLogs failed: %v", err)
+	}
+	if resp.Total != 1 || len(resp.Logs) != 1 || resp.Logs[0].Action != "user_created" {
+		t.Errorf("user_* matched %d logs, want only user_created", resp.Total)
+	}
 }
