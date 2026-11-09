@@ -17,7 +17,7 @@ public class AuditLoggingTests : IDisposable
     {
         _connection = new SqliteConnection("DataSource=:memory:");
         _connection.Open();
-        _repo = new AuditLogRepository(_connection.ConnectionString);
+        _repo = new AuditLogRepository(_connection);
     }
 
     public void Dispose()
@@ -35,8 +35,8 @@ public class AuditLoggingTests : IDisposable
             Action = action,
             ResourceType = resourceType,
             ResourceId = resourceId,
-            OldValue = JsonDocument.Parse("{\"tier\":\"team\"}").RootElement,
-            NewValue = JsonDocument.Parse("{\"tier\":\"enterprise\"}").RootElement,
+            OldValue = JsonSerializer.Deserialize<JsonElement>("{\"tier\":\"team\"}"),
+            NewValue = JsonSerializer.Deserialize<JsonElement>("{\"tier\":\"enterprise\"}"),
             WhyChainId = "wc_789"
         };
         return await _repo.LogMutationAsync(entry);
@@ -64,7 +64,7 @@ public class AuditLoggingTests : IDisposable
         var replay = await _repo.ReplayAsync(firstLogId);
         Assert.Equal(firstLogId, replay.LogId);
         Assert.True(replay.HasDiverged);
-        Assert.Equal("{\"tier\":\"team\"}", replay.ResourceStateAtTime.GetRawText());
+        Assert.Equal("{\"tier\":\"team\"}", replay.ResourceStateAtTime.Value.GetRawText());
     }
 
     [Fact]
@@ -101,7 +101,7 @@ public class AuditLoggingTests : IDisposable
         {
             var cmd = _connection.CreateCommand();
             cmd.CommandText = "UPDATE audit_log SET action = 'hacked' WHERE id = @id;";
-            cmd.Parameters.AddWithValue("@id", logId);
+            cmd.Parameters.Add(new SqliteParameter("@id", logId));
             await cmd.ExecuteNonQueryAsync();
         });
         Assert.Contains("cannot", ex.Message, StringComparison.OrdinalIgnoreCase);

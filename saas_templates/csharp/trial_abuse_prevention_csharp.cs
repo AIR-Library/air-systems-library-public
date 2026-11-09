@@ -19,20 +19,20 @@ namespace TrialAbusePrevention
 
     public class TrialAbusePreventionService
     {
-        private readonly TrialAbusePreventionDbContext _dbContext;
+        private readonly TrialAbusePreventionDbContext _context;
         private readonly ILogger<TrialAbusePreventionService> _logger;
         private const int TrialDays = 14; // Example trial duration, should be configurable
 
-        public TrialAbusePreventionService(TrialAbusePreventionDbContext dbContext, ILogger<TrialAbusePreventionService> logger)
+        public TrialAbusePreventionService(TrialAbusePreventionDbContext context, ILogger<TrialAbusePreventionService> logger)
         {
-            _dbContext = dbContext;
+            _context = context;
             _logger = logger;
         }
 
         public async Task<GateCheckResult> CheckEmailTrialHistory(string email)
         {
-            var priorCount = await _dbContext.TrialAbuseLedgers
-                .CountAsync(l => l.Email == email && 
+            var priorCount = await _context.TrialAbuseLedgers
+                .CountAsync(l => l.Email == email &&
                                  (l.SubscriptionStatus == "completed" || l.SubscriptionStatus == "chargebacked"));
 
             GateDecision decision;
@@ -46,17 +46,13 @@ namespace TrialAbusePrevention
             _logger.LogInformation("Gate check: email_trial_history, prior_count={PriorCount}, decision={Decision}",
                 priorCount, decision);
 
-            return new GateCheckResult
-            {
-                Decision = decision,
-                Reason = reason
-            };
+            return new GateCheckResult { Decision = decision, Reason = reason };
         }
 
         public async Task<GateCheckResult> CheckPaymentMethodHistory(string stripePaymentMethodId)
         {
-            var priorCount = await _dbContext.TrialAbuseLedgers
-                .CountAsync(l => l.StripePaymentMethodId == stripePaymentMethodId && 
+            var priorCount = await _context.TrialAbuseLedgers
+                .CountAsync(l => l.StripePaymentMethodId == stripePaymentMethodId &&
                                  (l.SubscriptionStatus == "completed" || l.SubscriptionStatus == "chargebacked"));
 
             GateDecision decision;
@@ -65,20 +61,16 @@ namespace TrialAbusePrevention
             else decision = GateDecision.Fail;
 
             var reason = $"Payment method {stripePaymentMethodId} used in {priorCount} prior trial(s)";
-            _logger.LogInformation("Gate check: payment_method_history, payment_id={PaymentId}, prior_count={PriorCount}, decision={Decision}", 
+            _logger.LogInformation("Gate check: payment_method_history, payment_id={PaymentId}, prior_count={PriorCount}, decision={Decision}",
                 stripePaymentMethodId, priorCount, decision);
 
-            return new GateCheckResult
-            {
-                Decision = decision,
-                Reason = reason
-            };
+            return new GateCheckResult { Decision = decision, Reason = reason };
         }
 
         public async Task<GateCheckResult> CheckIpSignupRateLimit(string ip)
         {
-            var count = await _dbContext.Signups
-                .CountAsync(s => s.Ip == ip && 
+            var count = await _context.Signups
+                .CountAsync(s => s.Ip == ip &&
                                  s.CreatedAt >= DateTime.UtcNow.AddHours(-24));
 
             GateDecision decision;
@@ -87,7 +79,7 @@ namespace TrialAbusePrevention
             else decision = GateDecision.Fail;
 
             var reason = $"IP {ip} has {count} signup(s) in last 24 hours";
-            _logger.LogInformation("Gate check: ip_signup_rate_limit, ip={Ip}, count={Count}, decision={Decision}", 
+            _logger.LogInformation("Gate check: ip_signup_rate_limit, ip={Ip}, count={Count}, decision={Decision}",
                 ip, count, decision);
 
             return new GateCheckResult
@@ -103,7 +95,7 @@ namespace TrialAbusePrevention
             var device = $"{userAgent}|{screenResolution}|{timezone}|{browserLanguage}";
             var deviceHash = ComputeSha256Hash(device);
 
-            var matchingUsers = await _dbContext.DeviceFingerprints
+            var matchingUsers = await _context.DeviceFingerprints
                 .Where(df => df.DeviceHash == deviceHash)
                 .Select(df => df.UserId)
                 .Distinct()
@@ -112,7 +104,7 @@ namespace TrialAbusePrevention
             bool matchesKnownDevice = false;
             if (!string.IsNullOrEmpty(userId))
             {
-                matchesKnownDevice = await _dbContext.DeviceFingerprints
+                matchesKnownDevice = await _context.DeviceFingerprints
                     .AnyAsync(df => df.DeviceHash == deviceHash && df.UserId == userId);
             }
 
@@ -122,64 +114,56 @@ namespace TrialAbusePrevention
             else decision = GateDecision.Fail;
 
             var reason = $"Device hash {deviceHash} matches {matchingUsers} user(s)";
-            _logger.LogInformation("Gate check: device_fingerprint, device_hash={DeviceHash}, matching_users={MatchingUsers}, decision={Decision}", 
+            _logger.LogInformation("Gate check: device_fingerprint, device_hash={DeviceHash}, matching_users={MatchingUsers}, decision={Decision}",
                 deviceHash, matchingUsers, decision);
 
-            return new GateCheckResult
-            {
-                Decision = decision,
-                Reason = reason
-            };
+            return new GateCheckResult { Decision = decision, Reason = reason };
         }
 
         public async Task<GateCheckResult> CheckTrialPaymentTiming(string userId)
         {
-            var user = await _dbContext.Users.FindAsync(userId);
+            var user = await _context.Users.FindAsync(userId);
             if (user == null)
             {
-                var reason = $"User {userId} not found";
-                _logger.LogWarning("Gate check: trial_payment_timing, user_id={UserId}, reason={Reason}", userId, reason);
-                return new GateCheckResult { Decision = GateDecision.Fail, Reason = reason };
+                var notFoundReason = $"User {userId} not found";
+                _logger.LogWarning("Gate check: trial_payment_timing, user_id={UserId}, reason={Reason}", userId, notFoundReason);
+                return new GateCheckResult { Decision = GateDecision.Fail, Reason = notFoundReason };
             }
 
             var trialStartDate = user.CreatedAt;
-            var now = DateTime.Utcnow;
+            var now = DateTime.UtcNow;
             var daysElapsed = (now - trialStartDate).Days;
-            var paymentAddedDate = await _dbContext.TrialAbuseLedgers
+            var paymentAddedDate = await _context.TrialAbuseLedgers
                 .Where(l => l.UserId == userId)
                 .Select(l => l.PaymentAddedDate)
                 .OrderByDescending(d => d)
                 .FirstOrDefaultAsync();
 
             GateDecision decision;
-            if (daysElapsed < TrialDays + 5 && paymentAddedDate > trialStartDate)
+            if (daysElapsed < TrialDays + 5 && paymentAddedDate.HasValue && paymentAddedDate.Value > trialStartDate)
                 decision = GateDecision.Pass;
-            else if (daysElapsed > TrialDays + 30 && paymentAddedDate > trialStartDate.AddDays(TrialDays))
+            else if (daysElapsed > TrialDays + 30 && paymentAddedDate.HasValue && paymentAddedDate.Value > trialStartDate.AddDays(TrialDays))
                 decision = GateDecision.Challenge;
-            else if (daysElapsed > TrialDays && paymentAddedDate == null && now > trialStartDate.AddDays(TrialDays + 90))
+            else if (daysElapsed > TrialDays && !paymentAddedDate.HasValue && now > trialStartDate.AddDays(TrialDays + 90))
                 decision = GateDecision.Fail;
             else
                 decision = GateDecision.Pass; // Default to pass if none of the above conditions match
 
             var reason = $"Trial started {daysElapsed} days ago, payment added { (paymentAddedDate.HasValue ? ((now - paymentAddedDate.Value).Days.ToString() + " days ago") : "never") }";
-            _logger.LogInformation("Gate check: trial_payment_timing, user_id={UserId}, trial_duration={TrialDuration}, payment_delay={PaymentDelay}, decision={Decision}", 
+            _logger.LogInformation("Gate check: trial_payment_timing, user_id={UserId}, trial_duration={TrialDuration}, payment_delay={PaymentDelay}, decision={Decision}",
                 userId, daysElapsed, paymentAddedDate.HasValue ? (now - paymentAddedDate.Value).Days : (int?)null, decision);
 
-            return new GateCheckResult
-            {
-                Decision = decision,
-                Reason = reason
-            };
+            return new GateCheckResult { Decision = decision, Reason = reason };
         }
 
         public async Task<GateCheckResult> CheckChargebackHistory(string stripeCustomerId, string userId)
         {
-            var stripeChargebacks = await _dbContext.StripeEvents
-                .CountAsync(e => e.Customer == stripeCustomerId && 
+            var stripeChargebacks = await _context.StripeEvents
+                .CountAsync(e => e.Customer == stripeCustomerId &&
                                  e.Type.Contains("chargeback"));
 
-            var refundChargebacks = await _dbContext.Refunds
-                .CountAsync(r => r.UserId == userId && 
+            var refundChargebacks = await _context.Refunds
+                .CountAsync(r => r.UserId == userId &&
                                  r.Status == "chargebacked");
 
             var totalChargebacks = stripeChargebacks + refundChargebacks;
@@ -190,29 +174,25 @@ namespace TrialAbusePrevention
             else decision = GateDecision.Fail;
 
             var reason = $"User {userId} has {totalChargebacks} chargeback(s)";
-            _logger.LogInformation("Gate check: chargeback_history, user_id={UserId}, chargebacks={Chargebacks}, decision={Decision}", 
+            _logger.LogInformation("Gate check: chargeback_history, user_id={UserId}, chargebacks={Chargebacks}, decision={Decision}",
                 userId, totalChargebacks, decision);
 
-            return new GateCheckResult
-            {
-                Decision = decision,
-                Reason = reason
-            };
+            return new GateCheckResult { Decision = decision, Reason = reason };
         }
 
-        public async Task LogAbuseEntry(TrialAbuseLedgerEntry entry)
+        public async Task LogAbuseEntry(TrialAbuseLedger entry)
         {
-            _dbContext.TrialAbuseLedgers.Add(entry);
-            await _dbContext.SaveChangesAsync();
+            _context.TrialAbuseLedgers.Add(entry);
+            await _context.SaveChangesAsync();
         }
 
         public async Task LogGateDecision(GateDecisionLog log)
         {
-            _dbContext.GateDecisionLogs.Add(log);
-            await _dbContext.SaveChangesAsync();
+            _context.GateDecisionLogs.Add(log);
+            await _context.SaveChangesAsync();
         }
 
-        private static string ComputeSha256Hash(string input)
+        public static string ComputeSha256Hash(string input)
         {
             using var sha256 = System.Security.Cryptography.SHA256.Create();
             var bytes = sha256.ComputeHash(System.Text.Encoding.UTF8.GetBytes(input));
@@ -288,7 +268,7 @@ namespace TrialAbusePrevention
             {
                 entity.HasKey(e => e.Id);
                 entity.Property(e => e.CreatedAt).IsRequired();
-                entity.Property(e => e.AbuseFlags).HasColumnType("text");
+                entity.Property(e => e.AbuseFlags).HasColumnType("jsonb");
             });
         }
     }
@@ -370,7 +350,6 @@ namespace TrialAbusePrevention
         public static string GetCreateTablesSql()
         {
             return @"
--- trial_abuse_ledger table
 CREATE TABLE IF NOT EXISTS trial_abuse_ledger (
     id SERIAL PRIMARY KEY,
     user_id VARCHAR(255) NOT NULL,
@@ -389,7 +368,6 @@ CREATE TABLE IF NOT EXISTS trial_abuse_ledger (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
--- device_fingerprints table
 CREATE TABLE IF NOT EXISTS device_fingerprints (
     id SERIAL PRIMARY KEY,
     user_id VARCHAR(255) NOT NULL,
@@ -401,7 +379,6 @@ CREATE TABLE IF NOT EXISTS device_fingerprints (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
--- gate_decisions table
 CREATE TABLE IF NOT EXISTS gate_decisions (
     id SERIAL PRIMARY KEY,
     user_id VARCHAR(255) NOT NULL,
@@ -412,7 +389,6 @@ CREATE TABLE IF NOT EXISTS gate_decisions (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
--- Indexes for performance
 CREATE INDEX IF NOT EXISTS idx_trial_abuse_ledger_email ON trial_abuse_ledger(email);
 CREATE INDEX IF NOT EXISTS idx_trial_abuse_ledger_stripe_payment_method_id ON trial_abuse_ledger(stripe_payment_method_id);
 CREATE INDEX IF NOT EXISTS idx_signups_ip_created_at ON signups(ip, created_at);

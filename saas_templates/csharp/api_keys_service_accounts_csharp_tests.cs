@@ -3,9 +3,12 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Security.Cryptography;
+using System.Text.Json;
 using System.Threading.Tasks;
 using BCrypt.Net;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
 using Moq;
 using StackExchange.Redis;
 using Xunit;
@@ -15,7 +18,7 @@ namespace SaaSLibrary.ApiKeys.Tests
 {
     public class ApiKeysServiceTests : IDisposable
     {
-        private readonly ApiKeysDbContext _dbContext;
+        private readonly ApiKeysDbContext _dbName;
         private readonly Mock<IConnectionMultiplexer> _redisMock;
         private readonly Mock<IDatabase> _redisDatabaseMock;
         private readonly Mock<ILogger<ApiKeysService>> _loggerMock;
@@ -27,7 +30,7 @@ namespace SaaSLibrary.ApiKeys.Tests
             var options = new DbContextOptionsBuilder<ApiKeysDbContext>()
                 .UseInMemoryDatabase(databaseName: Guid.NewGuid().ToString())
                 .Options;
-            _dbContext = new ApiKeysDbContext(options);
+            _dbName = new ApiKeysDbContext(options);
 
             _redisMock = new Mock<IConnectionMultiplexer>();
             _redisDatabaseMock = new Mock<IDatabase>();
@@ -35,12 +38,12 @@ namespace SaaSLibrary.ApiKeys.Tests
 
             _loggerMock = new Mock<ILogger<ApiKeysService>>();
 
-            _service = new ApiKeysService(_dbContext, _redisMock.Object, _loggerMock.Object);
+            _service = new ApiKeysService(_dbName, _redisMock.Object, _loggerMock.Object);
         }
 
         public void Dispose()
         {
-            _dbContext.Dispose();
+            _dbName.Dispose();
         }
 
         [Fact]
@@ -63,13 +66,12 @@ namespace SaaSLibrary.ApiKeys.Tests
             Assert.NotNull(result.ApiKeyId);
             Assert.NotNull(result.Key);
             Assert.StartsWith("sk_live_", result.Key);
-            Assert.Equal(request.Name, result.Key); // Name is not in response, but we check other properties
             Assert.Equal(request.RateLimit, result.RateLimit);
             Assert.Equal(request.ExpiresAt, result.ExpiresAt);
             Assert.Equal(DateTime.UtcNow.Date, result.CreatedAt.Date); // Created today
 
             // Verify in database
-            var apiKey = await _dbContext.ApiKeys.FindAsync(Guid.Parse(result.ApiKeyId));
+            var apiKey = await _dbName.ApiKeys.FindAsync(Guid.Parse(result.ApiKeyId));
             Assert.NotNull(apiKey);
             Assert.Equal(_testUserId, apiKey.UserId);
             Assert.Equal(request.Name, apiKey.Name);
@@ -149,7 +151,7 @@ namespace SaaSLibrary.ApiKeys.Tests
                 Assert.Contains(k.Name, new[] { "Key 1", "Key 2" });
                 Assert.NotEmpty(k.Scopes);
                 Assert.Equal(1000, k.RateLimit); // Default from test helper
-                Assert.False(k.IsActive == false); // All active by default
+                Assert.True(k.IsActive);
             });
         }
 
@@ -177,7 +179,7 @@ namespace SaaSLibrary.ApiKeys.Tests
             Assert.True(result.Success);
             Assert.Equal(DateTime.UtcNow.Date, result.RevokedAt.Date);
 
-            var updatedKey = await _dbContext.ApiKeys.FindAsync(apiKey.Id);
+            var updatedKey = await _dbName.ApiKeys.FindAsync(apiKey.Id);
             Assert.False(updatedKey.IsActive);
         }
 
@@ -206,7 +208,7 @@ namespace SaaSLibrary.ApiKeys.Tests
         {
             // Arrange
             var originalKey = await CreateTestApiKeyInDb("To Rotate", new List<string> { "read:deployments" });
-            var originalKeyString = $"sk_live_{originalKey.KeyPrefix}xxxx"; // Simulate full key for bcrypt
+            var originalPrefix = originalKey.KeyPrefix;
 
             // Act
             var result = await _service.RotateApiKeyAsync(_testUserId, originalKey.Id);
@@ -218,14 +220,16 @@ namespace SaaSLibrary.ApiKeys.Tests
             Assert.Equal(DateTime.UtcNow.Date, result.OldKeyRevokedAt.Date);
             Assert.Equal(DateTime.UtcNow.AddHours(24).Date, result.GracePeriodEndsAt.Date);
 
-            // Verify old key is inactive in DB
-            var oldKey = await _dbContext.ApiKeys.FindAsync(originalKey.Id);
-            Assert.False(oldKey.IsActive);
-            Assert.NotEqual(originalKey.KeyPrefix, oldKey.KeyPrefix); // Prefix changed
-            Assert.True(BCrypt.Net.BCrypt.Verify(result.NewKey, oldKey.KeySecretHash)); // New key matches hash
-
-            // Verify new key works (by checking prefix and hash)
-            Assert.Equal(oldKey.KeyPrefix, result.NewKey.Substring(8, 8));
+            // Verify old key material moved to previous fields, new key in current fields
+            var rotatedKey = await _dbName.ApiKeys.FindAsync(originalKey.Id);
+            Assert.True(rotatedKey.IsActive); // Key record stays active
+            Assert.Equal(originalPrefix, rotatedKey.PreviousKeyPrefix); // Old prefix preserved
+            Assert.NotNull(rotatedKey.PreviousKeySecretHash); // Old hash preserved
+            Assert.NotNull(rotatedKey.PreviousKeyRevokedAt);
+            Assert.NotNull(rotatedKey.GracePeriodEndsAt);
+            Assert.NotEqual(originalPrefix, rotatedKey.KeyPrefix); // New prefix generated
+            Assert.True(BCrypt.Net.BCrypt.Verify(result.NewKey, rotatedKey.KeySecretHash)); // New key matches new hash
+            Assert.Equal(rotatedKey.KeyPrefix, result.NewKey.Substring(8, 8)); // New key prefix matches stored prefix
         }
 
         [Fact]
@@ -252,31 +256,18 @@ namespace SaaSLibrary.ApiKeys.Tests
         public async Task ValidateApiKey_ValidKeyAndScope_ReturnsValid()
         {
             // Arrange
-            var apiKey = await CreateTestApiKeyInDb("Valid Key", new List<string> { "get:deployments" });
-            var fullKey = $"sk_live_{apiKey.KeyPrefix}xxxxxxxxxxxxxxxx"; // 24 bytes base64 -> 32 chars, plus prefix
-            // Adjust to match actual key format: our GenerateApiKey makes 24 bytes -> 32 base64 chars -> total 40 chars
-            // We'll create a valid key by using the actual generation method via reflection? 
-            // Instead, we'll use the service's internal method via a test helper or just verify with the stored hash.
-            // Since we have the apiKey from DB, we can construct a key that will verify:
-            // We know the prefix and we can append enough chars to make a verifiable key.
-            // But BCrypt.Verify expects the exact original key. Let's instead test via the service's internal logic by mocking?
-            // Better: we know the key that was generated in CreateTestApiKeyInDb is not stored, only hash.
-            // We'll create a key that matches the hash by using the same random generation? Not feasible in test.
-            // Alternative: test the validation logic directly by setting up the scenario.
-            // Let's change approach: we'll test ValidateApiKeyAsync by providing a key that we know will work because we just created it.
-            // But we don't have the original key string from CreateTestApiKeyInDb.
-            // We'll modify CreateTestApiKeyInDb to return the key string as well.
-
-            // For now, let's skip this test and come back to it after adjusting the helper.
-            // Actually, we can test the validation by using the service's own CreateApiKeyAsync to get a real key.
             var createRequest = new CreateApiKeyRequest
             {
                 Name = "Validation Test",
-                Scopes = new List<string> { "get:deployments" },
+                Scopes = new List<string> { "read:deployments" },
                 RateLimit = 1000
             };
             var createResult = await _service.CreateApiKeyAsync(_testUserId, createRequest);
             var validKey = createResult.Key;
+
+            // Mock Redis to allow the request
+            _redisDatabaseMock.Setup(r => r.StringIncrementAsync(It.IsAny<RedisKey>(), It.IsAny<long>(), It.IsAny<CommandFlags>()))
+                .ReturnsAsync(1L);
 
             // Act
             var result = await _service.ValidateApiKeyAsync(validKey, "/deployments", HttpMethod.Get);
@@ -327,7 +318,7 @@ namespace SaaSLibrary.ApiKeys.Tests
         public async Task ValidateApiKey_ValidKeyButWrongPrefix_ReturnsInvalidWithUnauthorized()
         {
             // Arrange
-            var apiKey = await CreateTestApiKeyInDb("Valid Key", new List<string> { "get:deployments" });
+            var apiKey = await CreateTestApiKeyInDb("Valid Key", new List<string> { "read:deployments" });
             // Use a different prefix that doesn't exist in DB
             var wrongKey = $"sk_live_{apiKey.KeyPrefix.Substring(0, 4)}xxxxxxxxxxxxxxxx"; // Still 8 chars prefix but different
 
@@ -344,7 +335,7 @@ namespace SaaSLibrary.ApiKeys.Tests
         public async Task ValidateApiKey_ValidKeyButFailedBcryptVerify_ReturnsInvalidWithUnauthorized()
         {
             // Arrange
-            var apiKey = await CreateTestApiKeyInDb("Valid Key", new List<string> { "get:deployments" });
+            var apiKey = await CreateTestApiKeyInDb("Valid Key", new List<string> { "read:deployments" });
             // Create a key that has the correct prefix but wrong secret (will fail bcrypt)
             var wrongKey = $"sk_live_{apiKey.KeyPrefix}wrongsecrethere123"; // Same prefix, different rest
 
@@ -362,16 +353,19 @@ namespace SaaSLibrary.ApiKeys.Tests
         {
             // Arrange
             var expiredDate = DateTime.UtcNow.AddDays(-1);
-            var apiKey = await CreateTestApiKeyInDb("Expired Key", new List<string> { "get:deployments" }, expiresAt: expiredDate);
             var createRequest = new CreateApiKeyRequest
             {
                 Name = "Expired Key Test",
-                Scopes = new List<string> { "get:deployments" },
+                Scopes = new List<string> { "read:deployments" },
                 RateLimit = 1000,
                 ExpiresAt = expiredDate
             };
             var createResult = await _service.CreateApiKeyAsync(_testUserId, createRequest);
             var expiredKey = createResult.Key;
+
+            // Mock Redis to allow the request
+            _redisDatabaseMock.Setup(r => r.StringIncrementAsync(It.IsAny<RedisKey>(), It.IsAny<long>(), It.IsAny<CommandFlags>()))
+                .ReturnsAsync(1L);
 
             // Act
             var result = await _service.ValidateApiKeyAsync(expiredKey, "/deployments", HttpMethod.Get);
@@ -395,7 +389,11 @@ namespace SaaSLibrary.ApiKeys.Tests
             var createResult = await _service.CreateApiKeyAsync(_testUserId, createRequest);
             var key = createResult.Key;
 
-            // Act
+            // Mock Redis to allow the request
+            _redisDatabaseMock.Setup(r => r.StringIncrementAsync(It.IsAny<RedisKey>(), It.IsAny<long>(), It.IsAny<CommandFlags>()))
+                .ReturnsAsync(1L);
+
+            // Act - POST requires write:deployments
             var result = await _service.ValidateApiKeyAsync(key, "/deployments", HttpMethod.Post); // Requires write
 
             // Assert
@@ -411,7 +409,7 @@ namespace SaaSLibrary.ApiKeys.Tests
             var createRequest = new CreateApiKeyRequest
             {
                 Name = "Rate Limit Test",
-                Scopes = new List<string> { "get:deployments" },
+                Scopes = new List<string> { "read:deployments" },
                 RateLimit = 2 // Very low for testing
             };
             var createResult = await _service.CreateApiKeyAsync(_testUserId, createRequest);
@@ -443,17 +441,21 @@ namespace SaaSLibrary.ApiKeys.Tests
             var createRequest = new CreateApiKeyRequest
             {
                 Name = "Last Used Test",
-                Scopes = new List<string> { "get:deployments" },
+                Scopes = new List<string> { "read:deployments" },
                 RateLimit = 1000
             };
             var createResult = await _service.CreateApiKeyAsync(_testUserId, createRequest);
             var key = createResult.Key;
 
+            // Mock Redis to allow the request
+            _redisDatabaseMock.Setup(r => r.StringIncrementAsync(It.IsAny<RedisKey>(), It.IsAny<long>(), It.IsAny<CommandFlags>()))
+                .ReturnsAsync(1L);
+
             // Act
             await _service.ValidateApiKeyAsync(key, "/deployments", HttpMethod.Get);
 
             // Assert
-            var apiKey = await _dbContext.ApiKeys.FindAsync(Guid.Parse(createResult.ApiKeyId));
+            var apiKey = await _dbName.ApiKeys.FindAsync(Guid.Parse(createResult.ApiKeyId));
             Assert.NotNull(apiKey.LastUsedAt);
             Assert.InRange(apiKey.LastUsedAt.Value, DateTime.UtcNow.AddSeconds(-5), DateTime.UtcNow.AddSeconds(5));
         }
@@ -462,13 +464,13 @@ namespace SaaSLibrary.ApiKeys.Tests
         public async Task LogApiKeyUsageAsync_AddsUsageRecord()
         {
             // Arrange
-            var apiKey = await CreateTestApiKeyInDb("Usage Test", new List<string> { "get:deployments" });
+            var apiKey = await CreateTestApiKeyInDb("Usage Test", new List<string> { "read:deployments" });
 
             // Act
             await _service.LogApiKeyUsageAsync(apiKey.Id, "/deployments", HttpMethod.Get, 200);
 
             // Assert
-            var usage = await _dbContext.ApiKeyUsages.FirstOrDefaultAsync();
+            var usage = await _dbName.ApiKeyUsages.FirstOrDefaultAsync();
             Assert.NotNull(usage);
             Assert.Equal(apiKey.Id, usage.ApiKeyId);
             Assert.Equal("/deployments", usage.Endpoint);
@@ -480,7 +482,7 @@ namespace SaaSLibrary.ApiKeys.Tests
         public async Task GetApiKeyUsageAsync_ForExistingKey_ReturnsUsageStats()
         {
             // Arrange
-            var apiKey = await CreateTestApiKeyInDb("Usage Stats Test", new List<string> { "get:deployments" });
+            var apiKey = await CreateTestApiKeyInDb("Usage Stats Test", new List<string> { "read:deployments" });
             await _service.LogApiKeyUsageAsync(apiKey.Id, "/deployments", HttpMethod.Get, 200);
             await _service.LogApiKeyUsageAsync(apiKey.Id, "/deployments", HttpMethod.Get, 200);
             await _service.LogApiKeyUsageAsync(apiKey.Id, "/webhooks", HttpMethod.Post, 200);
@@ -506,16 +508,13 @@ namespace SaaSLibrary.ApiKeys.Tests
         public async Task GetApiKeyUsageAsync_WithDateRange_FiltersByTimestamp()
         {
             // Arrange
-            var apiKey = await CreateTestApiKeyInDb("Date Range Test", new List<string> { "get:deployments" });
+            var apiKey = await CreateTestApiKeyInDb("Date Range Test", new List<string> { "read:deployments" });
             var now = DateTime.UtcNow;
             var yesterday = now.AddDays(-1);
-            var tomorrow = now.AddDays(1);
 
-            // Log usages at different times
             await _service.LogApiKeyUsageAsync(apiKey.Id, "/deployments", HttpMethod.Get, 200); // Now
             await _service.LogApiKeyUsageAsync(apiKey.Id, "/deployments", HttpMethod.Get, 200); // Now
-            // Manually insert an old usage to bypass service timestamp
-            _dbContext.ApiKeyUsages.Add(new ApiKeyUsage
+            _dbName.ApiKeyUsages.Add(new ApiKeyUsage
             {
                 Id = Guid.NewGuid(),
                 ApiKeyId = apiKey.Id,
@@ -524,7 +523,7 @@ namespace SaaSLibrary.ApiKeys.Tests
                 Status = 200,
                 Timestamp = yesterday
             });
-            await _dbContext.SaveChangesAsync();
+            await _dbName.SaveChangesAsync();
 
             // Act
             var result = await _service.GetApiKeyUsageAsync(_testUserId, apiKey.Id, yesterday.AddHours(1), now.AddHours(1));
@@ -546,7 +545,7 @@ namespace SaaSLibrary.ApiKeys.Tests
         {
             // Arrange
             var otherUserId = Guid.NewGuid();
-            var apiKey = await CreateTestApiKeyInDb("Other User Key", new List<string> { "get:deployments" }, otherUserId);
+            var apiKey = await CreateTestApiKeyInDb("Other User Key", new List<string> { "read:deployments" }, otherUserId);
 
             // Act & Assert
             await Assert.ThrowsAsync<KeyNotFoundException>(() => 
@@ -559,9 +558,9 @@ namespace SaaSLibrary.ApiKeys.Tests
             // Arrange
             var user1Id = Guid.NewGuid();
             var user2Id = Guid.NewGuid();
-            await CreateTestApiKeyInDb("User1 Key", new List<string> { "get:deployments" }, user1Id);
-            await CreateTestApiKeyInDb("User1 Key 2", new List<string> { "post:deployments" }, user1Id);
-            await CreateTestApiKeyInDb("User2 Key", new List<string> { "get:webhooks" }, user2Id);
+            await CreateTestApiKeyInDb("User1 Key", new List<string> { "read:deployments" }, user1Id);
+            await CreateTestApiKeyInDb("User1 Key 2", new List<string> { "write:deployments" }, user1Id);
+            await CreateTestApiKeyInDb("User2 Key", new List<string> { "read:webhooks" }, user2Id);
 
             // Act
             var result = await _service.AdminListApiKeysAsync(null, null);
@@ -578,15 +577,15 @@ namespace SaaSLibrary.ApiKeys.Tests
             // Arrange
             var user1Id = Guid.NewGuid();
             var user2Id = Guid.NewGuid();
-            await CreateTestApiKeyInDb("User1 Key", new List<string> { "get:deployments" }, user1Id);
-            await CreateTestApiKeyInDb("User2 Key", new List<string> { "get:webhooks" }, user2Id);
+            await CreateTestApiKeyInDb("User1 Key", new List<string> { "read:deployments" }, user1Id);
+            await CreateTestApiKeyInDb("User2 Key", new List<string> { "read:webhooks" }, user2Id);
 
             // Act
             var result = await _service.AdminListApiKeysAsync(user1Id, null);
 
             // Assert
             Assert.NotNull(result);
-            Assert.Equal(1, result.Keys.Count);
+            Assert.Single(result.Keys);
             Assert.Equal(1, result.Total);
             Assert.Contains(result.Keys, k => k.Name == "User1 Key");
         }
@@ -595,8 +594,8 @@ namespace SaaSLibrary.ApiKeys.Tests
         public async Task AdminListApiKeysAsync_WithStatusActiveFilter_ReturnsOnlyActiveKeys()
         {
             // Arrange
-            var activeKey = await CreateTestApiKeyInDb("Active Key", new List<string> { "get:deployments" });
-            var revokedKey = await CreateTestApiKeyInDb("Revoked Key", new List<string> { "get:deployments" });
+            var activeKey = await CreateTestApiKeyInDb("Active Key", new List<string> { "read:deployments" });
+            var revokedKey = await CreateTestApiKeyInDb("Revoked Key", new List<string> { "read:deployments" });
             await _service.RevokeApiKeyAsync(_testUserId, revokedKey.Id);
 
             // Act
@@ -604,7 +603,7 @@ namespace SaaSLibrary.ApiKeys.Tests
 
             // Assert
             Assert.NotNull(result);
-            Assert.Equal(1, result.Keys.Count);
+            Assert.Single(result.Keys);
             Assert.Equal(1, result.Total);
             Assert.Contains(result.Keys, k => k.Name == "Active Key");
             Assert.DoesNotContain(result.Keys, k => k.Name == "Revoked Key");
@@ -614,8 +613,8 @@ namespace SaaSLibrary.ApiKeys.Tests
         public async Task AdminListApiKeysAsync_WithStatusInactiveFilter_ReturnsOnlyInactiveKeys()
         {
             // Arrange
-            var activeKey = await CreateTestApiKeyInDb("Active Key", new List<string> { "get:deployments" });
-            var revokedKey = await CreateTestApiKeyInDb("Revoked Key", new List<string> { "get:deployments" });
+            var activeKey = await CreateTestApiKeyInDb("Active Key", new List<string> { "read:deployments" });
+            var revokedKey = await CreateTestApiKeyInDb("Revoked Key", new List<string> { "read:deployments" });
             await _service.RevokeApiKeyAsync(_testUserId, revokedKey.Id);
 
             // Act
@@ -623,7 +622,7 @@ namespace SaaSLibrary.ApiKeys.Tests
 
             // Assert
             Assert.NotNull(result);
-            Assert.Equal(1, result.Keys.Count);
+            Assert.Single(result.Keys);
             Assert.Equal(1, result.Total);
             Assert.Contains(result.Keys, k => k.Name == "Revoked Key");
             Assert.DoesNotContain(result.Keys, k => k.Name == "Active Key");
@@ -632,23 +631,46 @@ namespace SaaSLibrary.ApiKeys.Tests
         // Helper methods
         private async Task<ApiKey> CreateTestApiKeyInDb(string name, List<string> scopes, Guid? userId = null, DateTime? expiresAt = null)
         {
+            // Generate a unique key for each test key to avoid collisions
+            var keyParts = GenerateTestApiKey();
             var apiKey = new ApiKey
             {
                 Id = Guid.NewGuid(),
                 UserId = userId ?? _testUserId,
                 Name = name,
-                KeyPrefix = "testpref", // Fixed prefix for testing - note: in real code this is generated
-                KeySecretHash = BCrypt.Net.BCrypt.HashPassword($"sk_live_testpref{new string('x', 24)}"), // Hash of a dummy key
+                KeyPrefix = keyParts.Prefix,
+                KeySecretHash = BCrypt.Net.BCrypt.HashPassword(keyParts.FullKey),
                 ScopesJson = JsonSerializer.Serialize(scopes),
                 RateLimit = 1000,
                 ExpiresAt = expiresAt,
                 IsActive = true,
-                CreatedAt = DateTime.UtcNow
+                CreatedAt = DateTime.UtcNow,
+                PreviousKeyPrefix = null,
+                PreviousKeySecretHash = null,
+                PreviousKeyRevokedAt = null,
+                GracePeriodEndsAt = null
             };
 
-            _dbContext.ApiKeys.Add(apiKey);
-            await _dbContext.SaveChangesAsync();
+            _dbName.ApiKeys.Add(apiKey);
+            await _dbName.SaveChangesAsync();
             return apiKey;
+        }
+
+        private static (string FullKey, string Prefix) GenerateTestApiKey()
+        {
+            var randomBytes = RandomNumberGenerator.GetBytes(24);
+            var base64Url = Base64UrlEncode(randomBytes);
+            var fullKey = $"sk_live_{base64Url}";
+            var prefix = base64Url.Substring(0, 8);
+            return (fullKey, prefix);
+        }
+
+        private static string Base64UrlEncode(byte[] input)
+        {
+            var base64 = Convert.ToBase64String(input);
+            base64 = base64.TrimEnd('=');
+            base64 = base64.Replace('+', '-').Replace('/', '_');
+            return base64;
         }
     }
 }

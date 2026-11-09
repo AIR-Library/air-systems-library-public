@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+using Moq;
 using TrialAbusePrevention;
 using Xunit;
 
@@ -11,7 +13,7 @@ namespace TrialAbusePreventionTests
     public class TrialAbusePreventionTests : IDisposable
     {
         private readonly DbContextOptions<TrialAbusePreventionDbContext> _options;
-        private TrialAbusePreventionDbContext _dbContext;
+        private TrialAbusePreventionDbContext _context;
         private TrialAbusePreventionService _service;
         private readonly ILogger<TrialAbusePreventionService> _logger = Mock.Of<ILogger<TrialAbusePreventionService>>();
 
@@ -21,14 +23,14 @@ namespace TrialAbusePreventionTests
                 .UseInMemoryDatabase(databaseName: Guid.NewGuid().ToString())
                 .Options;
 
-            _dbContext = new TrialAbusePreventionDbContext(_options);
-            _dbContext.Database.EnsureCreated();
-            _service = new TrialAbusePreventionService(_dbContext, _logger);
+            _context = new TrialAbusePreventionDbContext(_options);
+            _context.Database.EnsureCreated();
+            _service = new TrialAbusePreventionService(_context, _logger);
         }
 
         public void Dispose()
         {
-            _dbContext.Dispose();
+            _context.Dispose();
         }
 
         [Fact]
@@ -50,14 +52,17 @@ namespace TrialAbusePreventionTests
         {
             // Arrange
             var email = "existing@example.com";
-            _dbContext.TrialAbuseLedgers.Add(new TrialAbuseLedger
+            _context.TrialAbuseLedgers.Add(new TrialAbuseLedger
             {
+                UserId = "user1",
                 Email = email,
+                Ip = "192.168.1.1",
                 SubscriptionStatus = "completed",
-                SignupDate = DateTime.Utcnow.AddDays(-30),
-                TrialStartedAt = DateTime.Utcnow.AddDays(-30)
+                SignupDate = DateTime.UtcNow.AddDays(-30),
+                TrialStartedAt = DateTime.UtcNow.AddDays(-30),
+                CreatedAt = DateTime.UtcNow.AddDays(-30)
             });
-            await _dbContext.SaveChangesAsync();
+            await _context.SaveChangesAsync();
 
             // Act
             var result = await _service.CheckEmailTrialHistory(email);
@@ -72,11 +77,29 @@ namespace TrialAbusePreventionTests
         {
             // Arrange
             var email = "abuser@example.com";
-            _dbContext.TrialAbuseLedgers.AddRange(
-                new TrialAbuseLedger { Email = email, SubscriptionStatus = "completed", SignupDate = DateTime.Utcnow.AddDays(-60), TrialStartedAt = DateTime.Utcnow.AddDays(-60) },
-                new TrialAbuseLedger { Email = email, SubscriptionStatus = "chargebacked", SignupDate = DateTime.Utcnow.AddDays(-30), TrialStartedAt = DateTime.Utcnow.AddDays(-30) }
+            _context.TrialAbuseLedgers.AddRange(
+                new TrialAbuseLedger 
+                { 
+                    UserId = "user1", 
+                    Email = email, 
+                    Ip = "192.168.1.1", 
+                    SubscriptionStatus = "completed", 
+                    SignupDate = DateTime.UtcNow.AddDays(-60), 
+                    TrialStartedAt = DateTime.UtcNow.AddDays(-60),
+                    CreatedAt = DateTime.UtcNow.AddDays(-60)
+                },
+                new TrialAbuseLedger 
+                { 
+                    UserId = "user2", 
+                    Email = email, 
+                    Ip = "192.168.1.2", 
+                    SubscriptionStatus = "chargebacked", 
+                    SignupDate = DateTime.UtcNow.AddDays(-30), 
+                    TrialStartedAt = DateTime.UtcNow.AddDays(-30),
+                    CreatedAt = DateTime.UtcNow.AddDays(-30)
+                }
             );
-            await _dbContext.SaveChangesAsync();
+            await _context.SaveChangesAsync();
 
             // Act
             var result = await _service.CheckEmailTrialHistory(email);
@@ -105,12 +128,42 @@ namespace TrialAbusePreventionTests
         {
             // Arrange
             var paymentId = "pm_abused_123";
-            _dbContext.TrialAbuseLedgers.AddRange(
-                new TrialAbuseLedger { StripePaymentMethodId = paymentId, SubscriptionStatus = "completed", SignupDate = DateTime.Utcnow.AddDays(-60), TrialStartedAt = DateTime.Utcnow.AddDays(-60) },
-                new TrialAbuseLedger { StripePaymentMethodId = paymentId, SubscriptionStatus = "completed", SignupDate = DateTime.Utcnow.AddDays(-45), TrialStartedAt = DateTime.Utcnow.AddDays(-45) },
-                new TrialAbuseLedger { StripePaymentMethodId = paymentId, SubscriptionStatus = "chargebacked", SignupDate = DateTime.Utcnow.AddDays(-30), TrialStartedAt = DateTime.Utcnow.AddDays(-30) }
+            _context.TrialAbuseLedgers.AddRange(
+                new TrialAbuseLedger 
+                { 
+                    UserId = "user1", 
+                    Email = "user1@example.com", 
+                    Ip = "192.168.1.1", 
+                    StripePaymentMethodId = paymentId, 
+                    SubscriptionStatus = "completed", 
+                    SignupDate = DateTime.UtcNow.AddDays(-60), 
+                    TrialStartedAt = DateTime.UtcNow.AddDays(-60),
+                    CreatedAt = DateTime.UtcNow.AddDays(-60)
+                },
+                new TrialAbuseLedger 
+                { 
+                    UserId = "user2", 
+                    Email = "user2@example.com", 
+                    Ip = "192.168.1.2", 
+                    StripePaymentMethodId = paymentId, 
+                    SubscriptionStatus = "completed", 
+                    SignupDate = DateTime.UtcNow.AddDays(-45), 
+                    TrialStartedAt = DateTime.UtcNow.AddDays(-45),
+                    CreatedAt = DateTime.UtcNow.AddDays(-45)
+                },
+                new TrialAbuseLedger 
+                { 
+                    UserId = "user3", 
+                    Email = "user3@example.com", 
+                    Ip = "192.168.1.3", 
+                    StripePaymentMethodId = paymentId, 
+                    SubscriptionStatus = "chargebacked", 
+                    SignupDate = DateTime.UtcNow.AddDays(-30), 
+                    TrialStartedAt = DateTime.UtcNow.AddDays(-30),
+                    CreatedAt = DateTime.UtcNow.AddDays(-30)
+                }
             );
-            await _dbContext.SaveChangesAsync();
+            await _context.SaveChangesAsync();
 
             // Act
             var result = await _service.CheckPaymentMethodHistory(paymentId);
@@ -127,9 +180,9 @@ namespace TrialAbusePreventionTests
             var ip = "192.168.1.1";
             for (int i = 0; i < 4; i++)
             {
-                _dbContext.Signups.Add(new Signup { Ip = ip, CreatedAt = DateTime.Utcnow.AddHours(-12) });
+                _context.Signups.Add(new Signup { Ip = ip, CreatedAt = DateTime.UtcNow.AddHours(-12) });
             }
-            await _dbContext.SaveChangesAsync();
+            await _context.SaveChangesAsync();
 
             // Act
             var result = await _service.CheckIpSignupRateLimit(ip);
@@ -147,9 +200,9 @@ namespace TrialAbusePreventionTests
             var ip = "10.0.0.1";
             for (int i = 0; i < 10; i++)
             {
-                _dbContext.Signups.Add(new Signup { Ip = ip, CreatedAt = DateTime.Utcnow.AddHours(-12) });
+                _context.Signups.Add(new Signup { Ip = ip, CreatedAt = DateTime.UtcNow.AddHours(-12) });
             }
-            await _dbContext.SaveChangesAsync();
+            await _context.SaveChangesAsync();
 
             // Act
             var result = await _service.CheckIpSignupRateLimit(ip);
@@ -168,8 +221,6 @@ namespace TrialAbusePreventionTests
             var screenResolution = "1920x1080";
             var timezone = "UTC";
             var browserLanguage = "en-US";
-            var device = $"{userAgent}|{screenResolution}|{timezone}|{browserLanguage}";
-            var deviceHash = TrialAbusePreventionService.ComputeSha256Hash(device);
 
             // Act
             var result = await _service.CheckDeviceFingerprint(userAgent, screenResolution, timezone, browserLanguage);
@@ -192,7 +243,7 @@ namespace TrialAbusePreventionTests
 
             for (int i = 0; i < 6; i++)
             {
-                _dbContext.DeviceFingerprints.Add(new DeviceFingerprint
+                _context.DeviceFingerprints.Add(new DeviceFingerprint
                 {
                     UserId = $"user{i}",
                     DeviceHash = deviceHash,
@@ -202,7 +253,7 @@ namespace TrialAbusePreventionTests
                     BrowserLanguage = browserLanguage
                 });
             }
-            await _dbContext.SaveChangesAsync();
+            await _context.SaveChangesAsync();
 
             // Act
             var result = await _service.CheckDeviceFingerprint(userAgent, screenResolution, timezone, browserLanguage);
@@ -217,9 +268,19 @@ namespace TrialAbusePreventionTests
         {
             // Arrange
             var userId = "user_timing_pass";
-            var user = new User { Id = userId, CreatedAt = DateTime.Utcnow.AddDays(-5) };
-            _dbContext.Users.Add(user);
-            await _dbContext.SaveChangesAsync();
+            var user = new User { Id = userId, CreatedAt = DateTime.UtcNow.AddDays(-5) };
+            _context.Users.Add(user);
+            _context.TrialAbuseLedgers.Add(new TrialAbuseLedger
+            {
+                UserId = userId,
+                Email = "test@example.com",
+                Ip = "1.2.3.4",
+                SignupDate = DateTime.UtcNow.AddDays(-5),
+                TrialStartedAt = DateTime.UtcNow.AddDays(-5),
+                PaymentAddedDate = DateTime.UtcNow.AddDays(-3),
+                SubscriptionStatus = "completed"
+            });
+            await _context.SaveChangesAsync();
 
             // Act
             var result = await _service.CheckTrialPaymentTiming(userId);
@@ -234,9 +295,9 @@ namespace TrialAbusePreventionTests
         {
             // Arrange
             var userId = "user_timing_fail";
-            var user = new User { Id = userId, CreatedAt = DateTime.Utcnow.AddDays(-120) }; // Trial ended 120 days ago
-            _dbContext.Users.Add(user);
-            await _dbContext.SaveChangesAsync();
+            var user = new User { Id = userId, CreatedAt = DateTime.UtcNow.AddDays(-120) };
+            _context.Users.Add(user);
+            await _context.SaveChangesAsync();
 
             // Act
             var result = await _service.CheckTrialPaymentTiming(userId);
@@ -268,11 +329,11 @@ namespace TrialAbusePreventionTests
             // Arrange
             var userId = "user_cb_fail";
             var stripeCustomerId = "cus_fail_123";
-            _dbContext.StripeEvents.AddRange(
-                new StripeEvent { Customer = stripeCustomerId, Type = "chargeback.created", CreatedAt = DateTime.Utcnow.AddDays(-60) },
-                new StripeEvent { Customer = stripeCustomerId, Type = "chargeback.created", CreatedAt = DateTime.Utcnow.AddDays(-30) }
+            _context.StripeEvents.AddRange(
+                new StripeEvent { Customer = stripeCustomerId, Type = "chargeback.created", CreatedAt = DateTime.UtcNow.AddDays(-60) },
+                new StripeEvent { Customer = stripeCustomerId, Type = "chargeback.created", CreatedAt = DateTime.UtcNow.AddDays(-30) }
             );
-            await _dbContext.SaveChangesAsync();
+            await _context.SaveChangesAsync();
 
             // Act
             var result = await _service.CheckChargebackHistory(stripeCustomerId, userId);
@@ -291,14 +352,14 @@ namespace TrialAbusePreventionTests
                 UserId = "user_log",
                 Email = "log@example.com",
                 Ip = "1.2.3.4",
-                SignupDate = DateTime.Utcnow,
-                TrialStartedAt = DateTime.Utcnow,
+                SignupDate = DateTime.UtcNow,
+                TrialStartedAt = DateTime.UtcNow,
                 SubscriptionStatus = "completed"
             };
 
             // Act
             await _service.LogAbuseEntry(entry);
-            var ledgerEntry = await _dbContext.TrialAbuseLedgers.FirstOrDefaultAsync(l => l.UserId == "user_log");
+            var ledgerEntry = await _context.TrialAbuseLedgers.FirstOrDefaultAsync(l => l.UserId == "user_log");
 
             // Assert
             Assert.NotNull(ledgerEntry);
@@ -320,7 +381,7 @@ namespace TrialAbusePreventionTests
 
             // Act
             await _service.LogGateDecision(log);
-            var gateLog = await _dbContext.GateDecisionLogs.FirstOrDefaultAsync(l => l.UserId == "user_gate");
+            var gateLog = await _context.GateDecisionLogs.FirstOrDefaultAsync(l => l.UserId == "user_gate");
 
             // Assert
             Assert.NotNull(gateLog);
