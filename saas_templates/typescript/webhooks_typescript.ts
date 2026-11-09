@@ -296,7 +296,7 @@ CREATE INDEX IF NOT EXISTS idx_deliveries_next_attempt ON webhook_deliveries(nex
 export interface Database {
   prepare(sql: string): Statement;
   exec(sql: string): void;
-  transaction<T>(fn: () => T): T;
+  transaction<T>(fn: () => T): () => T;   // as in better-sqlite3: returns a function that runs fn in one transaction
 }
 
 export interface Statement {

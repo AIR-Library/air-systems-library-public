@@ -74,6 +74,16 @@ class TestNotificationService(unittest.TestCase):
         self.assertEqual(log["status"], "sent")
 
     def test_batch_send(self):
+        # Users without preferences get the default quiet hours, 22:00 to 08:00 UTC, so at night every message here was
+        # queued for the morning. Give them a quiet window away from now. 2026-11-08, session f3daac6e: CI ran at 22:50.
+        now = datetime.now(timezone.utc)
+        for i in range(10):
+            self.service.update_user_preferences(i + 2, {
+                "do_not_disturb": False,
+                "quiet_hours_start": (now + timedelta(hours=2)).strftime("%H:%M"),
+                "quiet_hours_end": (now + timedelta(hours=3)).strftime("%H:%M"),
+                "channels_enabled": {"email": True, "sms": True, "in_app": True}
+            })
         batch = []
         for i in range(10):
             batch.append({

@@ -70,7 +70,7 @@ def test_signup_ip_rate_limit(auth_system):
 
 def test_verify_email_happy_path(auth_system):
     # First signup
-    signup_result = auth_system.signup('test@example.com', 'a' * 16, 'Test User', '127.0.0.1')
+    auth_system.signup('test@example.com', 'a' * 16, 'Test User', '127.0.0.1')
     user_id = None
     cursor = auth_system.db.cursor()
     cursor.execute("SELECT id FROM users WHERE email = 'test@example.com'")
@@ -226,7 +226,7 @@ def test_oauth_callback_existing_user(auth_system):
     code = cursor.fetchone()['code']
     auth_system.verify_email('existing@example.com', code)
     # Now OAuth with the same e-mail, as the provider reports it
-    auth_system.oauth_profile = lambda provider, code: {'email': 'existing@example.com'}
+    auth_system.oauth_profile = lambda provider, code: {'id': 'gh-42', 'email': 'existing@example.com', 'email_verified': True}
     result = auth_system.oauth_callback('github', 'auth_code', 'state')
     assert result['status'] == 'authenticated'
     assert result['user']['id'] == user_id
@@ -309,4 +309,31 @@ def test_token_refresh_happy_path(auth_system):
     auth_system.signup('test@example.com', 'a' * 16, 'Test User', '127.0.0.1')
     cursor = auth_system.db.cursor()
     cursor.execute("SELECT id FROM users WHERE email = 'test@example.com'")
-    user_id = cursor.fetchone()
+    cursor.fetchone()
+
+
+def test_oauth_callback_refuses_an_unverified_email(auth_system):
+    """The provider must vouch for the address before it can sign anyone in. 2026-11-08, from review."""
+    auth_system.oauth_profile = lambda provider, code: {'id': 'gh-7', 'email': 'someone@example.com', 'email_verified': False}
+    assert auth_system.oauth_callback('github', 'auth_code', 'state') == {'error': 'email_not_verified'}
+
+
+def test_oauth_callback_finds_a_returning_user_by_provider_id(auth_system):
+    """A user whose e-mail changed at the provider still reaches the same account. 2026-11-08, from review."""
+    auth_system.oauth_profile = lambda provider, code: {'id': 'gh-9', 'email': 'old@example.com', 'email_verified': True}
+    first = auth_system.oauth_callback('github', 'code-1', 'state')
+    auth_system.oauth_profile = lambda provider, code: {'id': 'gh-9', 'email': 'new@example.com', 'email_verified': True}
+    second = auth_system.oauth_callback('github', 'code-2', 'state')
+    assert second['user']['id'] == first['user']['id']
+
+
+def test_mfa_challenge_treats_non_ascii_input_as_a_wrong_code(auth_system):
+    """Full-width digits are a wrong code, not a crash. 2026-11-08, from review."""
+    cursor = auth_system.db.cursor()
+    cursor.execute("INSERT INTO users (email, password_hash, tier, status, created_at, updated_at) VALUES "
+                   "('mfa@example.com', NULL, 'free', 'verified', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')")
+    user_id = cursor.lastrowid
+    cursor.execute("INSERT INTO verification_codes (user_id, code, created_at, expires_at, type) VALUES (?, '123456', ?, ?, 'mfa')",
+                   (user_id, '2026-01-01T00:00:00+00:00', '2999-01-01T00:00:00+00:00'))
+    auth_system.db.commit()
+    assert auth_system.mfa_challenge(cursor.lastrowid, '１２３４５６') == {'error': 'invalid_code'}

@@ -15,6 +15,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HexFormat;
@@ -67,6 +68,9 @@ public class DataExportCompliance {
     public static final Duration EXPORT_ESTIMATE = Duration.ofMinutes(5);
     /** How long a user can change their mind before their data is erased. */
     public static final Duration GRACE_PERIOD = Duration.ofDays(30);
+    /** How long a worker's claim on an export or an erase holds. After that the worker is taken to have stopped, and
+     *  another may take the job over (2026-11-08, session f3daac6e, from review: a claim used to hold forever). */
+    public static final Duration CLAIM_LEASE = Duration.ofMinutes(15);
 
     public static final Set<String> FORMATS = Set.of("json", "csv");
     public static final Set<String> DELETION_REASONS =
@@ -150,7 +154,8 @@ public class DataExportCompliance {
          *  preferences, transactions and audit_trail. The profile must carry "email". */
         Map<String, Object> export(UUID userId) throws Exception;
 
-        /** Erases the user from every table except the audit log, which the law requires to be kept. */
+        /** Erases the user from every table except the audit log, which the law requires to be kept. It must be
+         *  safe to run twice: a worker that stalls past CLAIM_LEASE can overlap the one that takes over. */
         void eraseAll(UUID userId) throws Exception;
     }
 
@@ -220,8 +225,11 @@ public class DataExportCompliance {
                         reason VARCHAR(50) NOT NULL,
                         confirmation_token_hash VARCHAR(64) NOT NULL,
                         will_delete_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                        erase_started_at TIMESTAMP WITH TIME ZONE,
                         deleted_at TIMESTAMP WITH TIME ZONE
                     )""");
+            // Tables made before 2026-11-08 lack the erase claim (2026-11-08, session f3daac6e, from review of PR 17).
+            s.execute("ALTER TABLE deletion_requests ADD COLUMN IF NOT EXISTS erase_started_at TIMESTAMP WITH TIME ZONE");
         } catch (SQLException e) {
             throw new ComplianceException("storage_error", e);
         }
@@ -255,14 +263,16 @@ public class DataExportCompliance {
     /**
      * Builds one export: reads the user's data, stores the file, signs a 7 day link, e-mails it. A failure marks the export
      * failed rather than throwing, because this runs in the background with nobody to catch it. A second call for the same
-     * export does nothing.
+     * export does nothing while the first call's claim is younger than {@link #CLAIM_LEASE}.
      *
      * @param exportId the export to build
      */
     public void processExport(UUID exportId) {
-        Instant now = clock.instant();
-        int claimed = update("UPDATE export_requests SET claimed_at = ? WHERE id = ? AND status = ? AND claimed_at IS NULL",
-                now, exportId, ExportStatus.PENDING.value());
+        // The claim time is also this worker's fence: its final writes only land while the claim is still its own.
+        Instant now = clock.instant().truncatedTo(ChronoUnit.MILLIS);
+        int claimed = update("UPDATE export_requests SET claimed_at = ? WHERE id = ? AND status = ?"
+                        + " AND (claimed_at IS NULL OR claimed_at < ?)",
+                now, exportId, ExportStatus.PENDING.value(), now.minus(CLAIM_LEASE));
         if (claimed == 0) {
             return;
         }
@@ -279,11 +289,17 @@ public class DataExportCompliance {
             url = services.store().signedDownloadUrl(key, DOWNLOAD_LINK_TTL);
             Instant done = clock.instant();
             expiresAt = done.plus(DOWNLOAD_LINK_TTL);
-            update("UPDATE export_requests SET status = ?, file_url = ?, completed_at = ?, expires_at = ? WHERE id = ?",
-                    ExportStatus.COMPLETED.value(), url, done, expiresAt, exportId);
+            int finished = update("UPDATE export_requests SET status = ?, file_url = ?, completed_at = ?, expires_at = ?"
+                            + " WHERE id = ? AND claimed_at = ?",
+                    ExportStatus.COMPLETED.value(), url, done, expiresAt, exportId, now);
+            if (finished == 0) {
+                return;   // another worker took the export over after the lease; it reports the result
+            }
         } catch (Exception e) {
-            update("UPDATE export_requests SET status = ?, completed_at = ? WHERE id = ?",
-                    ExportStatus.FAILED.value(), clock.instant(), exportId);
+            if (update("UPDATE export_requests SET status = ?, completed_at = ? WHERE id = ? AND claimed_at = ?",
+                    ExportStatus.FAILED.value(), clock.instant(), exportId, now) == 0) {
+                return;
+            }
             services.audit().record("data_export_failed", export.userId(),
                     Map.of("export_id", exportId.toString(), "error", e.getClass().getSimpleName()));
             return;
@@ -423,7 +439,9 @@ public class DataExportCompliance {
         if (clock.instant().isAfter(deletion.willDeleteAt())) {
             throw new ComplianceException("grace_period_expired");
         }
-        int changed = update("UPDATE deletion_requests SET status = ? WHERE id = ? AND status IN (?, ?)",
+        // Only an erase that has not started can be cancelled, so a cancellation and the eraser never both win.
+        int changed = update("UPDATE deletion_requests SET status = ? WHERE id = ? AND status IN (?, ?)"
+                        + " AND erase_started_at IS NULL",
                 DeletionStatus.CANCELLED.value(), deletionId,
                 DeletionStatus.PENDING.value(), DeletionStatus.APPROVED.value());
         if (changed == 0) {
@@ -435,8 +453,10 @@ public class DataExportCompliance {
 
     /**
      * Erases every user whose confirmed request has reached the end of its grace period. Call this from a daily scheduled
-     * job. An unconfirmed request never erases anything. If erasing one user fails, that request stays approved and is
-     * tried again on the next run, and the others still go ahead.
+     * job. An unconfirmed request never erases anything. Each request is claimed before its data is touched, and a
+     * cancellation only succeeds before that claim, so the two cannot both win. If erasing one user fails, the claim
+     * stays (part of the data may be gone, so it can no longer be cancelled) and the next run after
+     * {@link #CLAIM_LEASE} tries again. The others still go ahead.
      *
      * @return how many users were erased
      */
@@ -448,6 +468,13 @@ public class DataExportCompliance {
         int erased = 0;
         for (DeletionView deletion : due) {
             Map<String, String> details = Map.of("deletion_id", deletion.deletionId().toString());
+            Instant claimedAt = clock.instant().truncatedTo(ChronoUnit.MILLIS);
+            int claimed = update("UPDATE deletion_requests SET erase_started_at = ? WHERE id = ? AND status = ?"
+                            + " AND (erase_started_at IS NULL OR erase_started_at < ?)",
+                    claimedAt, deletion.deletionId(), DeletionStatus.APPROVED.value(), claimedAt.minus(CLAIM_LEASE));
+            if (claimed == 0) {
+                continue;
+            }
             try {
                 services.users().eraseAll(deletion.userId());
             } catch (Exception e) {
@@ -455,8 +482,10 @@ public class DataExportCompliance {
                         Map.of("deletion_id", deletion.deletionId().toString(), "error", e.getClass().getSimpleName()));
                 continue;
             }
-            update("UPDATE deletion_requests SET status = ?, deleted_at = ? WHERE id = ?",
-                    DeletionStatus.COMPLETED.value(), clock.instant(), deletion.deletionId());
+            if (update("UPDATE deletion_requests SET status = ?, deleted_at = ? WHERE id = ? AND erase_started_at = ?",
+                    DeletionStatus.COMPLETED.value(), clock.instant(), deletion.deletionId(), claimedAt) == 0) {
+                continue;   // another worker took this erase over after the lease; it reports the result
+            }
             services.audit().record("deletion_completed", deletion.userId(), details);
             erased++;
         }
@@ -520,7 +549,8 @@ public class DataExportCompliance {
         return json.writerWithDefaultPrettyPrinter().writeValueAsBytes(userData);
     }
 
-    /** One row per value: category, key, value. Nested maps become dotted keys, and list items repeat the key. */
+    /** One row per value: category, key, value. Nested maps become dotted keys and each list item keeps its position,
+     *  as in {@code sessions,[1].ip,...}, so the fields of one record never mix with the next ({S}). */
     private static byte[] toCsv(Map<String, Object> userData) {
         StringBuilder out = new StringBuilder("category,key,value\n");
         for (Map.Entry<String, Object> category : userData.entrySet()) {
@@ -536,8 +566,9 @@ public class DataExportCompliance {
                         entry.getValue());
             }
         } else if (value instanceof Iterable<?> list) {
+            int position = 0;
             for (Object item : list) {
-                appendRows(out, category, key.isEmpty() && !(item instanceof Map) ? "item" : key, item);
+                appendRows(out, category, key + "[" + position++ + "]", item);
             }
         } else {
             out.append(csvCell(category)).append(',')

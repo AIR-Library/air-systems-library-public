@@ -244,3 +244,19 @@ fn response_shapes_match_spec() {
     assert!(v["has_more"].is_boolean());
     assert!(v["facets"]["tier"]["team"].is_number());
 }
+
+#[test]
+fn a_query_does_not_match_unrelated_words() {
+    // 2026-11-08, from review: every indexed word used to count as a prefix match.
+    let si = SearchIndex::new();
+    si.index_document(idx("invoice", 7, "invoice paid in full", json!({"status": "paid"})));
+    let res = si.search(SearchRequest {
+        q: "john".into(),
+        document_type: None,
+        filters: vec![],
+        facets: vec![],
+        limit: 20,
+        offset: 0,
+    });
+    assert_eq!(res.total, 0);
+}

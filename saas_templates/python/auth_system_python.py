@@ -5,7 +5,8 @@ import secrets
 import hashlib
 import json
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Optional, Tuple, Dict, Any
+from typing import Callable, Optional, Dict, Any
+import hmac
 import sqlite3
 import time
 
@@ -21,7 +22,9 @@ class AuthSystem:
         # Exchanges a provider's one-time code for the user's verified profile. Replace this with a real call to the
         # provider. The default invents a user, so the template runs without one.
         self.oauth_profile = oauth_profile or (
-            lambda provider, code: {"email": f"user_{secrets.token_hex(4)}@{provider}.com"})
+            lambda provider, code: {"id": f"{provider}-{secrets.token_hex(8)}",
+                                    "email": f"user_{secrets.token_hex(4)}@{provider}.com", "email_verified": True})
+        self.mfa_max_attempts = 5
         self.jwt_secret = jwt_secret or secrets.token_urlsafe(32)
         self.bcrypt_rounds = bcrypt_rounds
         self.access_token_expires_minutes = access_token_expires_minutes
@@ -37,6 +40,13 @@ class AuthSystem:
     def _now(self) -> datetime:
         """Return current UTC time as timezone-aware datetime."""
         return datetime.now(timezone.utc)
+
+    @staticmethod
+    def _parse_time(value: str) -> datetime:
+        """A stored time as an aware UTC datetime. Rows written before 2026-11-05 have no offset, and comparing them
+        with an aware time raised TypeError (2026-11-08, session f3daac6e, from review)."""
+        parsed = datetime.fromisoformat(value)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
     def _now_iso(self) -> str:
         """Return current UTC time as ISO format string."""
@@ -74,6 +84,7 @@ class AuthSystem:
             created_at TEXT NOT NULL,
             expires_at TEXT NOT NULL,
             type TEXT NOT NULL CHECK (type IN ('email', 'mfa')),
+            attempts INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (user_id) REFERENCES users(id)
         );
         CREATE TABLE IF NOT EXISTS oauth_accounts (
@@ -120,6 +131,10 @@ class AuthSystem:
         CREATE INDEX IF NOT EXISTS idx_why_chain_log_timestamp ON why_chain_log(timestamp);
         CREATE INDEX IF NOT EXISTS idx_rate_limit_log_ip_identifier_type_timestamp ON rate_limit_log(ip, identifier, type, timestamp);
         """)
+        # Tables made before 2026-11-08 lack the MFA attempt count; add it so a wrong code still counts.
+        columns = {row[1] for row in cursor.execute("PRAGMA table_info(verification_codes)")}
+        if "attempts" not in columns:
+            cursor.execute("ALTER TABLE verification_codes ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
         self.db.commit()
 
     def _log_why_chain(self, flow: str, decision_points: list):
@@ -367,11 +382,24 @@ class AuthSystem:
         # visitor's browser, so nothing inside it is ever trusted: the e-mail comes only from the provider.
         # 2026-11-05, session f3daac6e: an earlier repair read the e-mail from state, which let anyone log in as anyone.
         decision_points.append("state_valid")
-        email = self.oauth_profile(provider, code)["email"]
-        # email_verified_by_provider: we assume it's verified
+        profile = self.oauth_profile(provider, code)
+        # The provider must vouch for the address, or anyone could sign in by adding someone else's e-mail to their
+        # account there (2026-11-08, session f3daac6e, from review).
+        if not profile.get("email_verified"):
+            self._log_why_chain("oauth_callback", decision_points + ["email_verified:failed"])
+            return {"error": "email_not_verified"}
+        email = profile["email"]
+        provider_user_id = str(profile["id"])   # the provider's stable id for this person, not a random value
         decision_points.append("email_verified")
         cursor = self.db.cursor()
-        cursor.execute("SELECT id FROM users WHERE email = ?", (email,))
+        # A returning user is found by the provider's id first: their e-mail at the provider may have changed (2026-11-08, session f3daac6e, from review of PR 17).
+        cursor.execute("SELECT user_id FROM oauth_accounts WHERE provider = ? AND provider_user_id = ?",
+                       (provider, provider_user_id))
+        linked = cursor.fetchone()
+        if linked:
+            cursor.execute("SELECT id FROM users WHERE id = ?", (linked[0],))
+        else:
+            cursor.execute("SELECT id FROM users WHERE email = ?", (email,))
         user = cursor.fetchone()
         now_iso = self._now_iso()
         if user:
@@ -380,7 +408,7 @@ class AuthSystem:
             cursor.execute(
                 """INSERT OR IGNORE INTO oauth_accounts (user_id, provider, provider_user_id, created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?)""",
-                (user_id, provider, secrets.token_hex(16), now_iso, now_iso)
+                (user_id, provider, provider_user_id, now_iso, now_iso)
             )
             # If user is not verified, we don't change status? Spec says existing user -> link oauth provider to account
             # We'll assume the user is already verified (since OAuth email is verified)
@@ -417,7 +445,7 @@ class AuthSystem:
             cursor.execute(
                 """INSERT INTO oauth_accounts (user_id, provider, provider_user_id, created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?)""",
-                (user_id, provider, secrets.token_hex(16), now_iso, now_iso)
+                (user_id, provider, provider_user_id, now_iso, now_iso)
             )
             # Generate tokens
             access_token = self._generate_token(user_id, 'free', 'access')
@@ -453,16 +481,26 @@ class AuthSystem:
             self._log_why_chain("mfa_challenge", decision_points + ["challenge_exists_and_valid:failed"])
             return {"error": "invalid_challenge"}
         user_id, stored_code, expires_at = challenge
-        if datetime.fromisoformat(expires_at) < self._now():
+        if self._parse_time(expires_at) < self._now():
             self._log_why_chain("mfa_challenge", decision_points + ["challenge_exists_and_valid:failed"])
             return {"error": "challenge_expired"}
         decision_points.append("challenge_valid")
-        if code != stored_code:
+        # Bytes, not str: compare_digest raises TypeError on non-ASCII text such as full-width digits (from review).
+        if not hmac.compare_digest(str(code).encode("utf-8"), str(stored_code).encode("utf-8")):
+            # Each wrong code counts; after mfa_max_attempts the challenge is gone and the user signs in again, so a
+            # six digit code cannot be guessed (2026-11-08, session f3daac6e, from review).
+            cursor.execute("UPDATE verification_codes SET attempts = attempts + 1 WHERE id = ?", (challenge_id,))
+            cursor.execute("DELETE FROM verification_codes WHERE id = ? AND attempts >= ?",
+                           (challenge_id, self.mfa_max_attempts))
+            self.db.commit()
             self._log_why_chain("mfa_challenge", decision_points + ["code_correct:failed"])
             return {"error": "invalid_code"}
         decision_points.append("code_correct")
-        # Mark challenge as verified (delete it)
+        # Use the challenge up. Only the call that deletes it may sign in, so two at once cannot both get a session.
         cursor.execute("DELETE FROM verification_codes WHERE id = ?", (challenge_id,))
+        if cursor.rowcount != 1:
+            self._log_why_chain("mfa_challenge", decision_points + ["challenge_consumed:failed"])
+            return {"error": "invalid_challenge"}
         # Create session
         cursor.execute("SELECT tier FROM users WHERE id = ?", (user_id,))
         tier = cursor.fetchone()[0]
@@ -505,7 +543,7 @@ class AuthSystem:
             self._log_why_chain("token_refresh", decision_points + ["token_valid:failed"])
             return {"error": "invalid_token"}
         user_id, expires_at, status, tier = session
-        if datetime.fromisoformat(expires_at) < self._now():
+        if self._parse_time(expires_at) < self._now():
             self._log_why_chain("token_refresh", decision_points + ["token_valid:failed"])
             return {"error": "token_expired"}
         if status in ('suspended', 'banned'):

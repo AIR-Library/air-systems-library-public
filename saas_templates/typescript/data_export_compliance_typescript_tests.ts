@@ -29,19 +29,6 @@ function assertEquals<T>(actual: T, expected: T, message: string) {
   }
 }
 
-function assertArrayEquals<T>(actual: T[], expected: T[], message: string, compareFn?: (a: T, b: T) => boolean) {
-  if (actual.length !== expected.length) {
-    throw new Error(`Assertion Failed: ${message}\nExpected length: ${expected.length}\nActual length: ${actual.length}`);
-  }
-  for (let i = 0; i < actual.length; i++) {
-    const a = actual[i];
-    const b = expected[i];
-    const equal = compareFn ? compareFn(a, b) : a === b;
-    if (!equal) {
-      throw new Error(`Assertion Failed: ${message}\nElement ${i} mismatch\nExpected: ${JSON.stringify(b)}\nActual: ${JSON.stringify(a)}`);
-    }
-  }
-}
 
 class MockClock implements Clock {
   private currentTime: Date;
@@ -390,8 +377,8 @@ async function runTests() {
     await service.processExportAsync(exp2.export_id);
     
     // Create deletion requests
-    const del1 = await service.requestDeletion('user_123', 'user_requested');
-    const del2 = await service.requestDeletion('user_123', 'gdpr_request');
+    await service.requestDeletion('user_123', 'user_requested');
+    await service.requestDeletion('user_123', 'gdpr_request');
     
     // Admin lists exports
     const exportsList = await service.listExports('admin_999', {});

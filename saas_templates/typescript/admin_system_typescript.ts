@@ -1,4 +1,4 @@
-import { randomUUID, randomBytes, scrypt } from 'crypto';
+import { randomBytes, scrypt } from 'crypto';
 import { promisify } from 'util';
 import {
   createConnection,

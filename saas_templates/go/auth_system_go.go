@@ -384,7 +384,11 @@ func (a *AuthSystem) Login(ctx context.Context, email, password, deviceID, ip st
 			return jsonError("internal_error", "MFA not configured")
 		}
 		challengeID, _ := generateRandomString(12)
-		code, _ := totp.GenerateCodeCustom(mfaSecret, time.Now(), totp.ValidateOpts{Period: 30, Skew: 1})
+		// A malformed secret gives an empty code, which must never be stored as a valid answer (2026-11-08, session f3daac6e, from review).
+		code, genErr := totp.GenerateCodeCustom(mfaSecret, time.Now(), totp.ValidateOpts{Period: 30, Skew: 1})
+		if genErr != nil || code == "" {
+			return jsonError("internal_error", "MFA not configured")
+		}
 		_, _ = a.db.ExecContext(ctx,
 			`INSERT INTO verification_codes (user_id, code, created_at, expires_at, type)
 			 VALUES (?, ?, ?, ?, 'mfa')`,

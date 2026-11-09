@@ -53,7 +53,7 @@ class FakeDb {
     throw new Error(`FakeDb has no answer for: ${sql}`);
   }
 
-  async execute(sql: string, params: any[] = []): Promise<{ insertId: number }> {
+  async execute(sql: string, params: any[] = []): Promise<{ insertId: number; affectedRows?: number }> {
     if (sql.startsWith('INSERT INTO audit_log')) {
       this.audit.push({ actor_id: params[0], action: params[1], new_value: params[4] });
       return { insertId: 0 };
@@ -78,6 +78,7 @@ class FakeDb {
       const id = this.id();
       this.codes.push({
         id, user_id: params[0], code: params[1], type: params[2], expires_at: new Date(Date.now() + 10 * 60 * 1000),
+        attempts: 0,
       });
       return { insertId: id };
     }
@@ -91,9 +92,19 @@ class FakeDb {
       this.codes = this.codes.filter((c) => c.id !== params[0]);
       return { insertId: 0 };
     }
-    if (sql.startsWith('DELETE FROM verification_codes WHERE code = $1')) {
-      this.codes = this.codes.filter((c) => c.code !== params[0]);
+    if (sql.startsWith('UPDATE verification_codes SET attempts')) {
+      this.codes.filter((c) => c.code === params[0]).forEach((c) => { c.attempts += 1; });
       return { insertId: 0 };
+    }
+    if (sql.startsWith('DELETE FROM verification_codes WHERE code = $1 AND attempts >= $2')) {
+      const before = this.codes.length;
+      this.codes = this.codes.filter((c) => !(c.code === params[0] && c.attempts >= params[1]));
+      return { insertId: 0, affectedRows: before - this.codes.length };
+    }
+    if (sql.startsWith('DELETE FROM verification_codes WHERE code = $1')) {
+      const before = this.codes.length;
+      this.codes = this.codes.filter((c) => c.code !== params[0]);
+      return { insertId: 0, affectedRows: before - this.codes.length };
     }
     if (sql.startsWith('INSERT INTO sessions')) {
       this.sessions.push({
@@ -293,6 +304,26 @@ describe('AuthSystem', () => {
       expect(await auth.mfa_challenge(challengeId, '000000')).toEqual({ error: 'invalid_code' });
       expect(db.auditActions()).toContain('mfa_failed');
       expect(db.sessions).toHaveLength(0);
+    });
+
+    it('five wrong codes end the challenge, even for the right code after', async () => {
+      const { secret, challengeId } = await mfaChallenge();
+      for (let i = 0; i < 5; i++) {
+        expect(await auth.mfa_challenge(challengeId, '000000')).toEqual({ error: 'invalid_code' });
+      }
+
+      const code = speakeasy.totp({ secret, encoding: 'base32' });
+      expect(await auth.mfa_challenge(challengeId, code)).toEqual({ error: 'invalid_code' });
+      expect(db.sessions).toHaveLength(0);
+    });
+
+    it('a challenge works only once', async () => {
+      const { secret, challengeId } = await mfaChallenge();
+      const code = speakeasy.totp({ secret, encoding: 'base32' });
+      expect((await auth.mfa_challenge(challengeId, code)).status).toBe('authenticated');
+
+      expect(await auth.mfa_challenge(challengeId, code)).toEqual({ error: 'invalid_code' });
+      expect(db.sessions).toHaveLength(1);
     });
 
     it('mfa_challenge unknown challenge → {error: "invalid_code"}', async () => {

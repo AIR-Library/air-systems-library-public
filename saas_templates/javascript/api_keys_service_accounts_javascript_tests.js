@@ -186,7 +186,7 @@ async function main() {
       env: 'live',
       now: () => new Date(t).toISOString(),
     });
-    const rot = await svc2.rotateKey(created.api_key_id);
+    await svc2.rotateKey(created.api_key_id);
     t = base.getTime() + 12 * 60 * 60 * 1000;
     const svc3 = new ApiKeyService({
       store: svc.store,

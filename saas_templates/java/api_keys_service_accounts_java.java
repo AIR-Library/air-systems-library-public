@@ -148,10 +148,53 @@ public class ApiKeysServiceAccounts {
                                                      LocalDateTime from,
                                                      LocalDateTime to);
         List<ApiKeyUsage> findByApiKeyId(long apiKeyId);
+
+        /** Counts one call the rate limit refused. Refused calls are counted, not stored one by one, so a flood costs one
+         *  counter per second and endpoint (2026-11-08, session f3daac6e, from review of PR 17). */
+        default void countRejected(long apiKeyId, LocalDateTime at, String endpoint) {
+        }
+
+        /** Refused calls of one key in [from, to], per "METHOD /path". */
+        default Map<String, Integer> rejectedByEndpoint(long apiKeyId, LocalDateTime from, LocalDateTime to) {
+            return Map.of();
+        }
     }
 
     public static class InMemoryApiKeyUsageRepository implements ApiKeyUsageRepository {
+        /** How long refused-call counters are kept. Older ones are dropped, so the counters cannot grow forever. */
+        public static final java.time.Duration REJECTED_RETENTION = java.time.Duration.ofDays(31);
+
+        private record RejectedBucket(long apiKeyId, LocalDateTime second, String endpoint) {}
+
+        private final ConcurrentHashMap<RejectedBucket, AtomicInteger> rejected = new ConcurrentHashMap<>();
+        private final AtomicLong lastPrune = new AtomicLong();   // epoch second of the last cleanup
         private final Map<Long, ApiKeyUsage> store = new ConcurrentHashMap<>();
+
+        @Override
+        public void countRejected(long apiKeyId, LocalDateTime at, String endpoint) {
+            LocalDateTime second = at.truncatedTo(ChronoUnit.SECONDS);
+            AtomicInteger counter = rejected.computeIfAbsent(new RejectedBucket(apiKeyId, second, endpoint), b -> new AtomicInteger());
+            long nowSecond = second.toEpochSecond(java.time.ZoneOffset.UTC);
+            long last = lastPrune.get();
+            // At most once a minute, and only by the caller that wins the compare-and-set: a scan per new counter would
+            // make a flood quadratic, and racing callers would each scan (reviews of PR 17).
+            if (counter.incrementAndGet() == 1 && nowSecond - last >= 60 && lastPrune.compareAndSet(last, nowSecond)) {
+                LocalDateTime cutoff = second.minus(REJECTED_RETENTION);
+                rejected.keySet().removeIf(b -> b.second().isBefore(cutoff));
+            }
+        }
+
+        @Override
+        public Map<String, Integer> rejectedByEndpoint(long apiKeyId, LocalDateTime from, LocalDateTime to) {
+            Map<String, Integer> out = new HashMap<>();
+            LocalDateTime start = from.truncatedTo(ChronoUnit.SECONDS);
+            rejected.forEach((b, n) -> {
+                if (b.apiKeyId() == apiKeyId && !b.second().isBefore(start) && !b.second().isAfter(to)) {
+                    out.merge(b.endpoint(), n.get(), Integer::sum);
+                }
+            });
+            return out;
+        }
         private final AtomicLong idGen = new AtomicLong(1);
 
         @Override
@@ -330,13 +373,14 @@ public class ApiKeysServiceAccounts {
             if (!key.scopes.contains("*") && !key.scopes.contains(action)) {
                 throw new IllegalArgumentException("Insufficient scope");
             }
-            // Atomic rate-limit check and usage logging per key
-            synchronized (String.valueOf(key.id).intern()) {
+            // Atomic rate-limit check and usage logging per key, on a lock object of this key's own: a lock on an interned
+            // String can be taken by unrelated code anywhere in the process (code scanning, 2026-11-08, session f3daac6e, from review).
+            synchronized (keyLocks.computeIfAbsent(key.id, id -> new Object())) {
                 if (!rateLimiter.allow(String.valueOf(key.id), key.rateLimit)) {
-                    // Log the rate-limited attempt
-                    ApiKeyUsage usage = new ApiKeyUsage(0, key.id, endpoint, method, 429,
-                            LocalDateTime.now());
-                    usageRepo.save(usage);
+                    // Rejected calls are counted per key, second and endpoint, not stored one by one: a flood of them
+                    // would otherwise fill memory while being refused (2026-11-08, session f3daac6e, from review).
+                    // Counted by the usage repository, so every service sharing it sees the same numbers.
+                    usageRepo.countRejected(key.id, LocalDateTime.now(), method + " " + endpoint);
                     throw new IllegalStateException("Rate limit exceeded");
                 }
                 // Log usage
@@ -353,6 +397,8 @@ public class ApiKeysServiceAccounts {
         }
 
         /* Get usage stats */
+        private final ConcurrentHashMap<Long, Object> keyLocks = new ConcurrentHashMap<>();
+
         public Map<String, Object> getUsageStats(long apiKeyId,
                                                  LocalDateTime from,
                                                  LocalDateTime to) {
@@ -361,6 +407,13 @@ public class ApiKeysServiceAccounts {
             Map<String, Integer> byEndpoint = new HashMap<>();
             Map<Integer, Integer> errors = new HashMap<>();
             int rateLimitHits = 0;
+            for (Map.Entry<String, Integer> e : usageRepo.rejectedByEndpoint(apiKeyId, from, to).entrySet()) {
+                int n = e.getValue();
+                total += n;
+                rateLimitHits += n;
+                byEndpoint.merge(e.getKey(), n, Integer::sum);
+                errors.merge(429, n, Integer::sum);
+            }
             for (ApiKeyUsage u : usages) {
                 String ep = u.method + " " + u.endpoint;
                 byEndpoint.merge(ep, 1, Integer::sum);
