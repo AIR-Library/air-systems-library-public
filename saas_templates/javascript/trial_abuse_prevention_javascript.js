@@ -247,11 +247,12 @@ async function check_trial_payment_timing(user_id) {
   return { success: true };
 }
 
-async function check_chargeback_history(user_id) {
-  // Chargebacks are counted against the Stripe customer stored on the ledger. A user with no stored customer has
-  // none: the id is never guessed, since a guessed id could match someone else's events.
+async function check_chargeback_history(user_id, supplied_customer_id = null) {
+  // Chargebacks are counted against the Stripe customer supplied with this call (subscription_created passes it,
+  // since the ledger stores it only after the gates pass), else the one stored on the ledger. A user with neither
+  // has none: the id is never guessed, since a guessed id could match someone else's events.
   const ledger = db.prepare(`SELECT stripe_customer_id FROM trial_abuse_ledger WHERE user_id = ?`).get(user_id);
-  const stripe_customer_id = ledger?.stripe_customer_id ?? null;
+  const stripe_customer_id = supplied_customer_id ?? ledger?.stripe_customer_id ?? null;
 
   const stripeStmt = db.prepare(`
     SELECT COUNT(*) AS count
@@ -339,7 +340,7 @@ async function signup(email, password, ip, device) {
 async function subscription_created(user_id, stripe_payment_method_id, stripe_customer_id = null) {
   const paymentGate = await check_payment_method_history(stripe_payment_method_id);
   const timingGate = await check_trial_payment_timing(user_id);
-  const chargebackGate = await check_chargeback_history(user_id);
+  const chargebackGate = await check_chargeback_history(user_id, stripe_customer_id);
 
   if (paymentGate.error) return paymentGate;
   if (timingGate.error) return timingGate;

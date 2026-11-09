@@ -14,18 +14,16 @@ export interface Database {
 
 export class AuditLogger {
   private db: Database;
-  private lastTimestampMs = 0;
 
   /**
-   * The time is set here, not by the database: SQLite's CURRENT_TIMESTAMP has no zone and only whole seconds, so
-   * it was read back as local time and two writes in one second could not be ordered. An ISO string in UTC with
-   * fixed width sorts correctly as text, and each logger hands out strictly increasing times, so ORDER BY
-   * timestamp keeps write order. Postgres reads the same string into its timestamp column.
+   * The event's real time, set here and not by the database: SQLite's CURRENT_TIMESTAMP has no zone and whole
+   * seconds only, so it was read back as local time. An ISO string in UTC has fixed width and sorts correctly as
+   * text; Postgres reads it into its timestamptz column. Two writes in one millisecond share a time; the seq
+   * column, numbered by the database in insertion order, puts them in order (ORDER BY timestamp, seq). Times are
+   * never nudged forward to make them unique: that made bursts look like future events (review on PR 18).
    */
-  private nextTimestamp(): string {
-    const ms = Math.max(Date.now(), this.lastTimestampMs + 1);
-    this.lastTimestampMs = ms;
-    return new Date(ms).toISOString();
+  private eventTime(): string {
+    return new Date().toISOString();
   }
 
   constructor(db: Database) {
@@ -35,6 +33,7 @@ export class AuditLogger {
   static CREATE_TABLE_SQL = `
     CREATE TABLE IF NOT EXISTS audit_log (
       id UUID PRIMARY KEY,
+      seq BIGSERIAL NOT NULL,
       timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       actor_id TEXT,
       actor_type TEXT NOT NULL CHECK (actor_type IN ('user', 'service', 'api_key')),
@@ -53,8 +52,9 @@ export class AuditLogger {
 
   static CREATE_TABLE_SQL_SQLITE = `
     CREATE TABLE IF NOT EXISTS audit_log (
-      id TEXT PRIMARY KEY,
-      timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+      seq INTEGER PRIMARY KEY,
+      id TEXT NOT NULL UNIQUE,
+      timestamp TEXT NOT NULL,
       actor_id TEXT,
       actor_type TEXT NOT NULL CHECK (actor_type IN ('user', 'service', 'api_key')),
       action TEXT NOT NULL,
@@ -105,7 +105,7 @@ export class AuditLogger {
       )`,
       [
         logId,
-        this.nextTimestamp(),
+        this.eventTime(),
         actorIdStr,
         actor_type,
         action,
@@ -190,7 +190,7 @@ export class AuditLogger {
     const logsResult = await this.db.query(
       `SELECT id, timestamp, actor_id, action, resource_type, resource_id, old_value, new_value, why_chain_id
        FROM audit_log ${whereClause}
-       ORDER BY timestamp DESC
+       ORDER BY timestamp DESC, seq DESC
        LIMIT $${paramIndex++} OFFSET $${paramIndex++}`,
       [...values, limit, offset]
     );
@@ -238,7 +238,7 @@ export class AuditLogger {
     const resourceLogsResult = await this.db.query(
       `SELECT * FROM audit_log
        WHERE resource_type = $1 AND resource_id = $2
-       ORDER BY timestamp ASC`,
+       ORDER BY timestamp ASC, seq ASC`,
       [resourceType, resourceId]
     );
 
@@ -297,7 +297,7 @@ export class AuditLogger {
     const result = await this.db.query(
       `SELECT id, timestamp, actor_id, action, resource_type, resource_id, old_value, new_value, why_chain_id
        FROM audit_log ${whereClause}
-       ORDER BY timestamp DESC
+       ORDER BY timestamp DESC, seq DESC
        LIMIT $${paramIndex++}`,
       [...values, limit]
     );

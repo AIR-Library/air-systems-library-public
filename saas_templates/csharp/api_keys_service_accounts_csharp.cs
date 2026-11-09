@@ -110,6 +110,11 @@ namespace SaaSLibrary.ApiKeys
             if (apiKey == null)
                 throw new KeyNotFoundException($"API key {apiKeyId} not found for user {userId}");
 
+            // Rotation keeps the row active and swaps its secret, so a revoked key would hand back a secret
+            // that never validates. Revoked stays revoked: the caller creates a new key instead.
+            if (!apiKey.IsActive)
+                throw new InvalidOperationException($"API key {apiKeyId} is revoked and cannot be rotated");
+
             var oldKeyRevokedAt = DateTime.UtcNow;
             var gracePeriodEndsAt = oldKeyRevokedAt.AddHours(24);
 

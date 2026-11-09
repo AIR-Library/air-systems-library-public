@@ -233,6 +233,16 @@ namespace SaaSLibrary.ApiKeys.Tests
         }
 
         [Fact]
+        public async Task RotateApiKey_RevokedKey_ThrowsAndReturnsNoSecret()
+        {
+            var apiKey = await CreateTestApiKeyInDb("Revoked", new List<string> { "read:deployments" });
+            await _service.RevokeApiKeyAsync(_testUserId, apiKey.Id);
+
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                _service.RotateApiKeyAsync(_testUserId, apiKey.Id));
+        }
+
+        [Fact]
         public async Task RotateApiKey_NonExistingKeyForUser_ThrowsKeyNotFoundException()
         {
             // Act & Assert

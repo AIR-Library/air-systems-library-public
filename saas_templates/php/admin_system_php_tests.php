@@ -286,4 +286,15 @@ final class AdminSystemTest extends TestCase
         $this->assertNotEmpty($logs);
         $this->assertEquals('user_created', $logs[0]['action']);
     }
+
+    public function testCsrfTokenSurvivesANewRequest(): void
+    {
+        // The page and the POST that submits it are separate requests, so separate AdminSystem objects.
+        $page = new AdminSystem($this->pdo);
+        $post = new AdminSystem($this->pdo, $page->csrfToken());
+        $this->assertSame($page->csrfToken(), $post->csrfToken());
+
+        $stranger = new AdminSystem($this->pdo);
+        $this->assertNotSame($page->csrfToken(), $stranger->csrfToken());
+    }
 }

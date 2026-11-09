@@ -268,7 +268,7 @@ namespace TrialAbusePrevention
             {
                 entity.HasKey(e => e.Id);
                 entity.Property(e => e.CreatedAt).IsRequired();
-                entity.Property(e => e.AbuseFlags).HasColumnType("jsonb");
+                entity.Property(e => e.AbuseFlags).HasColumnType("text");   // comma-separated flags, not JSON
             });
         }
     }

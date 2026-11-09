@@ -166,3 +166,16 @@ test('chargeback_history FAIL → 2+ chargebacks, requires prepayment', async ()
   expect(res.error).toBe('chargeback_history_requires_prepayment');
   expect(res.code).toBe(403);
 });
+
+test('chargeback_history checks the customer supplied at subscription time, before the ledger has it', async () => {
+  const insertUser = db.prepare('INSERT INTO users (email, created_at) VALUES (?, ?)');
+  const user_id = insertUser.run('user_supplied@example.com', new Date().toISOString()).lastInsertRowid;
+  db.prepare(`INSERT INTO trial_abuse_ledger (user_id) VALUES (?)`).run(user_id);   // no customer stored yet
+  db.prepare(`INSERT INTO stripe_events (customer, type) VALUES (?, 'chargeback'), (?, 'chargeback')`)
+    .run('cus_supplied', 'cus_supplied');
+
+  expect((await check_chargeback_history(user_id)).success).toBe(true);   // nothing stored, nothing found
+  const res = await check_chargeback_history(user_id, 'cus_supplied');
+  expect(res.error).toBe('chargeback_history_requires_prepayment');
+  expect(res.code).toBe(403);
+});

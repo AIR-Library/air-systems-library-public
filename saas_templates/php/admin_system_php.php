@@ -8,16 +8,26 @@ class AdminSystem
     private string $current_user_tier = '';
     private const ALLOWED_TIERS = ['owner', 'admin', 'user'];
     /**
-     * 2026-10-08 fix: was a hard-coded constant ('valid_csrf_token'), which every attacker knows, so
-     * the CSRF check protected nothing. Now a random token per AdminSystem instance (hand it to the
-     * page with csrfToken()); compared in constant time.
+     * The token a page must send back with every write; compared in constant time. It was the constant
+     * 'valid_csrf_token', which every attacker knows. It must outlive one request: the page that shows the
+     * form and the POST that submits it build separate AdminSystem objects. So it is the caller's session
+     * token when one is passed, else the one kept in $_SESSION (made once per session), else, with no
+     * session, a random one for this object only.
      */
     private string $csrfToken;
+    private const SESSION_CSRF_KEY = 'admin_system_csrf_token';
 
-    public function __construct(PDO $pdo)
+    public function __construct(PDO $pdo, ?string $csrfToken = null)
     {
         $this->pdo = $pdo;
-        $this->csrfToken = bin2hex(random_bytes(32));
+        if ($csrfToken !== null && $csrfToken !== '') {
+            $this->csrfToken = $csrfToken;
+        } elseif (session_status() === PHP_SESSION_ACTIVE) {
+            $_SESSION[self::SESSION_CSRF_KEY] ??= bin2hex(random_bytes(32));
+            $this->csrfToken = $_SESSION[self::SESSION_CSRF_KEY];
+        } else {
+            $this->csrfToken = bin2hex(random_bytes(32));
+        }
         $this->initializeSchema();
     }
 
