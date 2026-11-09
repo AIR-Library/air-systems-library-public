@@ -167,7 +167,7 @@ public class ApiKeysServiceAccounts {
         private record RejectedBucket(long apiKeyId, LocalDateTime second, String endpoint) {}
 
         private final ConcurrentHashMap<RejectedBucket, AtomicInteger> rejected = new ConcurrentHashMap<>();
-        private volatile long lastPrune;   // epoch second of the last cleanup
+        private final AtomicLong lastPrune = new AtomicLong();   // epoch second of the last cleanup
         private final Map<Long, ApiKeyUsage> store = new ConcurrentHashMap<>();
 
         @Override
@@ -175,9 +175,10 @@ public class ApiKeysServiceAccounts {
             LocalDateTime second = at.truncatedTo(ChronoUnit.SECONDS);
             AtomicInteger counter = rejected.computeIfAbsent(new RejectedBucket(apiKeyId, second, endpoint), b -> new AtomicInteger());
             long nowSecond = second.toEpochSecond(java.time.ZoneOffset.UTC);
-            if (counter.incrementAndGet() == 1 && nowSecond - lastPrune >= 60) {
-                // At most once a minute: a scan per new counter would make a flood quadratic (review of PR 17).
-                lastPrune = nowSecond;
+            long last = lastPrune.get();
+            // At most once a minute, and only by the caller that wins the compare-and-set: a scan per new counter would
+            // make a flood quadratic, and racing callers would each scan (reviews of PR 17).
+            if (counter.incrementAndGet() == 1 && nowSecond - last >= 60 && lastPrune.compareAndSet(last, nowSecond)) {
                 LocalDateTime cutoff = second.minus(REJECTED_RETENTION);
                 rejected.keySet().removeIf(b -> b.second().isBefore(cutoff));
             }
