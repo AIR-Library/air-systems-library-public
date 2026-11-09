@@ -139,7 +139,11 @@ func initSchema(db *sql.DB) error {
 
 	-- Upgrade (2026-11-09): rows from the previous version used variable-width RFC3339Nano times, which sort
 	-- wrongly against the fixed nine-digit form now written (".123Z" sorted after ".123000000Z"). Rewritten once,
-	-- here, before the immutability triggers below exist; every UTC time of 30 characters is already fixed.
+	-- here, in one transaction with the update trigger dropped and recreated below, so a database that already
+	-- has the trigger can still be upgraded and is never left without it (CodeRabbit, PR 18). A database written
+	-- by this version has no such rows: nothing changes. Every UTC time of 30 characters is already fixed.
+	BEGIN;
+	DROP TRIGGER IF EXISTS audit_log_immutable_update;
 	UPDATE audit_log SET timestamp =
 		CASE WHEN instr(timestamp, '.') = 0
 			THEN substr(timestamp, 1, 19) || '.000000000Z'
@@ -167,6 +171,7 @@ func initSchema(db *sql.DB) error {
 	BEGIN
 		SELECT RAISE(ABORT, 'audit log is immutable');
 	END;
+	COMMIT;
 	`
 	_, err := db.Exec(schema)
 	return err

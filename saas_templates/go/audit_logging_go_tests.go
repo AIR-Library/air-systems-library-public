@@ -584,3 +584,36 @@ func TestAuditLogger_UpgradesOldTimestamps(t *testing.T) {
 		t.Errorf("a whole-second old time was not rewritten: %+v", all.Logs)
 	}
 }
+
+// A database that already has the update trigger and still holds old-format times opens and is upgraded; the trigger
+// is back afterwards, so the log stays immutable (CodeRabbit review on PR 18, 2026-11-09, session 04ec72ff).
+func TestAuditLogger_UpgradesOldTimestampsUnderTheTrigger(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old-with-trigger.db")
+	old, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open old db: %v", err)
+	}
+	_, err = old.Exec(`CREATE TABLE audit_log (id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, actor_id TEXT,
+		actor_type TEXT NOT NULL, action TEXT NOT NULL, resource_type TEXT NOT NULL, resource_id TEXT NOT NULL,
+		old_value TEXT, new_value TEXT, why_chain_id TEXT, metadata TEXT);
+		INSERT INTO audit_log VALUES ('log_a', '2026-11-01T12:00:00.5Z', '1', 'user', 'a', 'user', 'u1', 'null', '{}', NULL, 'null');
+		CREATE TRIGGER audit_log_immutable_update BEFORE UPDATE ON audit_log
+		BEGIN SELECT RAISE(ABORT, 'audit log is immutable'); END;`)
+	old.Close()
+	if err != nil {
+		t.Fatalf("write old db: %v", err)
+	}
+
+	logger, err := NewAuditLogger(path)
+	if err != nil {
+		t.Fatalf("NewAuditLogger on a db with the trigger failed: %v", err)
+	}
+	defer logger.Close()
+	all, _ := logger.QueryLogs(context.Background(), QueryLogsRequest{Limit: 10})
+	if all.Total != 1 || all.Logs[0].Timestamp != "2026-11-01T12:00:00.500000000Z" {
+		t.Fatalf("old time not rewritten under the trigger: %+v", all.Logs)
+	}
+	if _, err := logger.db.Exec(`UPDATE audit_log SET action = 'x'`); err == nil {
+		t.Error("the update trigger is gone after the upgrade; the log must stay immutable")
+	}
+}
