@@ -13,7 +13,7 @@ namespace TrialAbusePreventionTests
     public class TrialAbusePreventionTests : IDisposable
     {
         private readonly DbContextOptions<TrialAbusePreventionDbContext> _options;
-        private TrialAbusePreventionDbContext _context;
+        private readonly TrialAbusePreventionDbContext _context;
         private TrialAbusePreventionService _service;
         private readonly ILogger<TrialAbusePreventionService> _logger = Mock.Of<ILogger<TrialAbusePreventionService>>();
 
