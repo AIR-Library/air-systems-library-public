@@ -257,6 +257,12 @@ export class FileUploads {
     } catch {
       return { error: 'invalid link' };
     }
+    // Only the exact token this service issued is accepted. Base64 decoding ignores the spare bits of the last
+    // character, so a link with that character changed (A -> B) decoded to the same bytes and still worked; a
+    // token must re-encode to itself. Found by the flaky tamper test on PR 18, 2026-11-09, session 04ec72ff.
+    if (Buffer.from(payload, 'utf8').toString('base64url') !== token) {
+      return { error: 'invalid link' };
+    }
 
     const parts = payload.split(':');
     if (parts.length !== 3) {
