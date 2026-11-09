@@ -2,8 +2,10 @@ package auditlogging
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -530,5 +532,46 @@ func TestAuditLogger_ActionWildcardUnderscoreIsLiteral(t *testing.T) {
 	}
 	if resp.Total != 1 || len(resp.Logs) != 1 || resp.Logs[0].Action != "user_created" {
 		t.Errorf("user_* matched %d logs, want only user_created", resp.Total)
+	}
+}
+
+// A database written by the previous version (variable-width RFC3339Nano times) is upgraded when it is opened, so a
+// range ending at a row's exact instant still includes it (Codex review on PR 18, 2026-11-09, session 04ec72ff).
+func TestAuditLogger_UpgradesOldTimestamps(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	old, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open old db: %v", err)
+	}
+	_, err = old.Exec(`CREATE TABLE audit_log (id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, actor_id TEXT,
+		actor_type TEXT NOT NULL, action TEXT NOT NULL, resource_type TEXT NOT NULL, resource_id TEXT NOT NULL,
+		old_value TEXT, new_value TEXT, why_chain_id TEXT, metadata TEXT);
+		INSERT INTO audit_log VALUES ('log_a', '2026-11-01T12:00:00.123Z', '1', 'user', 'a', 'user', 'u1', 'null', '{}', NULL, 'null');
+		INSERT INTO audit_log VALUES ('log_b', '2026-11-01T12:00:05Z', '1', 'user', 'b', 'user', 'u1', 'null', '{}', NULL, 'null');`)
+	old.Close()
+	if err != nil {
+		t.Fatalf("write old rows: %v", err)
+	}
+
+	logger, err := NewAuditLogger(path)
+	if err != nil {
+		t.Fatalf("NewAuditLogger on the old db failed: %v", err)
+	}
+	defer logger.Close()
+
+	to := time.Date(2026, 11, 1, 12, 0, 0, 123_000_000, time.UTC)
+	resp, err := logger.QueryLogs(context.Background(), QueryLogsRequest{DateTo: &to, Limit: 10})
+	if err != nil {
+		t.Fatalf("QueryLogs failed: %v", err)
+	}
+	if resp.Total != 1 || resp.Logs[0].ID != "log_a" {
+		t.Fatalf("a range ending at log_a's instant returned %d logs, want log_a", resp.Total)
+	}
+	if got := resp.Logs[0].Timestamp; got != "2026-11-01T12:00:00.123000000Z" {
+		t.Errorf("old time not rewritten to the fixed form: %s", got)
+	}
+	all, _ := logger.QueryLogs(context.Background(), QueryLogsRequest{Limit: 10})
+	if all.Total != 2 || all.Logs[0].Timestamp != "2026-11-01T12:00:05.000000000Z" {
+		t.Errorf("a whole-second old time was not rewritten: %+v", all.Logs)
 	}
 }

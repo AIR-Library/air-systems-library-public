@@ -137,6 +137,16 @@ func initSchema(db *sql.DB) error {
 		metadata TEXT
 	);
 
+	-- Upgrade (2026-11-09): rows from the previous version used variable-width RFC3339Nano times, which sort
+	-- wrongly against the fixed nine-digit form now written (".123Z" sorted after ".123000000Z"). Rewritten once,
+	-- here, before the immutability triggers below exist; every UTC time of 30 characters is already fixed.
+	UPDATE audit_log SET timestamp =
+		CASE WHEN instr(timestamp, '.') = 0
+			THEN substr(timestamp, 1, 19) || '.000000000Z'
+			ELSE substr(timestamp, 1, 20) || substr(substr(timestamp, 21, length(timestamp) - 21) || '000000000', 1, 9) || 'Z'
+		END
+	WHERE length(timestamp) <> 30 AND timestamp LIKE '____-__-__T__:__:__%Z';
+
 	CREATE INDEX IF NOT EXISTS idx_audit_log_actor_action_resource_time 
 	ON audit_log(actor_id, action, resource_type, timestamp);
 	CREATE INDEX IF NOT EXISTS idx_audit_log_resource_time 

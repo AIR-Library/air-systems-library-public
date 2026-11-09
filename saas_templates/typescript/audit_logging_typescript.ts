@@ -48,6 +48,9 @@ export class AuditLogger {
 
     CREATE INDEX IF NOT EXISTS idx_audit_log_actor_action_resource_timestamp ON audit_log (actor_id, action, resource_type, timestamp);
     CREATE INDEX IF NOT EXISTS idx_audit_log_resource_type_resource_id_timestamp ON audit_log (resource_type, resource_id, timestamp);
+
+    -- Upgrade (2026-11-09): a table made by the previous version has no seq; re-running this SQL adds and numbers it.
+    ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS seq BIGSERIAL;
   `;
 
   static CREATE_TABLE_SQL_SQLITE = `
