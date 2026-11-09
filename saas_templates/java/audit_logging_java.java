@@ -42,7 +42,10 @@ public class AuditLoggingService implements AutoCloseable {
      */
     public AuditLoggingService(Connection connection) throws SQLException {
         this.connection = connection;
-        this.objectMapper = new ObjectMapper();
+        // Decimals are read as BigDecimal, so 0.100000000000000001 and ...002 stay different when Replay
+        // compares values (as doubles they were equal; CodeRabbit, PR 18, 2026-11-09).
+        this.objectMapper = new ObjectMapper()
+                .enable(com.fasterxml.jackson.databind.DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS);
         this.initializeSchema();
     }
 
@@ -312,17 +315,18 @@ public class AuditLoggingService implements AutoCloseable {
         String sql = """
             SELECT new_value FROM audit_log
             WHERE resource_type = ? AND resource_id = ? AND id > ?
-            ORDER BY timestamp ASC, id ASC LIMIT 1
+            ORDER BY timestamp ASC, id ASC
             """;
         try (PreparedStatement ps = connection.prepareStatement(sql)) {
             ps.setString(1, resourceType);
             ps.setString(2, resourceId);
             ps.setLong(3, logId);
             try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) {
-                    String laterValueStr = rs.getString(1);
-                    JsonNode laterValue = parseJson(laterValueStr);
-                    return !Objects.equals(newValueJson, laterValue);
+                // Every later entry counts: A, A, B has diverged from the first A (CodeRabbit, PR 18).
+                while (rs.next()) {
+                    if (!Objects.equals(newValueJson, parseJson(rs.getString(1)))) {
+                        return true;
+                    }
                 }
                 return false;
             }

@@ -155,6 +155,21 @@ class AuditLoggingServiceTest {
     }
 
     @Test
+    @Order(3)
+    void testReplay_divergenceAfterAnUnchangedEntry() throws Exception {
+        // Values A, A, B: the first A has diverged, though the entry right after it is the same (CodeRabbit, PR 18).
+        Map<String, Object> a = Map.of("status", "active");
+        Map<String, Object> b = Map.of("status", "suspended");
+        String first = (String) service.logMutation("1", "user", "user_created", "user", "u_aab",
+                AuditLoggingService.toJsonNode(Map.of("status", "none")), AuditLoggingService.toJsonNode(a), null, null).get("log_id");
+        service.logMutation("1", "user", "user_touched", "user", "u_aab",
+                AuditLoggingService.toJsonNode(a), AuditLoggingService.toJsonNode(a), null, null);
+        service.logMutation("1", "user", "user_suspended", "user", "u_aab",
+                AuditLoggingService.toJsonNode(a), AuditLoggingService.toJsonNode(b), null, null);
+        assertEquals(true, service.replay(first).get("has_diverged"));
+    }
+
+    @Test
     @Order(4)
     void testReplay_logNotFound() {
         assertThrows(NoSuchElementException.class, () -> service.replay("99999"));
