@@ -7,11 +7,17 @@ class AdminSystem
     private int $current_user_id = 0;
     private string $current_user_tier = '';
     private const ALLOWED_TIERS = ['owner', 'admin', 'user'];
-    private const CSRF_TOKEN = 'valid_csrf_token';
+    /**
+     * 2026-10-08 fix: was a hard-coded constant ('valid_csrf_token'), which every attacker knows, so
+     * the CSRF check protected nothing. Now a random token per AdminSystem instance (hand it to the
+     * page with csrfToken()); compared in constant time.
+     */
+    private string $csrfToken;
 
     public function __construct(PDO $pdo)
     {
         $this->pdo = $pdo;
+        $this->csrfToken = bin2hex(random_bytes(32));
         $this->initializeSchema();
     }
 
@@ -27,9 +33,20 @@ class AdminSystem
         $this->current_user_tier = $row['tier'];
     }
 
+    public function getCurrentUserId(): int
+    {
+        return $this->current_user_id;
+    }
+
+    /** The token the page must send back with every write. */
+    public function csrfToken(): string
+    {
+        return $this->csrfToken;
+    }
+
     private function verify_csrf(string $token): void
     {
-        if ($token !== self::CSRF_TOKEN) {
+        if ($token === '' || !hash_equals($this->csrfToken, $token)) {
             throw new RuntimeException('Invalid CSRF token');
         }
     }
@@ -109,7 +126,9 @@ CREATE TABLE IF NOT EXISTS customers (
     subscription_status TEXT,
     payment_method TEXT,
     address TEXT,
-    notes TEXT
+    notes TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS deployments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,6 +140,8 @@ CREATE TABLE IF NOT EXISTS deployments (
     published_at TEXT,
     suspend_reason TEXT,
     archived_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
     FOREIGN KEY(customer_id) REFERENCES customers(id)
 );
 CREATE TABLE IF NOT EXISTS refunds (
@@ -255,10 +276,6 @@ SQL;
             $user_id = (int)($data['user_id'] ?? 0);
             $new_tier = trim($data['new_tier'] ?? '');
 
-            if ($user_id === $this->current_user_id) {
-                return ['error' => 'cannot_change_own_role', 'message' => 'Cannot change own role'];
-            }
-
             if (!$this->validate_tier($new_tier)) {
                 return ['error' => 'invalid_tier', 'message' => 'Invalid tier'];
             }
@@ -270,8 +287,13 @@ SQL;
                 return ['error' => 'user_not_found', 'message' => 'User not found'];
             }
 
-            if ($user['tier'] === 'owner' && $this->countOwners() <= 1) {
+            // Check if trying to demote the last active owner (takes precedence over own-role check)
+            if ($user['tier'] === 'owner' && $this->countOwners() <= 1 && $new_tier !== 'owner') {
                 return ['error' => 'cannot_demote_last_owner', 'message' => 'Cannot demote last active owner'];
+            }
+
+            if ($user_id === $this->current_user_id) {
+                return ['error' => 'cannot_change_own_role', 'message' => 'Cannot change own role'];
             }
 
             $old_tier = $user['tier'];
