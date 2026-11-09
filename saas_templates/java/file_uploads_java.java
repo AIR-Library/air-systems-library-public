@@ -285,6 +285,7 @@ public final class FileUploadService {
         public java.util.logging.Logger getParentLogger() throws SQLFeatureNotSupportedException { throw new SQLFeatureNotSupportedException(); }
         @Override
         public <T> T unwrap(Class<T> iface) throws SQLException { throw new SQLException("SimpleDataSource wraps nothing"); }
+        @Override
         public boolean isWrapperFor(Class<?> iface) throws SQLException { return false; }
     }
 
