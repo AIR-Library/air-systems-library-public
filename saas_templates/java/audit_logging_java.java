@@ -62,9 +62,10 @@ public class AuditLoggingService implements AutoCloseable {
                 metadata        TEXT
             );
             """;
+        // Added 'id' as 5th column to fully cover ORDER BY timestamp, id
         String indexDdl = """
             CREATE INDEX IF NOT EXISTS idx_audit_log_query
-                ON audit_log (actor_id, action, resource_type, timestamp);
+                ON audit_log (actor_id, action, resource_type, timestamp, id);
             """;
         try (Statement stmt = connection.createStatement()) {
             stmt.execute(ddl);
@@ -211,18 +212,19 @@ public class AuditLoggingService implements AutoCloseable {
 
         String whereSql = whereClauses.isEmpty() ? "" : " WHERE " + String.join(" AND ", whereClauses);
 
-        // Count total
+        // Total matching rows, for has_more
+        long total = 0;
         String countSql = "SELECT COUNT(*) FROM audit_log" + whereSql;
-        long total;
-        try (PreparedStatement ps = connection.prepareStatement(countSql)) {
-            bindParams(ps, params);
-            try (ResultSet rs = ps.executeQuery()) {
-                rs.next();
-                total = rs.getLong(1);
+        try (PreparedStatement countPs = connection.prepareStatement(countSql)) {
+            bindParams(countPs, params);
+            try (ResultSet rs = countPs.executeQuery()) {
+                if (rs.next()) {
+                    total = rs.getLong(1);
+                }
             }
         }
 
-        // Fetch page
+        // Then fetch the page of data
         String selectSql = """
             SELECT id, timestamp, actor_id, actor_type, action, resource_type, resource_id,
                    old_value, new_value, why_chain_id, metadata
@@ -291,10 +293,11 @@ public class AuditLoggingService implements AutoCloseable {
         // Determine divergence: has the resource state changed since this log?
         // Divergence = there exists a later log entry for the same resource
         // (same resource_type + resource_id) with a different new_value.
+        JsonNode newValueNode = (JsonNode) logEntry.get("new_value");
         boolean hasDiverged = checkDivergence(id,
                 (String) logEntry.get("resource_type"),
                 (String) logEntry.get("resource_id"),
-                (String) logEntry.get("new_value"));
+                newValueNode);
 
         Map<String, Object> response = new LinkedHashMap<>();
         response.put("log_id", logId);
@@ -304,7 +307,7 @@ public class AuditLoggingService implements AutoCloseable {
         return response;
     }
 
-    private boolean checkDivergence(long logId, String resourceType, String resourceId, String newValueJson)
+    private boolean checkDivergence(long logId, String resourceType, String resourceId, JsonNode newValueJson)
             throws SQLException {
         String sql = """
             SELECT new_value FROM audit_log
@@ -317,7 +320,8 @@ public class AuditLoggingService implements AutoCloseable {
             ps.setLong(3, logId);
             try (ResultSet rs = ps.executeQuery()) {
                 if (rs.next()) {
-                    String laterValue = rs.getString(1);
+                    String laterValueStr = rs.getString(1);
+                    JsonNode laterValue = parseJson(laterValueStr);
                     return !Objects.equals(newValueJson, laterValue);
                 }
                 return false;
