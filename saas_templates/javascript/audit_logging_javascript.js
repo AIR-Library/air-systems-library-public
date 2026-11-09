@@ -58,6 +58,10 @@ class AuditLogger {
     this.indexByResourceType = new Map();
   }
 
+  /**
+   * Appends one frozen audit entry and indexes it. Input: actor, action, resource and values; resource_id may be
+   * a number. Output: { success, log_id }. Throws on a missing field. Touches: memory only. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+   */
   async logMutation(entry) {
     if (!entry.action) {
       throw new Error("Action is required");
@@ -206,6 +210,10 @@ class AuditLogger {
     };
   }
 
+  /**
+   * Returns the state an entry recorded and whether a later entry (later time, or same millisecond written after)
+   * or the given current state differs. Throws for an unknown id. Touches: memory only. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+   */
   async replay(logId, currentState = null) {
     const log = this.indexById.get(logId);
     if (!log) {
@@ -294,6 +302,9 @@ class AuditLogger {
     throw new Error("Table 'audit_log' is immutable: UPDATE operations are forbidden.");
   }
 
+  /**
+   * Always throws: the audit log is immutable. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+   */
   async deleteLog(logId) {
     throw new Error("Table 'audit_log' is immutable: DELETE operations are forbidden.");
   }

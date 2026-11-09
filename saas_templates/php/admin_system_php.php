@@ -17,6 +17,11 @@ class AdminSystem
     private string $csrfToken;
     private const SESSION_CSRF_KEY = 'admin_system_csrf_token';
 
+    /**
+     * Builds the admin service on a PDO connection and creates its schema.
+     * The CSRF token is the given session token, else $_SESSION's, else a random one for this object only.
+     * Touches: the database (schema). Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+     */
     public function __construct(PDO $pdo, ?string $csrfToken = null)
     {
         $this->pdo = $pdo;
@@ -43,6 +48,9 @@ class AdminSystem
         $this->current_user_tier = $row['tier'];
     }
 
+    /**
+     * The id of the user set with setCurrentUser (0 before that). Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+     */
     public function getCurrentUserId(): int
     {
         return $this->current_user_id;
@@ -54,6 +62,9 @@ class AdminSystem
         return $this->csrfToken;
     }
 
+    /**
+     * Throws RuntimeException unless the token matches this service's token (constant-time compare). Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+     */
     private function verify_csrf(string $token): void
     {
         if ($token === '' || !hash_equals($this->csrfToken, $token)) {
@@ -110,6 +121,9 @@ class AdminSystem
         ]);
     }
 
+    /**
+     * Creates the users, customers, deployments, governance and audit tables if missing. Touches: the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+     */
     private function initializeSchema(): void
     {
         $sql = <<<SQL
@@ -277,6 +291,10 @@ SQL;
         }
     }
 
+    /**
+     * Changes a user's tier after the CSRF check; refuses an invalid tier, demoting the last active owner and the
+     * caller's own role. Output: success or an error array. Touches: users and audit_logs. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+     */
     public function changeRole(array $data): array
     {
         try {
@@ -738,6 +756,9 @@ SQL;
 
     /* AUDIT LOG SEARCH */
 
+    /**
+     * Admin or owner: filters the audit log by the given fields. Output: matching rows. Touches: reads audit_logs. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+     */
     public function searchAuditLog(array $filters): array
     {
         try {

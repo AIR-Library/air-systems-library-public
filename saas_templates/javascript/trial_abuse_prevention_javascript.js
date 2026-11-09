@@ -247,6 +247,10 @@ async function check_trial_payment_timing(user_id) {
   return { success: true };
 }
 
+/**
+ * Gate: counts chargebacks for the supplied Stripe customer, else the ledger's, plus charged-back refunds.
+ * No customer means none is guessed. Output: { success } or { error, code: 403 }. Touches: reads the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+ */
 async function check_chargeback_history(user_id, supplied_customer_id = null) {
   // Chargebacks are counted against the Stripe customer supplied with this call (subscription_created passes it,
   // since the ledger stores it only after the gates pass), else the one stored on the ledger. A user with neither
@@ -337,6 +341,10 @@ async function signup(email, password, ip, device) {
   return result;
 }
 
+/**
+ * Runs the payment, timing and chargeback gates (checking the supplied customer before it is stored), then
+ * records the result on the ledger without erasing a stored customer id. Output: { success, flags? } or the error. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+ */
 async function subscription_created(user_id, stripe_payment_method_id, stripe_customer_id = null) {
   const paymentGate = await check_payment_method_history(stripe_payment_method_id);
   const timingGate = await check_trial_payment_timing(user_id);

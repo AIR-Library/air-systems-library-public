@@ -200,6 +200,11 @@ namespace AdminSystem
     // CSRF validation (per-user token)
     public static class CsrfValidator
     {
+        /// <summary>
+        /// Checks the CSRF token sent with a write against the current user's token.
+        /// Input: the token. Throws ApiException (unauthorized / invalid_csrf) when there is no user or it does not match.
+        /// Was a constant shared by everyone; now per user. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public static void Verify(string token)
         {
             if (AuthContext.CurrentUser == null)
@@ -209,6 +214,10 @@ namespace AdminSystem
                 throw new ApiException("csrf_invalid", "Invalid CSRF token");
         }
 
+        /// <summary>
+        /// Issues a new random CSRF token for <paramref name="user"/> and stores it on the user.
+        /// Output: the token to embed in the page. Touches: the in-memory user record. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public static string GenerateToken(User user)
         {
             user.CsrfToken = Guid.NewGuid().ToString("N");
@@ -233,6 +242,10 @@ namespace AdminSystem
                 throw new ApiException("invalid_name", "Name must be 1-100 characters");
         }
 
+        /// <summary>
+        /// Validates a tier name: it must parse to a defined Role, and Owner only when <paramref name="allowOwner"/>.
+        /// Throws ApiException(invalid_tier) otherwise; "99" no longer passes as (Role)99. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public static void ValidateTier(string tier, bool allowOwner = false)
         {
             // TryParse accepts any number ("99" -> (Role)99); only a defined role passes (CodeRabbit, PR 18).
@@ -243,6 +256,9 @@ namespace AdminSystem
                 throw new ApiException("invalid_tier", "Owner tier cannot be assigned via this operation");
         }
 
+        /// <summary>
+        /// Refuses an amount of zero or less with ApiException(invalid_amount). Used by refunds. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public static void ValidatePositiveAmount(decimal amount)
         {
             if (amount <= 0)
@@ -352,6 +368,11 @@ namespace AdminSystem
             };
         }
 
+        /// <summary>
+        /// Owner-only: resets a user's password after the CSRF check.
+        /// Refuses an unknown user, the last active owner and the caller's own account. Output: { success, ... }.
+        /// Touches: the in-memory user and audit records. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public object ResetPassword(string csrfToken, Guid userId)
         {
             CsrfValidator.Verify(csrfToken);
@@ -376,6 +397,11 @@ namespace AdminSystem
             return new { success = true, status = "reset_email_sent" };
         }
 
+        /// <summary>
+        /// Owner-only: changes a user's tier after the CSRF check; the Owner tier cannot be assigned here.
+        /// Refuses an unknown user, demoting the last active owner, and the caller's own role. Output: { success, old/new tier }.
+        /// Touches: the in-memory user and audit records. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public object ChangeUserRole(string csrfToken, Guid userId, string newTier)
         {
             CsrfValidator.Verify(csrfToken);
@@ -411,6 +437,10 @@ namespace AdminSystem
             };
         }
 
+        /// <summary>
+        /// Owner-only: suspends a user with a reason after the CSRF check.
+        /// Refuses an unknown user, the last active owner and the caller. Touches: the in-memory user and audit records. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public object SuspendUser(string csrfToken, Guid userId, string reason)
         {
             CsrfValidator.Verify(csrfToken);
@@ -477,6 +507,10 @@ namespace AdminSystem
             };
         }
 
+        /// <summary>
+        /// Owner-only: moves a customer to another plan tier (never Owner) after the CSRF check.
+        /// Refuses an unknown customer. Touches: the in-memory customer and audit records. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public object ChangeCustomerPlan(string csrfToken, Guid customerId, string newTier)
         {
             CsrfValidator.Verify(csrfToken);
@@ -510,6 +544,11 @@ namespace AdminSystem
             };
         }
 
+        /// <summary>
+        /// Owner-only: queues a refund on an invoice after the CSRF check.
+        /// The amount must be positive, the invoice must exist and have succeeded, and all refunds on it may not exceed its amount.
+        /// Output: { success, status: queued, amount }. Touches: the in-memory refund and audit records. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public object QueueRefund(string csrfToken, Guid invoiceId, decimal amount, string reason)
         {
             CsrfValidator.Verify(csrfToken);
@@ -574,6 +613,10 @@ namespace AdminSystem
             return items;
         }
 
+        /// <summary>
+        /// Owner-only: creates a deployment for a customer after the CSRF check; the tier cannot be Owner.
+        /// Refuses an unknown customer and a domain already registered. Touches: the in-memory deployment and audit records. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public object CreateDeployment(string csrfToken, Guid customerId, string domain, string tier, Guid themeId)
         {
             CsrfValidator.Verify(csrfToken);
@@ -752,6 +795,10 @@ namespace AdminSystem
             }
         }
 
+        /// <summary>
+        /// Owner or admin: filters the admin audit log by action, resource and time window after the CSRF check.
+        /// Output: the matching entries, newest first. Touches: reads the in-memory audit log only. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public object SearchAuditLog(string csrfToken, string actionType = null,
             Guid? resourceId = null, DateTime? start = null, DateTime? end = null,
             int limit = 100, int offset = 0)
@@ -808,6 +855,9 @@ namespace AdminSystem
             RequireAdminOrOwner(); // same check
         }
 
+        /// <summary>
+        /// True when <paramref name="candidate"/> is an Owner and no other active Owner exists. Reads users only. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         private bool IsLastActiveOwner(User candidate)
         {
             if (candidate.Tier != Role.Owner) return false;

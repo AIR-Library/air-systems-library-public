@@ -26,6 +26,9 @@ export class AuditLogger {
     return new Date().toISOString();
   }
 
+  /**
+   * Wraps a Database whose JSON columns come back parsed (pg does this for jsonb). Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+   */
   constructor(db: Database) {
     this.db = db;
   }
@@ -217,6 +220,10 @@ export class AuditLogger {
     };
   }
 
+  /**
+   * Returns the state before an entry and whether the latest state of that resource differs from the entry's,
+   * in timestamp then seq order. Throws for an unknown id. Touches: reads the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+   */
   async replay(logId: string): Promise<{
     log_id: string;
     timestamp: string;
@@ -320,6 +327,9 @@ export class AuditLogger {
     return { results };
   }
 
+  /**
+   * A random v4 UUID for a new entry. Touches: the crypto random source. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+   */
   private generateUuid(): string {
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
       const r = Math.random() * 16 | 0;

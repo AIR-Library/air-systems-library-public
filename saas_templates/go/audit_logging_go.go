@@ -29,6 +29,7 @@ type AuditLogger struct {
 // time.RFC3339Nano drops trailing zeros, which made ".1Z" sort after ".12Z" and broke "later" in Replay.
 const tsLayout = "2006-01-02T15:04:05.000000000Z"
 
+// formatTS writes t in UTC with the fixed nine-digit layout, so stored times compare correctly as text. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
 func formatTS(t time.Time) string { return t.UTC().Format(tsLayout) }
 
 // likeEscaper escapes LIKE's own wildcards and its escape character, for use with ESCAPE '\'.
@@ -94,6 +95,8 @@ type SearchResponse struct {
 	Results []LogEntry `json:"results"`
 }
 
+// NewAuditLogger opens the SQLite database at dbPath (":memory:" keeps one connection), creates or upgrades
+// the schema and prepares the insert. Touches: the database file. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
 func NewAuditLogger(dbPath string) (*AuditLogger, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -121,6 +124,8 @@ func NewAuditLogger(dbPath string) (*AuditLogger, error) {
 	return &AuditLogger{db: db, insertStmt: insertStmt}, nil
 }
 
+// initSchema creates the table, indexes and immutability triggers, and rewrites old variable-width times in one
+// transaction with the update trigger dropped and recreated. Touches: the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
 func initSchema(db *sql.DB) error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS audit_log (
@@ -177,6 +182,7 @@ func initSchema(db *sql.DB) error {
 	return err
 }
 
+// Close releases the prepared insert and the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
 func (a *AuditLogger) Close() error {
 	if a.insertStmt != nil {
 		a.insertStmt.Close()
@@ -184,6 +190,8 @@ func (a *AuditLogger) Close() error {
 	return a.db.Close()
 }
 
+// LogMutation validates the actor type and appends one entry with the fixed-width UTC time.
+// Output: the new id. Touches: inserts one row. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
 func (a *AuditLogger) LogMutation(ctx context.Context, req LogMutationRequest) (string, error) {
 	if req.ActorType != "user" && req.ActorType != "service" && req.ActorType != "api_key" {
 		return "", ErrInvalidActorType
@@ -216,6 +224,8 @@ func (a *AuditLogger) LogMutation(ctx context.Context, req LogMutationRequest) (
 	return id, nil
 }
 
+// QueryLogs filters by actor, action (only * is a wildcard), resource and time window; newest first, ties
+// by insertion order. Output: the page, total and has_more. Touches: reads the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
 func (a *AuditLogger) QueryLogs(ctx context.Context, req QueryLogsRequest) (QueryLogsResponse, error) {
 	whereClauses := []string{}
 	args := []any{}
@@ -318,6 +328,8 @@ func (a *AuditLogger) QueryLogs(ctx context.Context, req QueryLogsRequest) (Quer
 	return QueryLogsResponse{Logs: logs, Total: total, HasMore: hasMore}, nil
 }
 
+// Replay returns the state an entry recorded and whether any later entry (later time, or same time written
+// after) changed that resource. ErrLogNotFound for an unknown id. Touches: reads the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
 func (a *AuditLogger) Replay(ctx context.Context, logID string) (ReplayResponse, error) {
 	query := `
 		SELECT id, timestamp, old_value, new_value, resource_type, resource_id
@@ -364,6 +376,7 @@ func (a *AuditLogger) Replay(ctx context.Context, logID string) (ReplayResponse,
 	}, nil
 }
 
+// Search matches the query in any text column (only * is a wildcard), newest first. Touches: reads the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
 func (a *AuditLogger) Search(ctx context.Context, req SearchRequest) (SearchResponse, error) {
 	if req.Query == "" {
 		return SearchResponse{Results: []LogEntry{}}, nil
@@ -430,6 +443,7 @@ func (a *AuditLogger) Search(ctx context.Context, req SearchRequest) (SearchResp
 	return SearchResponse{Results: results}, nil
 }
 
+// generateID returns "log_" and 16 random bytes in hex. Touches: the system random source. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
 func generateID() string {
 	bytes := make([]byte, 16)
 	_, _ = rand.Read(bytes)

@@ -29,6 +29,10 @@ namespace TrialAbusePrevention
             _logger = logger;
         }
 
+        /// <summary>
+        /// Gate: counts completed or charged-back trials for this e-mail. Output: Pass/Challenge/Fail with a reason.
+        /// The log line carries no e-mail address (personal data). Touches: reads the ledger. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public async Task<GateCheckResult> CheckEmailTrialHistory(string email)
         {
             var priorCount = await _context.TrialAbuseLedgers
@@ -49,6 +53,9 @@ namespace TrialAbusePrevention
             return new GateCheckResult { Decision = decision, Reason = reason };
         }
 
+        /// <summary>
+        /// Gate: counts prior completed or charged-back trials on this payment method. Touches: reads the ledger. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public async Task<GateCheckResult> CheckPaymentMethodHistory(string stripePaymentMethodId)
         {
             var priorCount = await _context.TrialAbuseLedgers
@@ -67,6 +74,9 @@ namespace TrialAbusePrevention
             return new GateCheckResult { Decision = decision, Reason = reason };
         }
 
+        /// <summary>
+        /// Gate: counts signups from this IP in the last 24 hours. Touches: reads signups. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public async Task<GateCheckResult> CheckIpSignupRateLimit(string ip)
         {
             var count = await _context.Signups
@@ -90,6 +100,9 @@ namespace TrialAbusePrevention
             };
         }
 
+        /// <summary>
+        /// Gate: hashes the device traits and counts other users on the same device. Touches: reads fingerprints. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public async Task<GateCheckResult> CheckDeviceFingerprint(string userAgent, string screenResolution, string timezone, string browserLanguage, string userId = null)
         {
             var device = $"{userAgent}|{screenResolution}|{timezone}|{browserLanguage}";
@@ -120,6 +133,9 @@ namespace TrialAbusePrevention
             return new GateCheckResult { Decision = decision, Reason = reason };
         }
 
+        /// <summary>
+        /// Gate: compares when payment was added with the trial window. Fail for an unknown user. Touches: reads users and ledger. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public async Task<GateCheckResult> CheckTrialPaymentTiming(string userId)
         {
             var user = await _context.Users.FindAsync(userId);
@@ -156,6 +172,9 @@ namespace TrialAbusePrevention
             return new GateCheckResult { Decision = decision, Reason = reason };
         }
 
+        /// <summary>
+        /// Gate: counts Stripe chargeback events and charged-back refunds for the user. Touches: reads events and refunds. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public async Task<GateCheckResult> CheckChargebackHistory(string stripeCustomerId, string userId)
         {
             var stripeChargebacks = await _context.StripeEvents
@@ -180,18 +199,27 @@ namespace TrialAbusePrevention
             return new GateCheckResult { Decision = decision, Reason = reason };
         }
 
+        /// <summary>
+        /// Appends a trial ledger entry. Touches: inserts one row. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public async Task LogAbuseEntry(TrialAbuseLedger entry)
         {
             _context.TrialAbuseLedgers.Add(entry);
             await _context.SaveChangesAsync();
         }
 
+        /// <summary>
+        /// Records one gate decision. Touches: inserts one row. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public async Task LogGateDecision(GateDecisionLog log)
         {
             _context.GateDecisionLogs.Add(log);
             await _context.SaveChangesAsync();
         }
 
+        /// <summary>
+        /// Lower-case hex SHA-256 of the UTF-8 input (device fingerprints). Pure. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public static string ComputeSha256Hash(string input)
         {
             using var sha256 = System.Security.Cryptography.SHA256.Create();
@@ -212,6 +240,9 @@ namespace TrialAbusePrevention
         public DbSet<Refund> Refunds { get; set; }
         public DbSet<User> Users { get; set; }
 
+        /// <summary>
+        /// Maps the trial-abuse entities; AbuseFlags stays text (comma-separated flags, not JSON). Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
             modelBuilder.Entity<TrialAbuseLedger>(entity =>
@@ -347,6 +378,9 @@ namespace TrialAbusePrevention
 
     public static class TrialAbusePreventionSchema
     {
+        /// <summary>
+        /// The plain SQL that creates the ledger, fingerprint and decision tables with their indexes. Pure. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public static string GetCreateTablesSql()
         {
             return @"

@@ -49,6 +49,9 @@ public class AuditLoggingService implements AutoCloseable {
         this.initializeSchema();
     }
 
+    /**
+     * Creates the audit_log table and its query index (actor, action, resource, timestamp, id). Touches: the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+     */
     private void initializeSchema() throws SQLException {
         String ddl = """
             CREATE TABLE IF NOT EXISTS audit_log (
@@ -310,6 +313,10 @@ public class AuditLoggingService implements AutoCloseable {
         return response;
     }
 
+    /**
+     * True when any later entry for the same resource holds a different value (A, A, B has diverged).
+     * Values compare as JSON with exact decimals. Touches: reads the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+     */
     private boolean checkDivergence(long logId, String resourceType, String resourceId, JsonNode newValueJson)
             throws SQLException {
         String sql = """
@@ -489,6 +496,9 @@ public class AuditLoggingService implements AutoCloseable {
         return om.valueToTree(map);
     }
 
+    /**
+     * Converts a map or bean to a JsonNode for logMutation callers. Pure. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+     */
     public static JsonNode toJsonNode(Object obj) {
         if (obj == null) return NullNode.getInstance();
         ObjectMapper om = new ObjectMapper();

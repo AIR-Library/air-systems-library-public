@@ -53,6 +53,9 @@ namespace AuditLogging
             CreateSchema();
         }
 
+        /// <summary>
+        /// Creates the audit_log table, its index and the triggers that refuse UPDATE and DELETE. Touches: the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         private void CreateSchema()
         {
             var sql = @"
@@ -87,6 +90,9 @@ namespace AuditLogging
             cmd.ExecuteNonQuery();
         }
 
+        /// <summary>
+        /// Appends one audit entry. Output: its id. Touches: inserts one row. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public async Task<string> LogMutationAsync(AuditLogEntry entry)
         {
             entry.Id = Guid.NewGuid().ToString();
@@ -116,6 +122,10 @@ namespace AuditLogging
             return entry.Id;
         }
 
+        /// <summary>
+        /// Filters entries by actor, action (only * is a wildcard), resource type and time window, newest first.
+        /// Output: the page, the total and whether more follow. Touches: reads the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public async Task<(IEnumerable<AuditLogEntry> Logs, int Total, bool HasMore)> QueryLogsAsync(
             long? actorId = null,
             string action = null,
@@ -191,6 +201,9 @@ namespace AuditLogging
         /// %, _ or \ in a filter then matches only itself (CodeRabbit, PR 18, 2026-11-09).</summary>
         private static string EscapeLike(string s) => s.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_");
 
+        /// <summary>
+        /// Binds the filter values QueryLogsAsync uses to a command; the action is LIKE-escaped, then * becomes %. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         private void AddParameters(DbCommand cmd, long? actorId, string action, string resourceType, DateTime? dateFrom, DateTime? dateTo)
         {
             if (actorId.HasValue)
@@ -215,6 +228,10 @@ namespace AuditLogging
             }
         }
 
+        /// <summary>
+        /// Returns the resource state an entry recorded and whether a later entry changed that resource since.
+        /// Throws KeyNotFoundException for an unknown id. Touches: reads the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public async Task<ReplayResult> ReplayAsync(string logId)
         {
             var sql = "SELECT * FROM audit_log WHERE id = @id;";
@@ -256,6 +273,10 @@ namespace AuditLogging
             };
         }
 
+        /// <summary>
+        /// Substring search over action and resource type (%, _ and \ in the query match themselves).
+        /// Output: up to <paramref name="limit"/> entries. Touches: reads the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public async Task<IEnumerable<AuditLogEntry>> SearchAsync(string query, string resourceType = null, int limit = 50)
         {
             var sql = @"
@@ -286,6 +307,9 @@ namespace AuditLogging
             return results;
         }
 
+        /// <summary>
+        /// Builds an AuditLogEntry from the current row; JSON columns are deserialized into owned JsonElements. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         private AuditLogEntry ReadEntry(DbDataReader reader)
         {
             int idOrdinal = reader.GetOrdinal("id");
@@ -317,6 +341,9 @@ namespace AuditLogging
             return entry;
         }
 
+        /// <summary>
+        /// Marks the repository disposed. The connection belongs to the caller and is not closed here. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public void Dispose()
         {
             if (!_disposed)

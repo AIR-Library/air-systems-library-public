@@ -3,6 +3,9 @@ const { v4: uuidv4 } = require('uuid');
 const EventEmitter = require('events');
 
 class SearchEngine extends EventEmitter {
+  /**
+   * Opens the better-sqlite3 database, creates the index table and the in-memory inverted index. Touches: the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+   */
   constructor(dbPath = ':memory:') {
     super();
     this.db = new Database(dbPath);
@@ -12,6 +15,9 @@ class SearchEngine extends EventEmitter {
     this.stopWords = new Set(['the', 'and', 'or', 'a', 'an', 'of', 'to', 'in', 'is', 'it']);
   }
 
+  /**
+   * Creates the search_index table. Touches: the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+   */
   _initSchema() {
     const createTableSQL = `
       CREATE TABLE IF NOT EXISTS search_index (
@@ -57,6 +63,9 @@ class SearchEngine extends EventEmitter {
     });
   }
 
+  /**
+   * Stores or replaces one document and adds its words to the inverted index. Output: { success } or an error. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+   */
   indexDocument(payload) {
     const {
       document_type,
@@ -106,6 +115,9 @@ class SearchEngine extends EventEmitter {
     return { success: true, indexed_at };
   }
 
+  /**
+   * Removes one document from the table and the inverted index. Output: { success }. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+   */
   unindexDocument(document_type, document_id) {
     const docKey = this._docKey(document_type, document_id);
     const doc = this.documents.get(docKey);
@@ -173,6 +185,10 @@ class SearchEngine extends EventEmitter {
     return true;
   }
 
+  /**
+   * Finds documents by words and prefixes, optional type and filters; ranked by relevance, with facets on request.
+   * Output: { results, total, facets? }. Touches: memory only. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+   */
   search(params) {
     const {
       q = '',
@@ -266,6 +282,10 @@ class SearchEngine extends EventEmitter {
     return response;
   }
 
+  /**
+   * Rebuilds the in-memory index from the table (one type or all). Every row is parsed before the live index
+   * changes; reindex_completed or reindex_failed is emitted on the next tick. Output: { success, job_id, status }. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+   */
   reindexAll(payload) {
     const { document_type } = payload || {};
     const job_id = uuidv4();

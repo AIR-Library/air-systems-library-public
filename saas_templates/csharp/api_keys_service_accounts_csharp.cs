@@ -102,6 +102,11 @@ namespace SaaSLibrary.ApiKeys
             };
         }
 
+        /// <summary>
+        /// Rotates an active key: issues a new secret and keeps the old one valid for a 24-hour grace period.
+        /// Refuses an unknown key (KeyNotFoundException), a revoked key and a second rotation inside the grace period
+        /// (InvalidOperationException). Output: the new key once, with the grace end. Touches: the api_keys table. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public async Task<RotateApiKeyResponse> RotateApiKeyAsync(Guid userId, Guid apiKeyId)
         {
             var apiKey = await _dbContext.ApiKeys
@@ -144,6 +149,11 @@ namespace SaaSLibrary.ApiKeys
             };
         }
 
+        /// <summary>
+        /// Validates a presented key for a request: format, prefix (current or in-grace previous), bcrypt hash, expiry,
+        /// the exact scope the route needs, and the rate limit. Output: IsValid or the error and HTTP status.
+        /// Touches: the api_keys and usage tables, Redis (rate counter). Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public async Task<ApiKeyValidationResult> ValidateApiKeyAsync(string key, string endpoint, HttpMethod method)
         {
             if (string.IsNullOrWhiteSpace(key))
@@ -316,6 +326,10 @@ namespace SaaSLibrary.ApiKeys
             return base64;
         }
 
+        /// <summary>
+        /// Maps a request to the scope it needs: the first path segment after an optional api/vN prefix is the resource;
+        /// GET/HEAD read it, other methods write it. An unlisted resource needs the literal "method:resource". Pure. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         private static string GetRequiredScope(string endpoint, HttpMethod method)
         {
             // Normalize endpoint: remove leading/trailing slashes, convert to lowercase
@@ -355,6 +369,9 @@ namespace SaaSLibrary.ApiKeys
         public DbSet<ApiKey> ApiKeys => Set<ApiKey>();
         public DbSet<ApiKeyUsage> ApiKeyUsages => Set<ApiKeyUsage>();
 
+        /// <summary>
+        /// Maps the API key, service account and usage entities, including the previous-key grace fields. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
             modelBuilder.Entity<ApiKey>(entity =>

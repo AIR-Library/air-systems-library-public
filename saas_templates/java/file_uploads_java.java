@@ -37,6 +37,9 @@ public final class FileUploadService {
     public record Config(String jdbcUrl, String storageRoot, long maxFileSize, String hmacKeyBase64) {}
     public record UploadResult(String fileId) {}
     public record DownloadLink(String token) {}
+    /**
+     * Stored metadata of one upload, including when it was soft-deleted (null while it exists). Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+     */
     public record FileMeta(String id, String orgId, String ownerUserId, String storedName, String originalName,
                            String extension, String mimeType, long sizeBytes, String sha256, Instant createdAt,
                            Instant deletedAt) {}
@@ -50,6 +53,9 @@ public final class FileUploadService {
         initSchema();
     }
 
+    /**
+     * Creates the files table, its indexes and org_members. Touches: the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+     */
     private void initSchema() throws SQLException {
         try (Connection c = dataSource.getConnection(); Statement s = c.createStatement()) {
             s.execute("""
@@ -132,6 +138,10 @@ public final class FileUploadService {
         return new DownloadLink(token);
     }
 
+    /**
+     * Returns a file's bytes for a signed, unexpired link, only to a caller allowed to see the file.
+     * A malformed link is "Invalid token format". Throws DownloadException otherwise. Touches: database and storage. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+     */
     public byte[] download(String userId, String token) throws IOException, SQLException, DownloadException {
         try {
             String[] parts = new String(Base64.getUrlDecoder().decode(token)).split("\\.", 3);
@@ -185,6 +195,9 @@ public final class FileUploadService {
         return meta.ownerUserId().equals(userId) || isOrgMember(userId, meta.orgId());
     }
 
+    /**
+     * Reads one file's metadata, or null. Touches: reads the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+     */
     private FileMeta getFileMeta(String fileId) throws SQLException {
         try (Connection c = dataSource.getConnection();
              PreparedStatement ps = c.prepareStatement("SELECT * FROM files WHERE id = ?")) {
@@ -207,6 +220,9 @@ public final class FileUploadService {
         return dot > 0 ? filename.substring(dot + 1) : "";
     }
 
+    /**
+     * Checks the content starts with the full signature of its extension (PNG 8 bytes, PDF %PDF-, GIF87a/89a). Pure. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+     */
     private boolean verifyMagicBytes(byte[] content, String ext) {
         if (ext.equals("gif")) {
             return checkMagic(content, GIF87A) || checkMagic(content, GIF89A);
@@ -216,6 +232,9 @@ public final class FileUploadService {
         return checkMagic(content, magic);
     }
 
+    /**
+     * True when content begins with magic. Pure. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+     */
     private boolean checkMagic(byte[] content, byte[] magic) {
         if (content.length < magic.length) return false;
         for (int i = 0; i < magic.length; i++) {
@@ -264,6 +283,9 @@ public final class FileUploadService {
         return result == 0;
     }
 
+    /**
+     * Lower-case hex of the bytes. Pure. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+     */
     private static String bytesToHex(byte[] bytes) {
         StringBuilder sb = new StringBuilder(bytes.length * 2);
         for (byte b : bytes) sb.append(String.format("%02x", b));
@@ -282,8 +304,14 @@ public final class FileUploadService {
         public Connection getConnection(String username, String password) throws SQLException { return DriverManager.getConnection(url, username, password); }
         @Override
         public PrintWriter getLogWriter() throws SQLException { return null; }
+        /**
+         * DataSource contract: logging is not used here, so this does nothing. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+         */
         @Override
         public void setLogWriter(PrintWriter out) throws SQLException {}
+        /**
+         * DataSource contract: the timeout is not used here, so this does nothing. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+         */
         @Override
         public void setLoginTimeout(int seconds) throws SQLException {}
         @Override
@@ -296,6 +324,9 @@ public final class FileUploadService {
         public boolean isWrapperFor(Class<?> iface) throws SQLException { return false; }
     }
 
+    /**
+     * A new random 256-bit HMAC key, Base64, for signing download links. Touches: the system random source. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+     */
     public static String generateHmacKey() {
         byte[] key = new byte[32];
         RANDOM.nextBytes(key);
