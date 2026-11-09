@@ -199,7 +199,9 @@ describe('AuditLogger', () => {
     expect(queryDuration).toBeLessThan(100);
     expect(queryRes.logs.length).toBeLessThanOrEqual(50);
     expect(queryRes.total).toBeGreaterThanOrEqual(50);
-  });
+  // Building the million entries takes about 4 s on a fast PC (measured 2026-11-09, session 04ec72ff), so the default
+  // 5 s test limit failed it on CI's slower machines. Only the setup gets the time; the query must still be < 100 ms.
+  }, 120_000);
 
   test('testImmutabilityUpdateDeleteForbidden', async () => {
     const log = await logger.logMutation({
