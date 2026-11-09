@@ -276,11 +276,17 @@ public final class FileUploadService {
     private static class SimpleDataSource implements DataSource {
         private final String url;
         SimpleDataSource(String url) { this.url = url; }
+        @Override
         public Connection getConnection() throws SQLException { return DriverManager.getConnection(url); }
+        @Override
         public Connection getConnection(String username, String password) throws SQLException { return DriverManager.getConnection(url, username, password); }
+        @Override
         public PrintWriter getLogWriter() throws SQLException { return null; }
+        @Override
         public void setLogWriter(PrintWriter out) throws SQLException {}
+        @Override
         public void setLoginTimeout(int seconds) throws SQLException {}
+        @Override
         public int getLoginTimeout() throws SQLException { return 0; }
         @Override
         public java.util.logging.Logger getParentLogger() throws SQLFeatureNotSupportedException { throw new SQLFeatureNotSupportedException(); }
