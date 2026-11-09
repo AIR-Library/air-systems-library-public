@@ -136,6 +136,12 @@ test('chargeback_history PASS → no chargebacks, allowed', async () => {
   const userInfo = insertUser.run('user3@example.com', new Date().toISOString());
   const user_id = userInfo.lastInsertRowid;
 
+  // Create ledger entry with stripe_customer_id for chargeback lookup
+  db.prepare(`
+    INSERT INTO trial_abuse_ledger (user_id, stripe_customer_id)
+    VALUES (?, ?)
+  `).run(user_id, `cust_${user_id}`);
+
   const res = await check_chargeback_history(user_id);
   expect(res.success).toBe(true);
 });
@@ -144,6 +150,12 @@ test('chargeback_history FAIL → 2+ chargebacks, requires prepayment', async ()
   const insertUser = db.prepare('INSERT INTO users (email, created_at) VALUES (?, ?)');
   const userInfo = insertUser.run('user4@example.com', new Date().toISOString());
   const user_id = userInfo.lastInsertRowid;
+
+  // Create ledger entry with stripe_customer_id matching the stripe_events
+  db.prepare(`
+    INSERT INTO trial_abuse_ledger (user_id, stripe_customer_id)
+    VALUES (?, ?)
+  `).run(user_id, `cust_${user_id}`);
 
   db.prepare(`
     INSERT INTO stripe_events (customer, type)

@@ -1,11 +1,11 @@
-const sqlite3 = require('sqlite3').verbose();
+const Database = require('better-sqlite3');
 const { v4: uuidv4 } = require('uuid');
 const EventEmitter = require('events');
 
 class SearchEngine extends EventEmitter {
   constructor(dbPath = ':memory:') {
     super();
-    this.db = new sqlite3.Database(dbPath);
+    this.db = new Database(dbPath);
     this._initSchema();
     this.invertedIndex = new Map(); // word -> Set of docKey
     this.documents = new Map(); // docKey -> { document_type, document_id, contentTokens, metadata }
@@ -23,7 +23,7 @@ class SearchEngine extends EventEmitter {
         PRIMARY KEY (document_type, document_id)
       );
     `;
-    this.db.run(createTableSQL);
+    this.db.exec(createTableSQL);
   }
 
   _tokenize(text) {
@@ -92,7 +92,6 @@ class SearchEngine extends EventEmitter {
       indexed_at,
       JSON.stringify(metadata)
     );
-    stmt.finalize();
 
     // Update in-memory structures
     this._addToInvertedIndex(tokens, docKey);
@@ -116,7 +115,6 @@ class SearchEngine extends EventEmitter {
         DELETE FROM search_index WHERE document_type = ? AND document_id = ?
       `);
       stmt.run(document_type, document_id);
-      stmt.finalize();
       return { success: true };
     }
 
@@ -129,7 +127,6 @@ class SearchEngine extends EventEmitter {
       DELETE FROM search_index WHERE document_type = ? AND document_id = ?
     `);
     stmt.run(document_type, document_id);
-    stmt.finalize();
 
     this.emit('unindexed', { document_type, document_id });
     return { success: true };
@@ -211,7 +208,7 @@ class SearchEngine extends EventEmitter {
         }
         // also consider prefix matches
         for (const [word, keys] of this.invertedIndex.entries()) {
-          if (word.startsWith(token) && (!document_type || [...keys].some(k => k.startsWith(`${document_type}:`)))) {
+          if (word.startsWith(token)) {
             for (const key of keys) {
               if (!document_type || key.startsWith(`${document_type}:`)) {
                 candidateKeys.add(key);
@@ -277,39 +274,42 @@ class SearchEngine extends EventEmitter {
     const sql = `SELECT document_type, document_id, content, metadata FROM search_index ${whereClause}`;
     const params = document_type ? [document_type] : [];
 
-    this.db.all(sql, params, (err, rows) => {
-      if (err) {
-        this.emit('reindex_failed', { job_id, error: err });
-        return;
-      }
-      // Clear current in-memory index for affected types
-      if (document_type) {
-        for (const key of this.documents.keys()) {
-          if (key.startsWith(`${document_type}:`)) {
-            const doc = this.documents.get(key);
-            this._removeFromInvertedIndex(doc.contentTokens, key);
-            this.documents.delete(key);
-          }
-        }
-      } else {
-        this.invertedIndex.clear();
-        this.documents.clear();
-      }
+    let rows;
+    try {
+      rows = this.db.prepare(sql).all(...params);
+    } catch (error) {
+      // Events go out on the next tick, so a listener attached right after this call still hears them.
+      setImmediate(() => this.emit('reindex_failed', { job_id, error }));
+      return { success: true, job_id, status: 'enqueued' };
+    }
 
-      rows.forEach(row => {
-        const docKey = this._docKey(row.document_type, row.document_id);
-        const tokens = this._tokenize(row.content);
-        const metadata = JSON.parse(row.metadata);
-        this._addToInvertedIndex(tokens, docKey);
-        this.documents.set(docKey, {
-          document_type: row.document_type,
-          document_id: row.document_id,
-          contentTokens: tokens,
-          metadata
-        });
+    // Clear current in-memory index for affected types
+    if (document_type) {
+      for (const key of this.documents.keys()) {
+        if (key.startsWith(`${document_type}:`)) {
+          const doc = this.documents.get(key);
+          this._removeFromInvertedIndex(doc.contentTokens, key);
+          this.documents.delete(key);
+        }
+      }
+    } else {
+      this.invertedIndex.clear();
+      this.documents.clear();
+    }
+
+    rows.forEach(row => {
+      const docKey = this._docKey(row.document_type, row.document_id);
+      const tokens = this._tokenize(row.content);
+      const metadata = JSON.parse(row.metadata);
+      this._addToInvertedIndex(tokens, docKey);
+      this.documents.set(docKey, {
+        document_type: row.document_type,
+        document_id: row.document_id,
+        contentTokens: tokens,
+        metadata
       });
-      this.emit('reindex_completed', { job_id });
     });
+    setImmediate(() => this.emit('reindex_completed', { job_id }));
 
     return { success: true, job_id, status: 'enqueued' };
   }

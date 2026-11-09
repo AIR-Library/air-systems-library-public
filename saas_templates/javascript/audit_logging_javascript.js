@@ -65,7 +65,7 @@ class AuditLogger {
     if (!entry.resource_type) {
       throw new Error("Resource type is required");
     }
-    if (!entry.resource_id) {
+    if (entry.resource_id == null) {
       throw new Error("Resource ID is required");
     }
     if (entry.actor_type && !['user', 'service', 'api_key'].includes(entry.actor_type)) {
@@ -82,7 +82,7 @@ class AuditLogger {
       actor_type: entry.actor_type !== undefined ? entry.actor_type : null,
       action: entry.action,
       resource_type: entry.resource_type,
-      resource_id: entry.resource_id,
+      resource_id: String(entry.resource_id),
       old_value: entry.old_value !== undefined ? JSON.parse(JSON.stringify(entry.old_value)) : null,
       new_value: entry.new_value !== undefined ? JSON.parse(JSON.stringify(entry.new_value)) : null,
       why_chain_id: entry.why_chain_id !== undefined ? entry.why_chain_id : null,

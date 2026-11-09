@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS trial_abuse_ledger (
   user_id INTEGER,
   email TEXT,
   stripe_payment_method_id TEXT,
+  stripe_customer_id TEXT,
   ip TEXT,
   device_fingerprint TEXT,
   signup_date TEXT,
@@ -247,12 +248,17 @@ async function check_trial_payment_timing(user_id) {
 }
 
 async function check_chargeback_history(user_id) {
+  // Chargebacks are counted against the Stripe customer stored on the ledger. A user with no stored customer has
+  // none: the id is never guessed, since a guessed id could match someone else's events.
+  const ledger = db.prepare(`SELECT stripe_customer_id FROM trial_abuse_ledger WHERE user_id = ?`).get(user_id);
+  const stripe_customer_id = ledger?.stripe_customer_id ?? null;
+
   const stripeStmt = db.prepare(`
     SELECT COUNT(*) AS count
     FROM stripe_events
-    WHERE customer = (SELECT stripe_customer_id FROM trial_abuse_ledger WHERE user_id = ?) AND type LIKE '%chargeback%'
+    WHERE customer = ? AND type LIKE '%chargeback%'
   `);
-  const { count: stripe_count } = stripeStmt.get(user_id);
+  const { count: stripe_count } = stripe_customer_id === null ? { count: 0 } : stripeStmt.get(stripe_customer_id);
 
   const refundStmt = db.prepare(`
     SELECT COUNT(*) AS count
@@ -330,7 +336,7 @@ async function signup(email, password, ip, device) {
   return result;
 }
 
-async function subscription_created(user_id, stripe_payment_method_id) {
+async function subscription_created(user_id, stripe_payment_method_id, stripe_customer_id = null) {
   const paymentGate = await check_payment_method_history(stripe_payment_method_id);
   const timingGate = await check_trial_payment_timing(user_id);
   const chargebackGate = await check_chargeback_history(user_id);
@@ -343,12 +349,13 @@ async function subscription_created(user_id, stripe_payment_method_id) {
   // Update abuse ledger
   const updateLedger = db.prepare(`
     UPDATE trial_abuse_ledger
-    SET stripe_payment_method_id = ?, payment_added_date = ?, subscription_status = 'completed',
+    SET stripe_payment_method_id = ?, stripe_customer_id = COALESCE(?, stripe_customer_id), payment_added_date = ?, subscription_status = 'completed',
         gate_flags = json_set(gate_flags, '$.payment', ?, '$.timing', ?, '$.chargeback', ?)
     WHERE user_id = ?
   `);
   updateLedger.run(
     stripe_payment_method_id,
+    stripe_customer_id,
     now(),
     paymentGate.decision,
     timingGate.decision,
