@@ -282,6 +282,7 @@ public final class FileUploadService {
         public void setLogWriter(PrintWriter out) throws SQLException {}
         public void setLoginTimeout(int seconds) throws SQLException {}
         public int getLoginTimeout() throws SQLException { return 0; }
+        @Override
         public java.util.logging.Logger getParentLogger() throws SQLFeatureNotSupportedException { throw new SQLFeatureNotSupportedException(); }
         @Override
         public <T> T unwrap(Class<T> iface) throws SQLException { throw new SQLException("SimpleDataSource wraps nothing"); }
