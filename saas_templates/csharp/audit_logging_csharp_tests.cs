@@ -64,7 +64,8 @@ public class AuditLoggingTests : IDisposable
         var replay = await _repo.ReplayAsync(firstLogId);
         Assert.Equal(firstLogId, replay.LogId);
         Assert.True(replay.HasDiverged);
-        Assert.Equal("{\"tier\":\"team\"}", replay.ResourceStateAtTime.Value.GetRawText());
+        Assert.NotNull(replay.ResourceStateAtTime);
+        Assert.Equal("{\"tier\":\"team\"}", replay.ResourceStateAtTime!.Value.GetRawText());
     }
 
     [Fact]
