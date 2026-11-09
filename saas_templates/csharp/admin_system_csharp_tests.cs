@@ -428,6 +428,14 @@ public class AdminControllerTests
         Assert.Equal("refund_exceeds_invoice", ex.Code);
     }
 
+    [Fact]
+    public void ValidateTier_UndefinedNumber_Rejected()
+    {
+        // Enum.TryParse accepts "99" as (Role)99; it names no role (CodeRabbit, PR 18).
+        var ex = Assert.Throws<ApiException>(() => Validation.ValidateTier("99"));
+        Assert.Equal("invalid_tier", ex.Code);
+    }
+
     // ---------- DEPLOYMENT TESTS ----------
     [Fact]
     public void CreateDeployment_HappyPath()

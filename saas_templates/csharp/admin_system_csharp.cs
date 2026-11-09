@@ -235,7 +235,8 @@ namespace AdminSystem
 
         public static void ValidateTier(string tier, bool allowOwner = false)
         {
-            if (!Enum.TryParse<Role>(tier, true, out var role))
+            // TryParse accepts any number ("99" -> (Role)99); only a defined role passes (CodeRabbit, PR 18).
+            if (!Enum.TryParse<Role>(tier, true, out var role) || !Enum.IsDefined(typeof(Role), role))
                 throw new ApiException("invalid_tier", "Tier is not recognized");
 
             if (!allowOwner && role == Role.Owner)

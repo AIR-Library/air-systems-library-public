@@ -134,7 +134,7 @@ namespace AuditLogging
 
             if (!string.IsNullOrEmpty(action))
             {
-                whereClauses.Add("action LIKE @action");
+                whereClauses.Add("action LIKE @action ESCAPE '\\'");
             }
 
             if (!string.IsNullOrEmpty(resourceType))
@@ -187,6 +187,10 @@ namespace AuditLogging
             return (logs, total, hasMore);
         }
 
+        /// <summary>Escapes LIKE's own wildcards and its escape character, for use with ESCAPE '\'. A literal
+        /// %, _ or \ in a filter then matches only itself (CodeRabbit, PR 18, 2026-11-09).</summary>
+        private static string EscapeLike(string s) => s.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_");
+
         private void AddParameters(DbCommand cmd, long? actorId, string action, string resourceType, DateTime? dateFrom, DateTime? dateTo)
         {
             if (actorId.HasValue)
@@ -195,7 +199,7 @@ namespace AuditLogging
             }
             if (!string.IsNullOrEmpty(action))
             {
-                cmd.Parameters.Add(new SqliteParameter("@action", action.Replace("*", "%")));
+                cmd.Parameters.Add(new SqliteParameter("@action", EscapeLike(action).Replace("*", "%")));
             }
             if (!string.IsNullOrEmpty(resourceType))
             {
@@ -256,7 +260,7 @@ namespace AuditLogging
         {
             var sql = @"
                 SELECT * FROM audit_log
-                WHERE (action LIKE @q OR resource_type LIKE @q)
+                WHERE (action LIKE @q ESCAPE '\' OR resource_type LIKE @q ESCAPE '\')
             ";
             if (!string.IsNullOrEmpty(resourceType))
             {
@@ -266,7 +270,7 @@ namespace AuditLogging
 
             using var cmd = _connection.CreateCommand();
             cmd.CommandText = sql;
-            cmd.Parameters.Add(new SqliteParameter("@q", $"%{query}%"));
+            cmd.Parameters.Add(new SqliteParameter("@q", $"%{EscapeLike(query)}%"));
             if (!string.IsNullOrEmpty(resourceType))
             {
                 cmd.Parameters.Add(new SqliteParameter("@resource_type", resourceType));

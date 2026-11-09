@@ -263,6 +263,31 @@ namespace SaaSLibrary.ApiKeys.Tests
         }
 
         [Fact]
+        public async Task RotateApiKey_TwiceInsideGracePeriod_Throws()
+        {
+            // A second rotation would overwrite the first key's grace period (CodeRabbit, PR 18).
+            var apiKey = await CreateTestApiKeyInDb("Twice", new List<string> { "read:deployments" });
+            await _service.RotateApiKeyAsync(_testUserId, apiKey.Id);
+
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                _service.RotateApiKeyAsync(_testUserId, apiKey.Id));
+        }
+
+        [Fact]
+        public async Task ValidateApiKey_ResourceIsFirstSegmentAfterVersion()
+        {
+            // read:users opens /api/v1/users, not /internal/users (CodeRabbit, PR 18).
+            var created = await _service.CreateApiKeyAsync(_testUserId,
+                new CreateApiKeyRequest { Name = "Scopes", Scopes = new List<string> { "read:users" }, RateLimit = 1000 });
+            _redisDatabaseMock.Setup(r => r.StringIncrementAsync(It.IsAny<RedisKey>(), It.IsAny<long>(), It.IsAny<CommandFlags>()))
+                .ReturnsAsync(1L);
+
+            Assert.True((await _service.ValidateApiKeyAsync(created.Key, "/api/v1/users", HttpMethod.Get)).IsValid);
+            Assert.False((await _service.ValidateApiKeyAsync(created.Key, "/internal/users", HttpMethod.Get)).IsValid);
+            Assert.False((await _service.ValidateApiKeyAsync(created.Key, "/users", HttpMethod.Delete)).IsValid);
+        }
+
+        [Fact]
         public async Task ValidateApiKey_ValidKeyAndScope_ReturnsValid()
         {
             // Arrange

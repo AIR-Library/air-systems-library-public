@@ -127,4 +127,18 @@ public class AuditLoggingTests : IDisposable
         Assert.Single(results);
         Assert.Equal("subscription_changed", results.First().Action);
     }
+
+
+    [Fact]
+    public async Task Wildcard_Underscore_IsLiteral_InQueryAndSearch()
+    {
+        // "user_*" must not match "userXcreated"; Search for "r_c" must not match "userXcreated" (CodeRabbit, PR 18).
+        await LogSampleAsync(action: "user_created");
+        await LogSampleAsync(action: "userXcreated");
+        var result = await _repo.QueryLogsAsync(actorId: 123, action: "user_*", resourceType: "user");
+        Assert.Equal(1, result.Total);
+        var found = await _repo.SearchAsync("r_c");
+        Assert.Single(found);
+        Assert.Equal("user_created", found.First().Action);
+    }
 }

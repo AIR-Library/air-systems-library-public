@@ -115,6 +115,12 @@ namespace SaaSLibrary.ApiKeys
             if (!apiKey.IsActive)
                 throw new InvalidOperationException($"API key {apiKeyId} is revoked and cannot be rotated");
 
+            // One grace period at a time: a second rotation now would overwrite the previous secret, and clients
+            // still on it would lose access before the grace period they were promised ends (CodeRabbit, PR 18).
+            if (apiKey.GracePeriodEndsAt.HasValue && apiKey.GracePeriodEndsAt.Value > DateTime.UtcNow)
+                throw new InvalidOperationException(
+                    $"API key {apiKeyId} was rotated recently; rotate again after {apiKey.GracePeriodEndsAt.Value:o}");
+
             var oldKeyRevokedAt = DateTime.UtcNow;
             var gracePeriodEndsAt = oldKeyRevokedAt.AddHours(24);
 
@@ -319,25 +325,24 @@ namespace SaaSLibrary.ApiKeys
             var segments = normalizedEndpoint.Split('/', StringSplitOptions.RemoveEmptyEntries);
             if (segments.Length == 0) return "*";
 
-            var knownResources = new HashSet<string> { "users", "deployments", "invoices", "webhooks", "subscriptions", "billing" };
-            var resource = segments.FirstOrDefault(s => knownResources.Contains(s)) ?? segments[0];
+            // The resource is the first segment after an optional "api" and version ("v1") prefix, never a segment
+            // deeper in the path: "/internal/users" is not "users" (CodeRabbit, PR 18). Reads are GET and HEAD;
+            // every other method writes. A resource not listed needs the literal scope "<method>:<resource>".
+            var i = 0;
+            while (i < segments.Length && (segments[i] == "api" ||
+                   (segments[i].Length > 1 && segments[i][0] == 'v' && segments[i].Skip(1).All(char.IsDigit))))
+                i++;
+            if (i == segments.Length) return "*";
+            var resource = segments[i];
+            var read = methodLower is "get" or "head";
 
-            return (resource, methodLower) switch
+            return resource switch
             {
-                ("users", "get") => "read:users",
-                ("users", "post") => "write:users",
-                ("users", "put") => "write:users",
-                ("users", "patch") => "write:users",
-                ("deployments", "get") => "read:deployments",
-                ("deployments", "post") => "write:deployments",
-                ("deployments", "put") => "write:deployments",
-                ("deployments", "patch") => "write:deployments",
-                ("invoices", "get") => "read:invoices",
-                ("subscriptions", "post") => "write:billing",
-                ("billing", "put") => "write:billing",
-                ("billing", "patch") => "write:billing",
-                ("webhooks", "post") => "webhook:manage",
-                ("webhooks", "delete") => "webhook:manage",
+                "users" => read ? "read:users" : "write:users",
+                "deployments" => read ? "read:deployments" : "write:deployments",
+                "invoices" => read ? "read:invoices" : "write:invoices",
+                "subscriptions" or "billing" => read ? "read:billing" : "write:billing",
+                "webhooks" => read ? "read:webhooks" : "webhook:manage",
                 _ => $"{methodLower}:{resource}"
             };
         }
