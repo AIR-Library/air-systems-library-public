@@ -1,17 +1,38 @@
-import { Pool, QueryResult } from 'pg';
+export interface QueryResult {
+  rows: any[];
+  rowCount: number | null;
+}
 
-interface DbClient {
+/**
+ * The connection the logger writes through. JSON columns (old_value, new_value, metadata) come back already parsed,
+ * as pg does for jsonb; an adapter for a database that stores them as text parses them in query().
+ */
+export interface Database {
   query(text: string, values?: any[]): Promise<QueryResult>;
+  close?(): Promise<void>;
 }
 
 export class AuditLogger {
-  private db: DbClient;
+  private db: Database;
+  private lastTimestampMs = 0;
 
-  constructor(db: DbClient) {
+  /**
+   * The time is set here, not by the database: SQLite's CURRENT_TIMESTAMP has no zone and only whole seconds, so
+   * it was read back as local time and two writes in one second could not be ordered. An ISO string in UTC with
+   * fixed width sorts correctly as text, and each logger hands out strictly increasing times, so ORDER BY
+   * timestamp keeps write order. Postgres reads the same string into its timestamp column.
+   */
+  private nextTimestamp(): string {
+    const ms = Math.max(Date.now(), this.lastTimestampMs + 1);
+    this.lastTimestampMs = ms;
+    return new Date(ms).toISOString();
+  }
+
+  constructor(db: Database) {
     this.db = db;
   }
 
-  static readonly CREATE_TABLE_SQL = `
+  static CREATE_TABLE_SQL = `
     CREATE TABLE IF NOT EXISTS audit_log (
       id UUID PRIMARY KEY,
       timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -24,6 +45,25 @@ export class AuditLogger {
       new_value JSONB,
       why_chain_id TEXT,
       metadata JSONB
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_audit_log_actor_action_resource_timestamp ON audit_log (actor_id, action, resource_type, timestamp);
+    CREATE INDEX IF NOT EXISTS idx_audit_log_resource_type_resource_id_timestamp ON audit_log (resource_type, resource_id, timestamp);
+  `;
+
+  static CREATE_TABLE_SQL_SQLITE = `
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id TEXT PRIMARY KEY,
+      timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+      actor_id TEXT,
+      actor_type TEXT NOT NULL CHECK (actor_type IN ('user', 'service', 'api_key')),
+      action TEXT NOT NULL,
+      resource_type TEXT NOT NULL,
+      resource_id TEXT NOT NULL,
+      old_value TEXT,
+      new_value TEXT,
+      why_chain_id TEXT,
+      metadata TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_audit_log_actor_action_resource_timestamp ON audit_log (actor_id, action, resource_type, timestamp);
@@ -61,10 +101,11 @@ export class AuditLogger {
       `INSERT INTO audit_log (
         id, timestamp, actor_id, actor_type, action, resource_type, resource_id, old_value, new_value, why_chain_id, metadata
       ) VALUES (
-        $1, NOW(), $2, $3, $4, $5, $6, $7, $8, $9, $10
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
       )`,
       [
         logId,
+        this.nextTimestamp(),
         actorIdStr,
         actor_type,
         action,
@@ -138,10 +179,10 @@ export class AuditLogger {
     const whereClause = whereConditions.length > 0 ? `WHERE ${whereConditions.join(' AND ')}` : '';
 
     const countResult = await this.db.query(
-      `SELECT COUNT(*) FROM audit_log ${whereClause}`,
+      `SELECT COUNT(*) as count FROM audit_log ${whereClause}`,
       values
     );
-    const total = parseInt(countResult.rows[0].count, 10);
+    const total = parseInt(String(countResult.rows[0]?.count ?? countResult.rows[0]?.['COUNT(*)'] ?? '0'), 10);
 
     const limit = params.limit ?? 100;
     const offset = params.offset ?? 0;
@@ -156,7 +197,7 @@ export class AuditLogger {
 
     const logs = logsResult.rows.map(row => ({
       id: row.id,
-      timestamp: row.timestamp.toISOString(),
+      timestamp: row.timestamp.toISOString ? row.timestamp.toISOString() : new Date(row.timestamp).toISOString(),
       actor_id: row.actor_id === null ? null : (isNaN(Number(row.actor_id)) ? row.actor_id : Number(row.actor_id)),
       action: row.action,
       resource_type: row.resource_type,
@@ -186,7 +227,7 @@ export class AuditLogger {
       [logId]
     );
 
-    if (logResult.rowCount === 0) {
+    if (logResult.rowCount === 0 || logResult.rows.length === 0) {
       throw new Error(`Log not found: ${logId}`);
     }
 
@@ -201,25 +242,18 @@ export class AuditLogger {
       [resourceType, resourceId]
     );
 
-    let stateBefore = null;
     let stateNow = null;
-
-    for (const row of resourceLogsResult.rows) {
-      if (row.id === logId) {
-        break;
-      }
-      stateBefore = row.new_value;
-    }
 
     for (const row of resourceLogsResult.rows) {
       stateNow = row.new_value;
     }
 
-    const hasDiverged = stateNow !== log.new_value;
+    const logNewValue = log.new_value;
+    const hasDiverged = JSON.stringify(stateNow) !== JSON.stringify(logNewValue);
 
     return {
       log_id: log.id,
-      timestamp: log.timestamp.toISOString(),
+      timestamp: log.timestamp.toISOString ? log.timestamp.toISOString() : new Date(log.timestamp).toISOString(),
       resource_state_at_time: log.old_value,
       has_diverged: hasDiverged
     };
@@ -270,7 +304,7 @@ export class AuditLogger {
 
     const results = result.rows.map(row => ({
       id: row.id,
-      timestamp: row.timestamp.toISOString(),
+      timestamp: row.timestamp.toISOString ? row.timestamp.toISOString() : new Date(row.timestamp).toISOString(),
       actor_id: row.actor_id === null ? null : (isNaN(Number(row.actor_id)) ? row.actor_id : Number(row.actor_id)),
       action: row.action,
       resource_type: row.resource_type,

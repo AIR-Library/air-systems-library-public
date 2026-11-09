@@ -1,29 +1,79 @@
-import { Pool } from 'pg';
-import { AuditLogger } from './audit_logging_typescript';
+import Database, { Database as BetterSqliteDatabase } from 'better-sqlite3';
+import { AuditLogger, Database as AuditDatabase, QueryResult } from './audit_logging_typescript';
 
-const TEST_DB_CONFIG = {
-  user: 'postgres',
-  host: 'localhost',
-  database: 'audit_log_test',
-  password: 'postgres',
-  port: 5432
-};
+class SqliteTestDatabase implements AuditDatabase {
+  private db: BetterSqliteDatabase;
 
-let pool: Pool;
+  constructor() {
+    this.db = new Database(':memory:');
+    this.db.pragma('journal_mode = WAL');
+  }
+
+  private convertPlaceholders(sql: string): string {
+    // Replace PostgreSQL ILIKE with SQLite LIKE (case-insensitive by default for ASCII)
+    sql = sql.replace(/ILIKE/gi, 'LIKE');
+    // Replace $1, $2, ... with ? placeholders
+    let index = 0;
+    return sql.replace(/\$(\d+)/g, () => {
+      index++;
+      return '?';
+    });
+  }
+
+  async query(text: string, values?: any[]): Promise<QueryResult> {
+    const sql = this.convertPlaceholders(text);
+
+    // Handle multi-statement SQL (e.g., CREATE TABLE + CREATE INDEX) when no parameters
+    if ((!values || values.length === 0) && sql.includes(';')) {
+      const statements = sql.split(';').map(s => s.trim()).filter(s => s.length > 0);
+      if (statements.length > 1) {
+        this.db.exec(sql);
+        return { rows: [], rowCount: 0 };
+      }
+    }
+
+    const stmt = this.db.prepare(sql);
+
+    if (sql.trim().toUpperCase().startsWith('SELECT')) {
+      const rows = values ? stmt.all(...values) : stmt.all();
+      return {
+        rows: rows.map(row => ({
+          ...row,
+          old_value: row.old_value ? JSON.parse(row.old_value) : null,
+          new_value: row.new_value ? JSON.parse(row.new_value) : null,
+          metadata: row.metadata ? JSON.parse(row.metadata) : null
+        })),
+        rowCount: rows.length
+      };
+    } else {
+      const result = values ? stmt.run(...values) : stmt.run();
+      return {
+        rows: [],
+        rowCount: result.changes
+      };
+    }
+  }
+
+  async close(): Promise<void> {
+    this.db.close();
+  }
+}
+
+let testDb: SqliteTestDatabase;
 let auditLogger: AuditLogger;
 
 beforeAll(async () => {
-  pool = new Pool(TEST_DB_CONFIG);
-  await pool.query(AuditLogger.CREATE_TABLE_SQL);
-  auditLogger = new AuditLogger(pool);
+  testDb = new SqliteTestDatabase();
+  await testDb.query(AuditLogger.CREATE_TABLE_SQL_SQLITE);
+  auditLogger = new AuditLogger(testDb);
 });
 
 afterAll(async () => {
-  await pool.end();
+  await testDb.close();
 });
 
 beforeEach(async () => {
-  await pool.query('TRUNCATE TABLE audit_log RESTART IDENTITY');
+  await testDb.query('DELETE FROM audit_log');
 });
 
 describe('logMutation', () => {
