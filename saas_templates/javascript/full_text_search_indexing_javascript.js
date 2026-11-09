@@ -274,9 +274,17 @@ class SearchEngine extends EventEmitter {
     const sql = `SELECT document_type, document_id, content, metadata FROM search_index ${whereClause}`;
     const params = document_type ? [document_type] : [];
 
-    let rows;
+    // Read and parse every row first; the live index changes only once all of them parsed, so a bad row
+    // (metadata edited outside this class) leaves search as it was and reports reindex_failed (CodeRabbit, PR 18).
+    let parsed;
     try {
-      rows = this.db.prepare(sql).all(...params);
+      parsed = this.db.prepare(sql).all(...params).map(row => ({
+        docKey: this._docKey(row.document_type, row.document_id),
+        document_type: row.document_type,
+        document_id: row.document_id,
+        tokens: this._tokenize(row.content),
+        metadata: JSON.parse(row.metadata)
+      }));
     } catch (error) {
       // Events go out on the next tick, so a listener attached right after this call still hears them.
       setImmediate(() => this.emit('reindex_failed', { job_id, error }));
@@ -297,18 +305,15 @@ class SearchEngine extends EventEmitter {
       this.documents.clear();
     }
 
-    rows.forEach(row => {
-      const docKey = this._docKey(row.document_type, row.document_id);
-      const tokens = this._tokenize(row.content);
-      const metadata = JSON.parse(row.metadata);
-      this._addToInvertedIndex(tokens, docKey);
-      this.documents.set(docKey, {
+    for (const row of parsed) {
+      this._addToInvertedIndex(row.tokens, row.docKey);
+      this.documents.set(row.docKey, {
         document_type: row.document_type,
         document_id: row.document_id,
-        contentTokens: tokens,
-        metadata
+        contentTokens: row.tokens,
+        metadata: row.metadata
       });
-    });
+    }
     setImmediate(() => this.emit('reindex_completed', { job_id }));
 
     return { success: true, job_id, status: 'enqueued' };

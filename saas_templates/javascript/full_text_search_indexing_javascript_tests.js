@@ -156,4 +156,23 @@ describe('Full-Text Search & Indexing', () => {
     expect(searchRes.results[0].document_id).toBe(200);
     expect(searchRes.results[0].relevance).toBeGreaterThan(searchRes.results[1].relevance);
   });
+
+  // A row that cannot be parsed fails the reindex without emptying the live index (CodeRabbit, PR 18).
+  test('Reindex with a bad row reports reindex_failed and keeps search working', async () => {
+    const before = searchEngine.search({ q: 'stripe', document_type: 'deployment' }).total;
+    searchEngine.db.prepare(
+      `INSERT INTO search_index (document_type, document_id, content, indexed_at, metadata) VALUES (?, ?, ?, ?, ?)`
+    ).run('deployment', 999999, 'broken row', new Date().toISOString(), '{not json');
+    try {
+      const failed = new Promise(resolve => searchEngine.once('reindex_failed', resolve));
+      const res = searchEngine.reindexAll({ document_type: null });
+      expect(res.success).toBe(true);
+      const event = await failed;
+      expect(event.job_id).toBe(res.job_id);
+      expect(searchEngine.search({ q: 'stripe', document_type: 'deployment' }).total).toBe(before);
+    } finally {
+      searchEngine.db.prepare(`DELETE FROM search_index WHERE document_type = ? AND document_id = ?`)
+        .run('deployment', 999999);
+    }
+  });
 });

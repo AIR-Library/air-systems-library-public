@@ -175,6 +175,14 @@ describe('queryLogs', () => {
     expect(result.total).toBe(3);
   });
 
+  it('includes rows written on the date_to day itself', async () => {
+    // The bound is compared as text on SQLite; "YYYY-MM-DD 23:59:59.999" sorted before every ISO time of that
+    // day, so the last day of a range was empty (CodeRabbit, PR 18).
+    const today = new Date().toISOString().split('T')[0];
+    const result = await auditLogger.queryLogs({ date_from: today, date_to: today });
+    expect(result.total).toBe(3);
+  });
+
   it('should return total and has_more correctly', async () => {
     const result = await auditLogger.queryLogs({});
     expect(result.total).toBe(3);

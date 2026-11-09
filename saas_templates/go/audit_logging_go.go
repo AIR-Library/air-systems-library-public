@@ -364,9 +364,9 @@ func (a *AuditLogger) Search(ctx context.Context, req SearchRequest) (SearchResp
 		return SearchResponse{Results: []LogEntry{}}, nil
 	}
 
-	searchPattern := "%" + strings.ReplaceAll(req.Query, "*", "%") + "%"
+	searchPattern := "%" + strings.ReplaceAll(likeEscaper.Replace(req.Query), "*", "%") + "%"
 	whereClauses := []string{
-		"(action LIKE ? OR resource_type LIKE ? OR resource_id LIKE ? OR old_value LIKE ? OR new_value LIKE ?)",
+		`(action LIKE ? ESCAPE '\' OR resource_type LIKE ? ESCAPE '\' OR resource_id LIKE ? ESCAPE '\' OR old_value LIKE ? ESCAPE '\' OR new_value LIKE ? ESCAPE '\')`,
 	}
 	args := []any{searchPattern, searchPattern, searchPattern, searchPattern, searchPattern}
 

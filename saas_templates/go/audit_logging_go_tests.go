@@ -533,6 +533,15 @@ func TestAuditLogger_ActionWildcardUnderscoreIsLiteral(t *testing.T) {
 	if resp.Total != 1 || len(resp.Logs) != 1 || resp.Logs[0].Action != "user_created" {
 		t.Errorf("user_* matched %d logs, want only user_created", resp.Total)
 	}
+
+	// Search escapes the same way: "r_c" is found in user_created only (CodeRabbit, PR 18).
+	found, err := logger.Search(ctx, SearchRequest{Query: "r_c", Limit: 10})
+	if err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if len(found.Results) != 1 || found.Results[0].Action != "user_created" {
+		t.Errorf("search r_c found %d logs, want only user_created", len(found.Results))
+	}
 }
 
 // A database written by the previous version (variable-width RFC3339Nano times) is upgraded when it is opened, so a

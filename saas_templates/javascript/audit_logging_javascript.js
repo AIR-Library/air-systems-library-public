@@ -214,9 +214,13 @@ class AuditLogger {
 
     let hasDiverged = false;
     const resourceLogs = this.indexByResourceType.get(log.resource_type) || [];
+    // The index keeps write order, so a mutation with the same millisecond written after this one is later too.
+    // Comparing timestamps alone missed it (failed 96 of 100 runs; Codex review on PR 18, 2026-11-09).
+    const self = resourceLogs.indexOf(log);
     for (let i = 0; i < resourceLogs.length; i++) {
       const rLog = resourceLogs[i];
-      if (rLog.resource_id === log.resource_id && rLog.timestamp > log.timestamp) {
+      const later = rLog.timestamp > log.timestamp || (rLog.timestamp === log.timestamp && i > self);
+      if (rLog.resource_id === log.resource_id && rLog.id !== log.id && later) {
         hasDiverged = true;
         break;
       }

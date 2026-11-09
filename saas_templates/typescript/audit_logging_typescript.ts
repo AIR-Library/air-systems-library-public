@@ -171,12 +171,12 @@ export class AuditLogger {
 
     if (params.date_from) {
       whereConditions.push(`timestamp >= $${paramIndex++}`);
-      values.push(`${params.date_from} 00:00:00`);
+      values.push(`${params.date_from}T00:00:00.000Z`);   // the stored form: ISO, UTC (text-compared on SQLite)
     }
 
     if (params.date_to) {
       whereConditions.push(`timestamp <= $${paramIndex++}`);
-      values.push(`${params.date_to} 23:59:59.999`);
+      values.push(`${params.date_to}T23:59:59.999Z`);
     }
 
     const whereClause = whereConditions.length > 0 ? `WHERE ${whereConditions.join(' AND ')}` : '';
