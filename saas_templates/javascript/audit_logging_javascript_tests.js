@@ -1,13 +1,14 @@
-const assert = require('assert');
+import { describe, test, expect, beforeEach } from 'vitest';
 const { AuditLogger } = require('./audit_logging_javascript.js');
 
-async function runTests() {
-  console.log("Starting Audit Logging Test Suite...");
+describe('AuditLogger', () => {
+  let logger;
 
-  // 1. Happy path: log mutation, query it back
-  {
-    console.log("Running: Happy path...");
-    const logger = new AuditLogger();
+  beforeEach(() => {
+    logger = new AuditLogger();
+  });
+
+  test('testHappyPathLogMutationAndQuery', async () => {
     const logData = {
       actor_id: 123,
       actor_type: 'user',
@@ -21,22 +22,29 @@ async function runTests() {
     };
 
     const res = await logger.logMutation(logData);
-    assert.strictEqual(res.success, true);
-    assert.strictEqual(typeof res.log_id, 'string');
+    expect(res.success).toBe(true);
+    expect(typeof res.log_id).toBe('string');
+    expect(res.log_id.length).toBeGreaterThan(0);
 
     const queryRes = await logger.queryLogs({ actor_id: 123 });
-    assert.strictEqual(queryRes.logs.length, 1);
-    assert.strictEqual(queryRes.logs[0].id, res.log_id);
-    assert.strictEqual(queryRes.logs[0].action, 'subscription_changed');
-    assert.deepStrictEqual(queryRes.logs[0].old_value, logData.old_value);
-    assert.deepStrictEqual(queryRes.logs[0].new_value, logData.new_value);
-  }
+    expect(queryRes.logs.length).toBe(1);
+    expect(queryRes.total).toBe(1);
+    expect(queryRes.has_more).toBe(false);
 
-  // 2. Replay: divergence detection (state changed since log)
-  {
-    console.log("Running: Replay & Divergence Detection...");
-    const logger = new AuditLogger();
-    
+    const log = queryRes.logs[0];
+    expect(log.id).toBe(res.log_id);
+    expect(log.timestamp).toBeDefined();
+    expect(typeof log.timestamp).toBe('string');
+    expect(log.actor_id).toBe(123);
+    expect(log.action).toBe('subscription_changed');
+    expect(log.resource_type).toBe('subscription');
+    expect(log.resource_id).toBe('456');
+    expect(log.old_value).toEqual(logData.old_value);
+    expect(log.new_value).toEqual(logData.new_value);
+    expect(log.why_chain_id).toBe('wc_789');
+  });
+
+  test('testReplayDivergenceDetection', async () => {
     const log1 = await logger.logMutation({
       actor_id: 123,
       actor_type: 'user',
@@ -48,8 +56,10 @@ async function runTests() {
     });
 
     const replay1 = await logger.replay(log1.log_id);
-    assert.strictEqual(replay1.has_diverged, false);
-    assert.strictEqual(replay1.resource_state_at_time, null);
+    expect(replay1.log_id).toBe(log1.log_id);
+    expect(replay1.timestamp).toBeDefined();
+    expect(replay1.resource_state_at_time).toBeNull();
+    expect(replay1.has_diverged).toBe(false);
 
     await logger.logMutation({
       actor_id: 123,
@@ -62,29 +72,40 @@ async function runTests() {
     });
 
     const replay2 = await logger.replay(log1.log_id);
-    assert.strictEqual(replay2.has_diverged, true);
+    expect(replay2.has_diverged).toBe(true);
 
     const replay3 = await logger.replay(log1.log_id, { status: 'active', email: 'test@example.com' });
-    assert.strictEqual(replay3.has_diverged, true);
-  }
+    expect(replay3.has_diverged).toBe(true);
 
-  // 3. Filtering: actor_id + action + resource_type work together
-  {
-    console.log("Running: Filtering...");
-    const logger = new AuditLogger();
+    const log4 = await logger.logMutation({
+      actor_id: 456,
+      actor_type: 'user',
+      action: 'user_created',
+      resource_type: 'user',
+      resource_id: 'user_888',
+      old_value: null,
+      new_value: { status: 'pending', email: 'other@example.com' }
+    });
+    const replay4 = await logger.replay(log4.log_id, { status: 'pending', email: 'other@example.com' });
+    expect(replay4.has_diverged).toBe(false);
+    expect(replay4.resource_state_at_time).toBeNull();
+  });
+
+  test('testFilteringActorActionResourceType', async () => {
     await logger.logMutation({ actor_id: 'user_a', actor_type: 'user', action: 'user_created', resource_type: 'user', resource_id: '1' });
     await logger.logMutation({ actor_id: 'user_b', actor_type: 'user', action: 'user_suspended', resource_type: 'user', resource_id: '2' });
     await logger.logMutation({ actor_id: 'user_a', actor_type: 'user', action: 'billing_changed', resource_type: 'billing', resource_id: '3' });
 
     const filterRes = await logger.queryLogs({ actor_id: 'user_a', resource_type: 'user' });
-    assert.strictEqual(filterRes.logs.length, 1);
-    assert.strictEqual(filterRes.logs[0].action, 'user_created');
-  }
+    expect(filterRes.logs.length).toBe(1);
+    expect(filterRes.total).toBe(1);
+    expect(filterRes.has_more).toBe(false);
+    expect(filterRes.logs[0].action).toBe('user_created');
+    expect(filterRes.logs[0].actor_id).toBe('user_a');
+    expect(filterRes.logs[0].resource_type).toBe('user');
+  });
 
-  // 4. Pagination: limit/offset work
-  {
-    console.log("Running: Pagination...");
-    const logger = new AuditLogger();
+  test('testPaginationLimitOffset', async () => {
     for (let i = 0; i < 15; i++) {
       await logger.logMutation({
         actor_id: 'paginator',
@@ -96,18 +117,30 @@ async function runTests() {
     }
 
     const page1 = await logger.queryLogs({ actor_id: 'paginator', limit: 10, offset: 0 });
-    assert.strictEqual(page1.logs.length, 10);
-    assert.strictEqual(page1.has_more, true);
-    assert.strictEqual(page1.total, 15);
+    expect(page1.logs.length).toBe(10);
+    expect(page1.has_more).toBe(true);
+    expect(page1.total).toBe(15);
 
     const page2 = await logger.queryLogs({ actor_id: 'paginator', limit: 10, offset: 10 });
-    assert.strictEqual(page2.logs.length, 5);
-    assert.strictEqual(page2.has_more, false);
-  }
+    expect(page2.logs.length).toBe(5);
+    expect(page2.has_more).toBe(false);
+    expect(page2.total).toBe(15);
 
-  // 5. Performance: 1M+ logs, queries return <100ms
-  {
-    console.log("Running: Performance (1M+ logs)...");
+    const page1Ids = new Set(page1.logs.map(l => l.id));
+    const page2Ids = new Set(page2.logs.map(l => l.id));
+    for (const id of page1Ids) {
+      expect(page2Ids.has(id)).toBe(false);
+    }
+
+    for (let i = 0; i < page1.logs.length - 1; i++) {
+      expect(page1.logs[i].timestamp >= page1.logs[i + 1].timestamp).toBe(true);
+    }
+    for (let i = 0; i < page2.logs.length - 1; i++) {
+      expect(page2.logs[i].timestamp >= page2.logs[i + 1].timestamp).toBe(true);
+    }
+  });
+
+  test('testPerformanceOneMillionLogs', async () => {
     const perfLogger = new AuditLogger();
     const batchSize = 1000000;
     const mockLogs = [];
@@ -134,6 +167,7 @@ async function runTests() {
         metadata: null
       };
       Object.freeze(log);
+      if (log.new_value) Object.freeze(log.new_value);
       mockLogs.push(log);
     }
 
@@ -162,13 +196,14 @@ async function runTests() {
     });
     const queryDuration = Date.now() - queryStart;
     console.log(`Query returned ${queryRes.logs.length} results in ${queryDuration}ms`);
-    assert.ok(queryDuration < 100, `Query took too long: ${queryDuration}ms`);
-  }
+    expect(queryDuration).toBeLessThan(100);
+    expect(queryRes.logs.length).toBeLessThanOrEqual(50);
+    expect(queryRes.total).toBeGreaterThanOrEqual(50);
+  // Building the million entries takes about 4 s on a fast PC (measured 2026-11-09, session 04ec72ff), so the default
+  // 5 s test limit failed it on CI's slower machines. Only the setup gets the time; the query must still be < 100 ms.
+  }, 120_000);
 
-  // 6. Immutability: UPDATE on log returns error
-  {
-    console.log("Running: Immutability...");
-    const logger = new AuditLogger();
+  test('testImmutabilityUpdateDeleteForbidden', async () => {
     const log = await logger.logMutation({
       actor_id: 'system',
       actor_type: 'service',
@@ -177,45 +212,42 @@ async function runTests() {
       resource_id: '0'
     });
 
-    let threwError = false;
+    let updateThrew = false;
     try {
       await logger.updateLog(log.log_id, { action: 'hacked' });
     } catch (err) {
-      threwError = true;
-      assert.ok(err.message.includes("immutable"));
+      updateThrew = true;
+      expect(err.message).toContain('immutable');
     }
-    assert.strictEqual(threwError, true, "Expected update to throw an error due to immutability");
+    expect(updateThrew).toBe(true);
 
-    let threwDeleteError = false;
+    let deleteThrew = false;
     try {
       await logger.deleteLog(log.log_id);
     } catch (err) {
-      threwDeleteError = true;
-      assert.ok(err.message.includes("immutable"));
+      deleteThrew = true;
+      expect(err.message).toContain('immutable');
     }
-    assert.strictEqual(threwDeleteError, true, "Expected delete to throw an error due to immutability");
-  }
+    expect(deleteThrew).toBe(true);
+  });
 
-  // 7. Wildcard: action='user_*' matches user_created, user_suspended, etc.
-  {
-    console.log("Running: Wildcard Matching...");
-    const logger = new AuditLogger();
+  test('testWildcardActionMatching', async () => {
     await logger.logMutation({ actor_id: 1, actor_type: 'user', action: 'user_created', resource_type: 'user', resource_id: '1' });
     await logger.logMutation({ actor_id: 1, actor_type: 'user', action: 'user_suspended', resource_type: 'user', resource_id: '2' });
     await logger.logMutation({ actor_id: 1, actor_type: 'user', action: 'billing_changed', resource_type: 'billing', resource_id: '3' });
 
     const wildcardRes = await logger.queryLogs({ action: 'user_*' });
-    assert.strictEqual(wildcardRes.logs.length, 2);
+    expect(wildcardRes.logs.length).toBe(2);
+    expect(wildcardRes.total).toBe(2);
+    expect(wildcardRes.has_more).toBe(false);
+
     const actions = wildcardRes.logs.map(l => l.action);
-    assert.ok(actions.includes('user_created'));
-    assert.ok(actions.includes('user_suspended'));
-    assert.ok(!actions.includes('billing_changed'));
-  }
+    expect(actions).toContain('user_created');
+    expect(actions).toContain('user_suspended');
+    expect(actions).not.toContain('billing_changed');
 
-  console.log("All tests passed successfully!");
-}
-
-runTests().catch(err => {
-  console.error("Test suite failed:", err);
-  process.exit(1);
+    for (const action of actions) {
+      expect(action.startsWith('user_')).toBe(true);
+    }
+  });
 });

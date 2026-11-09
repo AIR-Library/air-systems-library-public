@@ -17,7 +17,7 @@ public class AuditLoggingTests : IDisposable
     {
         _connection = new SqliteConnection("DataSource=:memory:");
         _connection.Open();
-        _repo = new AuditLogRepository(_connection.ConnectionString);
+        _repo = new AuditLogRepository(_connection);
     }
 
     public void Dispose()
@@ -35,8 +35,8 @@ public class AuditLoggingTests : IDisposable
             Action = action,
             ResourceType = resourceType,
             ResourceId = resourceId,
-            OldValue = JsonDocument.Parse("{\"tier\":\"team\"}").RootElement,
-            NewValue = JsonDocument.Parse("{\"tier\":\"enterprise\"}").RootElement,
+            OldValue = JsonSerializer.Deserialize<JsonElement>("{\"tier\":\"team\"}"),
+            NewValue = JsonSerializer.Deserialize<JsonElement>("{\"tier\":\"enterprise\"}"),
             WhyChainId = "wc_789"
         };
         return await _repo.LogMutationAsync(entry);
@@ -64,7 +64,8 @@ public class AuditLoggingTests : IDisposable
         var replay = await _repo.ReplayAsync(firstLogId);
         Assert.Equal(firstLogId, replay.LogId);
         Assert.True(replay.HasDiverged);
-        Assert.Equal("{\"tier\":\"team\"}", replay.ResourceStateAtTime.GetRawText());
+        Assert.NotNull(replay.ResourceStateAtTime);
+        Assert.Equal("{\"tier\":\"team\"}", replay.ResourceStateAtTime!.Value.GetRawText());
     }
 
     [Fact]
@@ -101,7 +102,7 @@ public class AuditLoggingTests : IDisposable
         {
             var cmd = _connection.CreateCommand();
             cmd.CommandText = "UPDATE audit_log SET action = 'hacked' WHERE id = @id;";
-            cmd.Parameters.AddWithValue("@id", logId);
+            cmd.Parameters.Add(new SqliteParameter("@id", logId));
             await cmd.ExecuteNonQueryAsync();
         });
         Assert.Contains("cannot", ex.Message, StringComparison.OrdinalIgnoreCase);
@@ -125,5 +126,19 @@ public class AuditLoggingTests : IDisposable
         var results = await _repo.SearchAsync("subscription");
         Assert.Single(results);
         Assert.Equal("subscription_changed", results.First().Action);
+    }
+
+
+    [Fact]
+    public async Task Wildcard_Underscore_IsLiteral_InQueryAndSearch()
+    {
+        // "user_*" must not match "userXcreated"; Search for "r_c" must not match "userXcreated" (CodeRabbit, PR 18).
+        await LogSampleAsync(action: "user_created");
+        await LogSampleAsync(action: "userXcreated");
+        var result = await _repo.QueryLogsAsync(actorId: 123, action: "user_*", resourceType: "user");
+        Assert.Equal(1, result.Total);
+        var found = await _repo.SearchAsync("r_c");
+        Assert.Single(found);
+        Assert.Equal("user_created", found.First().Action);
     }
 }

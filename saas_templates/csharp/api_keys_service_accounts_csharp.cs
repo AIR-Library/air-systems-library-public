@@ -7,9 +7,13 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
+using System.Net.Http;
 using BCrypt.Net;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
 using StackExchange.Redis;
+
+#nullable enable
 
 namespace SaaSLibrary.ApiKeys
 {
@@ -98,6 +102,11 @@ namespace SaaSLibrary.ApiKeys
             };
         }
 
+        /// <summary>
+        /// Rotates an active key: issues a new secret and keeps the old one valid for a 24-hour grace period.
+        /// Refuses an unknown key (KeyNotFoundException), a revoked key and a second rotation inside the grace period
+        /// (InvalidOperationException). Output: the new key once, with the grace end. Touches: the api_keys table. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public async Task<RotateApiKeyResponse> RotateApiKeyAsync(Guid userId, Guid apiKeyId)
         {
             var apiKey = await _dbContext.ApiKeys
@@ -106,14 +115,28 @@ namespace SaaSLibrary.ApiKeys
             if (apiKey == null)
                 throw new KeyNotFoundException($"API key {apiKeyId} not found for user {userId}");
 
+            // Rotation keeps the row active and swaps its secret, so a revoked key would hand back a secret
+            // that never validates. Revoked stays revoked: the caller creates a new key instead.
+            if (!apiKey.IsActive)
+                throw new InvalidOperationException($"API key {apiKeyId} is revoked and cannot be rotated");
+
+            // One grace period at a time: a second rotation now would overwrite the previous secret, and clients
+            // still on it would lose access before the grace period they were promised ends (CodeRabbit, PR 18).
+            if (apiKey.GracePeriodEndsAt.HasValue && apiKey.GracePeriodEndsAt.Value > DateTime.UtcNow)
+                throw new InvalidOperationException(
+                    $"API key {apiKeyId} was rotated recently; rotate again after {apiKey.GracePeriodEndsAt.Value:o}");
+
             var oldKeyRevokedAt = DateTime.UtcNow;
-            apiKey.IsActive = false;
+            var gracePeriodEndsAt = oldKeyRevokedAt.AddHours(24);
+
+            apiKey.PreviousKeyPrefix = apiKey.KeyPrefix;
+            apiKey.PreviousKeySecretHash = apiKey.KeySecretHash;
+            apiKey.PreviousKeyRevokedAt = oldKeyRevokedAt;
+            apiKey.GracePeriodEndsAt = gracePeriodEndsAt;
 
             var newKeyParts = GenerateApiKey();
             apiKey.KeyPrefix = newKeyParts.Prefix;
             apiKey.KeySecretHash = BCrypt.Net.BCrypt.HashPassword(newKeyParts.FullKey);
-            apiKey.IsActive = true;
-            apiKey.CreatedAt = DateTime.UtcNow;
             apiKey.LastUsedAt = null;
 
             await _dbContext.SaveChangesAsync();
@@ -122,10 +145,15 @@ namespace SaaSLibrary.ApiKeys
             {
                 NewKey = newKeyParts.FullKey,
                 OldKeyRevokedAt = oldKeyRevokedAt,
-                GracePeriodEndsAt = oldKeyRevokedAt.AddHours(24)
+                GracePeriodEndsAt = gracePeriodEndsAt
             };
         }
 
+        /// <summary>
+        /// Validates a presented key for a request: format, prefix (current or in-grace previous), bcrypt hash, expiry,
+        /// the exact scope the route needs, and the rate limit. Output: IsValid or the error and HTTP status.
+        /// Touches: the api_keys and usage tables, Redis (rate counter). Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public async Task<ApiKeyValidationResult> ValidateApiKeyAsync(string key, string endpoint, HttpMethod method)
         {
             if (string.IsNullOrWhiteSpace(key))
@@ -143,16 +171,35 @@ namespace SaaSLibrary.ApiKeys
                 .FirstOrDefaultAsync(k => k.KeyPrefix == prefix && k.IsActive);
 
             if (apiKey == null)
+            {
+                apiKey = await _dbContext.ApiKeys
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(k => k.PreviousKeyPrefix == prefix && k.IsActive && k.GracePeriodEndsAt.HasValue && k.GracePeriodEndsAt.Value > DateTime.UtcNow);
+            }
+
+            if (apiKey == null)
                 return new ApiKeyValidationResult { IsValid = false, ErrorMessage = "Invalid API key", StatusCode = System.Net.HttpStatusCode.Unauthorized };
 
-            if (!BCrypt.Net.BCrypt.Verify(key, apiKey.KeySecretHash))
+            string secretHash = apiKey.KeySecretHash;
+            if (apiKey.PreviousKeyPrefix == prefix && apiKey.GracePeriodEndsAt.HasValue && apiKey.GracePeriodEndsAt.Value > DateTime.UtcNow)
+            {
+                secretHash = apiKey.PreviousKeySecretHash!;
+            }
+            else if (apiKey.KeyPrefix != prefix)
+            {
+                return new ApiKeyValidationResult { IsValid = false, ErrorMessage = "Invalid API key", StatusCode = System.Net.HttpStatusCode.Unauthorized };
+            }
+
+            if (!BCrypt.Net.BCrypt.Verify(key, secretHash))
                 return new ApiKeyValidationResult { IsValid = false, ErrorMessage = "Invalid API key", StatusCode = System.Net.HttpStatusCode.Unauthorized };
 
             if (apiKey.ExpiresAt.HasValue && apiKey.ExpiresAt.Value < DateTime.UtcNow)
                 return new ApiKeyValidationResult { IsValid = false, ErrorMessage = "API key expired", StatusCode = System.Net.HttpStatusCode.Unauthorized };
 
-            var requiredScope = GetRequiredScope(endpoint, method);
             var scopes = JsonSerializer.Deserialize<List<string>>(apiKey.ScopesJson)!;
+            // A key needs the exact scope for the route. There is no wildcard: keys are not checked for their scopes
+            // when created, so a "*" would let any key holder grant itself everything.
+            var requiredScope = GetRequiredScope(endpoint, method);
             if (!scopes.Contains(requiredScope))
                 return new ApiKeyValidationResult { IsValid = false, ErrorMessage = "Insufficient scope", StatusCode = System.Net.HttpStatusCode.Forbidden };
 
@@ -165,9 +212,12 @@ namespace SaaSLibrary.ApiKeys
             if (current > apiKey.RateLimit)
                 return new ApiKeyValidationResult { IsValid = false, ErrorMessage = "Rate limit exceeded", StatusCode = (System.Net.HttpStatusCode)429 };
 
-            apiKey.LastUsedAt = DateTime.UtcNow;
-            _dbContext.ApiKeys.Update(apiKey);
-            await _dbContext.SaveChangesAsync();
+            var trackedKey = await _dbContext.ApiKeys.FindAsync(apiKey.Id);
+            if (trackedKey != null)
+            {
+                trackedKey.LastUsedAt = DateTime.UtcNow;
+                await _dbContext.SaveChangesAsync();
+            }
 
             return new ApiKeyValidationResult { IsValid = true };
         }
@@ -276,15 +326,39 @@ namespace SaaSLibrary.ApiKeys
             return base64;
         }
 
+        /// <summary>
+        /// Maps a request to the scope it needs: the first path segment after an optional api/vN prefix is the resource;
+        /// GET/HEAD read it, other methods write it. An unlisted resource needs the literal "method:resource". Pure. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         private static string GetRequiredScope(string endpoint, HttpMethod method)
         {
             // Normalize endpoint: remove leading/trailing slashes, convert to lowercase
             var normalizedEndpoint = endpoint.TrimStart('/').TrimEnd('/').ToLowerInvariant();
             var methodLower = method.Method.ToLowerInvariant();
 
-            // Simple mapping: {method}:{endpoint}
-            // In a real system, this would be more sophisticated (e.g., route templates)
-            return $"{methodLower}:{normalizedEndpoint}";
+            var segments = normalizedEndpoint.Split('/', StringSplitOptions.RemoveEmptyEntries);
+            if (segments.Length == 0) return "*";
+
+            // The resource is the first segment after an optional "api" and version ("v1") prefix, never a segment
+            // deeper in the path: "/internal/users" is not "users" (CodeRabbit, PR 18). Reads are GET and HEAD;
+            // every other method writes. A resource not listed needs the literal scope "<method>:<resource>".
+            var i = 0;
+            while (i < segments.Length && (segments[i] == "api" ||
+                   (segments[i].Length > 1 && segments[i][0] == 'v' && segments[i].Skip(1).All(char.IsDigit))))
+                i++;
+            if (i == segments.Length) return "*";
+            var resource = segments[i];
+            var read = methodLower is "get" or "head";
+
+            return resource switch
+            {
+                "users" => read ? "read:users" : "write:users",
+                "deployments" => read ? "read:deployments" : "write:deployments",
+                "invoices" => read ? "read:invoices" : "write:invoices",
+                "subscriptions" or "billing" => read ? "read:billing" : "write:billing",
+                "webhooks" => read ? "read:webhooks" : "webhook:manage",
+                _ => $"{methodLower}:{resource}"
+            };
         }
     }
 
@@ -295,6 +369,9 @@ namespace SaaSLibrary.ApiKeys
         public DbSet<ApiKey> ApiKeys => Set<ApiKey>();
         public DbSet<ApiKeyUsage> ApiKeyUsages => Set<ApiKeyUsage>();
 
+        /// <summary>
+        /// Maps the API key, service account and usage entities, including the previous-key grace fields. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
             modelBuilder.Entity<ApiKey>(entity =>
@@ -311,8 +388,13 @@ namespace SaaSLibrary.ApiKeys
                 entity.Property(e => e.CreatedAt).HasDefaultValueSql("CURRENT_TIMESTAMP");
                 entity.Property(e => e.LastUsedAt);
                 entity.Property(e => e.IsActive).HasDefaultValue(true);
+                entity.Property(e => e.PreviousKeyPrefix).HasMaxLength(8);
+                entity.Property(e => e.PreviousKeySecretHash).HasMaxLength(255);
+                entity.Property(e => e.PreviousKeyRevokedAt);
+                entity.Property(e => e.GracePeriodEndsAt);
                 entity.HasIndex(e => e.UserId);
                 entity.HasIndex(e => e.KeyPrefix);
+                entity.HasIndex(e => e.PreviousKeyPrefix);
                 entity.HasIndex(e => e.IsActive);
             });
 
@@ -344,6 +426,10 @@ namespace SaaSLibrary.ApiKeys
         public DateTime CreatedAt { get; set; }
         public DateTime? LastUsedAt { get; set; }
         public bool IsActive { get; set; }
+        public string? PreviousKeyPrefix { get; set; }
+        public string? PreviousKeySecretHash { get; set; }
+        public DateTime? PreviousKeyRevokedAt { get; set; }
+        public DateTime? GracePeriodEndsAt { get; set; }
     }
 
     public class ApiKeyUsage
@@ -441,7 +527,11 @@ namespace SaaSLibrary.ApiKeys
                 expires_at TIMESTAMP WITH TIME ZONE,
                 created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 last_used_at TIMESTAMP WITH TIME ZONE,
-                is_active BOOLEAN NOT NULL DEFAULT TRUE
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                previous_key_prefix VARCHAR(8),
+                previous_key_secret_hash VARCHAR(255),
+                previous_key_revoked_at TIMESTAMP WITH TIME ZONE,
+                grace_period_ends_at TIMESTAMP WITH TIME ZONE
             );
 
             CREATE TABLE api_key_usage (
@@ -455,6 +545,7 @@ namespace SaaSLibrary.ApiKeys
 
             CREATE INDEX IX_api_keys_user_id ON api_keys(user_id);
             CREATE INDEX IX_api_keys_key_prefix ON api_keys(key_prefix);
+            CREATE INDEX IX_api_keys_previous_key_prefix ON api_keys(previous_key_prefix);
             CREATE INDEX IX_api_keys_is_active ON api_keys(is_active);
             CREATE INDEX IX_api_key_usage_api_key_id ON api_key_usage(api_key_id);
             CREATE INDEX IX_api_key_usage_timestamp ON api_key_usage(timestamp);

@@ -1,17 +1,23 @@
-const sqlite3 = require('sqlite3').verbose();
+const Database = require('better-sqlite3');
 const { v4: uuidv4 } = require('uuid');
 const EventEmitter = require('events');
 
 class SearchEngine extends EventEmitter {
+  /**
+   * Opens the better-sqlite3 database, creates the index table and the in-memory inverted index. Touches: the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+   */
   constructor(dbPath = ':memory:') {
     super();
-    this.db = new sqlite3.Database(dbPath);
+    this.db = new Database(dbPath);
     this._initSchema();
     this.invertedIndex = new Map(); // word -> Set of docKey
     this.documents = new Map(); // docKey -> { document_type, document_id, contentTokens, metadata }
     this.stopWords = new Set(['the', 'and', 'or', 'a', 'an', 'of', 'to', 'in', 'is', 'it']);
   }
 
+  /**
+   * Creates the search_index table. Touches: the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+   */
   _initSchema() {
     const createTableSQL = `
       CREATE TABLE IF NOT EXISTS search_index (
@@ -23,7 +29,7 @@ class SearchEngine extends EventEmitter {
         PRIMARY KEY (document_type, document_id)
       );
     `;
-    this.db.run(createTableSQL);
+    this.db.exec(createTableSQL);
   }
 
   _tokenize(text) {
@@ -57,6 +63,9 @@ class SearchEngine extends EventEmitter {
     });
   }
 
+  /**
+   * Stores or replaces one document and adds its words to the inverted index. Output: { success } or an error. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+   */
   indexDocument(payload) {
     const {
       document_type,
@@ -92,7 +101,6 @@ class SearchEngine extends EventEmitter {
       indexed_at,
       JSON.stringify(metadata)
     );
-    stmt.finalize();
 
     // Update in-memory structures
     this._addToInvertedIndex(tokens, docKey);
@@ -107,6 +115,9 @@ class SearchEngine extends EventEmitter {
     return { success: true, indexed_at };
   }
 
+  /**
+   * Removes one document from the table and the inverted index. Output: { success }. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+   */
   unindexDocument(document_type, document_id) {
     const docKey = this._docKey(document_type, document_id);
     const doc = this.documents.get(docKey);
@@ -116,7 +127,6 @@ class SearchEngine extends EventEmitter {
         DELETE FROM search_index WHERE document_type = ? AND document_id = ?
       `);
       stmt.run(document_type, document_id);
-      stmt.finalize();
       return { success: true };
     }
 
@@ -129,7 +139,6 @@ class SearchEngine extends EventEmitter {
       DELETE FROM search_index WHERE document_type = ? AND document_id = ?
     `);
     stmt.run(document_type, document_id);
-    stmt.finalize();
 
     this.emit('unindexed', { document_type, document_id });
     return { success: true };
@@ -176,6 +185,10 @@ class SearchEngine extends EventEmitter {
     return true;
   }
 
+  /**
+   * Finds documents by words and prefixes, optional type and filters; ranked by relevance, with facets on request.
+   * Output: { results, total, facets? }. Touches: memory only. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+   */
   search(params) {
     const {
       q = '',
@@ -211,7 +224,7 @@ class SearchEngine extends EventEmitter {
         }
         // also consider prefix matches
         for (const [word, keys] of this.invertedIndex.entries()) {
-          if (word.startsWith(token) && (!document_type || [...keys].some(k => k.startsWith(`${document_type}:`)))) {
+          if (word.startsWith(token)) {
             for (const key of keys) {
               if (!document_type || key.startsWith(`${document_type}:`)) {
                 candidateKeys.add(key);
@@ -269,6 +282,10 @@ class SearchEngine extends EventEmitter {
     return response;
   }
 
+  /**
+   * Rebuilds the in-memory index from the table (one type or all). Every row is parsed before the live index
+   * changes; reindex_completed or reindex_failed is emitted on the next tick. Output: { success, job_id, status }. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+   */
   reindexAll(payload) {
     const { document_type } = payload || {};
     const job_id = uuidv4();
@@ -277,39 +294,47 @@ class SearchEngine extends EventEmitter {
     const sql = `SELECT document_type, document_id, content, metadata FROM search_index ${whereClause}`;
     const params = document_type ? [document_type] : [];
 
-    this.db.all(sql, params, (err, rows) => {
-      if (err) {
-        this.emit('reindex_failed', { job_id, error: err });
-        return;
-      }
-      // Clear current in-memory index for affected types
-      if (document_type) {
-        for (const key of this.documents.keys()) {
-          if (key.startsWith(`${document_type}:`)) {
-            const doc = this.documents.get(key);
-            this._removeFromInvertedIndex(doc.contentTokens, key);
-            this.documents.delete(key);
-          }
-        }
-      } else {
-        this.invertedIndex.clear();
-        this.documents.clear();
-      }
+    // Read and parse every row first; the live index changes only once all of them parsed, so a bad row
+    // (metadata edited outside this class) leaves search as it was and reports reindex_failed (CodeRabbit, PR 18).
+    let parsed;
+    try {
+      parsed = this.db.prepare(sql).all(...params).map(row => ({
+        docKey: this._docKey(row.document_type, row.document_id),
+        document_type: row.document_type,
+        document_id: row.document_id,
+        tokens: this._tokenize(row.content),
+        metadata: JSON.parse(row.metadata)
+      }));
+    } catch (error) {
+      // Events go out on the next tick, so a listener attached right after this call still hears them.
+      setImmediate(() => this.emit('reindex_failed', { job_id, error }));
+      return { success: true, job_id, status: 'enqueued' };
+    }
 
-      rows.forEach(row => {
-        const docKey = this._docKey(row.document_type, row.document_id);
-        const tokens = this._tokenize(row.content);
-        const metadata = JSON.parse(row.metadata);
-        this._addToInvertedIndex(tokens, docKey);
-        this.documents.set(docKey, {
-          document_type: row.document_type,
-          document_id: row.document_id,
-          contentTokens: tokens,
-          metadata
-        });
+    // Clear current in-memory index for affected types
+    if (document_type) {
+      for (const key of this.documents.keys()) {
+        if (key.startsWith(`${document_type}:`)) {
+          const doc = this.documents.get(key);
+          this._removeFromInvertedIndex(doc.contentTokens, key);
+          this.documents.delete(key);
+        }
+      }
+    } else {
+      this.invertedIndex.clear();
+      this.documents.clear();
+    }
+
+    for (const row of parsed) {
+      this._addToInvertedIndex(row.tokens, row.docKey);
+      this.documents.set(row.docKey, {
+        document_type: row.document_type,
+        document_id: row.document_id,
+        contentTokens: row.tokens,
+        metadata: row.metadata
       });
-      this.emit('reindex_completed', { job_id });
-    });
+    }
+    setImmediate(() => this.emit('reindex_completed', { job_id }));
 
     return { success: true, job_id, status: 'enqueued' };
   }

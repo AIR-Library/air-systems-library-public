@@ -2,6 +2,7 @@ package com.saas.fileuploads;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
+import javax.sql.DataSource;
 import java.io.*;
 import java.nio.file.*;
 import java.security.MessageDigest;
@@ -14,14 +15,15 @@ import java.util.Base64.Encoder;
 public final class FileUploadService {
     private static final Set<String> ALLOWED_EXTENSIONS = Set.of("pdf", "png", "jpg", "jpeg", "gif", "txt", "csv", "docx", "xlsx");
     private static final Map<String, byte[]> MAGIC_BYTES = Map.of(
-        "png", new byte[]{(byte)0x89, 0x50, 0x4E, 0x47},
+        "png", new byte[]{(byte)0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A},
         "jpg", new byte[]{(byte)0xFF, (byte)0xD8, (byte)0xFF},
         "jpeg", new byte[]{(byte)0xFF, (byte)0xD8, (byte)0xFF},
-        "gif", new byte[]{0x47, 0x49, 0x46, 0x38},
-        "pdf", new byte[]{0x25, 0x50, 0x44, 0x46},
+        "pdf", new byte[]{0x25, 0x50, 0x44, 0x46, 0x2D},
         "docx", new byte[]{0x50, 0x4B, 0x03, 0x04},
         "xlsx", new byte[]{0x50, 0x4B, 0x03, 0x04}
     );
+    private static final byte[] GIF87A = new byte[]{0x47, 0x49, 0x46, 0x38, 0x37, 0x61};
+    private static final byte[] GIF89A = new byte[]{0x47, 0x49, 0x46, 0x38, 0x39, 0x61};
     private static final int MAX_FILENAME_LENGTH = 255;
     private static final long DEFAULT_MAX_SIZE = 10 * 1024 * 1024L;
     private static final SecureRandom RANDOM = new SecureRandom();
@@ -35,8 +37,12 @@ public final class FileUploadService {
     public record Config(String jdbcUrl, String storageRoot, long maxFileSize, String hmacKeyBase64) {}
     public record UploadResult(String fileId) {}
     public record DownloadLink(String token) {}
+    /**
+     * Stored metadata of one upload, including when it was soft-deleted (null while it exists). Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+     */
     public record FileMeta(String id, String orgId, String ownerUserId, String storedName, String originalName,
-                           String extension, String mimeType, long sizeBytes, String sha256, Instant createdAt) {}
+                           String extension, String mimeType, long sizeBytes, String sha256, Instant createdAt,
+                           Instant deletedAt) {}
 
     public FileUploadService(Config config) throws Exception {
         this.dataSource = new SimpleDataSource(config.jdbcUrl);
@@ -47,6 +53,9 @@ public final class FileUploadService {
         initSchema();
     }
 
+    /**
+     * Creates the files table, its indexes and org_members. Touches: the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+     */
     private void initSchema() throws SQLException {
         try (Connection c = dataSource.getConnection(); Statement s = c.createStatement()) {
             s.execute("""
@@ -65,6 +74,12 @@ public final class FileUploadService {
                 );
                 CREATE INDEX IF NOT EXISTS idx_files_org ON files(org_id);
                 CREATE INDEX IF NOT EXISTS idx_files_owner ON files(owner_user_id);
+                
+                CREATE TABLE IF NOT EXISTS org_members (
+                    org_id VARCHAR(36) NOT NULL,
+                    user_id VARCHAR(36) NOT NULL,
+                    PRIMARY KEY (org_id, user_id)
+                );
             """);
         }
     }
@@ -123,26 +138,35 @@ public final class FileUploadService {
         return new DownloadLink(token);
     }
 
-    public byte[] download(String token) throws IOException, SQLException, DownloadException {
-        String[] parts = new String(Base64.getUrlDecoder().decode(token)).split("\\.", 3);
-        if (parts.length != 3) throw new DownloadException("Invalid token format");
+    /**
+     * Returns a file's bytes for a signed, unexpired link, only to a caller allowed to see the file.
+     * A malformed link is "Invalid token format". Throws DownloadException otherwise. Touches: database and storage. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+     */
+    public byte[] download(String userId, String token) throws IOException, SQLException, DownloadException {
+        try {
+            String[] parts = new String(Base64.getUrlDecoder().decode(token)).split("\\.", 3);
+            if (parts.length != 3) throw new DownloadException("Invalid token format");
 
-        String fileId = parts[0];
-        long expiresAt = Long.parseLong(parts[1]);
-        String providedSig = parts[2];
+            String fileId = parts[0];
+            long expiresAt = Long.parseLong(parts[1]);
+            String providedSig = parts[2];
 
-        if (Instant.now().getEpochSecond() > expiresAt) throw new DownloadException("Link expired");
+            if (Instant.now().getEpochSecond() > expiresAt) throw new DownloadException("Link expired");
 
-        String expectedPayload = fileId + "." + expiresAt;
-        String expectedSig = hmacSha256(expectedPayload);
-        if (!constantTimeEquals(providedSig, expectedSig)) throw new DownloadException("Invalid signature");
+            String expectedPayload = fileId + "." + expiresAt;
+            String expectedSig = hmacSha256(expectedPayload);
+            if (!constantTimeEquals(providedSig, expectedSig)) throw new DownloadException("Invalid signature");
 
-        FileMeta meta = getFileMeta(fileId);
-        if (meta == null || meta.deletedAt() != null) throw new DownloadException("File not found");
+            FileMeta meta = getFileMeta(fileId);
+            if (meta == null || meta.deletedAt() != null) throw new DownloadException("File not found");
+            if (!canAccess(userId, meta)) throw new DownloadException("Access denied");
 
-        Path filePath = storageRoot.resolve(meta.storedName());
-        if (!Files.exists(filePath)) throw new DownloadException("File not found on disk");
-        return Files.readAllBytes(filePath);
+            Path filePath = storageRoot.resolve(meta.storedName());
+            if (!Files.exists(filePath)) throw new DownloadException("File not found on disk");
+            return Files.readAllBytes(filePath);
+        } catch (IllegalArgumentException | ArrayIndexOutOfBoundsException e) {
+            throw new DownloadException("Invalid token format");
+        }
     }
 
     public void deleteFile(String userId, String fileId) throws SQLException, DownloadException {
@@ -171,17 +195,22 @@ public final class FileUploadService {
         return meta.ownerUserId().equals(userId) || isOrgMember(userId, meta.orgId());
     }
 
+    /**
+     * Reads one file's metadata, or null. Touches: reads the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+     */
     private FileMeta getFileMeta(String fileId) throws SQLException {
         try (Connection c = dataSource.getConnection();
              PreparedStatement ps = c.prepareStatement("SELECT * FROM files WHERE id = ?")) {
             ps.setString(1, fileId);
             ResultSet rs = ps.executeQuery();
             if (!rs.next()) return null;
+            Timestamp deletedTs = rs.getTimestamp("deleted_at");
             return new FileMeta(
                 rs.getString("id"), rs.getString("org_id"), rs.getString("owner_user_id"),
                 rs.getString("stored_name"), rs.getString("original_name"), rs.getString("extension"),
                 rs.getString("mime_type"), rs.getLong("size_bytes"), rs.getString("sha256"),
-                rs.getTimestamp("created_at").toInstant()
+                rs.getTimestamp("created_at").toInstant(),
+                deletedTs != null ? deletedTs.toInstant() : null
             );
         }
     }
@@ -191,9 +220,22 @@ public final class FileUploadService {
         return dot > 0 ? filename.substring(dot + 1) : "";
     }
 
+    /**
+     * Checks the content starts with the full signature of its extension (PNG 8 bytes, PDF %PDF-, GIF87a/89a). Pure. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+     */
     private boolean verifyMagicBytes(byte[] content, String ext) {
+        if (ext.equals("gif")) {
+            return checkMagic(content, GIF87A) || checkMagic(content, GIF89A);
+        }
         byte[] magic = MAGIC_BYTES.get(ext);
         if (magic == null) return true;
+        return checkMagic(content, magic);
+    }
+
+    /**
+     * True when content begins with magic. Pure. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+     */
+    private boolean checkMagic(byte[] content, byte[] magic) {
         if (content.length < magic.length) return false;
         for (int i = 0; i < magic.length; i++) {
             if (content[i] != magic[i]) return false;
@@ -241,6 +283,9 @@ public final class FileUploadService {
         return result == 0;
     }
 
+    /**
+     * Lower-case hex of the bytes. Pure. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+     */
     private static String bytesToHex(byte[] bytes) {
         StringBuilder sb = new StringBuilder(bytes.length * 2);
         for (byte b : bytes) sb.append(String.format("%02x", b));
@@ -250,12 +295,38 @@ public final class FileUploadService {
     public static class UploadException extends Exception { public UploadException(String m) { super(m); } }
     public static class DownloadException extends Exception { public DownloadException(String m) { super(m); } }
 
-    private static class SimpleDataSource {
+    private static class SimpleDataSource implements DataSource {
         private final String url;
         SimpleDataSource(String url) { this.url = url; }
-        Connection getConnection() throws SQLException { return DriverManager.getConnection(url); }
+        @Override
+        public Connection getConnection() throws SQLException { return DriverManager.getConnection(url); }
+        @Override
+        public Connection getConnection(String username, String password) throws SQLException { return DriverManager.getConnection(url, username, password); }
+        @Override
+        public PrintWriter getLogWriter() throws SQLException { return null; }
+        /**
+         * DataSource contract: logging is not used here, so this does nothing. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+         */
+        @Override
+        public void setLogWriter(PrintWriter out) throws SQLException {}
+        /**
+         * DataSource contract: the timeout is not used here, so this does nothing. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+         */
+        @Override
+        public void setLoginTimeout(int seconds) throws SQLException {}
+        @Override
+        public int getLoginTimeout() throws SQLException { return 0; }
+        @Override
+        public java.util.logging.Logger getParentLogger() throws SQLFeatureNotSupportedException { throw new SQLFeatureNotSupportedException(); }
+        @Override
+        public <T> T unwrap(Class<T> iface) throws SQLException { throw new SQLException("SimpleDataSource wraps nothing"); }
+        @Override
+        public boolean isWrapperFor(Class<?> iface) throws SQLException { return false; }
     }
 
+    /**
+     * A new random 256-bit HMAC key, Base64, for signing download links. Touches: the system random source. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+     */
     public static String generateHmacKey() {
         byte[] key = new byte[32];
         RANDOM.nextBytes(key);

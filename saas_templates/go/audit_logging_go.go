@@ -21,19 +21,30 @@ var (
 )
 
 type AuditLogger struct {
-	db *sql.DB
+	db         *sql.DB
+	insertStmt *sql.Stmt
 }
 
+// tsLayout is fixed width (always nine fraction digits, always UTC), so timestamps compare correctly as text.
+// time.RFC3339Nano drops trailing zeros, which made ".1Z" sort after ".12Z" and broke "later" in Replay.
+const tsLayout = "2006-01-02T15:04:05.000000000Z"
+
+// formatTS writes t in UTC with the fixed nine-digit layout, so stored times compare correctly as text. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+func formatTS(t time.Time) string { return t.UTC().Format(tsLayout) }
+
+// likeEscaper escapes LIKE's own wildcards and its escape character, for use with ESCAPE '\'.
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
 type LogMutationRequest struct {
-	ActorID      *string          `json:"actor_id"`
-	ActorType    string           `json:"actor_type"`
-	Action       string           `json:"action"`
-	ResourceType string           `json:"resource_type"`
-	ResourceID   string           `json:"resource_id"`
-	OldValue     json.RawMessage  `json:"old_value"`
-	NewValue     json.RawMessage  `json:"new_value"`
-	WhyChainID   *string          `json:"why_chain_id,omitempty"`
-	Metadata     json.RawMessage  `json:"metadata,omitempty"`
+	ActorID      *string         `json:"actor_id"`
+	ActorType    string          `json:"actor_type"`
+	Action       string          `json:"action"`
+	ResourceType string          `json:"resource_type"`
+	ResourceID   string          `json:"resource_id"`
+	OldValue     json.RawMessage `json:"old_value"`
+	NewValue     json.RawMessage `json:"new_value"`
+	WhyChainID   *string         `json:"why_chain_id,omitempty"`
+	Metadata     json.RawMessage `json:"metadata,omitempty"`
 }
 
 type LogEntry struct {
@@ -62,9 +73,9 @@ type QueryLogsRequest struct {
 }
 
 type QueryLogsResponse struct {
-	Logs     []LogEntry `json:"logs"`
-	Total    int        `json:"total"`
-	HasMore  bool       `json:"has_more"`
+	Logs    []LogEntry `json:"logs"`
+	Total   int        `json:"total"`
+	HasMore bool       `json:"has_more"`
 }
 
 type ReplayResponse struct {
@@ -84,10 +95,16 @@ type SearchResponse struct {
 	Results []LogEntry `json:"results"`
 }
 
+// NewAuditLogger opens the SQLite database at dbPath (":memory:" keeps one connection), creates or upgrades
+// the schema and prepares the insert. Touches: the database file. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
 func NewAuditLogger(dbPath string) (*AuditLogger, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
+	}
+	if dbPath == ":memory:" {
+		// Every new connection to ":memory:" opens its own empty database, so the pool must keep exactly one.
+		db.SetMaxOpenConns(1)
 	}
 
 	if err := initSchema(db); err != nil {
@@ -95,9 +112,20 @@ func NewAuditLogger(dbPath string) (*AuditLogger, error) {
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
 
-	return &AuditLogger{db: db}, nil
+	insertStmt, err := db.Prepare(`
+		INSERT INTO audit_log (id, timestamp, actor_id, actor_type, action, resource_type, resource_id, old_value, new_value, why_chain_id, metadata)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("prepare insert: %w", err)
+	}
+
+	return &AuditLogger{db: db, insertStmt: insertStmt}, nil
 }
 
+// initSchema creates the table, indexes and immutability triggers, and rewrites old variable-width times in one
+// transaction with the update trigger dropped and recreated. Touches: the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
 func initSchema(db *sql.DB) error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS audit_log (
@@ -114,6 +142,20 @@ func initSchema(db *sql.DB) error {
 		metadata TEXT
 	);
 
+	-- Upgrade (2026-11-09): rows from the previous version used variable-width RFC3339Nano times, which sort
+	-- wrongly against the fixed nine-digit form now written (".123Z" sorted after ".123000000Z"). Rewritten once,
+	-- here, in one transaction with the update trigger dropped and recreated below, so a database that already
+	-- has the trigger can still be upgraded and is never left without it (CodeRabbit, PR 18). A database written
+	-- by this version has no such rows: nothing changes. Every UTC time of 30 characters is already fixed.
+	BEGIN;
+	DROP TRIGGER IF EXISTS audit_log_immutable_update;
+	UPDATE audit_log SET timestamp =
+		CASE WHEN instr(timestamp, '.') = 0
+			THEN substr(timestamp, 1, 19) || '.000000000Z'
+			ELSE substr(timestamp, 1, 20) || substr(substr(timestamp, 21, length(timestamp) - 21) || '000000000', 1, 9) || 'Z'
+		END
+	WHERE length(timestamp) <> 30 AND timestamp LIKE '____-__-__T__:__:__%Z';
+
 	CREATE INDEX IF NOT EXISTS idx_audit_log_actor_action_resource_time 
 	ON audit_log(actor_id, action, resource_type, timestamp);
 	CREATE INDEX IF NOT EXISTS idx_audit_log_resource_time 
@@ -122,41 +164,56 @@ func initSchema(db *sql.DB) error {
 	ON audit_log(timestamp);
 	CREATE INDEX IF NOT EXISTS idx_audit_log_action 
 	ON audit_log(action);
+
+	CREATE TRIGGER IF NOT EXISTS audit_log_immutable_update
+	BEFORE UPDATE ON audit_log
+	BEGIN
+		SELECT RAISE(ABORT, 'audit log is immutable');
+	END;
+
+	CREATE TRIGGER IF NOT EXISTS audit_log_immutable_delete
+	BEFORE DELETE ON audit_log
+	BEGIN
+		SELECT RAISE(ABORT, 'audit log is immutable');
+	END;
+	COMMIT;
 	`
 	_, err := db.Exec(schema)
 	return err
 }
 
+// Close releases the prepared insert and the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
 func (a *AuditLogger) Close() error {
+	if a.insertStmt != nil {
+		a.insertStmt.Close()
+	}
 	return a.db.Close()
 }
 
+// LogMutation validates the actor type and appends one entry with the fixed-width UTC time.
+// Output: the new id. Touches: inserts one row. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
 func (a *AuditLogger) LogMutation(ctx context.Context, req LogMutationRequest) (string, error) {
 	if req.ActorType != "user" && req.ActorType != "service" && req.ActorType != "api_key" {
 		return "", ErrInvalidActorType
 	}
 
 	id := generateID()
-	timestamp := time.Now().UTC().Format(time.RFC3339Nano)
+	timestamp := formatTS(time.Now())
 
-	oldVal := req.OldValue
-	if oldVal == nil {
-		oldVal = json.RawMessage("null")
+	oldVal := string(req.OldValue)
+	if oldVal == "" {
+		oldVal = "null"
 	}
-	newVal := req.NewValue
-	if newVal == nil {
-		newVal = json.RawMessage("null")
+	newVal := string(req.NewValue)
+	if newVal == "" {
+		newVal = "null"
 	}
-	meta := req.Metadata
-	if meta == nil {
-		meta = json.RawMessage("null")
+	meta := string(req.Metadata)
+	if meta == "" {
+		meta = "null"
 	}
 
-	query := `
-	INSERT INTO audit_log (id, timestamp, actor_id, actor_type, action, resource_type, resource_id, old_value, new_value, why_chain_id, metadata)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`
-	_, err := a.db.ExecContext(ctx, query,
+	_, err := a.insertStmt.ExecContext(ctx,
 		id, timestamp, req.ActorID, req.ActorType, req.Action,
 		req.ResourceType, req.ResourceID, oldVal, newVal, req.WhyChainID, meta,
 	)
@@ -167,6 +224,8 @@ func (a *AuditLogger) LogMutation(ctx context.Context, req LogMutationRequest) (
 	return id, nil
 }
 
+// QueryLogs filters by actor, action (only * is a wildcard), resource and time window; newest first, ties
+// by insertion order. Output: the page, total and has_more. Touches: reads the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
 func (a *AuditLogger) QueryLogs(ctx context.Context, req QueryLogsRequest) (QueryLogsResponse, error) {
 	whereClauses := []string{}
 	args := []any{}
@@ -176,8 +235,15 @@ func (a *AuditLogger) QueryLogs(ctx context.Context, req QueryLogsRequest) (Quer
 		args = append(args, *req.ActorID)
 	}
 	if req.Action != nil {
-		actionPattern := strings.ReplaceAll(*req.Action, "*", "%")
-		whereClauses = append(whereClauses, "action LIKE ?")
+		actionPattern := *req.Action
+		if strings.Contains(actionPattern, "*") {
+			// Only * is a wildcard: a literal %, _ or \ in an action name must match itself, not any text.
+			actionPattern = likeEscaper.Replace(actionPattern)
+			actionPattern = strings.ReplaceAll(actionPattern, "*", "%")
+			whereClauses = append(whereClauses, `action LIKE ? ESCAPE '\'`)
+		} else {
+			whereClauses = append(whereClauses, "action = ?")
+		}
 		args = append(args, actionPattern)
 	}
 	if req.ResourceType != nil {
@@ -190,11 +256,11 @@ func (a *AuditLogger) QueryLogs(ctx context.Context, req QueryLogsRequest) (Quer
 	}
 	if req.DateFrom != nil {
 		whereClauses = append(whereClauses, "timestamp >= ?")
-		args = append(args, req.DateFrom.UTC().Format(time.RFC3339Nano))
+		args = append(args, formatTS(*req.DateFrom))
 	}
 	if req.DateTo != nil {
 		whereClauses = append(whereClauses, "timestamp <= ?")
-		args = append(args, req.DateTo.UTC().Format(time.RFC3339Nano))
+		args = append(args, formatTS(*req.DateTo))
 	}
 
 	whereSQL := ""
@@ -222,7 +288,7 @@ func (a *AuditLogger) QueryLogs(ctx context.Context, req QueryLogsRequest) (Quer
 		SELECT id, timestamp, actor_id, actor_type, action, resource_type, resource_id, old_value, new_value, why_chain_id, metadata
 		FROM audit_log
 		%s
-		ORDER BY timestamp DESC
+		ORDER BY timestamp DESC, rowid DESC
 		LIMIT ? OFFSET ?
 	`, whereSQL)
 
@@ -237,7 +303,7 @@ func (a *AuditLogger) QueryLogs(ctx context.Context, req QueryLogsRequest) (Quer
 	for rows.Next() {
 		var entry LogEntry
 		var actorID, whyChainID sql.NullString
-		var oldVal, newVal, meta []byte
+		var oldVal, newVal, meta string
 		err := rows.Scan(
 			&entry.ID, &entry.Timestamp, &actorID, &entry.ActorType,
 			&entry.Action, &entry.ResourceType, &entry.ResourceID,
@@ -252,9 +318,9 @@ func (a *AuditLogger) QueryLogs(ctx context.Context, req QueryLogsRequest) (Quer
 		if whyChainID.Valid {
 			entry.WhyChainID = &whyChainID.String
 		}
-		entry.OldValue = oldVal
-		entry.NewValue = newVal
-		entry.Metadata = meta
+		entry.OldValue = json.RawMessage(oldVal)
+		entry.NewValue = json.RawMessage(newVal)
+		entry.Metadata = json.RawMessage(meta)
 		logs = append(logs, entry)
 	}
 
@@ -262,6 +328,8 @@ func (a *AuditLogger) QueryLogs(ctx context.Context, req QueryLogsRequest) (Quer
 	return QueryLogsResponse{Logs: logs, Total: total, HasMore: hasMore}, nil
 }
 
+// Replay returns the state an entry recorded and whether any later entry (later time, or same time written
+// after) changed that resource. ErrLogNotFound for an unknown id. Touches: reads the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
 func (a *AuditLogger) Replay(ctx context.Context, logID string) (ReplayResponse, error) {
 	query := `
 		SELECT id, timestamp, old_value, new_value, resource_type, resource_id
@@ -271,8 +339,8 @@ func (a *AuditLogger) Replay(ctx context.Context, logID string) (ReplayResponse,
 	var entry struct {
 		ID           string
 		Timestamp    string
-		OldValue     []byte
-		NewValue     []byte
+		OldValue     string
+		NewValue     string
 		ResourceType string
 		ResourceID   string
 	}
@@ -287,12 +355,15 @@ func (a *AuditLogger) Replay(ctx context.Context, logID string) (ReplayResponse,
 		return ReplayResponse{}, fmt.Errorf("query log: %w", err)
 	}
 
+	// "Later" is a later timestamp, or the same timestamp written after this entry (higher rowid). Ids are random,
+	// so they cannot break a tie. The same fix as the Rust template (2026-11-05, session f3daac6e).
 	divergedQuery := `
 		SELECT COUNT(*) FROM audit_log
-		WHERE resource_type = ? AND resource_id = ? AND timestamp > ?
+		WHERE resource_type = ? AND resource_id = ?
+		  AND (timestamp > ? OR (timestamp = ? AND rowid > (SELECT rowid FROM audit_log WHERE id = ?)))
 	`
 	var laterCount int
-	err = a.db.QueryRowContext(ctx, divergedQuery, entry.ResourceType, entry.ResourceID, entry.Timestamp).Scan(&laterCount)
+	err = a.db.QueryRowContext(ctx, divergedQuery, entry.ResourceType, entry.ResourceID, entry.Timestamp, entry.Timestamp, entry.ID).Scan(&laterCount)
 	if err != nil {
 		return ReplayResponse{}, fmt.Errorf("check divergence: %w", err)
 	}
@@ -300,19 +371,20 @@ func (a *AuditLogger) Replay(ctx context.Context, logID string) (ReplayResponse,
 	return ReplayResponse{
 		LogID:               entry.ID,
 		Timestamp:           entry.Timestamp,
-		ResourceStateAtTime: entry.NewValue,
+		ResourceStateAtTime: json.RawMessage(entry.NewValue),
 		HasDiverged:         laterCount > 0,
 	}, nil
 }
 
+// Search matches the query in any text column (only * is a wildcard), newest first. Touches: reads the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
 func (a *AuditLogger) Search(ctx context.Context, req SearchRequest) (SearchResponse, error) {
 	if req.Query == "" {
 		return SearchResponse{Results: []LogEntry{}}, nil
 	}
 
-	searchPattern := "%" + strings.ReplaceAll(req.Query, "*", "%") + "%"
+	searchPattern := "%" + strings.ReplaceAll(likeEscaper.Replace(req.Query), "*", "%") + "%"
 	whereClauses := []string{
-		"(action LIKE ? OR resource_type LIKE ? OR resource_id LIKE ? OR old_value LIKE ? OR new_value LIKE ?)",
+		`(action LIKE ? ESCAPE '\' OR resource_type LIKE ? ESCAPE '\' OR resource_id LIKE ? ESCAPE '\' OR old_value LIKE ? ESCAPE '\' OR new_value LIKE ? ESCAPE '\')`,
 	}
 	args := []any{searchPattern, searchPattern, searchPattern, searchPattern, searchPattern}
 
@@ -332,7 +404,7 @@ func (a *AuditLogger) Search(ctx context.Context, req SearchRequest) (SearchResp
 		SELECT id, timestamp, actor_id, actor_type, action, resource_type, resource_id, old_value, new_value, why_chain_id, metadata
 		FROM audit_log
 		%s
-		ORDER BY timestamp DESC
+		ORDER BY timestamp DESC, rowid DESC
 		LIMIT ?
 	`, whereSQL)
 
@@ -347,7 +419,7 @@ func (a *AuditLogger) Search(ctx context.Context, req SearchRequest) (SearchResp
 	for rows.Next() {
 		var entry LogEntry
 		var actorID, whyChainID sql.NullString
-		var oldVal, newVal, meta []byte
+		var oldVal, newVal, meta string
 		err := rows.Scan(
 			&entry.ID, &entry.Timestamp, &actorID, &entry.ActorType,
 			&entry.Action, &entry.ResourceType, &entry.ResourceID,
@@ -362,15 +434,16 @@ func (a *AuditLogger) Search(ctx context.Context, req SearchRequest) (SearchResp
 		if whyChainID.Valid {
 			entry.WhyChainID = &whyChainID.String
 		}
-		entry.OldValue = oldVal
-		entry.NewValue = newVal
-		entry.Metadata = meta
+		entry.OldValue = json.RawMessage(oldVal)
+		entry.NewValue = json.RawMessage(newVal)
+		entry.Metadata = json.RawMessage(meta)
 		results = append(results, entry)
 	}
 
 	return SearchResponse{Results: results}, nil
 }
 
+// generateID returns "log_" and 16 random bytes in hex. Touches: the system random source. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
 func generateID() string {
 	bytes := make([]byte, 16)
 	_, _ = rand.Read(bytes)

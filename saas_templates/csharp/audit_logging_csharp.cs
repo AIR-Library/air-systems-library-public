@@ -2,9 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Data.Common;
-using System.Data.SQLite;
 using System.Text.Json;
 using System.Threading.Tasks;
+using Microsoft.Data.Sqlite;
 
 namespace AuditLogging
 {
@@ -41,14 +41,21 @@ namespace AuditLogging
     public class AuditLogRepository : IDisposable
     {
         private readonly DbConnection _connection;
+        private bool _disposed;
 
-        public AuditLogRepository(string connectionString)
+        public AuditLogRepository(DbConnection connection)
         {
-            _connection = new SQLiteConnection(connectionString);
-            _connection.Open();
+            _connection = connection ?? throw new ArgumentNullException(nameof(connection));
+            if (_connection.State != ConnectionState.Open)
+            {
+                _connection.Open();
+            }
             CreateSchema();
         }
 
+        /// <summary>
+        /// Creates the audit_log table, its index and the triggers that refuse UPDATE and DELETE. Touches: the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         private void CreateSchema()
         {
             var sql = @"
@@ -67,12 +74,25 @@ namespace AuditLogging
                 );
                 CREATE INDEX IF NOT EXISTS idx_audit_log_actor_action_resource_timestamp
                     ON audit_log(actor_id, action, resource_type, timestamp);
+                CREATE TRIGGER IF NOT EXISTS prevent_audit_log_update
+                    BEFORE UPDATE ON audit_log
+                    BEGIN
+                        SELECT RAISE(ABORT, 'cannot update immutable audit log');
+                    END;
+                CREATE TRIGGER IF NOT EXISTS prevent_audit_log_delete
+                    BEFORE DELETE ON audit_log
+                    BEGIN
+                        SELECT RAISE(ABORT, 'cannot delete from immutable audit log');
+                    END;
             ";
             using var cmd = _connection.CreateCommand();
             cmd.CommandText = sql;
             cmd.ExecuteNonQuery();
         }
 
+        /// <summary>
+        /// Appends one audit entry. Output: its id. Touches: inserts one row. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public async Task<string> LogMutationAsync(AuditLogEntry entry)
         {
             entry.Id = Guid.NewGuid().ToString();
@@ -87,21 +107,25 @@ namespace AuditLogging
             ";
             using var cmd = _connection.CreateCommand();
             cmd.CommandText = sql;
-            cmd.Parameters.AddWithValue("@id", entry.Id);
-            cmd.Parameters.AddWithValue("@timestamp", entry.Timestamp.ToString("o"));
-            cmd.Parameters.AddWithValue("@actor_id", (object)entry.ActorId ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("@actor_type", (object)entry.ActorType?.ToString() ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("@action", entry.Action);
-            cmd.Parameters.AddWithValue("@resource_type", entry.ResourceType);
-            cmd.Parameters.AddWithValue("@resource_id", entry.ResourceId);
-            cmd.Parameters.AddWithValue("@old_value", entry.OldValue.HasValue ? entry.OldValue.Value.GetRawText() : (object)DBNull.Value);
-            cmd.Parameters.AddWithValue("@new_value", entry.NewValue.HasValue ? entry.NewValue.Value.GetRawText() : (object)DBNull.Value);
-            cmd.Parameters.AddWithValue("@why_chain_id", (object)entry.WhyChainId ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("@metadata", entry.Metadata.HasValue ? entry.Metadata.Value.GetRawText() : (object)DBNull.Value);
+            cmd.Parameters.Add(new SqliteParameter("@id", entry.Id));
+            cmd.Parameters.Add(new SqliteParameter("@timestamp", entry.Timestamp.ToString("o")));
+            cmd.Parameters.Add(new SqliteParameter("@actor_id", (object)entry.ActorId ?? DBNull.Value));
+            cmd.Parameters.Add(new SqliteParameter("@actor_type", (object)entry.ActorType?.ToString() ?? DBNull.Value));
+            cmd.Parameters.Add(new SqliteParameter("@action", entry.Action));
+            cmd.Parameters.Add(new SqliteParameter("@resource_type", entry.ResourceType));
+            cmd.Parameters.Add(new SqliteParameter("@resource_id", entry.ResourceId));
+            cmd.Parameters.Add(new SqliteParameter("@old_value", entry.OldValue.HasValue ? entry.OldValue.Value.GetRawText() : (object)DBNull.Value));
+            cmd.Parameters.Add(new SqliteParameter("@new_value", entry.NewValue.HasValue ? entry.NewValue.Value.GetRawText() : (object)DBNull.Value));
+            cmd.Parameters.Add(new SqliteParameter("@why_chain_id", (object)entry.WhyChainId ?? DBNull.Value));
+            cmd.Parameters.Add(new SqliteParameter("@metadata", entry.Metadata.HasValue ? entry.Metadata.Value.GetRawText() : (object)DBNull.Value));
             await cmd.ExecuteNonQueryAsync();
             return entry.Id;
         }
 
+        /// <summary>
+        /// Filters entries by actor, action (only * is a wildcard), resource type and time window, newest first.
+        /// Output: the page, the total and whether more follow. Touches: reads the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public async Task<(IEnumerable<AuditLogEntry> Logs, int Total, bool HasMore)> QueryLogsAsync(
             long? actorId = null,
             string action = null,
@@ -112,37 +136,30 @@ namespace AuditLogging
             DateTime? dateTo = null)
         {
             var whereClauses = new List<string>();
-            var parameters = new List<SQLiteParameter>();
 
             if (actorId.HasValue)
             {
                 whereClauses.Add("actor_id = @actor_id");
-                parameters.Add(new SQLiteParameter("@actor_id", actorId.Value));
             }
 
             if (!string.IsNullOrEmpty(action))
             {
-                var likeAction = action.Replace("*", "%");
-                whereClauses.Add("action LIKE @action");
-                parameters.Add(new SQLiteParameter("@action", likeAction));
+                whereClauses.Add("action LIKE @action ESCAPE '\\'");
             }
 
             if (!string.IsNullOrEmpty(resourceType))
             {
                 whereClauses.Add("resource_type = @resource_type");
-                parameters.Add(new SQLiteParameter("@resource_type", resourceType));
             }
 
             if (dateFrom.HasValue)
             {
                 whereClauses.Add("timestamp >= @date_from");
-                parameters.Add(new SQLiteParameter("@date_from", dateFrom.Value.ToString("o")));
             }
 
             if (dateTo.HasValue)
             {
                 whereClauses.Add("timestamp <= @date_to");
-                parameters.Add(new SQLiteParameter("@date_to", dateTo.Value.ToString("o")));
             }
 
             var where = whereClauses.Count > 0 ? "WHERE " + string.Join(" AND ", whereClauses) : "";
@@ -152,8 +169,9 @@ namespace AuditLogging
             using (var countCmd = _connection.CreateCommand())
             {
                 countCmd.CommandText = countSql;
-                foreach (var p in parameters) countCmd.Parameters.Add(p);
-                total = Convert.ToInt32(await countCmd.ExecuteScalarAsync());
+                AddParameters(countCmd, actorId, action, resourceType, dateFrom, dateTo);
+                var result = await countCmd.ExecuteScalarAsync();
+                total = Convert.ToInt32(result);
             }
 
             var dataSql = $@"
@@ -164,9 +182,9 @@ namespace AuditLogging
             ";
             using var dataCmd = _connection.CreateCommand();
             dataCmd.CommandText = dataSql;
-            foreach (var p in parameters) dataCmd.Parameters.Add(p);
-            dataCmd.Parameters.AddWithValue("@limit", limit);
-            dataCmd.Parameters.AddWithValue("@offset", offset);
+            AddParameters(dataCmd, actorId, action, resourceType, dateFrom, dateTo);
+            dataCmd.Parameters.Add(new SqliteParameter("@limit", limit));
+            dataCmd.Parameters.Add(new SqliteParameter("@offset", offset));
 
             var logs = new List<AuditLogEntry>();
             using var reader = await dataCmd.ExecuteReaderAsync();
@@ -179,12 +197,47 @@ namespace AuditLogging
             return (logs, total, hasMore);
         }
 
+        /// <summary>Escapes LIKE's own wildcards and its escape character, for use with ESCAPE '\'. A literal
+        /// %, _ or \ in a filter then matches only itself (CodeRabbit, PR 18, 2026-11-09).</summary>
+        private static string EscapeLike(string s) => s.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_");
+
+        /// <summary>
+        /// Binds the filter values QueryLogsAsync uses to a command; the action is LIKE-escaped, then * becomes %. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
+        private void AddParameters(DbCommand cmd, long? actorId, string action, string resourceType, DateTime? dateFrom, DateTime? dateTo)
+        {
+            if (actorId.HasValue)
+            {
+                cmd.Parameters.Add(new SqliteParameter("@actor_id", actorId.Value));
+            }
+            if (!string.IsNullOrEmpty(action))
+            {
+                cmd.Parameters.Add(new SqliteParameter("@action", EscapeLike(action).Replace("*", "%")));
+            }
+            if (!string.IsNullOrEmpty(resourceType))
+            {
+                cmd.Parameters.Add(new SqliteParameter("@resource_type", resourceType));
+            }
+            if (dateFrom.HasValue)
+            {
+                cmd.Parameters.Add(new SqliteParameter("@date_from", dateFrom.Value.ToString("o")));
+            }
+            if (dateTo.HasValue)
+            {
+                cmd.Parameters.Add(new SqliteParameter("@date_to", dateTo.Value.ToString("o")));
+            }
+        }
+
+        /// <summary>
+        /// Returns the resource state an entry recorded and whether a later entry changed that resource since.
+        /// Throws KeyNotFoundException for an unknown id. Touches: reads the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public async Task<ReplayResult> ReplayAsync(string logId)
         {
             var sql = "SELECT * FROM audit_log WHERE id = @id;";
             using var cmd = _connection.CreateCommand();
             cmd.CommandText = sql;
-            cmd.Parameters.AddWithValue("@id", logId);
+            cmd.Parameters.Add(new SqliteParameter("@id", logId));
             AuditLogEntry entry = null;
             using var reader = await cmd.ExecuteReaderAsync();
             if (await reader.ReadAsync())
@@ -205,9 +258,9 @@ namespace AuditLogging
             ";
             using var divergeCmd = _connection.CreateCommand();
             divergeCmd.CommandText = divergeSql;
-            divergeCmd.Parameters.AddWithValue("@resource_type", entry.ResourceType);
-            divergeCmd.Parameters.AddWithValue("@resource_id", entry.ResourceId);
-            divergeCmd.Parameters.AddWithValue("@timestamp", entry.Timestamp.ToString("o"));
+            divergeCmd.Parameters.Add(new SqliteParameter("@resource_type", entry.ResourceType));
+            divergeCmd.Parameters.Add(new SqliteParameter("@resource_id", entry.ResourceId));
+            divergeCmd.Parameters.Add(new SqliteParameter("@timestamp", entry.Timestamp.ToString("o")));
             var diverge = await divergeCmd.ExecuteScalarAsync();
             bool hasDiverged = diverge != null;
 
@@ -220,11 +273,15 @@ namespace AuditLogging
             };
         }
 
+        /// <summary>
+        /// Substring search over action and resource type (%, _ and \ in the query match themselves).
+        /// Output: up to <paramref name="limit"/> entries. Touches: reads the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public async Task<IEnumerable<AuditLogEntry>> SearchAsync(string query, string resourceType = null, int limit = 50)
         {
             var sql = @"
                 SELECT * FROM audit_log
-                WHERE (action LIKE @q OR resource_type LIKE @q)
+                WHERE (action LIKE @q ESCAPE '\' OR resource_type LIKE @q ESCAPE '\')
             ";
             if (!string.IsNullOrEmpty(resourceType))
             {
@@ -234,12 +291,12 @@ namespace AuditLogging
 
             using var cmd = _connection.CreateCommand();
             cmd.CommandText = sql;
-            cmd.Parameters.AddWithValue("@q", $"%{query}%");
+            cmd.Parameters.Add(new SqliteParameter("@q", $"%{EscapeLike(query)}%"));
             if (!string.IsNullOrEmpty(resourceType))
             {
-                cmd.Parameters.AddWithValue("@resource_type", resourceType);
+                cmd.Parameters.Add(new SqliteParameter("@resource_type", resourceType));
             }
-            cmd.Parameters.AddWithValue("@limit", limit);
+            cmd.Parameters.Add(new SqliteParameter("@limit", limit));
 
             var results = new List<AuditLogEntry>();
             using var reader = await cmd.ExecuteReaderAsync();
@@ -250,28 +307,50 @@ namespace AuditLogging
             return results;
         }
 
+        /// <summary>
+        /// Builds an AuditLogEntry from the current row; JSON columns are deserialized into owned JsonElements. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         private AuditLogEntry ReadEntry(DbDataReader reader)
         {
+            int idOrdinal = reader.GetOrdinal("id");
+            int timestampOrdinal = reader.GetOrdinal("timestamp");
+            int actorIdOrdinal = reader.GetOrdinal("actor_id");
+            int actorTypeOrdinal = reader.GetOrdinal("actor_type");
+            int actionOrdinal = reader.GetOrdinal("action");
+            int resourceTypeOrdinal = reader.GetOrdinal("resource_type");
+            int resourceIdOrdinal = reader.GetOrdinal("resource_id");
+            int oldValueOrdinal = reader.GetOrdinal("old_value");
+            int newValueOrdinal = reader.GetOrdinal("new_value");
+            int whyChainIdOrdinal = reader.GetOrdinal("why_chain_id");
+            int metadataOrdinal = reader.GetOrdinal("metadata");
+
             var entry = new AuditLogEntry
             {
-                Id = reader.GetString(reader.GetOrdinal("id")),
-                Timestamp = DateTime.Parse(reader.GetString(reader.GetOrdinal("timestamp")), null, System.Globalization.DateTimeStyles.RoundtripKind),
-                ActorId = reader.IsDBNull(reader.GetOrdinal("actor_id")) ? (long?)null : reader.GetInt64(reader.GetOrdinal("actor_id")),
-                ActorType = reader.IsDBNull(reader.GetOrdinal("actor_type")) ? (ActorType?)null : Enum.Parse<ActorType>(reader.GetString(reader.GetOrdinal("actor_type"))),
-                Action = reader.GetString(reader.GetOrdinal("action")),
-                ResourceType = reader.GetString(reader.GetOrdinal("resource_type")),
-                ResourceId = reader.GetString(reader.GetOrdinal("resource_id")),
-                OldValue = reader.IsDBNull(reader.GetOrdinal("old_value")) ? (JsonElement?)null : JsonDocument.Parse(reader.GetString(reader.GetOrdinal("old_value"))).RootElement,
-                NewValue = reader.IsDBNull(reader.GetOrdinal("new_value")) ? (JsonElement?)null : JsonDocument.Parse(reader.GetString(reader.GetOrdinal("new_value"))).RootElement,
-                WhyChainId = reader.IsDBNull(reader.GetOrdinal("why_chain_id")) ? null : reader.GetString(reader.GetOrdinal("why_chain_id")),
-                Metadata = reader.IsDBNull(reader.GetOrdinal("metadata")) ? (JsonElement?)null : JsonDocument.Parse(reader.GetString(reader.GetOrdinal("metadata"))).RootElement
+                Id = reader.GetString(idOrdinal),
+                Timestamp = DateTime.Parse(reader.GetString(timestampOrdinal), null, System.Globalization.DateTimeStyles.RoundtripKind),
+                ActorId = reader.IsDBNull(actorIdOrdinal) ? (long?)null : reader.GetInt64(actorIdOrdinal),
+                ActorType = reader.IsDBNull(actorTypeOrdinal) ? (ActorType?)null : Enum.Parse<ActorType>(reader.GetString(actorTypeOrdinal)),
+                Action = reader.GetString(actionOrdinal),
+                ResourceType = reader.GetString(resourceTypeOrdinal),
+                ResourceId = reader.GetString(resourceIdOrdinal),
+                OldValue = reader.IsDBNull(oldValueOrdinal) ? (JsonElement?)null : JsonSerializer.Deserialize<JsonElement>(reader.GetString(oldValueOrdinal)),
+                NewValue = reader.IsDBNull(newValueOrdinal) ? (JsonElement?)null : JsonSerializer.Deserialize<JsonElement>(reader.GetString(newValueOrdinal)),
+                WhyChainId = reader.IsDBNull(whyChainIdOrdinal) ? null : reader.GetString(whyChainIdOrdinal),
+                Metadata = reader.IsDBNull(metadataOrdinal) ? (JsonElement?)null : JsonSerializer.Deserialize<JsonElement>(reader.GetString(metadataOrdinal))
             };
             return entry;
         }
 
+        /// <summary>
+        /// Marks the repository disposed. The connection belongs to the caller and is not closed here. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public void Dispose()
         {
-            _connection?.Dispose();
+            if (!_disposed)
+            {
+                _disposed = true;
+                // Do not dispose the connection - it is owned by the caller
+            }
         }
     }
 }

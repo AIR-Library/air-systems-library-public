@@ -1,7 +1,7 @@
 using System;
-using System.Data.SQLite;
 using System.Threading.Tasks;
 using Dapper;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Caching.Memory;
 using QuotasRateLimiting;
 using Xunit;
@@ -10,13 +10,13 @@ namespace QuotasRateLimitingTests
 {
     public class QuotaServiceTests : IDisposable
     {
-        private readonly SQLiteConnection _conn;
+        private readonly SqliteConnection _conn;
         private readonly QuotaService _service;
         private readonly IMemoryCache _cache;
 
         public QuotaServiceTests()
         {
-            _conn = new SQLiteConnection("Data Source=:memory:;Version=3;New=True;");
+            _conn = new SqliteConnection("Data Source=:memory:");
             _conn.Open();
             _conn.Execute(QuotaService.SchemaSql);
             _cache = new MemoryCache(new MemoryCacheOptions());
@@ -97,7 +97,9 @@ VALUES (@UserId, @Month, 0, @Used, @Now);
             var user = await CreateUserAsync(Tier.Team);
             for (int i = 0; i < 99; i++)
             {
-                var (success, _) = await _service.ProcessApiCallAsync(user, "1.2.3.4", "/test");
+                // Use a unique IP per call to avoid hitting the per-IP rate limit (10/sec)
+                var ip = $"10.0.0.{i + 1}";
+                var (success, _) = await _service.ProcessApiCallAsync(user, ip, "/test");
                 Assert.True(success);
             }
         }
@@ -108,10 +110,13 @@ VALUES (@UserId, @Month, 0, @Used, @Now);
             var user = await CreateUserAsync(Tier.Team);
             for (int i = 0; i < 100; i++)
             {
-                var (success, _) = await _service.ProcessApiCallAsync(user, "1.2.3.4", "/test");
+                // Use a unique IP per call to avoid hitting the per-IP rate limit (10/sec)
+                var ip = $"10.0.1.{i + 1}";
+                var (success, _) = await _service.ProcessApiCallAsync(user, ip, "/test");
                 Assert.True(success);
             }
-            var (fail, json) = await _service.ProcessApiCallAsync(user, "1.2.3.4", "/test");
+            // 101st call should be rejected by per-user rate limit
+            var (fail, json) = await _service.ProcessApiCallAsync(user, "10.0.1.101", "/test");
             Assert.False(fail);
             Assert.Contains("\"error\":\"rate_limit_exceeded\"", json);
         }

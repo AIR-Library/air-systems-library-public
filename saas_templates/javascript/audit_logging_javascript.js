@@ -58,6 +58,10 @@ class AuditLogger {
     this.indexByResourceType = new Map();
   }
 
+  /**
+   * Appends one frozen audit entry and indexes it. Input: actor, action, resource and values; resource_id may be
+   * a number. Output: { success, log_id }. Throws on a missing field. Touches: memory only. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+   */
   async logMutation(entry) {
     if (!entry.action) {
       throw new Error("Action is required");
@@ -65,7 +69,7 @@ class AuditLogger {
     if (!entry.resource_type) {
       throw new Error("Resource type is required");
     }
-    if (!entry.resource_id) {
+    if (entry.resource_id == null) {
       throw new Error("Resource ID is required");
     }
     if (entry.actor_type && !['user', 'service', 'api_key'].includes(entry.actor_type)) {
@@ -82,7 +86,7 @@ class AuditLogger {
       actor_type: entry.actor_type !== undefined ? entry.actor_type : null,
       action: entry.action,
       resource_type: entry.resource_type,
-      resource_id: entry.resource_id,
+      resource_id: String(entry.resource_id),
       old_value: entry.old_value !== undefined ? JSON.parse(JSON.stringify(entry.old_value)) : null,
       new_value: entry.new_value !== undefined ? JSON.parse(JSON.stringify(entry.new_value)) : null,
       why_chain_id: entry.why_chain_id !== undefined ? entry.why_chain_id : null,
@@ -206,6 +210,10 @@ class AuditLogger {
     };
   }
 
+  /**
+   * Returns the state an entry recorded and whether a later entry (later time, or same millisecond written after)
+   * or the given current state differs. Throws for an unknown id. Touches: memory only. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+   */
   async replay(logId, currentState = null) {
     const log = this.indexById.get(logId);
     if (!log) {
@@ -214,9 +222,13 @@ class AuditLogger {
 
     let hasDiverged = false;
     const resourceLogs = this.indexByResourceType.get(log.resource_type) || [];
+    // The index keeps write order, so a mutation with the same millisecond written after this one is later too.
+    // Comparing timestamps alone missed it (failed 96 of 100 runs; Codex review on PR 18, 2026-11-09).
+    const self = resourceLogs.indexOf(log);
     for (let i = 0; i < resourceLogs.length; i++) {
       const rLog = resourceLogs[i];
-      if (rLog.resource_id === log.resource_id && rLog.timestamp > log.timestamp) {
+      const later = rLog.timestamp > log.timestamp || (rLog.timestamp === log.timestamp && i > self);
+      if (rLog.resource_id === log.resource_id && rLog.id !== log.id && later) {
         hasDiverged = true;
         break;
       }
@@ -290,6 +302,9 @@ class AuditLogger {
     throw new Error("Table 'audit_log' is immutable: UPDATE operations are forbidden.");
   }
 
+  /**
+   * Always throws: the audit log is immutable. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+   */
   async deleteLog(logId) {
     throw new Error("Table 'audit_log' is immutable: DELETE operations are forbidden.");
   }

@@ -12,7 +12,8 @@ CREATE TABLE users (
     tier         TEXT NOT NULL,          -- owner, admin, user
     status       TEXT NOT NULL,          -- active, suspended
     created_at   TIMESTAMP NOT NULL,
-    password_hash TEXT
+    password_hash TEXT,
+    csrf_token   TEXT NOT NULL
 );
 
 CREATE TABLE customers (
@@ -39,6 +40,14 @@ CREATE TABLE deployments (
     published_at  TIMESTAMP,
     suspend_reason TEXT,
     archived_at   TIMESTAMP
+);
+
+CREATE TABLE invoices (
+    invoice_id     UUID PRIMARY KEY,
+    customer_id    UUID REFERENCES customers(customer_id),
+    amount         NUMERIC NOT NULL,
+    status         TEXT NOT NULL,          -- succeeded, failed, pending
+    created_at     TIMESTAMP NOT NULL
 );
 
 CREATE TABLE refunds (
@@ -92,6 +101,7 @@ namespace AdminSystem
         public Role Tier { get; set; }
         public string Status { get; set; } = "active";
         public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+        public string CsrfToken { get; set; } = Guid.NewGuid().ToString("N");
     }
 
     public class Customer
@@ -120,6 +130,15 @@ namespace AdminSystem
         public DateTime? PublishedAt { get; set; }
         public string SuspendReason { get; set; }
         public DateTime? ArchivedAt { get; set; }
+    }
+
+    public class Invoice
+    {
+        public Guid InvoiceId { get; set; } = Guid.NewGuid();
+        public Guid CustomerId { get; set; }
+        public decimal Amount { get; set; }
+        public string Status { get; set; } = "succeeded";
+        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     }
 
     public class Refund
@@ -166,6 +185,7 @@ namespace AdminSystem
         public static List<User> Users = new List<User>();
         public static List<Customer> Customers = new List<Customer>();
         public static List<Deployment> Deployments = new List<Deployment>();
+        public static List<Invoice> Invoices = new List<Invoice>();
         public static List<Refund> Refunds = new List<Refund>();
         public static List<GovernanceAction> GovernanceActions = new List<GovernanceAction>();
         public static List<AuditLogEntry> AuditLog = new List<AuditLogEntry>();
@@ -177,15 +197,31 @@ namespace AdminSystem
         public static User CurrentUser { get; set; }
     }
 
-    // CSRF validation (simplified)
+    // CSRF validation (per-user token)
     public static class CsrfValidator
     {
-        private const string ExpectedToken = "valid_csrf_token";
-
+        /// <summary>
+        /// Checks the CSRF token sent with a write against the current user's token.
+        /// Input: the token. Throws ApiException (unauthorized / invalid_csrf) when there is no user or it does not match.
+        /// Was a constant shared by everyone; now per user. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public static void Verify(string token)
         {
-            if (token != ExpectedToken)
+            if (AuthContext.CurrentUser == null)
+                throw new ApiException("unauthorized", "No authenticated user");
+
+            if (string.IsNullOrWhiteSpace(token) || token != AuthContext.CurrentUser.CsrfToken)
                 throw new ApiException("csrf_invalid", "Invalid CSRF token");
+        }
+
+        /// <summary>
+        /// Issues a new random CSRF token for <paramref name="user"/> and stores it on the user.
+        /// Output: the token to embed in the page. Touches: the in-memory user record. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
+        public static string GenerateToken(User user)
+        {
+            user.CsrfToken = Guid.NewGuid().ToString("N");
+            return user.CsrfToken;
         }
     }
 
@@ -206,10 +242,27 @@ namespace AdminSystem
                 throw new ApiException("invalid_name", "Name must be 1-100 characters");
         }
 
-        public static void ValidateTier(string tier)
+        /// <summary>
+        /// Validates a tier name: it must parse to a defined Role, and Owner only when <paramref name="allowOwner"/>.
+        /// Throws ApiException(invalid_tier) otherwise; "99" no longer passes as (Role)99. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
+        public static void ValidateTier(string tier, bool allowOwner = false)
         {
-            if (!Enum.TryParse<Role>(tier, true, out _))
+            // TryParse accepts any number ("99" -> (Role)99); only a defined role passes (CodeRabbit, PR 18).
+            if (!Enum.TryParse<Role>(tier, true, out var role) || !Enum.IsDefined(typeof(Role), role))
                 throw new ApiException("invalid_tier", "Tier is not recognized");
+
+            if (!allowOwner && role == Role.Owner)
+                throw new ApiException("invalid_tier", "Owner tier cannot be assigned via this operation");
+        }
+
+        /// <summary>
+        /// Refuses an amount of zero or less with ApiException(invalid_amount). Used by refunds. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
+        public static void ValidatePositiveAmount(decimal amount)
+        {
+            if (amount <= 0)
+                throw new ApiException("invalid_amount", "Amount must be positive");
         }
     }
 
@@ -280,7 +333,7 @@ namespace AdminSystem
 
             Validation.ValidateEmail(email);
             Validation.ValidateName(name);
-            Validation.ValidateTier(tier);
+            Validation.ValidateTier(tier, allowOwner: false); // Cannot create Owner via API
             var role = (Role)Enum.Parse(typeof(Role), tier, true);
 
             if (Database.Users.Any(u => u.Email.Equals(email, StringComparison.OrdinalIgnoreCase)))
@@ -315,6 +368,11 @@ namespace AdminSystem
             };
         }
 
+        /// <summary>
+        /// Owner-only: resets a user's password after the CSRF check.
+        /// Refuses an unknown user, the last active owner and the caller's own account. Output: { success, ... }.
+        /// Touches: the in-memory user and audit records. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public object ResetPassword(string csrfToken, Guid userId)
         {
             CsrfValidator.Verify(csrfToken);
@@ -323,11 +381,12 @@ namespace AdminSystem
             var target = Database.Users.FirstOrDefault(u => u.UserId == userId)
                 ?? throw new ApiException("user_not_found", "User does not exist");
 
-            if (target.UserId == AuthContext.CurrentUser.UserId)
-                throw new ApiException("cannot_reset_own_password", "Cannot reset own password");
-
+            // Check last active owner FIRST (more specific protection)
             if (IsLastActiveOwner(target))
                 throw new ApiException("cannot_reset_last_owner", "Cannot reset password of last active owner");
+
+            if (target.UserId == AuthContext.CurrentUser.UserId)
+                throw new ApiException("cannot_reset_own_password", "Cannot reset own password");
 
             AuditLogger.Log("password_reset_initiated", AuthContext.CurrentUser.UserId,
                 resourceType: "user", resourceId: target.UserId);
@@ -338,22 +397,28 @@ namespace AdminSystem
             return new { success = true, status = "reset_email_sent" };
         }
 
+        /// <summary>
+        /// Owner-only: changes a user's tier after the CSRF check; the Owner tier cannot be assigned here.
+        /// Refuses an unknown user, demoting the last active owner, and the caller's own role. Output: { success, old/new tier }.
+        /// Touches: the in-memory user and audit records. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public object ChangeUserRole(string csrfToken, Guid userId, string newTier)
         {
             CsrfValidator.Verify(csrfToken);
             RequireOwner();
 
-            Validation.ValidateTier(newTier);
+            Validation.ValidateTier(newTier, allowOwner: false); // Cannot promote to Owner via API
             var newRole = (Role)Enum.Parse(typeof(Role), newTier, true);
 
             var target = Database.Users.FirstOrDefault(u => u.UserId == userId)
                 ?? throw new ApiException("user_not_found", "User does not exist");
 
-            if (target.UserId == AuthContext.CurrentUser.UserId)
-                throw new ApiException("cannot_change_own_role", "Cannot change own role");
-
+            // Check last active owner FIRST (more specific protection)
             if (IsLastActiveOwner(target) && newRole != Role.Owner)
                 throw new ApiException("cannot_demote_last_owner", "Cannot demote last active owner");
+
+            if (target.UserId == AuthContext.CurrentUser.UserId)
+                throw new ApiException("cannot_change_own_role", "Cannot change own role");
 
             var oldTier = target.Tier.ToString();
 
@@ -372,6 +437,10 @@ namespace AdminSystem
             };
         }
 
+        /// <summary>
+        /// Owner-only: suspends a user with a reason after the CSRF check.
+        /// Refuses an unknown user, the last active owner and the caller. Touches: the in-memory user and audit records. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public object SuspendUser(string csrfToken, Guid userId, string reason)
         {
             CsrfValidator.Verify(csrfToken);
@@ -380,11 +449,12 @@ namespace AdminSystem
             var target = Database.Users.FirstOrDefault(u => u.UserId == userId)
                 ?? throw new ApiException("user_not_found", "User does not exist");
 
-            if (target.UserId == AuthContext.CurrentUser.UserId)
-                throw new ApiException("cannot_suspend_yourself", "Cannot suspend yourself");
-
+            // Check last active owner FIRST (more specific protection)
             if (IsLastActiveOwner(target))
                 throw new ApiException("cannot_suspend_last_owner", "Cannot suspend last active owner");
+
+            if (target.UserId == AuthContext.CurrentUser.UserId)
+                throw new ApiException("cannot_suspend_yourself", "Cannot suspend yourself");
 
             AuditLogger.Log("user_suspended", AuthContext.CurrentUser.UserId,
                 resourceType: "user", resourceId: target.UserId,
@@ -402,7 +472,7 @@ namespace AdminSystem
             RequireAdminOrOwner();
 
             var skip = (page - 1) * pageSize;
-            var items = Database.Customers.Skip(skip).Take(pageSize).Select(c => new
+            var items = Database.Customers.Skip(skip).Take(pageSize).Select(c => (object)new
             {
                 customer_id = c.CustomerId,
                 email = c.Email,
@@ -437,12 +507,16 @@ namespace AdminSystem
             };
         }
 
+        /// <summary>
+        /// Owner-only: moves a customer to another plan tier (never Owner) after the CSRF check.
+        /// Refuses an unknown customer. Touches: the in-memory customer and audit records. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public object ChangeCustomerPlan(string csrfToken, Guid customerId, string newTier)
         {
             CsrfValidator.Verify(csrfToken);
             RequireOwner();
 
-            Validation.ValidateTier(newTier);
+            Validation.ValidateTier(newTier, allowOwner: false); // Customers cannot be Owner tier
             var newRole = (Role)Enum.Parse(typeof(Role), newTier, true);
 
             var cust = Database.Customers.FirstOrDefault(c => c.CustomerId == customerId)
@@ -470,13 +544,30 @@ namespace AdminSystem
             };
         }
 
+        /// <summary>
+        /// Owner-only: queues a refund on an invoice after the CSRF check.
+        /// The amount must be positive, the invoice must exist and have succeeded, and all refunds on it may not exceed its amount.
+        /// Output: { success, status: queued, amount }. Touches: the in-memory refund and audit records. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public object QueueRefund(string csrfToken, Guid invoiceId, decimal amount, string reason)
         {
             CsrfValidator.Verify(csrfToken);
             RequireOwner();
 
-            // In a real system we would verify invoice existence and status.
-            // Here we assume it exists and succeeded.
+            Validation.ValidatePositiveAmount(amount);
+
+            var invoice = Database.Invoices.FirstOrDefault(i => i.InvoiceId == invoiceId)
+                ?? throw new ApiException("invoice_not_found", "Invoice does not exist");
+
+            if (!invoice.Status.Equals("succeeded", StringComparison.OrdinalIgnoreCase))
+                throw new ApiException("invalid_invoice_status", "Invoice must have succeeded status");
+
+            // Refunds already queued or made on this invoice count against it: the total never passes what was paid.
+            var alreadyRefunded = Database.Refunds
+                .Where(r => r.InvoiceId == invoiceId && !r.Status.Equals("rejected", StringComparison.OrdinalIgnoreCase))
+                .Sum(r => r.Amount);
+            if (alreadyRefunded + amount > invoice.Amount)
+                throw new ApiException("refund_exceeds_invoice", "Refunds would exceed the invoice amount");
 
             var refund = new Refund
             {
@@ -522,12 +613,16 @@ namespace AdminSystem
             return items;
         }
 
+        /// <summary>
+        /// Owner-only: creates a deployment for a customer after the CSRF check; the tier cannot be Owner.
+        /// Refuses an unknown customer and a domain already registered. Touches: the in-memory deployment and audit records. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public object CreateDeployment(string csrfToken, Guid customerId, string domain, string tier, Guid themeId)
         {
             CsrfValidator.Verify(csrfToken);
             RequireOwner();
 
-            Validation.ValidateTier(tier);
+            Validation.ValidateTier(tier, allowOwner: false); // Deployments cannot be Owner tier
             var role = (Role)Enum.Parse(typeof(Role), tier, true);
 
             if (!Database.Customers.Any(c => c.CustomerId == customerId))
@@ -700,6 +795,10 @@ namespace AdminSystem
             }
         }
 
+        /// <summary>
+        /// Owner or admin: filters the admin audit log by action, resource and time window after the CSRF check.
+        /// Output: the matching entries, newest first. Touches: reads the in-memory audit log only. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         public object SearchAuditLog(string csrfToken, string actionType = null,
             Guid? resourceId = null, DateTime? start = null, DateTime? end = null,
             int limit = 100, int offset = 0)
@@ -722,7 +821,7 @@ namespace AdminSystem
                 .OrderByDescending(l => l.Timestamp)
                 .Skip(offset)
                 .Take(limit)
-                .Select(l => new
+                .Select(l => (object)new
                 {
                     timestamp = l.Timestamp,
                     actor_id = l.ActorId,
@@ -756,6 +855,9 @@ namespace AdminSystem
             RequireAdminOrOwner(); // same check
         }
 
+        /// <summary>
+        /// True when <paramref name="candidate"/> is an Owner and no other active Owner exists. Reads users only. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// </summary>
         private bool IsLastActiveOwner(User candidate)
         {
             if (candidate.Tier != Role.Owner) return false;
