@@ -1,60 +1,120 @@
 package com.saas.billing;
 
-import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
-import com.stripe.Stripe;
+import com.stripe.exception.SignatureVerificationException;
 import com.stripe.exception.StripeException;
-import com.stripe.model.Invoice;
 import com.stripe.model.Subscription;
 import com.stripe.model.SubscriptionItem;
-import com.stripe.model.Customer;
-import com.stripe.param.InvoiceRetrieveParams;
+import com.stripe.net.RequestOptions;
+import com.stripe.net.Webhook;
 import com.stripe.param.SubscriptionCreateParams;
 import com.stripe.param.SubscriptionUpdateParams;
-import com.stripe.net.Webhook;
 
 import java.sql.*;
+import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
-import java.util.Properties;
-import java.util.UUID;
+import java.util.Objects;
 
+/**
+ * Billing and subscriptions on Stripe (spec: GEMINI_DISPATCH_MASTER_SPEC, template #4): create a subscription,
+ * change plan with a proration credit, queue a refund (never executed automatically), and process Stripe webhooks
+ * once each (signature verified, idempotent by Stripe event id).
+ *
+ * Stripe sits behind {@link StripeGateway}: {@link StripeSdkGateway} calls the real API with stripe-java;
+ * {@link InMemoryStripeGateway} is a deterministic fake for tests and local runs (no network). The webhook
+ * signature check is local HMAC work (stripe-java's Webhook.Signature, a constant-time comparison) and needs no
+ * network. Secrets come from configuration (environment variable, else JVM system property), never from code.
+ *
+ * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. It did not compile against stripe-java 28.1.0
+ * (addItems, a static Subscription.update and Webhook.constructEvent returning JsonObject do not exist). Also fixed:
+ * the webhook secret was read only from the environment; "ON DUPLICATE KEY UPDATE" is MySQL-only; a
+ * subscription.updated event without a lookup key wiped the tier to null and the event's items list was read in
+ * a shape real Stripe events do not have; refunds could add up to more than the invoice; the processed-event
+ * record and its effects were not one transaction; Stripe.apiKey was set globally at class load.
+ * Touches: the database (subscriptions, invoices, refunds, events, audit_log); Stripe's API (money) through
+ * StripeSdkGateway only.
+ */
 public class BillingService {
 
-    private static final Gson gson = new Gson();
-    private static final DateTimeFormatter ISO_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'").withZone(ZoneOffset.UTC);
-    private static final Map<String, String> PRICE_IDS = new HashMap<>();
-    private static final Map<String, String> TIER_NAMES = new HashMap<>();
+    private static final DateTimeFormatter ISO_FORMATTER =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'").withZone(ZoneOffset.UTC);
+
+    /** Stripe price id per tier. Override with STRIPE_PRICE_SOLO / _TEAM / _ENTERPRISE; placeholders otherwise. */
+    public static final Map<String, String> PRICE_IDS;
+    /** Monthly list price per tier in cents (spec: Solo $9.99, Team $19.99, Enterprise $99), for proration. */
+    public static final Map<String, Long> TIER_PRICE_CENTS;
 
     static {
-        // Initialize Stripe API key from environment
-        String stripeKey = System.getenv("STRIPE_SECRET_KEY");
-        if (stripeKey != null && !stripeKey.isEmpty()) {
-            Stripe.apiKey = stripeKey;
-        }
+        Map<String, String> prices = new HashMap<>();
+        prices.put("solo", config("STRIPE_PRICE_SOLO", "price_1UI_solo_placeholder"));
+        prices.put("team", config("STRIPE_PRICE_TEAM", "price_1UI_team_placeholder"));
+        prices.put("enterprise", config("STRIPE_PRICE_ENTERPRISE", "price_1UI_enterprise_placeholder"));
+        PRICE_IDS = Collections.unmodifiableMap(prices);
 
-        // Initialize Price IDs (using placeholders as per spec, in production these would be loaded from config)
-        PRICE_IDS.put("solo", "price_1UI_solo_placeholder");
-        PRICE_IDS.put("team", "price_1UI_team_placeholder");
-        PRICE_IDS.put("enterprise", "price_1UI_enterprise_placeholder");
-
-        TIER_NAMES.put("solo", "Solo");
-        TIER_NAMES.put("team", "Team");
-        TIER_NAMES.put("enterprise", "Enterprise");
+        Map<String, Long> cents = new HashMap<>();
+        cents.put("solo", 999L);
+        cents.put("team", 1999L);
+        cents.put("enterprise", 9900L);
+        TIER_PRICE_CENTS = Collections.unmodifiableMap(cents);
     }
 
-    private final Connection connection;
+    /** Seconds of clock skew accepted on a webhook signature timestamp (Stripe's default). */
+    private static final long WEBHOOK_TOLERANCE_SECONDS = 300;
 
+    private final Connection connection;
+    private final StripeGateway stripe;
+    private final String webhookSecret;
+    private final Clock clock;
+
+    /**
+     * Production constructor: real Stripe (key from STRIPE_SECRET_KEY), webhook secret from
+     * STRIPE_WEBHOOK_SECRET, system UTC clock. Each setting is read from the environment, else from a JVM system
+     * property of the same name.
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: the webhook secret was read from the
+     * environment only, and the API key was set on the global Stripe.apiKey. Touches: nothing until called.
+     */
     public BillingService(Connection connection) {
-        this.connection = connection;
+        this(connection, new StripeSdkGateway(config("STRIPE_SECRET_KEY", null)),
+                config("STRIPE_WEBHOOK_SECRET", null), Clock.systemUTC());
     }
 
     /**
-     * Executes the database schema.
+     * Full constructor: any StripeGateway (real or InMemoryStripeGateway), the webhook signing secret and a clock.
+     * Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP so tests run without network or wall-clock
+     * dependence. Touches: nothing until called.
+     */
+    public BillingService(Connection connection, StripeGateway stripe, String webhookSecret, Clock clock) {
+        this.connection = Objects.requireNonNull(connection, "connection");
+        this.stripe = Objects.requireNonNull(stripe, "stripe");
+        this.webhookSecret = webhookSecret;
+        this.clock = Objects.requireNonNull(clock, "clock");
+    }
+
+    /**
+     * Reads a setting from the environment, else from a JVM system property, else the default.
+     * Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: process environment (read only).
+     */
+    static String config(String name, String defaultValue) {
+        String value = System.getenv(name);
+        if (value == null || value.isEmpty()) value = System.getProperty(name);
+        return (value == null || value.isEmpty()) ? defaultValue : value;
+    }
+
+    /**
+     * Creates the five tables (H2 and MySQL compatible).
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: dropped MySQL-only "ON UPDATE
+     * CURRENT_TIMESTAMP" (updated_at is set by every UPDATE here). Touches: the database.
      */
     public static void initializeSchema(Connection conn) throws SQLException {
         String ddl = "CREATE TABLE IF NOT EXISTS subscriptions (\n" +
@@ -64,7 +124,7 @@ public class BillingService {
                 "    tier VARCHAR(50) NOT NULL,\n" +
                 "    status VARCHAR(50) NOT NULL DEFAULT 'active',\n" +
                 "    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,\n" +
-                "    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,\n" +
+                "    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,\n" +
                 "    cancelled_at TIMESTAMP NULL\n" +
                 ");\n" +
                 "CREATE TABLE IF NOT EXISTS invoices (\n" +
@@ -117,45 +177,43 @@ public class BillingService {
     }
 
     /**
-     * Flow 1: Create Subscription
+     * Flow 1: create a subscription for a Stripe customer on a tier.
+     * Input: Stripe customer id, tier (solo|team|enterprise). Output: {success, subscription_id, tier, status,
+     * next_billing_date} or {error: invalid_tier|stripe_error|db_error, message}.
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: Stripe goes through the gateway; times come
+     * from the clock. Touches: Stripe (creates a billable subscription), the database.
      */
     public JsonObject createSubscription(String customerId, String tier) {
-        // Validate tier
-        if (!PRICE_IDS.containsKey(tier)) {
+        if (tier == null || !PRICE_IDS.containsKey(tier)) {
             return errorResponse("invalid_tier", "Invalid tier: " + tier);
+        }
+        if (customerId == null || customerId.isEmpty()) {
+            return errorResponse("invalid_customer", "customer_id is required");
         }
 
         try {
-            // Call Stripe
-            SubscriptionCreateParams params = SubscriptionCreateParams.builder()
-                    .setCustomer(customerId)
-                    .addItems(SubscriptionCreateParams.Item.builder()
-                            .setPrice(PRICE_IDS.get(tier))
-                            .build())
-                    .build();
+            StripeSubscription subscription = stripe.createSubscription(customerId, PRICE_IDS.get(tier));
 
-            Subscription subscription = Subscription.create(params);
-
-            // DB: Insert subscription
-            String sql = "INSERT INTO subscriptions (stripe_subscription_id, customer_id, tier, status, created_at) VALUES (?, ?, ?, 'active', ?)";
+            String sql = "INSERT INTO subscriptions (stripe_subscription_id, customer_id, tier, status, created_at, updated_at) VALUES (?, ?, ?, 'active', ?, ?)";
+            Timestamp now = now();
             try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
-                pstmt.setString(1, subscription.getId());
+                pstmt.setString(1, subscription.id);
                 pstmt.setString(2, customerId);
                 pstmt.setString(3, tier);
-                pstmt.setTimestamp(4, Timestamp.from(Instant.now()));
+                pstmt.setTimestamp(4, now);
+                pstmt.setTimestamp(5, now);
                 pstmt.executeUpdate();
             }
 
-            // Log: Audit
-            logAudit("subscription_created", customerId, subscription.getId(), null, tier, null, null, null, null, null);
+            logAudit("subscription_created", customerId, subscription.id, null, tier, null, null, null, null, null);
 
-            // Return
             JsonObject response = new JsonObject();
             response.addProperty("success", true);
-            response.addProperty("subscription_id", subscription.getId());
+            response.addProperty("subscription_id", subscription.id);
             response.addProperty("tier", tier);
             response.addProperty("status", "active");
-            response.addProperty("next_billing_date", ISO_FORMATTER.format(Instant.ofEpochSecond(subscription.getCurrentPeriodEnd())));
+            response.addProperty("next_billing_date",
+                    ISO_FORMATTER.format(Instant.ofEpochSecond(subscription.currentPeriodEnd)));
             return response;
 
         } catch (StripeException e) {
@@ -166,64 +224,53 @@ public class BillingService {
     }
 
     /**
-     * Flow 2: Change Plan
+     * Flow 2: move a subscription to another tier. Stripe prorates; the response reports the credit for the
+     * unused part of the current period at the old tier's price.
+     * Input: Stripe subscription id, new tier. Output: {success, subscription_id, old_tier, new_tier,
+     * effective_date, proration_credit (cents)} or {error: invalid_tier|not_found|stripe_error|db_error}.
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: the Stripe update did not compile and the
+     * credit was always 0. Touches: Stripe (changes what the customer is billed), the database.
      */
     public JsonObject changePlan(String subscriptionId, String newTier) {
-        // Validate tier
-        if (!PRICE_IDS.containsKey(newTier)) {
+        if (newTier == null || !PRICE_IDS.containsKey(newTier)) {
             return errorResponse("invalid_tier", "Invalid tier: " + newTier);
         }
 
         try {
-            // Fetch existing subscription from DB to get stripe_id and old_tier
-            String oldTier = null;
-            String stripeSubId = null;
-            String customerId = null;
-            String sql = "SELECT stripe_subscription_id, tier, customer_id FROM subscriptions WHERE stripe_subscription_id = ?";
+            String oldTier;
+            String customerId;
+            String sql = "SELECT tier, customer_id FROM subscriptions WHERE stripe_subscription_id = ?";
             try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
                 pstmt.setString(1, subscriptionId);
-                ResultSet rs = pstmt.executeQuery();
-                if (rs.next()) {
-                    stripeSubId = rs.getString("stripe_subscription_id");
+                try (ResultSet rs = pstmt.executeQuery()) {
+                    if (!rs.next()) {
+                        return errorResponse("not_found", "Subscription not found");
+                    }
                     oldTier = rs.getString("tier");
                     customerId = rs.getString("customer_id");
-                } else {
-                    return errorResponse("not_found", "Subscription not found");
                 }
             }
 
-            // Call Stripe
-            SubscriptionUpdateParams params = SubscriptionUpdateParams.builder()
-                    .setSubscription(stripeSubId)
-                    .addItems(SubscriptionUpdateParams.Item.builder()
-                            .setPrice(PRICE_IDS.get(newTier))
-                            .build())
-                    .build();
+            StripeSubscription updated = stripe.changePrice(subscriptionId, PRICE_IDS.get(newTier));
+            Instant now = clock.instant();
+            long prorationCredit = prorationCredit(oldTier, updated, now);
 
-            Subscription updatedSub = Subscription.update(params);
-
-            // Calculate proration credit (simplified: 0 for this implementation, real logic would compare dates)
-            long prorationCredit = 0;
-
-            // DB: Update subscription
             String updateSql = "UPDATE subscriptions SET tier = ?, updated_at = ? WHERE stripe_subscription_id = ?";
             try (PreparedStatement pstmt = connection.prepareStatement(updateSql)) {
                 pstmt.setString(1, newTier);
-                pstmt.setTimestamp(2, Timestamp.from(Instant.now()));
-                pstmt.setString(3, stripeSubId);
+                pstmt.setTimestamp(2, Timestamp.from(now));
+                pstmt.setString(3, subscriptionId);
                 pstmt.executeUpdate();
             }
 
-            // Log: Audit
-            logAudit("plan_changed", customerId, stripeSubId, null, null, oldTier, newTier, null, null, prorationCredit);
+            logAudit("plan_changed", customerId, subscriptionId, null, null, oldTier, newTier, null, null, prorationCredit);
 
-            // Return
             JsonObject response = new JsonObject();
             response.addProperty("success", true);
-            response.addProperty("subscription_id", stripeSubId);
+            response.addProperty("subscription_id", subscriptionId);
             response.addProperty("old_tier", oldTier);
             response.addProperty("new_tier", newTier);
-            response.addProperty("effective_date", ISO_FORMATTER.format(Instant.now()));
+            response.addProperty("effective_date", ISO_FORMATTER.format(now));
             response.addProperty("proration_credit", prorationCredit);
             return response;
 
@@ -235,24 +282,47 @@ public class BillingService {
     }
 
     /**
-     * Flow 3: Queue Refund
+     * Credit in cents for the unused part of the current period at the old tier's price:
+     * floor(price * remaining / period). 0 when the period is unknown or over.
+     * Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (spec: "proration calculated"). Pure.
+     */
+    static long prorationCredit(String oldTier, StripeSubscription period, Instant now) {
+        Long price = TIER_PRICE_CENTS.get(oldTier);
+        if (price == null || period == null) return 0;
+        long length = period.currentPeriodEnd - period.currentPeriodStart;
+        long remaining = period.currentPeriodEnd - now.getEpochSecond();
+        if (length <= 0 || remaining <= 0) return 0;
+        remaining = Math.min(remaining, length);
+        return Math.floorDiv(price * remaining, length);
+    }
+
+    /**
+     * Flow 3: queue a refund for a paid invoice. Refunds are only queued here, never sent to Stripe.
+     * Input: Stripe invoice id, amount in cents (> 0), reason, createdBy (the authenticated admin's id, taken
+     * from the server-side session, never from the request body). Output: {success, refund_id, status: queued,
+     * amount, reason} or {error: invalid_amount|not_found|invalid_invoice_status|refund_exceeds_invoice|db_error}.
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: refunds already queued or executed for the
+     * invoice now count against its amount (two refunds could add up to more than was paid); non-positive
+     * amounts are rejected. Touches: the database (money owed back to a customer).
      */
     public JsonObject queueRefund(String invoiceId, long amount, String reason, String createdBy) {
+        if (amount <= 0) {
+            return errorResponse("invalid_amount", "Refund amount must be positive");
+        }
         try {
-            // Check: Invoice exists and status
+            long invoiceDbId;
+            long invoiceAmount;
+            String invoiceStatus;
             String sql = "SELECT id, amount, status FROM invoices WHERE stripe_invoice_id = ?";
-            long invoiceDbId = 0;
-            long invoiceAmount = 0;
-            String invoiceStatus = null;
             try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
                 pstmt.setString(1, invoiceId);
-                ResultSet rs = pstmt.executeQuery();
-                if (rs.next()) {
+                try (ResultSet rs = pstmt.executeQuery()) {
+                    if (!rs.next()) {
+                        return errorResponse("not_found", "Invoice not found");
+                    }
                     invoiceDbId = rs.getLong("id");
                     invoiceAmount = rs.getLong("amount");
                     invoiceStatus = rs.getString("status");
-                } else {
-                    return errorResponse("not_found", "Invoice not found");
                 }
             }
 
@@ -260,11 +330,18 @@ public class BillingService {
                 return errorResponse("invalid_invoice_status", "Invoice is not in succeeded status");
             }
 
-            if (amount > invoiceAmount) {
+            long alreadyRefunded = 0;
+            String sumSql = "SELECT COALESCE(SUM(amount), 0) FROM refunds WHERE invoice_id = ? AND status <> 'failed'";
+            try (PreparedStatement pstmt = connection.prepareStatement(sumSql)) {
+                pstmt.setLong(1, invoiceDbId);
+                try (ResultSet rs = pstmt.executeQuery()) {
+                    if (rs.next()) alreadyRefunded = rs.getLong(1);
+                }
+            }
+            if (amount > invoiceAmount - alreadyRefunded) {
                 return errorResponse("refund_exceeds_invoice", "Refund amount exceeds invoice amount");
             }
 
-            // DB: Insert refund
             String insertSql = "INSERT INTO refunds (invoice_id, amount, reason, status, created_by, created_at) VALUES (?, ?, ?, 'queued', ?, ?)";
             long refundId = 0;
             try (PreparedStatement pstmt = connection.prepareStatement(insertSql, Statement.RETURN_GENERATED_KEYS)) {
@@ -272,18 +349,17 @@ public class BillingService {
                 pstmt.setLong(2, amount);
                 pstmt.setString(3, reason);
                 pstmt.setString(4, createdBy);
-                pstmt.setTimestamp(5, Timestamp.from(Instant.now()));
+                pstmt.setTimestamp(5, now());
                 pstmt.executeUpdate();
-                ResultSet keys = pstmt.getGeneratedKeys();
-                if (keys.next()) {
-                    refundId = keys.getLong(1);
+                try (ResultSet keys = pstmt.getGeneratedKeys()) {
+                    if (keys.next()) {
+                        refundId = keys.getLong(1);
+                    }
                 }
             }
 
-            // Log: Audit
             logAudit("refund_queued", null, null, invoiceId, null, null, null, amount, reason, null);
 
-            // Return
             JsonObject response = new JsonObject();
             response.addProperty("success", true);
             response.addProperty("refund_id", refundId);
@@ -298,44 +374,69 @@ public class BillingService {
     }
 
     /**
-     * Flow 4: Handle Stripe Webhook
+     * Flow 4: process one Stripe webhook. The Stripe-Signature header is verified (HMAC-SHA256, constant-time
+     * compare, 300 s tolerance on this service's clock) before anything is parsed. An event id already in the
+     * events table is acknowledged and not processed again. The event's effects and its events row are written
+     * in one transaction, so a failure leaves nothing half-applied and Stripe's retry processes it cleanly.
+     * Input: raw request body, Stripe-Signature header. Output: {received: true} (plus duplicate: true for a
+     * replay) or {error: config_error|invalid_signature|invalid_payload|db_error, message}.
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: Webhook.constructEvent returns an Event,
+     * not a JsonObject (compile error); the secret now also comes from a system property; one transaction.
+     * Touches: the database.
      */
     public JsonObject handleStripeWebhook(String payload, String signature) {
-        // Verify signature
-        String webhookSecret = System.getenv("STRIPE_WEBHOOK_SECRET");
         if (webhookSecret == null || webhookSecret.isEmpty()) {
             return errorResponse("config_error", "Webhook secret not configured");
         }
-
-        JsonObject event;
-        try {
-            event = Webhook.constructEvent(payload, signature, webhookSecret);
-        } catch (Exception e) {
+        if (payload == null || signature == null) {
             return errorResponse("invalid_signature", "Invalid webhook signature");
         }
 
-        String eventId = event.get("id").getAsString();
-        String eventType = event.get("type").getAsString();
-
-        // Idempotency check
         try {
+            Webhook.Signature.verifyHeader(payload, signature, webhookSecret, WEBHOOK_TOLERANCE_SECONDS, clock);
+        } catch (SignatureVerificationException e) {
+            return errorResponse("invalid_signature", "Invalid webhook signature");
+        }
+
+        String eventId;
+        String eventType;
+        JsonObject event;
+        try {
+            event = JsonParser.parseString(payload).getAsJsonObject();
+            eventId = event.get("id").getAsString();
+            eventType = event.get("type").getAsString();
+        } catch (RuntimeException e) {
+            return errorResponse("invalid_payload", "Webhook payload is not a Stripe event");
+        }
+
+        boolean previousAutoCommit = true;
+        try {
+            previousAutoCommit = connection.getAutoCommit();
+            connection.setAutoCommit(false);
+
             String checkSql = "SELECT id FROM events WHERE stripe_event_id = ?";
             try (PreparedStatement pstmt = connection.prepareStatement(checkSql)) {
                 pstmt.setString(1, eventId);
-                ResultSet rs = pstmt.executeQuery();
-                if (rs.next()) {
-                    // Already processed
-                    JsonObject response = new JsonObject();
-                    response.addProperty("received", true);
-                    return response;
+                try (ResultSet rs = pstmt.executeQuery()) {
+                    if (rs.next()) {
+                        connection.rollback();
+                        JsonObject response = new JsonObject();
+                        response.addProperty("received", true);
+                        response.addProperty("duplicate", true);
+                        return response;
+                    }
                 }
             }
-        } catch (SQLException e) {
-            return errorResponse("db_error", e.getMessage());
-        }
 
-        // Process event
-        try {
+            // Claim the event first: a concurrent delivery of the same id fails on the UNIQUE key and rolls back.
+            String insertEventSql = "INSERT INTO events (stripe_event_id, event_type, processed_at) VALUES (?, ?, ?)";
+            try (PreparedStatement pstmt = connection.prepareStatement(insertEventSql)) {
+                pstmt.setString(1, eventId);
+                pstmt.setString(2, eventType);
+                pstmt.setTimestamp(3, now());
+                pstmt.executeUpdate();
+            }
+
             if ("invoice.payment_succeeded".equals(eventType)) {
                 processPaymentSucceeded(event);
             } else if ("invoice.payment_failed".equals(eventType)) {
@@ -346,17 +447,20 @@ public class BillingService {
                 processSubscriptionDeleted(event);
             }
 
-            // Log event as processed
-            String insertEventSql = "INSERT INTO events (stripe_event_id, event_type, processed_at) VALUES (?, ?, ?)";
-            try (PreparedStatement pstmt = connection.prepareStatement(insertEventSql)) {
-                pstmt.setString(1, eventId);
-                pstmt.setString(2, eventType);
-                pstmt.setTimestamp(3, Timestamp.from(Instant.now()));
-                pstmt.executeUpdate();
+            connection.commit();
+        } catch (SQLException | RuntimeException e) {
+            try {
+                connection.rollback();
+            } catch (SQLException ignored) {
+                // the original error is the one to report
             }
-
-        } catch (SQLException e) {
-            return errorResponse("db_error", e.getMessage());
+            return errorResponse(e instanceof SQLException ? "db_error" : "invalid_payload", e.getMessage());
+        } finally {
+            try {
+                connection.setAutoCommit(previousAutoCommit);
+            } catch (SQLException ignored) {
+                // connection unusable; the caller will see it on next use
+            }
         }
 
         JsonObject response = new JsonObject();
@@ -364,111 +468,148 @@ public class BillingService {
         return response;
     }
 
+    /**
+     * invoice.payment_succeeded: upserts the invoice as succeeded with amount_paid and paid_at, and audits it.
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: update-then-insert instead of MySQL-only
+     * ON DUPLICATE KEY UPDATE. Touches: the database (caller's transaction).
+     */
     private void processPaymentSucceeded(JsonObject event) throws SQLException {
-        JsonObject data = event.getAsJsonObject("data");
-        JsonObject invoiceObj = data.getAsJsonObject("object");
+        JsonObject invoiceObj = event.getAsJsonObject("data").getAsJsonObject("object");
         String stripeInvoiceId = invoiceObj.get("id").getAsString();
         String customerId = invoiceObj.get("customer").getAsString();
         long amount = invoiceObj.get("amount_paid").getAsLong();
+        Timestamp paidAt = now();
 
-        // DB: Insert/Update invoice
-        String sql = "INSERT INTO invoices (stripe_invoice_id, customer_id, amount, status, paid_at) VALUES (?, ?, ?, 'succeeded', ?) " +
-                "ON DUPLICATE KEY UPDATE status = 'succeeded', paid_at = ?";
-        try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
-            pstmt.setString(1, stripeInvoiceId);
-            pstmt.setString(2, customerId);
-            pstmt.setLong(3, amount);
-            pstmt.setTimestamp(4, Timestamp.from(Instant.now()));
-            pstmt.setTimestamp(5, Timestamp.from(Instant.now()));
-            pstmt.executeUpdate();
+        String update = "UPDATE invoices SET status = 'succeeded', amount = ?, paid_at = ? WHERE stripe_invoice_id = ?";
+        int updated;
+        try (PreparedStatement pstmt = connection.prepareStatement(update)) {
+            pstmt.setLong(1, amount);
+            pstmt.setTimestamp(2, paidAt);
+            pstmt.setString(3, stripeInvoiceId);
+            updated = pstmt.executeUpdate();
+        }
+        if (updated == 0) {
+            String insert = "INSERT INTO invoices (stripe_invoice_id, customer_id, amount, status, paid_at) VALUES (?, ?, ?, 'succeeded', ?)";
+            try (PreparedStatement pstmt = connection.prepareStatement(insert)) {
+                pstmt.setString(1, stripeInvoiceId);
+                pstmt.setString(2, customerId);
+                pstmt.setLong(3, amount);
+                pstmt.setTimestamp(4, paidAt);
+                pstmt.executeUpdate();
+            }
         }
 
-        // Log: Audit
         logAudit("payment_succeeded", customerId, null, stripeInvoiceId, null, null, null, amount, null, null);
     }
 
+    /**
+     * invoice.payment_failed: marks the invoice's subscription (or, if the event names none, the customer's
+     * live subscriptions) past_due, and audits the failure reason.
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: targets the invoice's subscription when
+     * Stripe names it, instead of every subscription of the customer. Touches: the database.
+     */
     private void processPaymentFailed(JsonObject event) throws SQLException {
-        JsonObject data = event.getAsJsonObject("data");
-        JsonObject invoiceObj = data.getAsJsonObject("object");
+        JsonObject invoiceObj = event.getAsJsonObject("data").getAsJsonObject("object");
         String stripeInvoiceId = invoiceObj.get("id").getAsString();
         String customerId = invoiceObj.get("customer").getAsString();
-        String reason = invoiceObj.has("failure_reason") ? invoiceObj.get("failure_reason").getAsString() : "unknown";
+        String subscriptionId = stringOrNull(invoiceObj, "subscription");
+        String reason = stringOrNull(invoiceObj, "failure_reason");
+        if (reason == null) reason = "unknown";
 
-        // DB: Update subscription status to past_due
-        String sql = "UPDATE subscriptions SET status = 'past_due', updated_at = ? WHERE customer_id = ? AND status != 'cancelled'";
+        String sql = subscriptionId != null
+                ? "UPDATE subscriptions SET status = 'past_due', updated_at = ? WHERE stripe_subscription_id = ? AND status NOT IN ('cancelled', 'past_due')"
+                : "UPDATE subscriptions SET status = 'past_due', updated_at = ? WHERE customer_id = ? AND status NOT IN ('cancelled', 'past_due')";
         try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
-            pstmt.setTimestamp(1, Timestamp.from(Instant.now()));
-            pstmt.setString(2, customerId);
+            pstmt.setTimestamp(1, now());
+            pstmt.setString(2, subscriptionId != null ? subscriptionId : customerId);
             pstmt.executeUpdate();
         }
 
-        // Log: Audit
-        logAudit("payment_failed", customerId, null, stripeInvoiceId, null, null, null, null, reason, null);
+        logAudit("payment_failed", customerId, subscriptionId, stripeInvoiceId, null, null, null, null, reason, null);
     }
 
+    /**
+     * customer.subscription.updated: sets status, and tier from items[0].price.lookup_key when that is a known
+     * tier. Accepts Stripe's real shape (items: {data: [...]}) and a bare array.
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: an event without a lookup key set the tier
+     * to null (the column is NOT NULL, so the whole webhook failed); real Stripe item lists were not read.
+     * Touches: the database.
+     */
     private void processSubscriptionUpdated(JsonObject event) throws SQLException {
-        JsonObject data = event.getAsJsonObject("data");
-        JsonObject subObj = data.getAsJsonObject("object");
+        JsonObject subObj = event.getAsJsonObject("data").getAsJsonObject("object");
         String stripeSubId = subObj.get("id").getAsString();
         String customerId = subObj.get("customer").getAsString();
         String status = subObj.get("status").getAsString();
 
-        // Get new tier from items
         String newTier = null;
-        if (subObj.has("items") && subObj.getAsJsonArray("items").size() > 0) {
-            JsonObject item = subObj.getAsJsonArray("items").get(0).getAsJsonObject();
-            if (item.has("price")) {
-                JsonObject price = item.getAsJsonObject("price");
-                if (price.has("lookup_key")) {
-                    newTier = price.get("lookup_key").getAsString();
+        JsonArray items = null;
+        if (subObj.has("items")) {
+            JsonElement el = subObj.get("items");
+            if (el.isJsonArray()) {
+                items = el.getAsJsonArray();
+            } else if (el.isJsonObject() && el.getAsJsonObject().has("data")) {
+                items = el.getAsJsonObject().getAsJsonArray("data");
+            }
+        }
+        if (items != null && items.size() > 0) {
+            JsonObject item = items.get(0).getAsJsonObject();
+            if (item.has("price") && item.get("price").isJsonObject()) {
+                String lookupKey = stringOrNull(item.getAsJsonObject("price"), "lookup_key");
+                if (lookupKey != null && PRICE_IDS.containsKey(lookupKey)) {
+                    newTier = lookupKey;
                 }
             }
         }
 
-        // Get old tier
         String oldTier = null;
-        String checkSql = "SELECT tier FROM subscriptions WHERE stripe_subscription_id = ?";
-        try (PreparedStatement pstmt = connection.prepareStatement(checkSql)) {
+        try (PreparedStatement pstmt = connection.prepareStatement(
+                "SELECT tier FROM subscriptions WHERE stripe_subscription_id = ?")) {
             pstmt.setString(1, stripeSubId);
-            ResultSet rs = pstmt.executeQuery();
-            if (rs.next()) {
-                oldTier = rs.getString("tier");
+            try (ResultSet rs = pstmt.executeQuery()) {
+                if (rs.next()) {
+                    oldTier = rs.getString("tier");
+                }
             }
         }
+        if (newTier == null) newTier = oldTier;
 
-        // DB: Update subscription
         String updateSql = "UPDATE subscriptions SET tier = ?, status = ?, updated_at = ? WHERE stripe_subscription_id = ?";
         try (PreparedStatement pstmt = connection.prepareStatement(updateSql)) {
             pstmt.setString(1, newTier);
             pstmt.setString(2, status);
-            pstmt.setTimestamp(3, Timestamp.from(Instant.now()));
+            pstmt.setTimestamp(3, now());
             pstmt.setString(4, stripeSubId);
             pstmt.executeUpdate();
         }
 
-        // Log: Audit
         logAudit("subscription_updated", customerId, stripeSubId, null, null, oldTier, newTier, null, null, null);
     }
 
+    /**
+     * customer.subscription.deleted: marks the subscription cancelled with cancelled_at, and audits it.
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: times from the clock. Touches: the database.
+     */
     private void processSubscriptionDeleted(JsonObject event) throws SQLException {
-        JsonObject data = event.getAsJsonObject("data");
-        JsonObject subObj = data.getAsJsonObject("object");
+        JsonObject subObj = event.getAsJsonObject("data").getAsJsonObject("object");
         String stripeSubId = subObj.get("id").getAsString();
         String customerId = subObj.get("customer").getAsString();
 
-        // DB: Update subscription status to cancelled
         String sql = "UPDATE subscriptions SET status = 'cancelled', cancelled_at = ?, updated_at = ? WHERE stripe_subscription_id = ?";
+        Timestamp now = now();
         try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
-            pstmt.setTimestamp(1, Timestamp.from(Instant.now()));
-            pstmt.setTimestamp(2, Timestamp.from(Instant.now()));
+            pstmt.setTimestamp(1, now);
+            pstmt.setTimestamp(2, now);
             pstmt.setString(3, stripeSubId);
             pstmt.executeUpdate();
         }
 
-        // Log: Audit
         logAudit("subscription_cancelled", customerId, stripeSubId, null, null, null, null, null, null, null);
     }
 
+    /**
+     * Appends one audit_log row. Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: time from the
+     * clock. Touches: the database.
+     */
     private void logAudit(String action, String customerId, String subscriptionId, String invoiceId,
                           String tier, String oldTier, String newTier, Long amount, String reason, Long prorationCredits) throws SQLException {
         String sql = "INSERT INTO audit_log (action, customer_id, subscription_id, invoice_id, tier, old_tier, new_tier, amount, reason, proration_credits, created_at) " +
@@ -484,15 +625,173 @@ public class BillingService {
             if (amount != null) pstmt.setLong(8, amount); else pstmt.setNull(8, Types.BIGINT);
             pstmt.setString(9, reason);
             if (prorationCredits != null) pstmt.setLong(10, prorationCredits); else pstmt.setNull(10, Types.BIGINT);
-            pstmt.setTimestamp(11, Timestamp.from(Instant.now()));
+            pstmt.setTimestamp(11, now());
             pstmt.executeUpdate();
         }
     }
 
+    /** Current time from the clock as a JDBC timestamp. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. */
+    private Timestamp now() {
+        return Timestamp.from(clock.instant());
+    }
+
+    /** A JSON member as a string, or null when absent or JSON null. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. */
+    private static String stringOrNull(JsonObject obj, String name) {
+        JsonElement el = obj.get(name);
+        return (el == null || el.isJsonNull()) ? null : el.getAsString();
+    }
+
+    /** {error, message} response. Documented 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Pure. */
     private JsonObject errorResponse(String code, String message) {
         JsonObject response = new JsonObject();
         response.addProperty("error", code);
         response.addProperty("message", message);
         return response;
+    }
+
+    // ─── Stripe boundary ─────────────────────────────────────────────────────────────────────────────────
+
+    /**
+     * What this service needs from Stripe. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP so the
+     * template runs and is tested without network (rule: external services behind an interface with a fake).
+     */
+    public interface StripeGateway {
+        /** Creates a subscription for the customer on one price. Touches: Stripe (money). */
+        StripeSubscription createSubscription(String customerId, String priceId) throws StripeException;
+
+        /** Moves the subscription's (first) item to another price, prorating. Touches: Stripe (money). */
+        StripeSubscription changePrice(String subscriptionId, String priceId) throws StripeException;
+    }
+
+    /**
+     * The parts of a Stripe subscription this service uses: its id and current period (epoch seconds).
+     * Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.
+     */
+    public static final class StripeSubscription {
+        public final String id;
+        public final long currentPeriodStart;
+        public final long currentPeriodEnd;
+
+        /** Value object; no side effects. */
+        public StripeSubscription(String id, long currentPeriodStart, long currentPeriodEnd) {
+            this.id = id;
+            this.currentPeriodStart = currentPeriodStart;
+            this.currentPeriodEnd = currentPeriodEnd;
+        }
+    }
+
+    /**
+     * StripeGateway on the real Stripe API (stripe-java 28.1.0). The API key is passed per request, never stored
+     * in the global Stripe.apiKey. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (replaces calls that
+     * did not compile: addItems, static Subscription.update). Touches: network (api.stripe.com), money.
+     */
+    public static final class StripeSdkGateway implements StripeGateway {
+        private final String apiKey;
+
+        /** Gateway using apiKey (may be null: calls then fail with a clear error instead of a global key). */
+        public StripeSdkGateway(String apiKey) {
+            this.apiKey = apiKey;
+        }
+
+        /** Request options carrying the key; fails clearly when no key is configured. */
+        private RequestOptions options() {
+            if (apiKey == null || apiKey.isEmpty()) {
+                throw new IllegalStateException("STRIPE_SECRET_KEY is not configured");
+            }
+            return RequestOptions.builder().setApiKey(apiKey).build();
+        }
+
+        /** Creates the subscription with one item at priceId. Touches: network, money. */
+        @Override
+        public StripeSubscription createSubscription(String customerId, String priceId) throws StripeException {
+            SubscriptionCreateParams params = SubscriptionCreateParams.builder()
+                    .setCustomer(customerId)
+                    .addItem(SubscriptionCreateParams.Item.builder().setPrice(priceId).build())
+                    .build();
+            Subscription s = Subscription.create(params, options());
+            return new StripeSubscription(s.getId(), orZero(s.getCurrentPeriodStart()), orZero(s.getCurrentPeriodEnd()));
+        }
+
+        /** Replaces the price of the subscription's first item, with prorations. Touches: network, money. */
+        @Override
+        public StripeSubscription changePrice(String subscriptionId, String priceId) throws StripeException {
+            RequestOptions opts = options();
+            Subscription current = Subscription.retrieve(subscriptionId, opts);
+            List<SubscriptionItem> items = current.getItems() == null ? new ArrayList<>() : current.getItems().getData();
+            SubscriptionUpdateParams.Item.Builder item = SubscriptionUpdateParams.Item.builder().setPrice(priceId);
+            if (!items.isEmpty()) {
+                item.setId(items.get(0).getId());
+            }
+            SubscriptionUpdateParams params = SubscriptionUpdateParams.builder()
+                    .addItem(item.build())
+                    .setProrationBehavior(SubscriptionUpdateParams.ProrationBehavior.CREATE_PRORATIONS)
+                    .build();
+            Subscription s = current.update(params, opts);
+            return new StripeSubscription(s.getId(), orZero(s.getCurrentPeriodStart()), orZero(s.getCurrentPeriodEnd()));
+        }
+
+        /** Null-safe unboxing of Stripe's epoch-second fields. Pure. */
+        private static long orZero(Long v) {
+            return v == null ? 0L : v;
+        }
+    }
+
+    /**
+     * Deterministic in-memory StripeGateway for tests and local runs: ids sub_test_1, sub_test_2, ... and
+     * 30-day periods starting at the clock's time; it records every call. Unknown subscriptions throw like
+     * Stripe would. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+     */
+    public static final class InMemoryStripeGateway implements StripeGateway {
+        private final Clock clock;
+        private final Map<String, String> priceBySubscription = new HashMap<>();
+        private final Map<String, long[]> periodBySubscription = new HashMap<>();
+        private final List<String> calls = new ArrayList<>();
+        private int next = 1;
+
+        /** Fake on the given clock (period starts come from it). */
+        public InMemoryStripeGateway(Clock clock) {
+            this.clock = clock;
+        }
+
+        /** Creates sub_test_N with a 30-day period from now and records the call. Touches: memory only. */
+        @Override
+        public synchronized StripeSubscription createSubscription(String customerId, String priceId) {
+            String id = "sub_test_" + next++;
+            long start = clock.instant().getEpochSecond();
+            long end = start + Duration.ofDays(30).getSeconds();
+            priceBySubscription.put(id, priceId);
+            periodBySubscription.put(id, new long[]{start, end});
+            calls.add("create " + customerId + " " + priceId);
+            return new StripeSubscription(id, start, end);
+        }
+
+        /** Records an existing subscription (e.g. one already in the database) with its period. */
+        public synchronized void addExisting(String subscriptionId, String priceId, long periodStart, long periodEnd) {
+            priceBySubscription.put(subscriptionId, priceId);
+            periodBySubscription.put(subscriptionId, new long[]{periodStart, periodEnd});
+        }
+
+        /** Moves a known subscription to priceId (InvalidRequestException for unknown ids, as Stripe). Touches: memory only. */
+        @Override
+        public synchronized StripeSubscription changePrice(String subscriptionId, String priceId) throws StripeException {
+            long[] period = periodBySubscription.get(subscriptionId);
+            if (period == null) {
+                throw new com.stripe.exception.InvalidRequestException(
+                        "No such subscription: " + subscriptionId, null, null, "resource_missing", 404, null);
+            }
+            priceBySubscription.put(subscriptionId, priceId);
+            calls.add("update " + subscriptionId + " " + priceId);
+            return new StripeSubscription(subscriptionId, period[0], period[1]);
+        }
+
+        /** Price currently on the subscription, or null. */
+        public synchronized String priceOf(String subscriptionId) {
+            return priceBySubscription.get(subscriptionId);
+        }
+
+        /** Every call made, in order ("create cus price", "update sub price"). */
+        public synchronized List<String> calls() {
+            return new ArrayList<>(calls);
+        }
     }
 }

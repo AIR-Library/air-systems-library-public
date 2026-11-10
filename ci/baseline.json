@@ -1,6 +1,5 @@
 {
   "known_failing": [
-    "admin_system/java",
     "admin_system/rust",
     "api_keys_service_accounts/rust",
     "auth_system/csharp",
@@ -8,23 +7,18 @@
     "background_jobs_task_queue/csharp",
     "background_jobs_task_queue/rust",
     "billing_subscriptions/csharp",
-    "billing_subscriptions/java",
     "billing_subscriptions/rust",
     "data_export_compliance/csharp",
     "data_export_compliance/rust",
     "file_uploads/rust",
     "full_text_search_indexing/csharp",
-    "full_text_search_indexing/java",
     "health_checks/rust",
     "idempotency_keys/rust",
     "notifications/csharp",
-    "notifications/java",
     "notifications/rust",
     "organizations_teams/rust",
     "permissions_rbac/rust",
-    "quotas_rate_limiting/java",
     "quotas_rate_limiting/rust",
-    "trial_abuse_prevention/java",
     "trial_abuse_prevention/rust",
     "webhooks/rust"
   ]

@@ -523,6 +523,7 @@ class FullTextSearchIndexingTests {
         assertEquals("1", resp.results.get(0).documentId);
     }
 
+    /** Reindex of all types clears and rebuilds from the source. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: waits on the job (awaitJob) instead of a fixed 200 ms sleep. Touches: memory only. */
     @Test
     @DisplayName("Reindex: clears and rebuilds index")
     void testReindex() {
@@ -568,12 +569,9 @@ class FullTextSearchIndexingTests {
         assertNotNull(resp.jobId);
         assertEquals("enqueued", resp.status);
 
-        // Wait for job to complete
-        try {
-            Thread.sleep(200);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        // Wait for job to complete. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: a fixed
+        // Thread.sleep(200) raced the background job on a loaded machine; awaitJob waits on the job itself.
+        assertTrue(search.awaitJob(resp.jobId, 10_000), "reindex job should finish");
 
         assertEquals("completed", search.getJobStatus(resp.jobId));
         assertEquals(1, search.getDocumentCount());
@@ -583,6 +581,7 @@ class FullTextSearchIndexingTests {
         assertTrue(sr.total >= 1);
     }
 
+    /** Reindex of one type rebuilds only that type. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: waits on the job instead of sleeping. Touches: memory only. */
     @Test
     @DisplayName("Reindex specific type")
     void testReindexSpecificType() {
@@ -625,11 +624,8 @@ class FullTextSearchIndexingTests {
         FullTextSearchIndexing.ReindexResponse resp = search.reindexAll("user");
         assertTrue(resp.success);
 
-        try {
-            Thread.sleep(200);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        // Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: wait on the job, not a fixed 200 ms sleep.
+        assertTrue(search.awaitJob(resp.jobId, 10_000), "reindex job should finish");
 
         assertEquals("completed", search.getJobStatus(resp.jobId));
         // Only user docs should be reindexed

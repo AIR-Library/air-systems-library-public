@@ -1,7 +1,13 @@
 import static org.junit.Assert.*;
-import org.junit.*;
+// Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: explicit JUnit imports (the library's runner
+// recognises a JUnit suite by "org.junit.Test"; with only "org.junit.*" it looked for a main method and failed)
+// and the missing ChronoUnit import (testTrialPaymentTimingFail could not compile).
+import org.junit.Before;
+import org.junit.BeforeClass;
+import org.junit.Test;
 import java.sql.*;
 import java.time.*;
+import java.time.temporal.ChronoUnit;
 import java.util.*;
 import javax.sql.DataSource;
 import org.h2.jdbcx.JdbcDataSource;
@@ -114,12 +120,17 @@ public class TrialAbusePreventionTest {
         assertEquals(GateDecision.PASS, decision);
     }
 
+    /** Five users on one device: FAIL. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: stores TrialAbusePrevention.deviceHash of that device instead of the literal "hash123". Touches: in-memory H2. */
     @Test
     public void testDeviceFingerprintFail() throws Exception {
-        // Insert 5 different users with same device fingerprint
+        // Insert 5 different users with same device fingerprint. Changed 2026-11-10, session
+        // session_012zDydZCZ4AChqhEZ4oVtaP: the rows held the literal "hash123", which no SHA-256 of the device
+        // (the spec's device_hash) can equal, so the gate could never see these users; they now store the hash
+        // of the same device the gate is asked about.
+        String deviceHash = TrialAbusePrevention.deviceHash("UA", "1920x1080", "UTC", "en");
         for (int i = 0; i < 5; i++) {
             Long userId = createUser("user" + i + "@example.com", "completed");
-            tap.insertDeviceFingerprint(userId, "hash123", "UA", "1920x1080", "UTC");
+            tap.insertDeviceFingerprint(userId, deviceHash, "UA", "1920x1080", "UTC");
         }
         GateDecision decision = tap.checkDeviceFingerprint("UA", "1920x1080", "UTC", "en");
         assertEquals(GateDecision.FAIL, decision);

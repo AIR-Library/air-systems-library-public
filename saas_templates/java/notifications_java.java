@@ -4,6 +4,18 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.logging.*;
 
+/**
+ * Notifications (email, SMS, in-app) with templates, user preferences (do-not-disturb, quiet hours, channels),
+ * delivery tracking and retry with exponential backoff. Email/SMS/in-app delivery sits behind the EmailSender,
+ * SmsSender and InAppSender interfaces; the Simple* senders are in-memory stand-ins that send nothing.
+ *
+ * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: it did not compile (two toJson overloads with
+ * the same erasure); every instance shared one in-memory database, so the second instance failed seeding the
+ * templates; the template key column was the reserved word KEY; logs had no status column, so every insert
+ * failed silently and track() returned null; vars were written to JSON unescaped; the log recorded the requested
+ * channel (null when auto-selected) instead of the one used; unsubscribing a user with no saved preferences did
+ * nothing. Touches: an in-memory H2 database per instance; the injected senders (network in a real deployment).
+ */
 public class NotificationService {
     private static final Logger logger = Logger.getLogger(NotificationService.class.getName());
     private final Connection conn;
@@ -11,8 +23,13 @@ public class NotificationService {
     private final SmsSender smsSender;
     private final InAppSender inAppSender;
 
+    /**
+     * Creates a service with the in-memory stand-in senders and its own private in-memory database.
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: one database per instance (a shared
+     * "test" database made the second instance fail on duplicate templates). Touches: in-memory H2.
+     */
     public NotificationService() throws SQLException {
-        this.conn = DriverManager.getConnection("jdbc:h2:mem:test;DB_CLOSE_DELAY=-1");
+        this.conn = DriverManager.getConnection(newDatabaseUrl());
         this.emailSender = new SimpleEmailSender();
         this.smsSender = new SimpleSmsSender();
         this.inAppSender = new SimpleInAppSender();
@@ -20,8 +37,13 @@ public class NotificationService {
         seedTemplates();
     }
 
+    /**
+     * Creates a service with the given senders (real or fake) and its own private in-memory database.
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: one database per instance.
+     * Touches: in-memory H2; the senders.
+     */
     public NotificationService(EmailSender emailSender, SmsSender smsSender, InAppSender inAppSender) throws SQLException {
-        this.conn = DriverManager.getConnection("jdbc:h2:mem:test;DB_CLOSE_DELAY=-1");
+        this.conn = DriverManager.getConnection(newDatabaseUrl());
         this.emailSender = emailSender;
         this.smsSender = smsSender;
         this.inAppSender = inAppSender;
@@ -29,10 +51,23 @@ public class NotificationService {
         seedTemplates();
     }
 
+    /**
+     * A JDBC URL for a fresh, private in-memory H2 database; it lives as long as this instance's connection.
+     * Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing (pure).
+     */
+    private static String newDatabaseUrl() {
+        return "jdbc:h2:mem:notifications_" + UUID.randomUUID().toString().replace("-", "");
+    }
+
+    /**
+     * Creates the three tables of the spec's schema. notification_templates.template_key holds the spec's
+     * "key" (KEY is reserved in H2 and MySQL); notification_logs also stores the delivery status that track()
+     * returns. Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database.
+     */
     private void initDatabase() throws SQLException {
         try (Statement stmt = conn.createStatement()) {
             stmt.execute("CREATE TABLE IF NOT EXISTS notification_templates (" +
-                    "key VARCHAR(255) PRIMARY KEY," +
+                    "template_key VARCHAR(255) PRIMARY KEY," +
                     "subject VARCHAR(255)," +
                     "body_text TEXT," +
                     "body_html TEXT," +
@@ -49,7 +84,8 @@ public class NotificationService {
                     "opened_at TIMESTAMP," +
                     "clicked_at TIMESTAMP," +
                     "bounced BOOLEAN," +
-                    "error TEXT" +
+                    "error TEXT," +
+                    "status VARCHAR(20)" +
                     ")");
             stmt.execute("CREATE TABLE IF NOT EXISTS user_notification_preferences (" +
                     "user_id BIGINT PRIMARY KEY," +
@@ -118,9 +154,14 @@ public class NotificationService {
                 "[\"actor\",\"action\",\"resource\"]"));
     }
 
+    /**
+     * Stores a template. Input: NotificationTemplate. Output: none; throws SQLException on a duplicate key.
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: column renamed to template_key.
+     * Touches: the database.
+     */
     public void addTemplate(NotificationTemplate template) throws SQLException {
         try (PreparedStatement ps = conn.prepareStatement(
-                "INSERT INTO notification_templates (key, subject, body_text, body_html, channels_default, variables) VALUES (?,?,?,?,?,?)")) {
+                "INSERT INTO notification_templates (template_key, subject, body_text, body_html, channels_default, variables) VALUES (?,?,?,?,?,?)")) {
             ps.setString(1, template.key);
             ps.setString(2, template.subject);
             ps.setString(3, template.bodyText);
@@ -131,6 +172,14 @@ public class NotificationService {
         }
     }
 
+    /**
+     * Sends one notification, honouring do-not-disturb (skipped), quiet hours (queued), disabled channels
+     * (skipped) and scheduled_at (queued); retries a failing email/SMS/in-app send up to 3 attempts with
+     * exponential backoff (1s, 2s); a bounce is not retried. Every outcome is logged.
+     * Input: NotificationRequest. Output: SendResponse(success, messageId, status sent|queued|skipped|failed).
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: the log now records the channel actually
+     * used (it recorded null for auto-selected channels). Touches: the database; the senders.
+     */
     public SendResponse sendSingle(NotificationRequest request) {
         String messageId = UUID.randomUUID().toString();
         LocalDateTime now = LocalDateTime.now();
@@ -140,11 +189,11 @@ public class NotificationService {
                     Map.of("email", true, "sms", true, "in_app", true));
         }
         if (prefs.doNotDisturb) {
-            logMessage(messageId, request, "skipped", null, null, null, true, "Do-not-disturb");
+            logMessage(messageId, request, request.channel, "skipped", null, null, null, false, "Do-not-disturb");
             return new SendResponse(true, messageId, "skipped");
         }
         if (isInQuietHours(prefs, now.toLocalTime())) {
-            logMessage(messageId, request, "queued", null, null, null, false, null);
+            logMessage(messageId, request, request.channel, "queued", null, null, null, false, null);
             return new SendResponse(true, messageId, "queued");
         }
         String channel = request.channel;
@@ -152,16 +201,16 @@ public class NotificationService {
             channel = selectChannel(prefs, null);
         }
         if (channel == null || !isChannelEnabled(prefs, channel)) {
-            logMessage(messageId, request, "skipped", null, null, null, true, "Channel disabled");
+            logMessage(messageId, request, channel, "skipped", null, null, null, false, "Channel disabled");
             return new SendResponse(true, messageId, "skipped");
         }
         if (request.scheduledAt != null && request.scheduledAt.isAfter(now)) {
-            logMessage(messageId, request, "queued", null, null, null, false, null);
+            logMessage(messageId, request, channel, "queued", null, null, null, false, null);
             return new SendResponse(true, messageId, "queued");
         }
         NotificationTemplate template = getTemplate(request.templateKey);
         if (template == null) {
-            logMessage(messageId, request, "failed", null, null, null, true, "Template not found");
+            logMessage(messageId, request, channel, "failed", null, null, null, false, "Template not found");
             return new SendResponse(false, messageId, "failed");
         }
         String body = renderTemplate(template.bodyText, request.vars);
@@ -193,10 +242,10 @@ public class NotificationService {
             }
         }
         if (success) {
-            logMessage(messageId, request, "sent", now, null, null, bounced, error);
+            logMessage(messageId, request, channel, "sent", now, null, null, bounced, error);
             return new SendResponse(true, messageId, "sent");
         } else {
-            logMessage(messageId, request, "failed", now, null, null, bounced, error);
+            logMessage(messageId, request, channel, bounced ? "bounced" : "failed", now, null, null, bounced, error);
             return new SendResponse(false, messageId, "failed");
         }
     }
@@ -300,22 +349,34 @@ public class NotificationService {
         }
     }
 
+    /**
+     * Turns off the email channel for a user (the unsubscribe link). A user with no saved preferences gets the
+     * defaults with email off. Input: user id. Output: none.
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: a user without saved preferences stayed
+     * subscribed. Touches: the database.
+     */
     public void unsubscribeEmail(long userId) {
         UserNotificationPreferences prefs = getUserPreferences(userId);
-        if (prefs != null) {
-            prefs.channelsEnabled.put("email", false);
-            updateUserPreferences(userId, prefs);
+        if (prefs == null) {
+            prefs = new UserNotificationPreferences(userId, false, "00:00", "00:00",
+                    new HashMap<>(Map.of("email", true, "sms", true, "in_app", true)));
         }
+        prefs.channelsEnabled.put("email", false);
+        updateUserPreferences(userId, prefs);
     }
 
+    /**
+     * Loads a template by key, or null. Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: column
+     * renamed to template_key. Touches: reads the database.
+     */
     private NotificationTemplate getTemplate(String key) {
         try (PreparedStatement ps = conn.prepareStatement(
-                "SELECT * FROM notification_templates WHERE key = ?")) {
+                "SELECT * FROM notification_templates WHERE template_key = ?")) {
             ps.setString(1, key);
             try (ResultSet rs = ps.executeQuery()) {
                 if (rs.next()) {
                     return new NotificationTemplate(
-                            rs.getString("key"),
+                            rs.getString("template_key"),
                             rs.getString("subject"),
                             rs.getString("body_text"),
                             rs.getString("body_html"),
@@ -330,7 +391,13 @@ public class NotificationService {
         return null;
     }
 
-    private void logMessage(String messageId, NotificationRequest request, String status,
+    /**
+     * Writes one notification_logs row. Input: message id, request, the channel used (may be null when no
+     * channel was chosen), status, timestamps, bounce flag, error text. Output: none (SQL errors are logged).
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: takes the channel actually used; the
+     * status column it writes now exists. Touches: the database.
+     */
+    private void logMessage(String messageId, NotificationRequest request, String channel, String status,
                             LocalDateTime sentAt, LocalDateTime openedAt, LocalDateTime clickedAt,
                             boolean bounced, String error) {
         try (PreparedStatement ps = conn.prepareStatement(
@@ -338,8 +405,8 @@ public class NotificationService {
             ps.setString(1, messageId);
             ps.setLong(2, request.userId);
             ps.setString(3, request.templateKey);
-            ps.setString(4, request.channel);
-            ps.setString(5, toJson(request.vars));
+            ps.setString(4, channel);
+            ps.setString(5, request.vars != null ? toJson(request.vars) : null);
             ps.setTimestamp(6, sentAt != null ? Timestamp.valueOf(sentAt) : null);
             ps.setTimestamp(7, openedAt != null ? Timestamp.valueOf(openedAt) : null);
             ps.setTimestamp(8, clickedAt != null ? Timestamp.valueOf(clickedAt) : null);
@@ -375,11 +442,17 @@ public class NotificationService {
         return null;
     }
 
+    /**
+     * Simple {variable} substitution. Input: template text, vars (may be null). Output: rendered text.
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: null vars or values no longer throw.
+     * Touches: nothing (pure).
+     */
     private String renderTemplate(String template, Map<String, Object> vars) {
         if (template == null) return null;
+        if (vars == null) return template;
         String result = template;
         for (Map.Entry<String, Object> e : vars.entrySet()) {
-            result = result.replace("{" + e.getKey() + "}", e.getValue().toString());
+            result = result.replace("{" + e.getKey() + "}", String.valueOf(e.getValue()));
         }
         return result;
     }
@@ -404,36 +477,59 @@ public class NotificationService {
         return map;
     }
 
-    private String toJson(Map<String, Boolean> map) {
+    /**
+     * Serializes a flat map (preferences' channels_enabled, or a request's vars) to a JSON object. Numbers and
+     * booleans are written bare, null as null, everything else as an escaped JSON string.
+     * Input: map with String keys. Output: JSON text.
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: replaces two overloads whose erasures
+     * clashed (the file did not compile); keys and string values are now escaped, so a quote in a variable
+     * cannot break or inject into the stored JSON. Touches: nothing (pure).
+     */
+    private static String toJson(Map<String, ?> map) {
         StringBuilder sb = new StringBuilder();
         sb.append("{");
         boolean first = true;
-        for (Map.Entry<String, Boolean> e : map.entrySet()) {
+        for (Map.Entry<String, ?> e : map.entrySet()) {
             if (!first) sb.append(",");
-            sb.append("\"").append(e.getKey()).append("\":").append(e.getValue());
+            appendJsonString(sb, e.getKey());
+            sb.append(":");
+            Object val = e.getValue();
+            if (val == null) {
+                sb.append("null");
+            } else if (val instanceof Number || val instanceof Boolean) {
+                sb.append(val);
+            } else {
+                appendJsonString(sb, val.toString());
+            }
             first = false;
         }
         sb.append("}");
         return sb.toString();
     }
 
-    private String toJson(Map<String, Object> map) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("{");
-        boolean first = true;
-        for (Map.Entry<String, Object> e : map.entrySet()) {
-            if (!first) sb.append(",");
-            sb.append("\"").append(e.getKey()).append("\":");
-            Object val = e.getValue();
-            if (val instanceof Number || val instanceof Boolean) {
-                sb.append(val.toString());
-            } else {
-                sb.append("\"").append(val.toString()).append("\"");
+    /**
+     * Appends s as a quoted JSON string, escaping quotes, backslashes and control characters.
+     * Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing (pure).
+     */
+    private static void appendJsonString(StringBuilder sb, String s) {
+        sb.append('"');
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '"': sb.append("\\\""); break;
+                case '\\': sb.append("\\\\"); break;
+                case '\n': sb.append("\\n"); break;
+                case '\r': sb.append("\\r"); break;
+                case '\t': sb.append("\\t"); break;
+                default:
+                    if (c < 0x20) {
+                        sb.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        sb.append(c);
+                    }
             }
-            first = false;
         }
-        sb.append("}");
-        return sb.toString();
+        sb.append('"');
     }
 
     // Data classes
@@ -553,28 +649,32 @@ public class NotificationService {
         void send(long userId, String body);
     }
 
-    // Simple implementations
+    /**
+     * In-memory stand-ins for the three senders: they accept and drop the message, so the template runs with
+     * no SMTP/SMS provider and no network. Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: they
+     * logged recipients and message bodies at INFO; they now log nothing personal. Touches: nothing.
+     */
     public static class SimpleEmailSender implements EmailSender {
         @Override
         public void send(String to, String subject, String body) throws Exception {
-            // Simulate sending
-            logger.info("Email sent to " + to + " subject: " + subject);
+            // In-memory stand-in: sends nothing. Message contents are not logged (they can hold personal data).
+            logger.fine("Email accepted by the in-memory sender");
         }
     }
 
     public static class SimpleSmsSender implements SmsSender {
         @Override
         public void send(String to, String body) throws Exception {
-            // Simulate sending
-            logger.info("SMS sent to " + to + " body: " + body);
+            // In-memory stand-in: sends nothing. Message contents are not logged (they can hold personal data).
+            logger.fine("SMS accepted by the in-memory sender");
         }
     }
 
     public static class SimpleInAppSender implements InAppSender {
         @Override
         public void send(long userId, String body) {
-            // Simulate in-app notification
-            logger.info("In-app notification sent to user " + userId + " body: " + body);
+            // In-memory stand-in: a real one stores it for the user's inbox. Contents are not logged.
+            logger.fine("In-app notification accepted by the in-memory sender");
         }
     }
 

@@ -6,16 +6,25 @@ import java.util.*;
 public class NotificationServiceTest {
     private NotificationService service;
 
+    /** Fresh service and preferences for users 1 and 2. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: the quiet window is placed 2 to 3 hours from now so the suite no longer fails between 22:00 and 08:00. Touches: in-memory H2. */
     @BeforeEach
     public void setUp() throws Exception {
         service = new NotificationService();
+        // A quiet window that never covers the moment the tests run. Changed 2026-11-10, session
+        // session_012zDydZCZ4AChqhEZ4oVtaP: it was a fixed 22:00 to 08:00, so between 22:00 and 08:00 every
+        // "sent" expectation below failed because the message was correctly queued (time-of-day dependence;
+        // the Python suite made the same change on 2026-11-08).
+        LocalTime now = LocalTime.now();
+        java.time.format.DateTimeFormatter hhmm = java.time.format.DateTimeFormatter.ofPattern("HH:mm");
+        String quietStart = now.plusHours(2).format(hhmm);
+        String quietEnd = now.plusHours(3).format(hhmm);
         // Set default preferences for user 1
         service.updateUserPreferences(1L, new NotificationService.UserNotificationPreferences(
-                1L, false, "22:00", "08:00",
+                1L, false, quietStart, quietEnd,
                 new HashMap<>(Map.of("email", true, "sms", true, "in_app", true))));
         // Set default preferences for user 2
         service.updateUserPreferences(2L, new NotificationService.UserNotificationPreferences(
-                2L, false, "22:00", "08:00",
+                2L, false, quietStart, quietEnd,
                 new HashMap<>(Map.of("email", true, "sms", false, "in_app", true))));
     }
 

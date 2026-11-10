@@ -6,26 +6,53 @@ import java.time.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
-public class QuotaManager {
-    private static final String DB_URL = "jdbc:h2:mem:test;DB_CLOSE_DELAY=-1";
+/**
+ * Quotas and rate limiting by tier (spec: GEMINI_DISPATCH_MASTER_SPEC, template #5). Every API call passes, in
+ * order: per-IP rate limit (10/second), per-user rate limit (100/minute), feature gate by tier, monthly API call
+ * quota (solo 1,000, team 10,000, enterprise unlimited) and, for uploads, the storage quota (solo 1e9 bytes, team
+ * 100e9, enterprise unlimited). Time comes from the injected Clock, so tests are deterministic.
+ *
+ * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: the usage_metrics column "month" is a reserved
+ * word in H2 (every test failed creating the table), so it is usage_month; every instance shared one in-memory
+ * database, so usage leaked between instances; the usage counter was overwritten with 1 on each call instead of
+ * incremented, so the monthly quota could never be reached; the 403 always named "team" as the minimum tier.
+ * Touches: a private in-memory H2 database per instance. No network, no money.
+ */
+public class QuotaManager implements AutoCloseable {
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private final Connection conn;
     private final Clock clock;
 
+    /**
+     * Creates a manager on the system UTC clock with its own in-memory database. Touches: in-memory H2.
+     * Documented 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.
+     */
     public QuotaManager() throws SQLException {
         this(Clock.systemUTC());
     }
 
+    /**
+     * Creates a manager on the given clock with its own private in-memory database.
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: one database per instance (it was a shared
+     * "test" database that kept every earlier instance's usage). Touches: in-memory H2.
+     */
     public QuotaManager(Clock clock) throws SQLException {
         this.clock = clock;
-        this.conn = DriverManager.getConnection(DB_URL);
+        this.conn = DriverManager.getConnection(
+                "jdbc:h2:mem:quotas_" + UUID.randomUUID().toString().replace("-", ""));
         initSchema();
     }
 
+    /**
+     * Creates usage_metrics, api_calls and user_files. The spec's usage_metrics.month is stored as usage_month
+     * because MONTH is a reserved word in H2 (and a function name in MySQL).
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database.
+     */
     private void initSchema() throws SQLException {
         try (Statement stmt = conn.createStatement()) {
             stmt.execute("CREATE TABLE IF NOT EXISTS usage_metrics (" +
-                    "user_id VARCHAR(255), month VARCHAR(7), call_count INT, storage_bytes BIGINT, updated_at TIMESTAMP)");
+                    "user_id VARCHAR(255) NOT NULL, usage_month VARCHAR(7) NOT NULL, call_count INT NOT NULL, " +
+                    "storage_bytes BIGINT NOT NULL, updated_at TIMESTAMP, PRIMARY KEY (user_id, usage_month))");
             stmt.execute("CREATE TABLE IF NOT EXISTS api_calls (" +
                     "id IDENTITY PRIMARY KEY, user_id VARCHAR(255), ip VARCHAR(45), endpoint VARCHAR(255), " +
                     "timestamp TIMESTAMP, status_code INT, response_time_ms INT)");
@@ -34,7 +61,16 @@ public class QuotaManager {
         }
     }
 
-    public Response handleApiCall(User user, String endpoint, String ip, byte[] incomingFile, String feature) throws SQLException {
+    /**
+     * Runs every gate for one API call and, if all pass, stores the upload (if any), records the call and
+     * increments the month's usage. Input: user, endpoint, client IP, optional uploaded bytes, feature name.
+     * Output: Response 200, or 429 (ip_rate_limit_exceeded / rate_limit_exceeded / quota_exceeded),
+     * 403 (feature_not_available) or 413 (storage_quota_exceeded) with a JSON body.
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: synchronized, so two concurrent calls cannot
+     * both pass the same last unit of quota; the 403 names the real minimum tier and an upgrade hint.
+     * Touches: the database.
+     */
+    public synchronized Response handleApiCall(User user, String endpoint, String ip, byte[] incomingFile, String feature) throws SQLException {
         // Rate limit per IP
         if (rateLimitPerIp(ip)) {
             return errorResponse(429, "ip_rate_limit_exceeded", Map.of("reset_seconds", 1));
@@ -47,10 +83,14 @@ public class QuotaManager {
 
         // Feature gate
         if (!featureGate(user, feature)) {
-            return errorResponse(403, "feature_not_available", Map.of(
-                    "tier", user.getTier().name().toLowerCase(),
-                    "minimum_tier", "team"
-            ));
+            Map<String, Object> details = new LinkedHashMap<>();
+            details.put("tier", user.getTier().name().toLowerCase(Locale.ROOT));
+            Tier minimum = minimumTier(feature);
+            if (minimum != null) {
+                details.put("minimum_tier", minimum.name().toLowerCase(Locale.ROOT));
+                details.put("upgrade_url", "/billing/upgrade?tier=" + minimum.name().toLowerCase(Locale.ROOT));
+            }
+            return errorResponse(403, "feature_not_available", details);
         }
 
         // API quota
@@ -106,14 +146,30 @@ public class QuotaManager {
         }
     }
 
+    /** Feature -> tiers allowed to use it (spec's feature_gate_by_tier). Unknown features are allowed to nobody. */
+    private static final Map<String, Set<Tier>> FEATURES = Map.of(
+            "feature_a", EnumSet.of(Tier.TEAM, Tier.ENTERPRISE),
+            "feature_b", EnumSet.of(Tier.ENTERPRISE),
+            "feature_c", EnumSet.of(Tier.SOLO, Tier.TEAM, Tier.ENTERPRISE)
+    );
+
+    /**
+     * True when the user's tier may use the feature. Pure. Repaired 2026-11-10, session
+     * session_012zDydZCZ4AChqhEZ4oVtaP: the table moved to the FEATURES constant so minimumTier can share it.
+     */
     private boolean featureGate(User user, String feature) {
-        Map<String, Set<Tier>> features = Map.of(
-                "feature_a", Set.of(Tier.TEAM, Tier.ENTERPRISE),
-                "feature_b", Set.of(Tier.ENTERPRISE),
-                "feature_c", Set.of(Tier.SOLO, Tier.TEAM, Tier.ENTERPRISE)
-        );
-        Set<Tier> allowed = features.getOrDefault(feature, Set.of());
-        return allowed.contains(user.getTier());
+        return FEATURES.getOrDefault(feature, Set.of()).contains(user.getTier());
+    }
+
+    /**
+     * Lowest tier that may use the feature, or null for an unknown feature. Pure.
+     * Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: the 403 said "team" even for enterprise-only
+     * features.
+     */
+    private static Tier minimumTier(String feature) {
+        Set<Tier> allowed = FEATURES.get(feature);
+        if (allowed == null || allowed.isEmpty()) return null;
+        return Collections.min(allowed);
     }
 
     private boolean apiQuotaCheck(User user) throws SQLException {
@@ -122,8 +178,12 @@ public class QuotaManager {
         return limit < 0 || (current + 1) <= limit;
     }
 
+    /**
+     * Calls the user has made this month (0 if none). Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: reads usage_month (the column
+     * was the reserved word "month"). Touches: reads the database.
+     */
     private int getCurrentApiUsage(User user) throws SQLException {
-        String sql = "SELECT SUM(call_count) FROM usage_metrics WHERE user_id = ? AND month = ?";
+        String sql = "SELECT SUM(call_count) FROM usage_metrics WHERE user_id = ? AND usage_month = ?";
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, user.getId());
             ps.setString(2, currentMonth());
@@ -167,12 +227,28 @@ public class QuotaManager {
         };
     }
 
+    /**
+     * Adds one call to the user's usage for the current month, creating the month's row on first use.
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: it MERGEd a row with call_count = 1 every
+     * time, so usage never passed 1 and the monthly quota never triggered. Touches: the database.
+     */
     private void incrementApiUsage(User user) throws SQLException {
-        String sql = "MERGE INTO usage_metrics KEY(user_id, month) VALUES (?, ?, 1, 0, ?)";
-        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+        String month = currentMonth();
+        Timestamp now = Timestamp.from(clock.instant());
+        String update = "UPDATE usage_metrics SET call_count = call_count + 1, updated_at = ? " +
+                "WHERE user_id = ? AND usage_month = ?";
+        try (PreparedStatement ps = conn.prepareStatement(update)) {
+            ps.setTimestamp(1, now);
+            ps.setString(2, user.getId());
+            ps.setString(3, month);
+            if (ps.executeUpdate() > 0) return;
+        }
+        String insert = "INSERT INTO usage_metrics (user_id, usage_month, call_count, storage_bytes, updated_at) " +
+                "VALUES (?, ?, 1, 0, ?)";
+        try (PreparedStatement ps = conn.prepareStatement(insert)) {
             ps.setString(1, user.getId());
-            ps.setString(2, currentMonth());
-            ps.setTimestamp(3, Timestamp.from(clock.instant()));
+            ps.setString(2, month);
+            ps.setTimestamp(3, now);
             ps.executeUpdate();
         }
     }
@@ -220,6 +296,15 @@ public class QuotaManager {
         ObjectNode node = MAPPER.createObjectNode();
         details.forEach((k, v) -> node.putPOJO(k, v));
         return new Response(status, node.toString());
+    }
+
+    /**
+     * Closes this manager's database connection, which drops its in-memory database.
+     * Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database.
+     */
+    @Override
+    public void close() throws SQLException {
+        conn.close();
     }
 
     public static class User {

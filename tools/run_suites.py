@@ -274,6 +274,10 @@ JAVA_DEPS = [
     ("org.mockito", "mockito-junit-jupiter", "5.14.2"),
     ("com.fasterxml.jackson.core", "jackson-databind", "2.18.1"),
     ("com.google.code.gson", "gson", "2.11.0"), ("com.stripe", "stripe-java", "28.1.0"),
+    # [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] json-path (from spring-boot-starter-test) pulls slf4j-api 1.7.36,
+    # which wins over the 2.x that logback 1.4 needs, and Spring Boot then stops with "LoggerFactory is not a Logback
+    # LoggerContext" (java admin_system). Naming 2.0.11 directly makes Maven pick it.
+    ("org.slf4j", "slf4j-api", "2.0.11"),
     ("com.auth0", "java-jwt", "4.4.0"), ("org.mindrot", "jbcrypt", "0.4"),
     ("com.h2database", "h2", "2.3.232"),
     ("org.springframework.boot", "spring-boot-starter-web", "3.2.2"),
