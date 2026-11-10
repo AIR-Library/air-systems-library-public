@@ -287,7 +287,16 @@ JAVA_DEPS = [
 
 
 def setup_java() -> Path:
+    """Downloads JAVA_DEPS into .deps/java/lib once. Out: that folder.
+
+    [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] The folder is fetched again when JAVA_DEPS changes (a stamp file holds
+    the list it was built from), so a checkout that already had jars picks up a new pin such as slf4j-api (CodeRabbit,
+    PR 19). Touches: network (Maven Central), files under .deps/java."""
     d = DEPS / "java"
+    wanted = "\n".join(f"{g}:{a}:{v}" for g, a, v in JAVA_DEPS)
+    stamp = d / "deps.txt"
+    if list((d / "lib").glob("*.jar")) and (not stamp.is_file() or stamp.read_text() != wanted):
+        shutil.rmtree(d / "lib", ignore_errors=True)
     if not list((d / "lib").glob("*.jar")):
         d.mkdir(parents=True, exist_ok=True)
         deps = "\n".join(f"<dependency><groupId>{g}</groupId><artifactId>{a}</artifactId>"
@@ -296,6 +305,7 @@ def setup_java() -> Path:
         rc, out = sh(["mvn", "-q", "-B", "dependency:copy-dependencies", "-DoutputDirectory=lib"], d, 1500)
         if rc != 0:
             raise RuntimeError("mvn dependency:copy-dependencies failed:\n" + tail(out, [], 30))
+        stamp.write_text(wanted)
     return d
 
 
@@ -619,7 +629,8 @@ def render_summary(lang: str, res: dict, baseline: set[str], regress: list[str],
         out += ["**Regressions (not passing, and either not in the baseline or MISSING/BROKEN, which it cannot "
                 "excuse):** " + ", ".join(regress), ""]
     if fixed:
-        out += ["**Newly passing (remove from `ci/baseline.json`):** " + ", ".join(fixed), ""]
+        out += ["**Newly passing: remove from `ci/baseline.json` (the run fails until they are removed):** "
+                + ", ".join(fixed), ""]
     return "\n".join(out)
 
 
@@ -705,6 +716,14 @@ def main() -> int:
         p.write_text(json.dumps({"known_failing": sorted(keep)}, indent=2) + "\n")
     print(f"\n{a.lang}: {sum(r['status'] == 'PASS' for r in res.values())}/{len(res)} pass; "
           f"regressions={len(regress)}; newly passing={len(fixed)}")
+    # [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] A suite that passes while it is still listed in the baseline fails
+    # the run too (unless the baseline is being rewritten), so its stale entry is removed in the same pull request and
+    # the README table (tools/readme_status.py, which reads the baseline) never shows a passing suite as failing
+    # (CodeRabbit, PR 19). Only a full run can tell, so this applies when --baseline is given.
+    if fixed and a.baseline and not a.update_baseline:
+        print("STALE BASELINE: these suites pass; remove them from " + a.baseline + ": "
+              + ", ".join(key(a.lang, s) for s in fixed))
+        return 1
     return 1 if regress else 0
 
 

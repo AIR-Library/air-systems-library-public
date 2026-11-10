@@ -41,7 +41,7 @@ QUOTA CHECKS (on every API request):
   2. storage_quota
      Query: SELECT SUM(bytes) FROM user_files WHERE user_id = ?
      Limit: {solo: 1e9, team: 100e9, enterprise: -1}
-     Decision: PASS if (current_storage + incoming_file_size) <= limit
+     Decision: PASS if limit == -1 (unlimited), else PASS if (current_storage + incoming_file_size) <= limit
      Log: why_chain(gate="storage_quota_check", user_id, tier, current_usage, limit)
      Action: if REJECT: return 413 {error: "storage_quota_exceeded", usage, limit}
 

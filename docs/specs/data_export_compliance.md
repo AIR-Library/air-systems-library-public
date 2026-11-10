@@ -68,8 +68,12 @@ ENDPOINTS:
    Response: { success: true, deletion_id: '...', status: 'pending', will_delete_at: '2026-10-02T00:00:00Z' }
 
    Behind scenes:
-   - 30-day grace period (GDPR requirement, allow user to cancel)
-   - Schedule cascade delete: sessions, audit_logs (old ones), api_keys, preferences, etc
+   - 30-day grace period so the user can cancel an account deletion they asked for. This is a product choice,
+     not a GDPR requirement: a statutory erasure request (reason gdpr_request or gdpr_right_to_be_forgotten)
+     must be completed without undue delay and within one month, so a deployment may shorten the period for
+     those. Clarified 2026-11-10 from review on PR 19.
+   - Schedule cascade delete: sessions, api_keys, preferences, export files and their request rows, etc.
+     The audit log is kept (EXPORT-08). Corrected 2026-11-10 from review on PR 19: this line listed audit_logs.
    - Log in audit_log: action='deletion_requested', reason
 
 4. Approve/confirm deletion (user must confirm in email link)

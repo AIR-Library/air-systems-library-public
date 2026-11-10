@@ -78,7 +78,10 @@ IMPLEMENTATION:
 - Database: Store ALL mutations, never delete (archival tier optional)
 - Indexing: Index on (actor_id, action, resource_type, timestamp) for fast queries
 - Immutability: Once inserted, no updates (append-only log)
-- Retention: Keep indefinitely (GDPR requires 7+ years for some industries)
+- Retention: Keep entries for a configured retention period set by purpose and the legal obligations that apply
+  (some industries require several years; GDPR itself sets no fixed period and limits storage to what is
+  necessary). After that period, pseudonymize the personal data in an entry (actor and snapshots) instead of
+  deleting the entry, so the chain of events stays intact. Clarified 2026-11-10 from review on PR 19.
 - Integration: Every mutation in Auth, Billing, Admin, Permissions calls audit.log()
 
 TESTS:

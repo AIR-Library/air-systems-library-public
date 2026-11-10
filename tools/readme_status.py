@@ -7,7 +7,10 @@ What it does
   The README table between the markers <!-- status:start --> and <!-- status:end --> says, for every system and
   language, whether the suite passes. CI already guarantees that every suite NOT listed in ci/baseline.json passes
   (tools/run_suites.py fails the run on any other result), so the baseline is the source of truth: a suite is
-  marked passing exactly when it is absent from the baseline and both of its files exist.
+  marked passing exactly when it is absent from the baseline and both of its files exist. tools/run_suites.py also
+  fails a run in which a suite on the baseline passes, so a stale baseline entry cannot leave a passing suite shown
+  as failing here (CodeRabbit, PR 19). The systems come from docs/specs/README.md, so a system that loses its files
+  stays in the table as failing.
 
 Inputs   ci/baseline.json; the files under saas_templates/<lang>/; README.md.
 Outputs  `--write` rewrites the table in README.md; `--check` (the default) exits 1 and prints the expected table
@@ -33,8 +36,15 @@ START, END = "<!-- status:start -->", "<!-- status:end -->"
 
 
 def systems() -> list[str]:
-    """Every system that has a file in any language. Out: sorted names. Touches: reads the template folders."""
+    """Every system the library declares, plus any that has a file. Out: sorted names.
+
+    The declared set is docs/specs/README.md's table (one row per system spec), so a system whose files vanished from
+    every language still gets a row, shown failing, instead of silently dropping out of the total (CodeRabbit, PR 19,
+    2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). Touches: reads docs/specs/README.md and the template folders."""
     names: set[str] = set()
+    spec_index = ROOT / "docs" / "specs" / "README.md"
+    if spec_index.is_file():
+        names |= set(re.findall(r"^\|\s*([a-z0-9_]+)\s*\|\s*\[[a-z0-9_]+\.md\]", spec_index.read_text(encoding="utf-8"), re.M))
     for lang in LANGS:
         for p in (ROOT / "saas_templates" / lang).glob(f"*_{lang}.{EXT[lang]}"):
             names.add(p.name[: -len(f"_{lang}.{EXT[lang]}")])
