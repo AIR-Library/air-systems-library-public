@@ -1029,7 +1029,13 @@ class AuditService {
 @Service
 class UserService {
     static final Set<String> VALID_TIERS = Set.of("OWNER", "ADMIN", "USER");
-    private static final Pattern EMAIL = Pattern.compile("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$");
+    /**
+     * An e-mail address: one "@", no spaces, and a domain of dot-separated labels with no empty label. Each label
+     * excludes ".", so every "." in the domain can only be a separator and the match is linear. Changed 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP: the old pattern ([^@\\s]+\\.[^@\\s]+) could split the domain at any of
+     * its dots, which code scanning flagged as a polynomial regular expression on user input (PR 19). Touches nothing.
+     */
+    private static final Pattern EMAIL = Pattern.compile("^[^@\\s]+@[^@\\s.]+(?:\\.[^@\\s.]+)+$");
     private static final SecureRandom RANDOM = new SecureRandom();
 
     private final UserRepository userRepo;
