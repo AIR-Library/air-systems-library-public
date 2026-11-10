@@ -10,9 +10,12 @@
 //   oauth_callback takes the e-mail only from the provider and links the account in oauth_accounts (AUTH-10/11).
 // Changed again 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP, Phase B.2, AUTH-16 and "Secrets at rest"): every flow that
 //   creates a session (login, MFA, OAuth) returns its refresh_token, which token_refresh() takes; sessions store only
-//   refresh_token_hash (SHA-256), verification codes only code_hash, OAuth state only state_hash; OAuth state comes
+//   refresh_token_hash (HMAC-SHA256 since d270fa3), verification codes only code_hash, OAuth state only state_hash; OAuth state comes
 //   from oauth_start(), is single-use and expires in 10 minutes; the callback exchanges the code through the
 //   injected provider client and never uses the code as an identity. A database read hands out no usable credential.
+// Changed again 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP, spec d270fa3: keyed HMAC for stored secrets): those hashes
+//   are now HMAC-SHA256 under the AUTH_SECRET_KEY environment variable (at least 32 bytes; configure() refuses to start
+//   without it), not a plain SHA-256. Touches also: the AUTH_SECRET_KEY environment variable.
 declare(strict_types=1);
 
 class Database {
@@ -38,7 +41,7 @@ class Database {
     }
     /**
      * Create the tables if missing. sessions keeps refresh_token_hash, verification_codes keeps code_hash and
-     * oauth_states keeps state_hash: only SHA-256 hex of each secret (Phase B.2, "Secrets at rest", 2026-11-10,
+     * oauth_states keeps state_hash: only HMAC-SHA256 hex (AUTH_SECRET_KEY, spec d270fa3) of each secret (Phase B.2, "Secrets at rest", 2026-11-10,
      * session_012zDydZCZ4AChqhEZ4oVtaP; the plain columns refresh_token and code are gone). An older database that
      * still has those columns needs a migration that drops them; CREATE TABLE IF NOT EXISTS leaves it as it is.
      * Input: none. Output: none. Touches: the database (DDL).
@@ -123,8 +126,12 @@ class AuthSystem {
      * provider (null = oauth_callback refuses with 503 oauth_not_configured). Output: none.
      * Why: no network in tests, a deterministic clock, and AUTH-01 ("email sent") / AUTH-10/11 need fakes.
      * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing by itself.
+     * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: configure() is the
+     * service's start, and it throws RuntimeException (changing nothing) unless AUTH_SECRET_KEY holds at least 32
+     * bytes, so the service refuses to start without the key. Touches: the AUTH_SECRET_KEY environment variable (read).
      */
     public static function configure(?Closure $clock = null, ?Closure $mailer = null, ?Closure $oauthProfile = null): void {
+        self::secretKey();
         self::$clock = $clock;
         self::$mailer = $mailer;
         self::$oauthProfile = $oauthProfile;
@@ -187,15 +194,33 @@ class AuthSystem {
     public const OAUTH_STATE_EXPIRES = 600;
 
     /**
-     * SHA-256 hex of a secret: the only form in which refresh tokens, verification codes and OAuth state are stored.
-     * Input: the secret. Output: 64 lowercase hex characters. Why: auth_system.md "Secrets at rest" (Phase B.2,
-     * AUTH-16). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+     * The HMAC key for stored secrets, read from the AUTH_SECRET_KEY environment variable the way jwtSecret() reads
+     * AUTH_JWT_SECRET. Input: none. Output: the key (at least 32 bytes). Throws RuntimeException when it is unset or
+     * shorter, so the service refuses to start (configure()) or to hash a secret without it.
+     * Why: spec d270fa3: keyed HMAC for stored secrets. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches: the AUTH_SECRET_KEY environment variable (read only).
      */
-    public static function secretHash(string $secret): string { return hash('sha256', $secret); }
+    private static function secretKey(): string
+    {
+        $key = (string) getenv('AUTH_SECRET_KEY');
+        if (strlen($key) < 32) {
+            throw new RuntimeException('AUTH_SECRET_KEY must be set to at least 32 bytes');
+        }
+        return $key;
+    }
+
+    /**
+     * Keyed hash of a secret, lowercase hex HMAC-SHA256(AUTH_SECRET_KEY, secret): the only form in which refresh
+     * tokens, verification codes and OAuth state are stored. Input: the secret. Output: 64 lowercase hex characters.
+     * Why: auth_system.md "Secrets at rest" (Phase B.2, AUTH-16); spec d270fa3: keyed HMAC for stored secrets (it was
+     * a plain SHA-256 until 2026-11-10). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches: the AUTH_SECRET_KEY environment variable (read only).
+     */
+    public static function secretHash(string $secret): string { return hash_hmac('sha256', $secret, self::secretKey()); }
 
     /**
      * Create a session row and return its id and refresh token. The refresh token is 32 random bytes as hex; only
-     * its SHA-256 is stored (refresh_token_hash), so a database read hands out no usable token.
+     * its HMAC-SHA256 is stored (refresh_token_hash), so a database read hands out no usable token.
      * Inputs: user id, ip, device id. Output: {session_id, refresh_token}. Why: AUTH-16; login, MFA and OAuth each
      * wrote the plain token into sessions.refresh_token and none returned it. 2026-11-10,
      * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database (sessions).
@@ -330,7 +355,7 @@ class AuthSystem {
         // Verification code
         $code = self::randomString(16);
         $expires = gmdate('c', $now + 86400);
-        // Only the code's SHA-256 is stored (Phase B.2, AUTH-16, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
+        // Only the code's HMAC-SHA256 (spec d270fa3) is stored (Phase B.2, AUTH-16, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
         $stmt = $db->prepare('INSERT INTO verification_codes (id,user_id,code_hash,created_at,expires_at,type) VALUES (?,?,?,?,?,?)');
         $stmt->execute([self::randomString(32),$userId,self::secretHash($code),$now,$expires,'email']);
         // Send email
@@ -347,7 +372,7 @@ class AuthSystem {
      *
      * Inputs: email, code. Output: 200 {status: "verified", user_id, message}, or 400 with error
      * code_invalid (no such user or no matching code), code_expired (the matching code is past expires_at)
-     * or already_verified. The code's SHA-256 is compared with the stored code_hash in constant time
+     * or already_verified. The code's HMAC-SHA256 is compared with the stored code_hash in constant time
      * (hash_equals), never in the SQL WHERE.
      * Why: AUTH-05/06; expiry was never checked and status stayed 'unverified'. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
      * Codes are stored only as code_hash since the same day (Phase B.2, AUTH-16).
@@ -429,7 +454,7 @@ class AuthSystem {
      * Start an OAuth sign-in: make the state value the provider will send back.
      *
      * Input: the provider name. Output: 200 {success, state, expires_in: 600}. state is 32 random bytes as hex;
-     * only its SHA-256 is stored (oauth_states), with the provider and an expiry 10 minutes ahead. The app keeps
+     * only its HMAC-SHA256 is stored (oauth_states), with the provider and an expiry 10 minutes ahead. The app keeps
      * state in the visitor's session (cookie) and sends it in the provider's authorize URL; oauth_callback()
      * accepts it once. Why: auth_system.md "Secrets at rest" (Phase B.2): OAuth state is single-use, expires in
      * 10 minutes and is stored only as its hash; the callback took any state. 2026-11-10,
@@ -571,7 +596,7 @@ class AuthSystem {
     /**
      * Issue a new access token for a valid, unexpired refresh token; a banned or suspended user gets 403
      * user_banned. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: times come from the injectable clock. The same
-     * day (Phase B.2, AUTH-16) the session is found by the token's SHA-256 (refresh_token_hash) and the hashes are
+     * day (Phase B.2, AUTH-16) the session is found by the token's HMAC-SHA256 (refresh_token_hash) and the hashes are
      * compared in constant time; the plain token is no longer stored. Input: the refresh_token login, MFA or OAuth
      * returned. Output: 200 {status: "ok", token, expires_in}, 400 invalid_token | token_expired, 403 user_banned.
      * Touches: the database.

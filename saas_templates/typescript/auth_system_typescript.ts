@@ -1,7 +1,7 @@
 import bcrypt from 'bcrypt';
 import speakeasy from 'speakeasy';
 import jwt from 'jsonwebtoken';
-import { createHash, randomBytes, randomInt, timingSafeEqual } from 'crypto';
+import { createHmac, randomBytes, randomInt, timingSafeEqual } from 'crypto';
 
 /**
  * The schema this module expects (PostgreSQL). Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16 and the
@@ -169,11 +169,31 @@ function fail(code: string, extra: { reason?: string } = {}): AuthError {
 }
 
 /**
- * SHA-256 of a secret as 64 lower-case hex characters: how refresh tokens, verification codes, MFA challenge ids and
- * OAuth states are stored (AUTH-16, "Secrets at rest"). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+ * Keyed hash of a secret: HMAC-SHA256(key, value) as 64 lower-case hex characters, how refresh tokens, verification
+ * codes, MFA challenge ids and OAuth states are stored (AUTH-16, "Secrets at rest"). In: the key bytes, the secret.
+ * Out: 64 hex characters. Why: spec d270fa3: keyed HMAC for stored secrets (it replaced the plain SHA-256 helper
+ * sha256Hex). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
  */
-export function sha256Hex(value: string): string {
-  return createHash('sha256').update(String(value ?? ''), 'utf8').digest('hex');
+export function hmacSha256Hex(key: Buffer, value: string): string {
+  return createHmac('sha256', key).update(String(value ?? ''), 'utf8').digest('hex');
+}
+
+/** Minimum HMAC key length in bytes (spec d270fa3). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+export const MIN_SECRET_KEY_BYTES = 32;
+
+/**
+ * The HMAC key for stored secrets: options.secretKey if given, else the AUTH_SECRET_KEY environment variable.
+ * In: the configured key or undefined. Out: the key bytes. Throws when there is none or it is shorter than 32 bytes,
+ * so the service refuses to start without one. Why: spec d270fa3: keyed HMAC for stored secrets. 2026-11-10,
+ * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the process environment (read only).
+ */
+function loadSecretKey(configured: string | Buffer | undefined): Buffer {
+  const raw = configured ?? process.env.AUTH_SECRET_KEY ?? '';
+  const key = Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw), 'utf8');
+  if (key.length < MIN_SECRET_KEY_BYTES) {
+    throw new Error('AUTH_SECRET_KEY must be set and at least 32 bytes');
+  }
+  return key;
 }
 
 /**
@@ -196,6 +216,7 @@ class AuthSystem {
   private emailSender: EmailSender;
   private logger: Logger;
   private jwtSecret: string;
+  private secretKey: Buffer;
   private bcryptSaltRounds: number;
   private tokenExpiry: string;
   private refreshTokenExpiry: string;
@@ -213,6 +234,10 @@ class AuthSystem {
    * windows, and (added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, Phase B.2) oauthClient, the injected provider
    * client the OAuth callback exchanges codes through (none: OAuth answers 503 oauth_not_configured), and now, the
    * clock OAuth state expiry reads (default the system clock). Out: the service. Touches nothing.
+   * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets. options.secretKey
+   * (else the AUTH_SECRET_KEY environment variable) keys the HMAC-SHA256 every stored secret is kept as; the
+   * constructor throws when it is missing or shorter than 32 bytes, so the service refuses to start. Touches: the
+   * process environment (read only).
    */
   constructor(
     db: Db,
@@ -220,6 +245,7 @@ class AuthSystem {
     logger: Logger,
     options: {
       jwtSecret: string;
+      secretKey?: string | Buffer;
       bcryptSaltRounds?: number;
       tokenExpiry?: string;
       refreshTokenExpiry?: string;
@@ -231,6 +257,7 @@ class AuthSystem {
       now?: () => Date;
     } = {}
   ) {
+    this.secretKey = loadSecretKey(options.secretKey);
     this.db = db;
     this.emailSender = emailSender;
     this.logger = logger;
@@ -246,6 +273,15 @@ class AuthSystem {
     this.loginLimiter = new Map();
     this.oauthClient = options.oauthClient ?? null;
     this.now = options.now ?? (() => new Date());
+  }
+
+  /**
+   * The stored form of a refresh token, verification code, MFA challenge id or OAuth state: lowercase hex
+   * HMAC-SHA256(secretKey, value). In: the secret. Out: 64 hex characters. Why: spec d270fa3: keyed HMAC for stored
+   * secrets. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+   */
+  private hashSecret(value: string): string {
+    return hmacSha256Hex(this.secretKey, value);
   }
 
   private async hashPassword(password: string): Promise<string> {
@@ -354,10 +390,11 @@ class AuthSystem {
 
   /**
    * Creates a session for a user: a random session id and a refresh token (32 random bytes, hex), of which only the
-   * SHA-256 is stored (refresh_token_hash); valid 7 days. In: user id, client IP, device id. Out: the session id and
+   * HMAC-SHA256 is stored (refresh_token_hash); valid 7 days. In: user id, client IP, device id. Out: the session id and
    * the raw refresh token, which only the caller sees. Why: AUTH-16 (Phase B.2, 2026-11-10): sessions stored the
    * refresh token in plain text, and the session id returned was not stored at all. 2026-11-10,
    * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database (sessions).
+   * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
    */
   private async createSession(userId: number, ip: string, deviceId: string): Promise<{ sessionId: string; refreshToken: string }> {
     const sessionId = randomBytes(16).toString('hex');
@@ -365,7 +402,7 @@ class AuthSystem {
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
     await this.db.execute(
       'INSERT INTO sessions (id, user_id, refresh_token_hash, expires_at, ip, device_id) VALUES ($1, $2, $3, $4, $5, $6)',
-      [sessionId, userId, sha256Hex(refreshToken), expiresAt, ip, deviceId]
+      [sessionId, userId, this.hashSecret(refreshToken), expiresAt, ip, deviceId]
     );
     return { sessionId, refreshToken };
   }
@@ -380,8 +417,9 @@ class AuthSystem {
    * Why: AUTH-01..04. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: a weak password now returns
    * {error: 'password_rejected', reason} (AUTH-03 amendment; 'password_too_weak' is gone), and the IP is a
    * parameter instead of a constant, so the 5-per-24h limit is per address rather than global. Phase B.2 the same
-   * day: errors carry their HTTP status, and the emailed code is stored only as its SHA-256 (code_hash, AUTH-16).
+   * day: errors carry their HTTP status, and the emailed code is stored only as its HMAC-SHA256 (code_hash, AUTH-16).
    * Touches: the database, the email sender, the audit log.
+   * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
    */
   async signup(email: string, password: string, name: string, ip: string = '0.0.0.0'): Promise<any> {
     try {
@@ -411,7 +449,7 @@ class AuthSystem {
       const code = this.generateVerificationCode();
       await this.db.execute(
         'INSERT INTO verification_codes (user_id, code_hash, type, expires_at) VALUES ($1, $2, $3, NOW() + INTERVAL \'10 minutes\')',
-        [userId, sha256Hex(code), 'email']
+        [userId, this.hashSecret(code), 'email']
       );
       await this.emailSender.sendVerificationEmail(email, code);
       await this.logWhyChain('signup', ['email_unique', 'password_strength', 'rate_limit_ip_24h']);
@@ -426,11 +464,12 @@ class AuthSystem {
   /**
    * Verifies an email with the emailed code. In: email and code. Out: {status: 'verified', user_id, message} or
    * {error, message, http_status}: 400 code_expired (unknown email, wrong or expired code: one answer), 409
-   * already_verified. The user's live email codes are read and each stored code_hash is compared with the SHA-256 of
+   * already_verified. The user's live email codes are read and each stored code_hash is compared with the HMAC-SHA256 of
    * the given code in constant time; the matching row is deleted.
    * Why: AUTH-05/06; changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, AUTH-16 and the spec's "Secrets
    * at rest" line): the code was stored and matched in plain text in SQL; errors now carry their HTTP status.
    * Touches: the database (users, verification_codes), the audit log.
+   * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
    */
   async verify_email(email: string, code_or_token: string): Promise<any> {
     try {
@@ -448,7 +487,7 @@ class AuthSystem {
         'SELECT id, code_hash FROM verification_codes WHERE user_id = $1 AND type = \'email\' AND expires_at > NOW()',
         [user[0].id]
       );
-      const given = sha256Hex(code_or_token);
+      const given = this.hashSecret(code_or_token);
       let match: any = null;
       for (const row of live) {
         if (sameHash(row.code_hash, given)) match = row; // every row is compared, so the time does not say which
@@ -479,10 +518,11 @@ class AuthSystem {
    * Signs a user in. In: email, password, device id, client IP. Out: {status: 'authenticated', session_id, token,
    * refresh_token, expires_in, user}, or {status: 'mfa_required', challenge_id, http_status: 202} when MFA is on, or
    * {error, message, http_status}: 429 too_many_login_attempts, 401 invalid_credentials.
-   * The MFA challenge id is stored only as its SHA-256 (code_hash); the session stores only refresh_token_hash.
+   * The MFA challenge id is stored only as its HMAC-SHA256 (code_hash); the session stores only refresh_token_hash.
    * Why: AUTH-07/08/09; changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, AUTH-16): it returned no
    * refresh_token (token_refresh could not be called), stored the refresh token and the challenge id in plain text,
    * and its errors carried no HTTP status. Touches: the database (users, verification_codes, sessions), the audit log.
+   * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
    */
   async login(email: string, password: string, device_id: string, ip: string): Promise<any> {
     try {
@@ -509,11 +549,11 @@ class AuthSystem {
         const challengeId = randomBytes(16).toString('hex');
         await this.db.execute(
           'INSERT INTO verification_codes (user_id, code_hash, type, expires_at) VALUES ($1, $2, $3, NOW() + INTERVAL \'10 minutes\')',
-          [user[0].id, sha256Hex(challengeId), 'mfa']
+          [user[0].id, this.hashSecret(challengeId), 'mfa']
         );
         await this.logWhyChain('login', ['user_exists', 'password_correct', 'mfa_gate', 'rate_limit']);
         // The audit entry names the challenge by its hash: the raw id is what the client presents.
-        await this.logAudit('mfa_challenge_initiated', user[0].id, { challenge_hash: sha256Hex(challengeId) });
+        await this.logAudit('mfa_challenge_initiated', user[0].id, { challenge_hash: this.hashSecret(challengeId) });
         return { status: 'mfa_required', challenge_id: challengeId, http_status: 202 };
       }
 
@@ -537,11 +577,12 @@ class AuthSystem {
 
   /**
    * Starts an OAuth sign-in: issues the state value the provider must hand back to oauth_callback. The state is 32
-   * random bytes (base64url), stored only as its SHA-256, bound to the provider, single-use and valid 10 minutes.
+   * random bytes (base64url), stored only as its HMAC-SHA256, bound to the provider, single-use and valid 10 minutes.
    * In: the provider name. Out: {status: 'ok', state, expires_in: 600} or {error, message, http_status}: 503
    * oauth_not_configured when no provider client is injected.
    * Why: AUTH spec "OAuth state is single-use and expires in 10 minutes" (Phase B.2, 2026-11-10): the state was
    * never checked. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database (oauth_states).
+   * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
    */
   async oauth_start(provider: string): Promise<any> {
     try {
@@ -550,7 +591,7 @@ class AuthSystem {
       const created = this.now();
       await this.db.execute(
         'INSERT INTO oauth_states (state_hash, provider, created_at, expires_at) VALUES ($1, $2, $3, $4)',
-        [sha256Hex(state), provider, created, new Date(created.getTime() + OAUTH_STATE_TTL_MS)]
+        [this.hashSecret(state), provider, created, new Date(created.getTime() + OAUTH_STATE_TTL_MS)]
       );
       return { status: 'ok', state, expires_in: OAUTH_STATE_TTL_MS / 1000 };
     } catch (err) {
@@ -564,13 +605,14 @@ class AuthSystem {
    * before. One conditional UPDATE marks it used, so two callbacks with the same state cannot both pass.
    * In: provider, state. Out: true when valid. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH spec, Phase B.2).
    * Touches: the database (oauth_states).
+   * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
    */
   private async consumeOAuthState(provider: string, state: string): Promise<boolean> {
     if (typeof state !== 'string' || state.length === 0) return false;
     const now = this.now();
     const res = await this.db.execute(
       'UPDATE oauth_states SET used_at = $1 WHERE state_hash = $2 AND provider = $3 AND used_at IS NULL AND expires_at > $1',
-      [now, sha256Hex(state), provider]
+      [now, this.hashSecret(state), provider]
     );
     return res.affectedRows === 1;
   }
@@ -653,15 +695,16 @@ class AuthSystem {
   /**
    * Completes an MFA sign-in. In: the challenge id from login and the TOTP code. Out: {status: 'authenticated',
    * session_id, token, refresh_token, expires_in, user} or 401 {error: 'invalid_code', message, http_status}.
-   * The challenge is found by the SHA-256 of its id (code_hash) and compared again in constant time; five wrong codes
+   * The challenge is found by the HMAC-SHA256 of its id (code_hash) and compared again in constant time; five wrong codes
    * end it; it is used up by a single DELETE, so only one caller can sign in with it.
    * Why: AUTH-12/13; changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, AUTH-16): the challenge id was
    * stored in plain text, no refresh_token was returned, and errors carried no HTTP status.
    * Touches: the database (verification_codes, users, sessions), the audit log.
+   * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
    */
   async mfa_challenge(challenge_id: string, code: string): Promise<any> {
     try {
-      const challengeHash = sha256Hex(challenge_id);
+      const challengeHash = this.hashSecret(challenge_id);
       const challenge = await this.db.query(
         'SELECT user_id, code_hash FROM verification_codes WHERE code_hash = $1 AND type = \'mfa\' AND expires_at > NOW()',
         [challengeHash]
@@ -720,14 +763,15 @@ class AuthSystem {
   /**
    * Issues a new access token for a refresh token. In: the refresh_token a session-creating flow returned. Out:
    * {status: 'ok', token, expires_in} or {error, message, http_status}: 401 invalid_token (unknown or expired),
-   * 403 user_banned (status suspended or banned). The session is found by the token's SHA-256 (refresh_token_hash)
+   * 403 user_banned (status suspended or banned). The session is found by the token's HMAC-SHA256 (refresh_token_hash)
    * and the stored hash is compared again in constant time.
    * Why: AUTH-14/15; changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, AUTH-16): it looked the token up
    * in plain text, and errors carried no HTTP status. Touches: the database (sessions, users), the audit log.
+   * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
    */
   async token_refresh(refresh_token: string): Promise<any> {
     try {
-      const tokenHash = sha256Hex(refresh_token);
+      const tokenHash = this.hashSecret(refresh_token);
       const session = await this.db.query(
         'SELECT s.user_id, s.refresh_token_hash, u.tier, u.status FROM sessions s JOIN users u ON s.user_id = u.id WHERE s.refresh_token_hash = $1 AND s.expires_at > NOW()',
         [tokenHash]

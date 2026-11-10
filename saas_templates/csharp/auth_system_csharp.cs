@@ -1,8 +1,11 @@
 // Auth system template (GEMINI_DISPATCH_MASTER_SPEC template #1): signup, email verification, login with optional
 // TOTP MFA, OAuth callback, refresh and access-token verification, over EF Core, with bcrypt, HS256 JWTs and an
 // in-memory rate-limit cache. Repaired 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP); see AuthService.
-// Phase B.2 (2026-11-10, same session): every secret at rest is a SHA-256 (refresh tokens, email codes, MFA challenge
+// Phase B.2 (2026-11-10, same session): every secret at rest is a SHA-256 (an HMAC-SHA256 since d270fa3) (refresh tokens, email codes, MFA challenge
 // ids, OAuth states) and the OAuth callback exchanges the provider's code once through IOAuthProvider.ExchangeCodeAsync.
+// spec d270fa3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: keyed HMAC for stored secrets): those hashes are now
+// HMAC-SHA256 under a server key (constructor secretKey, else the AUTH_SECRET_KEY environment variable, at least 32
+// bytes; the constructor refuses to start without it), not a plain SHA-256. Touches also: the process environment.
 // Touches: the auth database, the email sender and OAuth provider interfaces, the cache, stdout (why chain).
 using System;
 using System.Collections.Generic;
@@ -101,7 +104,7 @@ namespace AuthSystem
     }
 
     /// <summary>
-    /// A login session. The refresh token is stored only as its SHA-256 (lower-case hex) in RefreshTokenHash; the raw
+    /// A login session. The refresh token is stored only as its HMAC-SHA256 (lower-case hex) in RefreshTokenHash; the raw
     /// token exists only in memory (RefreshToken, not mapped) when the session is created, to be handed to the client
     /// once. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the raw token was stored and looked up as is (a
     /// database leak handed out every session; docs/specs/README.md "Secure by default"). Pure data.
@@ -123,7 +126,7 @@ namespace AuthSystem
     /// A one-time code: an email code, an MFA challenge or an OAuth state. UserId is null for an OAuth state, which
     /// exists before any user is known (2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP). Pure data.
     /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, auth spec "Secrets at rest", AUTH-16): the value
-    /// is stored only as CodeHash, the lower-case hex SHA-256 of the code (<see cref="AuthService.HashSecret"/>); the
+    /// is stored only as CodeHash, the lower-case hex HMAC-SHA256 (AUTH_SECRET_KEY, spec d270fa3) of the code (<see cref="AuthService.HashSecret"/>); the
     /// column was Code, holding the code itself, so a database read handed out usable codes and OAuth states.
     /// </summary>
     public class VerificationCode
@@ -131,7 +134,7 @@ namespace AuthSystem
         public int Id { get; set; }
         public int? UserId { get; set; }
 
-        /// <summary>SHA-256 (lower-case hex) of the email code, MFA challenge id or OAuth state; never the value itself.</summary>
+        /// <summary>HMAC-SHA256 (lower-case hex) of the email code, MFA challenge id or OAuth state; never the value itself.</summary>
         public string CodeHash { get; set; }
         public DateTime CreatedAt { get; set; }
         public DateTime ExpiresAt { get; set; }
@@ -214,6 +217,8 @@ namespace AuthSystem
         private readonly IOAuthProvider _oauthProvider;
         private readonly IMemoryCache _cache;
         private readonly byte[] _jwtKey;
+        /// <summary>HMAC key for stored secrets (spec d270fa3, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).</summary>
+        private readonly byte[] _secretKey;
         private static readonly object CounterGate = new object();
         private readonly string _serviceName = "MyService";
         private readonly HashSet<string> _commonPasswords = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -231,9 +236,17 @@ namespace AuthSystem
         /// the JWT signing secret (from configuration, never hard-coded; at least 32 bytes because HS256 needs a 256-bit
         /// key). Throws ArgumentException on a short secret. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.
         /// Touches: nothing until a flow runs.
+        /// [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets. secretKey (from
+        /// configuration like the JWT secret; null means the AUTH_SECRET_KEY environment variable) keys the
+        /// HMAC-SHA256 every stored secret is kept as. Throws ArgumentException when it is missing or shorter than 32
+        /// bytes, so the service refuses to start without it. Touches also: the process environment (read).
         /// </summary>
-        public AuthService(AuthDbContext db, IEmailSender emailSender, IOAuthProvider oauthProvider, IMemoryCache cache, string jwtSecret)
+        public AuthService(AuthDbContext db, IEmailSender emailSender, IOAuthProvider oauthProvider, IMemoryCache cache, string jwtSecret, string secretKey)
         {
+            secretKey ??= Environment.GetEnvironmentVariable("AUTH_SECRET_KEY");
+            if (string.IsNullOrEmpty(secretKey) || Encoding.UTF8.GetByteCount(secretKey) < 32)
+                throw new ArgumentException("AUTH_SECRET_KEY must be set and at least 32 bytes.", nameof(secretKey));
+            _secretKey = Encoding.UTF8.GetBytes(secretKey);
             _db = db ?? throw new ArgumentNullException(nameof(db));
             _emailSender = emailSender ?? throw new ArgumentNullException(nameof(emailSender));
             _oauthProvider = oauthProvider ?? throw new ArgumentNullException(nameof(oauthProvider));
@@ -250,7 +263,7 @@ namespace AuthSystem
         /// (optional; omitted IPs share the <see cref="UnknownIp"/> bucket). Output: {status:"pending_verification",
         /// email, message} or {error}. Repaired 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): BCrypt.Net.BCrypt,
         /// cache Set instead of the non-existent SetAsync, email normalised before the uniqueness check, CSPRNG code.
-        /// Changed the same day (Phase B.2, AUTH-16): the code is stored only as its SHA-256.
+        /// Changed the same day (Phase B.2, AUTH-16): the code is stored only as its HMAC-SHA256.
         /// Touches: users, verification_codes, audit_log, the cache, the email sender (network in production).
         /// </summary>
         public async Task<object> SignupAsync(string email, string password, string name, string clientIp = null)
@@ -307,7 +320,7 @@ namespace AuthSystem
         /// email, code. Output: {status:"verified", user_id, message} or {error: invalid_request | code_invalid |
         /// code_expired}. Repaired 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): sets status so login accepts
         /// the user, constant-time comparison, wrong vs expired codes reported apart. Changed the same day (Phase B.2,
-        /// AUTH-16): the stored value is the code's SHA-256, compared in constant time with the hash of the code given.
+        /// AUTH-16): the stored value is the code's HMAC-SHA256, compared in constant time with the hash of the code given.
         /// Touches: users, verification_codes, audit_log.
         /// </summary>
         public async Task<object> VerifyEmailAsync(string email, string code)
@@ -342,7 +355,7 @@ namespace AuthSystem
         /// Flow 3, login. Gates: rate_limit (5 failures per 15 minutes per ip+email, checked first so a locked pair
         /// cannot keep guessing), user_exists_and_verified (status 'verified', as in the Go template),
         /// password_correct (bcrypt), mfa_gate. With MFA on, returns {status:"mfa_required", challenge_id} (a random
-        /// id valid 5 minutes, stored only as its SHA-256); otherwise creates a session and returns {status:
+        /// id valid 5 minutes, stored only as its HMAC-SHA256); otherwise creates a session and returns {status:
         /// "authenticated", session_id, token, refresh_token, expires_in, user} (AUTH-16: the refresh_token is the
         /// value token_refresh takes). Every failure answers invalid_credentials, so accounts cannot be enumerated.
         /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): the challenge id is hashed at rest. The
@@ -402,7 +415,7 @@ namespace AuthSystem
         /// consumed by <see cref="OAuthCallbackAsync"/> (spec gate state_valid: CSRF protection). Output: the state
         /// string, to be put in the redirect and bound to the browser session by the caller. Added 2026-11-10
         /// (session session_012zDydZCZ4AChqhEZ4oVtaP): the callback checked a state that nothing could create.
-        /// Changed the same day (Phase B.2, auth spec "Secrets at rest"): only the state's SHA-256 is stored.
+        /// Changed the same day (Phase B.2, auth spec "Secrets at rest"): only the state's HMAC-SHA256 is stored.
         /// Touches: verification_codes.
         /// </summary>
         public async Task<string> CreateOAuthStateAsync()
@@ -428,7 +441,7 @@ namespace AuthSystem
         /// Repaired 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): BCrypt.Net.BCrypt, the state is consumed
         /// before the provider is asked (a replayed state fails even if the provider call does), suspended/banned
         /// users are refused, the audit actor is the user. Changed the same day (Phase B.2, AUTH-16 and "Secrets at
-        /// rest"): the state is looked up by its SHA-256 (single use, 10 minutes); the code is exchanged ONCE through
+        /// rest"): the state is looked up by its HMAC-SHA256 (single use, 10 minutes); the code is exchanged ONCE through
         /// the injected client (<see cref="IOAuthProvider.ExchangeCodeAsync"/>), never treated as an identity, and a
         /// refused exchange is {error: "oauth_exchange_failed"}; the answer carries refresh_token.
         /// Touches: users, sessions, verification_codes, audit_log, the OAuth provider (network in production).
@@ -487,7 +500,7 @@ namespace AuthSystem
         /// so a 6-digit code cannot be brute-forced. Inputs: challenge id, code. Output: {status:"authenticated", ...}
         /// or {error: invalid_challenge | invalid_code}. Repaired 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP):
         /// drift window narrowed from ±2 steps, attempt limit added. Changed the same day (Phase B.2, AUTH-16): the
-        /// challenge is found by its id's SHA-256, and the answer carries refresh_token. Touches: users, sessions,
+        /// challenge is found by its id's HMAC-SHA256, and the answer carries refresh_token. Touches: users, sessions,
         /// verification_codes, audit_log, the cache.
         /// </summary>
         public async Task<object> MfaChallengeAsync(string challengeId, string totpCode)
@@ -540,7 +553,7 @@ namespace AuthSystem
         {
             if (string.IsNullOrEmpty(refreshToken))
                 return new { error = "invalid_token" };
-            // looked up by the token's SHA-256: equal hashes leak nothing about the token (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+            // looked up by the token's HMAC-SHA256: equal hashes leak nothing about the token (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
             var hash = HashRefreshToken(refreshToken);
             var session = await _db.Sessions
                 .Include(s => s.User)
@@ -663,18 +676,22 @@ namespace AuthSystem
         }
 
         /// <summary>
-        /// SHA-256 of a refresh token as lower-case hex: what the sessions table stores and is searched by.
-        /// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Pure. Same as <see cref="HashSecret"/>.
+        /// HMAC-SHA256 of a refresh token under the service key, as lower-case hex: what the sessions table stores and
+        /// is searched by. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Pure. Same as <see cref="HashSecret"/>.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec d270fa3: keyed HMAC for stored secrets): an
+        /// instance method now, since the hash is keyed; it was a static plain SHA-256.
         /// </summary>
-        public static string HashRefreshToken(string refreshToken) => HashSecret(refreshToken);
+        public string HashRefreshToken(string refreshToken) => HashSecret(refreshToken);
 
         /// <summary>
-        /// SHA-256 of a secret (refresh token, email code, MFA challenge id, OAuth state) as lower-case hex: the only
-        /// form in which any of them is stored (auth spec "Secrets at rest", AUTH-16). In: the secret. Out: 64 hex
-        /// characters. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2). Pure.
+        /// HMAC-SHA256(secretKey, secret) as lower-case hex for a secret (refresh token, email code, MFA challenge id,
+        /// OAuth state): the only form in which any of them is stored (auth spec "Secrets at rest", AUTH-16). In: the
+        /// secret. Out: 64 hex characters. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2).
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec d270fa3: keyed HMAC for stored secrets): it was a
+        /// static plain SHA-256, which a leaked table of 6-digit codes gives up to brute force. Pure.
         /// </summary>
-        public static string HashSecret(string secret) =>
-            Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(secret))).ToLowerInvariant();
+        public string HashSecret(string secret) =>
+            Convert.ToHexString(HMACSHA256.HashData(_secretKey, Encoding.UTF8.GetBytes(secret))).ToLowerInvariant();
 
         /// <summary>
         /// Creates a session with a random refresh token valid 7 days; only its hash is stored, the raw token is on the

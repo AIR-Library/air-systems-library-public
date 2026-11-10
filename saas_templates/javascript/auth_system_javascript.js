@@ -3,8 +3,10 @@
  * access-token verification. Contract: docs/specs/auth_system.md.
  *
  * Secrets at rest (auth spec, amended 2026-11-10, Phase B.2; AUTH-16): refresh tokens, e-mail verification codes and
- * OAuth state values are stored only as their SHA-256 and compared in constant time, so a database read hands out no
- * usable credential. Every flow that creates a session (login, MFA verify, OAuth) returns the session's refresh_token,
+ * OAuth state values are stored only as their keyed hash, lowercase hex HMAC-SHA256(AUTH_SECRET_KEY, value), and
+ * compared in constant time, so a database read hands out no usable credential (spec d270fa3, 2026-11-10: a plain
+ * SHA-256 of a 6-digit code could be brute-forced from a leaked table). The module refuses to load without an
+ * AUTH_SECRET_KEY environment variable of at least 32 bytes. Every flow that creates a session (login, MFA verify, OAuth) returns the session's refresh_token,
  * the value token_refresh() takes. OAuth state is single-use and expires in 10 minutes, and oauth_callback exchanges
  * the provider's code through an injected provider client: it never uses the code itself as an identity (before this
  * change the "code" WAS the e-mail address, so anyone could log in as anyone).
@@ -32,6 +34,19 @@ const DB_PATH = ':memory:';
 // The signing key comes from the deployment's own configuration. A key written in public code lets anyone mint tokens.
 // Without one, each start makes a random key, so tokens only last until a restart (2026-11-08, session f3daac6e, from review).
 const JWT_SECRET = process.env.JWT_SECRET || require('crypto').randomBytes(32).toString('hex');
+
+/**
+ * The HMAC key for stored secrets, read from the AUTH_SECRET_KEY environment variable as the JWT secret is read from
+ * JWT_SECRET. In: process.env.AUTH_SECRET_KEY. Out: the key as a Buffer. Throws when it is missing or shorter than
+ * 32 bytes, so the service refuses to start (require() fails) without one. Why: spec d270fa3: keyed HMAC for stored
+ * secrets. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the process environment (read only).
+ */
+function loadSecretKey(value) {
+  const key = Buffer.from(typeof value === 'string' ? value : '', 'utf8');
+  if (key.length < 32) throw new Error('AUTH_SECRET_KEY must be set and at least 32 bytes');
+  return key;
+}
+const AUTH_SECRET_KEY = loadSecretKey(process.env.AUTH_SECRET_KEY);
 const ACCESS_TOKEN_EXPIRES = '15m';
 const REFRESH_TOKEN_EXPIRES_DAYS = 30;
 const OAUTH_STATE_TTL_MS = 10 * 60 * 1000; // OAuth state expires in 10 minutes (auth spec, Phase B.2)
@@ -161,12 +176,13 @@ function fail(status, error, message, extra = {}) {
 }
 
 /**
- * SHA-256 of a secret, lowercase hex. In: a string. Out: 64 hex characters. Why: refresh tokens, verification codes
- * and OAuth states are stored only as this (AUTH-16). Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
- * Touches: nothing.
+ * Keyed hash of a secret: lowercase hex HMAC-SHA256(AUTH_SECRET_KEY, value). In: a string. Out: 64 hex characters.
+ * Why: refresh tokens, verification codes and OAuth states are stored only as this (AUTH-16); spec d270fa3: keyed
+ * HMAC for stored secrets (it replaced the plain SHA-256 helper `sha256`). 2026-11-10,
+ * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
  */
-function sha256(value) {
-  return crypto.createHash('sha256').update(String(value), 'utf8').digest('hex');
+function hashSecret(value) {
+  return crypto.createHmac('sha256', AUTH_SECRET_KEY).update(String(value), 'utf8').digest('hex');
 }
 
 /**
@@ -206,11 +222,12 @@ function generateToken(user) {
 
 /**
  * Creates a session and its refresh token. The refresh token is "<session_id>.<64 hex>" (32 random bytes); only its
- * SHA-256 is stored (refresh_token_hash), and the session id in front lets token_refresh find the row and compare the
+ * HMAC-SHA256 is stored (refresh_token_hash), and the session id in front lets token_refresh find the row and compare the
  * hash in constant time.
  * In: user { id, tier }, ip, device id. Out: { session_id, token, expires_in, refresh_token }.
  * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16: the plain token was stored). Touches: sessions,
  * audit_log.
+ * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
  */
 async function createSession(user, ip, device_id) {
   const db = await dbPromise;
@@ -221,7 +238,7 @@ async function createSession(user, ip, device_id) {
   await db.run(`
     INSERT INTO sessions (id, user_id, refresh_token_hash, created_at, expires_at, ip, device_id)
     VALUES (?,?,?,?,?,?,?)`,
-    session_id, user.id, sha256(refresh_token), created_at, expires_at, ip, device_id);
+    session_id, user.id, hashSecret(refresh_token), created_at, expires_at, ip, device_id);
   await logAudit({ actor_id: user.id, action: 'session_created', resource_type: 'session', resource_id: session_id, old_value: null, new_value: null });
   return { session_id, token: generateToken(user), expires_in: 900, refresh_token };
 }
@@ -296,10 +313,11 @@ function checkPasswordStrength(password, email, name) {
  * signup(email, password, name, ip) -> {success, status: "pending_verification", email} | {error, status, ...}.
  * Gates in order: rate_limit_ip_24h (429 too_many_signups_from_ip), email_unique (409 email_already_exists),
  * password_strength (400 password_rejected with reason; AUTH-03). Then the user is created, a verification code is
- * stored as its SHA-256 only (code_hash) and the plain code is e-mailed through the mailer.
+ * stored as its HMAC-SHA256 only (code_hash) and the plain code is e-mailed through the mailer.
  * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-03; Phase B.2: statuses on errors, code_hash, and the
  * verification e-mail is really sent; the plain code was stored and never sent). Touches the users,
  * verification_codes and audit tables, and the mailer.
+ * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
  */
 async function signup(email, password, name, ip) {
   const db = await dbPromise;
@@ -322,7 +340,7 @@ async function signup(email, password, name, ip) {
     user_id, email, hash, 'free', 'unverified', 0);
   logWhyChain('signup', ['email_unique', 'password_strength', 'rate_limit_ip_24h']);
   await logAudit({ actor_id: user_id, action: 'user_created', resource_type: 'user', resource_id: user_id, old_value: null, new_value: null });
-  // create the verification code: stored only as its SHA-256, sent to the user in plain
+  // create the verification code: stored only as its HMAC-SHA256, sent to the user in plain
   const code = generateCode();
   const code_id = uuidv4();
   const created_at = now();
@@ -330,7 +348,7 @@ async function signup(email, password, name, ip) {
   await db.run(`
     INSERT INTO verification_codes (id, user_id, code_hash, created_at, expires_at, type)
     VALUES (?,?,?,?,?,?)`,
-    code_id, user_id, sha256(code), created_at, expires_at, 'email');
+    code_id, user_id, hashSecret(code), created_at, expires_at, 'email');
   await settings.mailer.send({
     to: email,
     subject: 'Verify your e-mail address',
@@ -341,17 +359,18 @@ async function signup(email, password, name, ip) {
 
 /**
  * verify_email(email, code) -> { success, status: 'verified', user_id } | { error, status, message }.
- * Gates: code_valid (its SHA-256 matches a stored code_hash, compared in constant time; 400 invalid_code; past
+ * Gates: code_valid (its HMAC-SHA256 matches a stored code_hash, compared in constant time; 400 invalid_code; past
  * expires_at 400 code_expired), user_unverified (409 already_verified). The used code is deleted.
  * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2: code_hash, statuses, the injectable clock).
  * Touches: users, verification_codes, audit_log.
+ * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
  */
 async function verify_email(email, code) {
   const db = await dbPromise;
   const user = await db.get(`SELECT * FROM users WHERE email = ?`, email);
   if (!user) return fail(400, 'invalid_code', 'Invalid code');
   if (user.email_verified_at) return fail(409, 'already_verified', 'Already verified');
-  const presented = sha256(code == null ? '' : code);
+  const presented = hashSecret(code == null ? '' : code);
   const rows = await db.all(`SELECT * FROM verification_codes WHERE user_id = ? AND type = 'email'`, user.id);
   const record = rows.find(r => safeEqualHex(presented, r.code_hash));
   if (!record) return fail(400, 'invalid_code', 'Invalid code');
@@ -407,25 +426,26 @@ async function login(email, password, device_id, ip) {
 
 /**
  * oauth_start(provider, binding) -> { success, state, expires_in: 600 } | { error, status, message }.
- * Makes the OAuth state for the provider's authorize URL: 32 random bytes, stored only as its SHA-256 with the
+ * Makes the OAuth state for the provider's authorize URL: 32 random bytes, stored only as its HMAC-SHA256 with the
  * provider, an optional binding (the browser's pre-login session id, also hashed) and an expiry 10 minutes ahead.
  * Unknown or unconfigured provider: 400 unknown_provider.
  * Why: auth spec "OAuth state is single-use and expires in 10 minutes" (Phase B.2, AUTH-16); there was no state at
  * all. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: oauth_states.
+ * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
  */
 async function oauth_start(provider, binding = null) {
   if (!settings.oauthProviders[provider]) return fail(400, 'unknown_provider', 'OAuth provider is not configured');
   const db = await dbPromise;
   const state = crypto.randomBytes(32).toString('hex');
   await db.run(`INSERT INTO oauth_states (state_hash, provider, binding_hash, created_at, expires_at) VALUES (?,?,?,?,?)`,
-    sha256(state), provider, binding == null ? null : sha256(binding), now(), new Date(nowMs() + OAUTH_STATE_TTL_MS).toISOString());
+    hashSecret(state), provider, binding == null ? null : hashSecret(binding), now(), new Date(nowMs() + OAUTH_STATE_TTL_MS).toISOString());
   return { success: true, state, expires_in: OAUTH_STATE_TTL_MS / 1000 };
 }
 
 /**
  * oauth_callback(provider, code, state, ip, device_id, binding) -> authenticated (with refresh_token) |
  * { error, status, message }.
- * Gates, in order: provider configured (400 unknown_provider); state_valid: the state's SHA-256 names an unused,
+ * Gates, in order: provider configured (400 unknown_provider); state_valid: the state's HMAC-SHA256 names an unused,
  * unexpired state for this provider whose binding matches (400 invalid_state), consumed by one conditional write so
  * it works once; the provider client exchanges the code (401 oauth_exchange_failed if it refuses or returns no
  * identity); email_verified_by_provider (403 email_not_verified). Then: the (provider, provider_user_id) link decides
@@ -435,16 +455,17 @@ async function oauth_start(provider, binding = null) {
  * oauth_account_conflict. The code is never used as an identity.
  * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, AUTH-10/11/16: the code was taken as the e-mail
  * and no state was checked). Touches: oauth_states, oauth_links, users, sessions, audit_log, the provider client.
+ * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
  */
 async function oauth_callback(provider, code, state, ip, device_id, binding = null) {
   const client = settings.oauthProviders[provider];
   if (!client) return fail(400, 'unknown_provider', 'OAuth provider is not configured');
   const db = await dbPromise;
   const stateRow = typeof state === 'string' && state.length > 0
-    ? await db.get(`SELECT * FROM oauth_states WHERE state_hash = ?`, sha256(state))
+    ? await db.get(`SELECT * FROM oauth_states WHERE state_hash = ?`, hashSecret(state))
     : null;
   const bindingOk = stateRow && (stateRow.binding_hash == null
-    || (binding != null && safeEqualHex(sha256(binding), stateRow.binding_hash)));
+    || (binding != null && safeEqualHex(hashSecret(binding), stateRow.binding_hash)));
   if (!stateRow || stateRow.provider !== provider || stateRow.used_at || !bindingOk
       || Date.parse(stateRow.expires_at) <= nowMs()) {
     return fail(400, 'invalid_state', 'OAuth state is missing, expired or already used');
@@ -533,17 +554,18 @@ async function mfa_challenge(challenge_id, code, ip, device_id) {
 
 /**
  * token_refresh(refresh_token) -> { success, status: 'ok', token, expires_in } | { error, status, message }.
- * Gates: token_valid: "<session_id>.<secret>", the session exists and the token's SHA-256 equals its
+ * Gates: token_valid: "<session_id>.<secret>", the session exists and the token's HMAC-SHA256 equals its
  * refresh_token_hash in constant time (401 invalid_token), not past expires_at (401 token_expired);
  * user_not_banned (403 user_banned).
  * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, AUTH-14/15/16: the token was looked up in plain
  * text; statuses on errors). Touches: sessions and users (read), audit_log.
+ * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
  */
 async function token_refresh(refresh_token) {
   const db = await dbPromise;
   const match = typeof refresh_token === 'string' ? /^([0-9a-f-]{36})\.[0-9a-f]{64}$/.exec(refresh_token) : null;
   const session = match ? await db.get(`SELECT * FROM sessions WHERE id = ?`, match[1]) : null;
-  if (!session || !safeEqualHex(sha256(refresh_token), session.refresh_token_hash)) {
+  if (!session || !safeEqualHex(hashSecret(refresh_token), session.refresh_token_hash)) {
     return fail(401, 'invalid_token', 'Invalid refresh token');
   }
   if (Date.parse(session.expires_at) < nowMs()) {
@@ -604,5 +626,5 @@ module.exports = {
   rateLimits,
   resetRateLimits,
   sentEmails,
-  sha256,
+  hashSecret,
 };

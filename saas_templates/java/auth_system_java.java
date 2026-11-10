@@ -25,6 +25,29 @@ import com.fasterxml.jackson.core.type.TypeReference;
  */
 public class AuthSystem {
 
+    /**
+     * The HMAC key for stored secrets, read before anything else so the class refuses to load (the service refuses to
+     * start) without it. It comes from AUTH_SECRET_KEY, the system property if set, else the environment variable, the
+     * way AUTH_JWT_SECRET is read. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec d270fa3: keyed HMAC for
+     * stored secrets). Touches: reads the environment and system properties.
+     */
+    private static final SecretKeySpec SECRET_KEY = new SecretKeySpec(
+            secretKeyFrom(System.getProperty("AUTH_SECRET_KEY", System.getenv("AUTH_SECRET_KEY"))), "HmacSHA256");
+
+    /**
+     * Validates the configured HMAC key. In: the configured value (null when unset). Out: its UTF-8 bytes. Throws
+     * IllegalStateException when it is unset or shorter than 32 bytes, so class initialisation fails and the service
+     * refuses to start. Why: spec d270fa3: keyed HMAC for stored secrets ("the service refuses to start without it").
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+     */
+    static byte[] secretKeyFrom(String configured) {
+        byte[] bytes = configured == null ? new byte[0] : configured.getBytes(StandardCharsets.UTF_8);
+        if (bytes.length < 32) {
+            throw new IllegalStateException("AUTH_SECRET_KEY must be set and at least 32 bytes");
+        }
+        return bytes;
+    }
+
     /* ---------- Database ---------- */
     private static final String DB_URL = "jdbc:h2:mem:authdb;DB_CLOSE_DELAY=-1";
     private static final Connection conn;
@@ -54,7 +77,7 @@ public class AuthSystem {
                 "expires_at TIMESTAMP, type VARCHAR(10))";
         String oauthLinks = "CREATE TABLE IF NOT EXISTS oauth_links (" +
                 "id IDENTITY PRIMARY KEY, user_id BIGINT, provider VARCHAR(50), provider_user_id VARCHAR(255))";
-        // OAuth state values, stored only as their SHA-256 (AUTH spec "Secrets at rest", 2026-11-10,
+        // OAuth state values, stored only as their HMAC-SHA256 under AUTH_SECRET_KEY (spec d270fa3) (AUTH spec "Secrets at rest", 2026-11-10,
         // session_012zDydZCZ4AChqhEZ4oVtaP): single-use (used_at) and valid 10 minutes (expires_at).
         String oauthStates = "CREATE TABLE IF NOT EXISTS oauth_states (" +
                 "state_hash CHAR(64) PRIMARY KEY, provider VARCHAR(50), created_at TIMESTAMP, " +
@@ -91,17 +114,22 @@ public class AuthSystem {
     }
 
     /**
-     * Lowercase hex SHA-256 of a UTF-8 string. In: a secret (refresh token, verification code, challenge id, OAuth
-     * state). Out: 64 hex characters. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16 and the spec's
-     * "Secrets at rest": the database holds only this hash, so a read hands out no usable credential). Touches: nothing.
+     * Lowercase hex HMAC-SHA256(AUTH_SECRET_KEY, value) of a UTF-8 string. In: a secret (refresh token, verification
+     * code, challenge id, OAuth state). Out: 64 hex characters. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP
+     * (AUTH-16 and the spec's "Secrets at rest": the database holds only this hash, so a read hands out no usable
+     * credential). Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec d270fa3: keyed HMAC for stored secrets):
+     * it was the plain SHA-256 helper sha256Hex, which a leaked table of 6-digit codes gives up to brute force.
+     * Touches: nothing.
      */
-    public static String sha256Hex(String value) {
+    static String secretHash(String value) {
         try {
-            byte[] d = MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8));
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(SECRET_KEY);
+            byte[] d = mac.doFinal(value.getBytes(StandardCharsets.UTF_8));
             StringBuilder sb = new StringBuilder(64);
             for (byte b : d) sb.append(String.format("%02x", b));
             return sb.toString();
-        } catch (NoSuchAlgorithmException e) {
+        } catch (GeneralSecurityException e) {
             throw new IllegalStateException(e);
         }
     }
@@ -362,7 +390,7 @@ public class AuthSystem {
             // MFA check
             if (isMfaEnabled(userId)) {
                 decisions.add("mfa_gate");
-                // The challenge id is a bearer secret: only its SHA-256 is stored (AUTH spec "Secrets at rest", 2026-11-10,
+                // The challenge id is a bearer secret: only its HMAC-SHA256 is stored (AUTH spec "Secrets at rest", 2026-11-10,
                 // session_012zDydZCZ4AChqhEZ4oVtaP).
                 String challengeId = generateCode();
                 insertVerificationCode(userId, challengeId, "mfa");
@@ -383,8 +411,9 @@ public class AuthSystem {
      * Starts an OAuth sign-in: issues the state value the provider must hand back to oauthCallback.
      * In: provider name (must have a registered OAuthProvider). Out: {success, state, expires_in: 600} or
      * {error: "unknown_provider"}. Why: AUTH spec "Secrets at rest" (2026-11-10 amendment) and the java bug list:
-     * the state was never checked. The state is 32 random bytes, stored only as its SHA-256, bound to the provider,
+     * the state was never checked. The state is 32 random bytes, stored only as its HMAC-SHA256, bound to the provider,
      * single-use and valid 10 minutes. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (oauth_states).
+     * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
      */
     public static Map<String, Object> oauthStart(String provider) {
         try {
@@ -397,7 +426,7 @@ public class AuthSystem {
             Instant created = now();
             try (PreparedStatement ps = conn.prepareStatement(
                     "INSERT INTO oauth_states (state_hash, provider, created_at, expires_at, used_at) VALUES (?, ?, ?, ?, NULL)")) {
-                ps.setString(1, sha256Hex(state));
+                ps.setString(1, secretHash(state));
                 ps.setString(2, provider);
                 ps.setTimestamp(3, java.sql.Timestamp.from(created));
                 ps.setTimestamp(4, java.sql.Timestamp.from(created.plus(OAUTH_STATE_TTL)));
@@ -417,12 +446,13 @@ public class AuthSystem {
      * before, and marks it used in the same UPDATE so two callbacks with one state cannot both pass.
      * In: provider, state. Out: true when valid. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH spec
      * "OAuth state is single-use and expires in 10 minutes"; java bug: state was not validated). The lookup is by the
-     * SHA-256 of the state (the raw state is never stored), then compared again in constant time.
+     * HMAC-SHA256 of the state (the raw state is never stored), then compared again in constant time.
      * Touches: database (oauth_states).
+     * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
      */
     private static boolean consumeOAuthState(String provider, String state) throws SQLException {
         if (state == null || state.isEmpty()) return false;
-        String hash = sha256Hex(state);
+        String hash = secretHash(state);
         Instant at = now();
         String stored = null;
         try (PreparedStatement ps = conn.prepareStatement(
@@ -624,12 +654,12 @@ public class AuthSystem {
      * Creates a session row and returns the access token and refresh token. In: user id, email, ip, device id, the
      * why-chain so far, flow name and audit action. Out: {status: "authenticated", session_id, token, refresh_token,
      * expires_in, user}. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16): the refresh token is returned
-     * and only its SHA-256 is stored. Touches: database (sessions, audit_log).
+     * and only its HMAC-SHA256 is stored. Touches: database (sessions, audit_log).
      */
     private static Map<String, Object> createSessionAndToken(long userId, String email, String ip, String deviceId,
             List<String> decisions, String flow, String auditAction) throws SQLException {
         String sessionId = UUID.randomUUID().toString();
-        // 32 random bytes; only its SHA-256 is stored (AUTH-16, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
+        // 32 random bytes; only its HMAC-SHA256 is stored (AUTH-16, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
         byte[] rt = new byte[32];
         random.nextBytes(rt);
         String refreshToken = Base64.getUrlEncoder().withoutPadding().encodeToString(rt);
@@ -760,8 +790,9 @@ public class AuthSystem {
 
     /**
      * Inserts a session. In: ids, the raw refresh token (hashed here), times, ip, device. Out: none.
-     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16): stores refresh_token_hash = SHA-256, never the token.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16): stores refresh_token_hash = HMAC-SHA256, never the token.
      * Touches: database (sessions).
+     * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
      */
     private static void insertSession(String sessionId, long userId, String refreshToken,
                                       Instant createdAt, Instant expiresAt, String ip, String deviceId) throws SQLException {
@@ -769,7 +800,7 @@ public class AuthSystem {
                 "INSERT INTO sessions (id, user_id, refresh_token_hash, created_at, expires_at, ip, device_id) VALUES (?, ?, ?, ?, ?, ?, ?)")) {
             ps.setString(1, sessionId);
             ps.setLong(2, userId);
-            ps.setString(3, sha256Hex(refreshToken));
+            ps.setString(3, secretHash(refreshToken));
             ps.setTimestamp(4, java.sql.Timestamp.from(createdAt));
             ps.setTimestamp(5, java.sql.Timestamp.from(expiresAt));
             ps.setString(6, ip);
@@ -780,11 +811,12 @@ public class AuthSystem {
 
     /**
      * Finds the session of a refresh token. In: the raw token. Out: the Session or null.
-     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16): looks up by SHA-256 and compares the stored hash
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16): looks up by HMAC-SHA256 and compares the stored hash
      * in constant time. Touches: database (sessions, read).
+     * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
      */
     private static Session getSessionByRefreshToken(String refreshToken) throws SQLException {
-        String hash = sha256Hex(refreshToken);
+        String hash = secretHash(refreshToken);
         try (PreparedStatement ps = conn.prepareStatement(
                 "SELECT id, user_id, created_at, expires_at, ip, device_id, refresh_token_hash FROM sessions WHERE refresh_token_hash = ?")) {
             ps.setString(1, hash);
@@ -838,8 +870,9 @@ public class AuthSystem {
 
     /**
      * Stores a verification code or MFA challenge id. In: user id, the raw code, type 'email' | 'mfa'. Out: none.
-     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16, java SECURITY bug): stores code_hash = SHA-256;
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16, java SECURITY bug): stores code_hash = HMAC-SHA256;
      * the raw code only goes to the user. Touches: database (verification_codes).
+     * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
      */
     private static void insertVerificationCode(long userId, String code, String type) throws SQLException {
         Instant now = now();
@@ -847,7 +880,7 @@ public class AuthSystem {
         try (PreparedStatement ps = conn.prepareStatement(
                 "INSERT INTO verification_codes (user_id, code_hash, created_at, expires_at, type) VALUES (?, ?, ?, ?, ?)")) {
             ps.setLong(1, userId);
-            ps.setString(2, sha256Hex(code));
+            ps.setString(2, secretHash(code));
             ps.setTimestamp(3, java.sql.Timestamp.from(now));
             ps.setTimestamp(4, java.sql.Timestamp.from(exp));
             ps.setString(5, type);
@@ -858,12 +891,13 @@ public class AuthSystem {
     /**
      * The user's code row of that type matching code, expired or not (null if none). In: user id, code, type.
      * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP so verify_email can answer code_expired (AUTH-06).
-     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16): matches code_hash = SHA-256(code), compared again in
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16): matches code_hash = HMAC-SHA256(code), compared again in
      * constant time; VerificationCode.code now holds that hash. Touches: reads the database.
+     * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
      */
     private static VerificationCode getVerificationCodeIgnoringExpiry(long userId, String code, String type) throws SQLException {
         if (code == null) return null;
-        String hash = sha256Hex(code);
+        String hash = secretHash(code);
         try (PreparedStatement ps = conn.prepareStatement(
                 "SELECT id, user_id, code_hash, created_at, expires_at, type FROM verification_codes WHERE user_id = ? AND code_hash = ? AND type = ?")) {
             ps.setLong(1, userId);
@@ -880,11 +914,12 @@ public class AuthSystem {
 
     /**
      * The unexpired code row of that type for that user, or null. In: user id, raw code, type.
-     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16): matches code_hash = SHA-256(code) in constant time.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16): matches code_hash = HMAC-SHA256(code) in constant time.
      * Touches: reads the database.
+     * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
      */
     private static VerificationCode getVerificationCode(long userId, String code, String type) throws SQLException {
-        String hash = sha256Hex(code);
+        String hash = secretHash(code);
         try (PreparedStatement ps = conn.prepareStatement(
                 "SELECT id, user_id, code_hash, created_at, expires_at, type FROM verification_codes WHERE user_id = ? AND code_hash = ? AND type = ?")) {
             ps.setLong(1, userId);
@@ -909,11 +944,12 @@ public class AuthSystem {
 
     /**
      * The unexpired row whose code (here the MFA challenge id) matches, or null. In: raw code, type.
-     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16): matches code_hash = SHA-256(code) in constant time.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16): matches code_hash = HMAC-SHA256(code) in constant time.
      * Touches: reads the database.
+     * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
      */
     private static VerificationCode getVerificationCodeByCode(String code, String type) throws SQLException {
-        String hash = sha256Hex(code);
+        String hash = secretHash(code);
         try (PreparedStatement ps = conn.prepareStatement(
                 "SELECT id, user_id, code_hash, created_at, expires_at, type FROM verification_codes WHERE code_hash = ? AND type = ?")) {
             ps.setString(1, hash);

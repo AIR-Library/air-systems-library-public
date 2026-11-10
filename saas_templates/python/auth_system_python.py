@@ -9,18 +9,39 @@ from typing import Callable, Optional, Dict, Any
 import hmac
 import sqlite3
 import time
+import os
 
 # OAuth state lifetime (auth spec, "Secrets at rest": single-use, expires in 10 minutes). Phase B.2, 2026-11-10,
 # session_012zDydZCZ4AChqhEZ4oVtaP.
 OAUTH_STATE_TTL = timedelta(minutes=10)
 
 
-def _sha256_hex(value: str) -> str:
-    """Lowercase hex SHA-256 of a secret's UTF-8 bytes: the only form in which refresh tokens, verification codes
-    and OAuth state values are stored. In: the secret. Out: 64 hex chars. Why: AUTH-16 and the auth spec's
-    "Secrets at rest" line (Phase B.2, 2026-11-10: sessions and verification_codes held them in plain text).
-    2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing."""
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+# Minimum length of the HMAC key for stored secrets (spec d270fa3: AUTH_SECRET_KEY, at least 32 bytes).
+# 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+MIN_SECRET_KEY_BYTES = 32
+
+
+def _load_secret_key(secret_key) -> bytes:
+    """The HMAC key for stored secrets, as bytes: the secret_key argument if given, else the AUTH_SECRET_KEY
+    environment variable. In: str, bytes or None. Out: the key bytes. Raises ValueError when there is no key or it
+    is shorter than 32 bytes, so the service refuses to start without one. Why: spec d270fa3: keyed HMAC for
+    stored secrets (a plain SHA-256 of a 6-digit code can be brute-forced from a leaked table; code scanning
+    flagged it). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the process environment (read only)."""
+    if secret_key is None:
+        secret_key = os.environ.get("AUTH_SECRET_KEY")
+    if isinstance(secret_key, str):
+        secret_key = secret_key.encode("utf-8")
+    if not secret_key or len(secret_key) < MIN_SECRET_KEY_BYTES:
+        raise ValueError("AUTH_SECRET_KEY must be set and at least 32 bytes")
+    return bytes(secret_key)
+
+
+def _hmac_hex(key: bytes, value: str) -> str:
+    """Lowercase hex HMAC-SHA256(key, value's UTF-8 bytes): the only form in which refresh tokens, verification
+    codes and OAuth state values are stored. In: the key, the secret. Out: 64 hex chars. Why: spec d270fa3: keyed
+    HMAC for stored secrets (replaces the plain SHA-256 of Phase B.2). 2026-11-10,
+    session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing."""
+    return hmac.new(key, value.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def _unconfigured_oauth_client(provider: str, code: str) -> Dict[str, Any]:
@@ -41,8 +62,14 @@ class AuthSystem:
                  login_rate_limit_max: int = 5,
                  oauth_profile: Optional[Callable[[str, str], Dict[str, Any]]] = None,
                  email_sender: Optional[Callable[[str, str], None]] = None,
-                 clock: Optional[Callable[[], datetime]] = None):
+                 clock: Optional[Callable[[], datetime]] = None,
+                 secret_key: Optional[Any] = None):
         """Set up the auth system on one SQLite connection.
+
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets. secret_key
+        (str or bytes, else the AUTH_SECRET_KEY environment variable) keys the HMAC-SHA256 under which refresh
+        tokens, verification codes and OAuth state are stored. Raises ValueError, before touching the database,
+        when it is missing or shorter than 32 bytes: the service refuses to start without it.
 
         [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] New optional email_sender(email, code): signup sends the
         verification code through it (AUTH-01 "email sent"; docs/specs/README.md: email goes through an
@@ -52,6 +79,7 @@ class AuthSystem:
         email_verified}; the default now refuses (it invented a user for any code). clock() returns the aware UTC
         now (default the wall clock), so state expiry can be tested.
         Touches: SQLite (creates tables); network only through the injected sender/oauth_profile."""
+        self._secret_key = _load_secret_key(secret_key)
         self.email_sender = email_sender or (lambda email, code: None)
         self.db = db_connection
         self.clock = clock
@@ -87,13 +115,20 @@ class AuthSystem:
         """Return current UTC time as ISO format string."""
         return self._now().isoformat()
 
+    def _hash_secret(self, value: str) -> str:
+        """The stored form of a refresh token, verification code or OAuth state: lowercase hex
+        HMAC-SHA256(secret_key, value). In: the secret. Out: 64 hex chars. Why: spec d270fa3: keyed HMAC for
+        stored secrets. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing."""
+        return _hmac_hex(self._secret_key, value)
+
     def _ensure_tables(self):
         """Create the tables. [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2 (AUTH-16, "Secrets at
         rest"): sessions keep refresh_token_hash and verification_codes keep code_hash, never the secret, and
-        oauth_states holds the SHA-256 of each issued OAuth state. A sessions or verification_codes table from
+        oauth_states holds the HMAC-SHA256 of each issued OAuth state. A sessions or verification_codes table from
         before this change holds plain-text secrets; it is dropped and recreated, which signs those sessions out
         and voids those codes (they cannot be hashed in place without keeping the plain text readable).
-        In/Out: none. Touches: SQLite (DDL)."""
+        In/Out: none. Touches: SQLite (DDL).
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: each stored or compared secret is now HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256)."""
         cursor = self.db.cursor()
         for table, plain_column in (("sessions", "refresh_token"), ("verification_codes", "code")):
             if plain_column in {row[1] for row in cursor.execute(f"PRAGMA table_info({table})")}:
@@ -114,7 +149,7 @@ class AuthSystem:
         CREATE TABLE IF NOT EXISTS sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
-            refresh_token_hash TEXT UNIQUE NOT NULL,  -- SHA-256 hex of the refresh token (AUTH-16)
+            refresh_token_hash TEXT UNIQUE NOT NULL,  -- HMAC-SHA256 hex of the refresh token (AUTH-16)
             created_at TEXT NOT NULL,
             expires_at TEXT NOT NULL,
             ip TEXT,
@@ -124,7 +159,7 @@ class AuthSystem:
         CREATE TABLE IF NOT EXISTS verification_codes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
-            code_hash TEXT NOT NULL,  -- SHA-256 hex of the emailed / expected code (AUTH-16)
+            code_hash TEXT NOT NULL,  -- HMAC-SHA256 hex of the emailed / expected code (AUTH-16)
             created_at TEXT NOT NULL,
             expires_at TEXT NOT NULL,
             type TEXT NOT NULL CHECK (type IN ('email', 'mfa')),
@@ -145,7 +180,7 @@ class AuthSystem:
             UNIQUE(provider, provider_user_id)
         );
         CREATE TABLE IF NOT EXISTS oauth_states (
-            state_hash TEXT PRIMARY KEY,  -- SHA-256 hex of the state sent to the provider; single-use
+            state_hash TEXT PRIMARY KEY,  -- HMAC-SHA256 hex of the state sent to the provider; single-use
             provider TEXT NOT NULL,
             created_at TEXT NOT NULL,
             expires_at TEXT NOT NULL
@@ -190,16 +225,17 @@ class AuthSystem:
     def _create_session(self, cursor: sqlite3.Cursor, user_id: int, ip: Optional[str] = None,
                         device_id: Optional[str] = None) -> tuple:
         """Insert a session for user_id and return (session_id, refresh_token). The refresh token is 32 random
-        bytes (URL-safe); only its SHA-256 is stored, so reading the sessions table hands out nothing usable.
+        bytes (URL-safe); only its HMAC-SHA256 is stored, so reading the sessions table hands out nothing usable.
         The caller commits. In: an open cursor, the user id, the request's ip and device id. Out: (session id,
         the plain refresh token, which the caller returns to the client once). Why: AUTH-16 (Phase B.2,
         2026-11-10): every flow that creates a session returns its refresh_token, and sessions stored it in plain
-        text. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite (sessions)."""
+        text. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite (sessions).
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: each stored or compared secret is now HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256)."""
         refresh_token = secrets.token_urlsafe(32)
         cursor.execute(
             """INSERT INTO sessions (user_id, refresh_token_hash, created_at, expires_at, ip, device_id)
                VALUES (?, ?, ?, ?, ?, ?)""",
-            (user_id, _sha256_hex(refresh_token), self._now_iso(),
+            (user_id, self._hash_secret(refresh_token), self._now_iso(),
              (self._now() + timedelta(days=self.refresh_token_expires_days)).isoformat(), ip, device_id)
         )
         return cursor.lastrowid, refresh_token
@@ -315,7 +351,8 @@ class AuthSystem:
         {error: "too_many_signups_from_ip" | "email_already_exists" | "password_rejected", reason}.
         [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Password checks run too_short, too_long, blocklisted (AUTH-03 as amended) and the code is sent
         through the injected email_sender (AUTH-01). [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2
-        (AUTH-16): only the code's SHA-256 is stored. Touches: SQLite, the email sender."""
+        (AUTH-16): only the code's HMAC-SHA256 is stored. Touches: SQLite, the email sender.
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: each stored or compared secret is now HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256)."""
         decision_points = []
         # rate_limit_ip_24h
         if self._is_rate_limited(ip, ip, 'signup'):
@@ -352,7 +389,7 @@ class AuthSystem:
         cursor.execute(
             """INSERT INTO verification_codes (user_id, code_hash, created_at, expires_at, type)
                VALUES (?, ?, ?, ?, ?)""",
-            (user_id, _sha256_hex(code), now_iso,
+            (user_id, self._hash_secret(code), now_iso,
              (self._now() + timedelta(hours=self.email_verification_expires_hours)).isoformat(), 'email')
         )
         self.db.commit()
@@ -370,8 +407,9 @@ class AuthSystem:
         In: email, the code. Out: {status: "verified", user_id, message} or {error: "invalid_email" |
         "email_already_verified" | "code_expired"}. [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] The code is now
         compared in constant time in Python (docs/specs/README.md); it was matched with "code = ?" in SQL.
-        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2 (AUTH-16): the supplied code's SHA-256 is
-        compared with the stored code_hash. Touches: SQLite (users, verification_codes, audit_log)."""
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2 (AUTH-16): the supplied code's HMAC-SHA256 is
+        compared with the stored code_hash. Touches: SQLite (users, verification_codes, audit_log).
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: each stored or compared secret is now HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256)."""
         decision_points = []
         cursor = self.db.cursor()
         cursor.execute("SELECT id, email_verified_at FROM users WHERE email = ?", (email,))
@@ -389,7 +427,7 @@ class AuthSystem:
                WHERE user_id = ? AND type = 'email' AND expires_at > ? ORDER BY id""",
             (user_id, self._now_iso())
         )
-        supplied = _sha256_hex(code_or_token if isinstance(code_or_token, str) else "").encode("utf-8")
+        supplied = self._hash_secret(code_or_token if isinstance(code_or_token, str) else "").encode("utf-8")
         code_record = None
         for candidate in cursor.fetchall():
             if hmac.compare_digest(str(candidate[1]).encode("utf-8"), supplied):
@@ -417,8 +455,9 @@ class AuthSystem:
         {error: "too_many_failed_logins" | "invalid_credentials" | "unverified_email"}.
         [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2 bug fix (AUTH-16): login now returns the
         session's refresh_token (it returned none, so token_refresh could never be used) and stores only its
-        SHA-256; the MFA challenge stores only the expected code's SHA-256.
-        Touches: SQLite (users read; sessions, verification_codes, rate_limit_log, audit_log, why_chain_log)."""
+        HMAC-SHA256; the MFA challenge stores only the expected code's HMAC-SHA256.
+        Touches: SQLite (users read; sessions, verification_codes, rate_limit_log, audit_log, why_chain_log).
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: each stored or compared secret is now HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256)."""
         decision_points = []
         # rate_limit (5 failed per 15min per ip/user)
         if self._is_rate_limited(ip, email, 'login'):
@@ -455,7 +494,7 @@ class AuthSystem:
             cursor.execute(
                 """INSERT INTO verification_codes (user_id, code_hash, created_at, expires_at, type)
                    VALUES (?, ?, ?, ?, ?)""",
-                (user_id, _sha256_hex(current_code), now_iso,
+                (user_id, self._hash_secret(current_code), now_iso,
                  (self._now() + timedelta(minutes=self.mfa_challenge_expires_minutes)).isoformat(), 'mfa')
             )
             challenge_id = cursor.lastrowid
@@ -488,15 +527,16 @@ class AuthSystem:
         session cookie, which the caller compares with the callback's state before calling oauth_callback).
 
         In: the provider name. Out: {state, expires_in: 600}. The state is 32 random bytes (URL-safe); only its
-        SHA-256 is stored, with the provider and an expiry 10 minutes ahead. Why: the auth spec's "Secrets at
+        HMAC-SHA256 is stored, with the provider and an expiry 10 minutes ahead. Why: the auth spec's "Secrets at
         rest" line (Phase B.2, 2026-11-10): OAuth state is single-use and expires in 10 minutes; nothing issued
-        or checked it. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite (oauth_states)."""
+        or checked it. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite (oauth_states).
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: each stored or compared secret is now HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256)."""
         state = secrets.token_urlsafe(32)
         now = self._now()
         cursor = self.db.cursor()
         cursor.execute("DELETE FROM oauth_states WHERE expires_at <= ?", (now.isoformat(),))
         cursor.execute("INSERT INTO oauth_states (state_hash, provider, created_at, expires_at) VALUES (?, ?, ?, ?)",
-                       (_sha256_hex(state), provider, now.isoformat(), (now + OAUTH_STATE_TTL).isoformat()))
+                       (self._hash_secret(state), provider, now.isoformat(), (now + OAUTH_STATE_TTL).isoformat()))
         self.db.commit()
         return {"state": state, "expires_in": int(OAUTH_STATE_TTL.total_seconds())}
 
@@ -505,10 +545,11 @@ class AuthSystem:
         minutes old and not used before; it is deleted either way, so it works once. The hash is compared in
         constant time, and only the call whose DELETE removes the row wins (two concurrent callbacks cannot both
         pass). In: provider, the state from the callback. Out: bool. Why: auth spec "Secrets at rest" (Phase B.2,
-        2026-11-10). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite (oauth_states)."""
+        2026-11-10). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite (oauth_states).
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: each stored or compared secret is now HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256)."""
         if not isinstance(state, str) or not state:
             return False
-        supplied = _sha256_hex(state)
+        supplied = self._hash_secret(state)
         cursor = self.db.cursor()
         row = cursor.execute("SELECT state_hash, provider, expires_at FROM oauth_states WHERE state_hash = ?",
                              (supplied,)).fetchone()
@@ -530,8 +571,9 @@ class AuthSystem:
         by provider id, else by email, is linked, or a verified user is created.
         [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2 (AUTH-16, "Secrets at rest"): state is now
         checked server-side and single-use, a failed exchange is refused, and the refresh_token is returned
-        (stored only as its SHA-256). Touches: SQLite (oauth_states, users, oauth_accounts, sessions, audit_log,
-        why_chain_log); network through the provider client."""
+        (stored only as its HMAC-SHA256). Touches: SQLite (oauth_states, users, oauth_accounts, sessions, audit_log,
+        why_chain_log); network through the provider client.
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: each stored or compared secret is now HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256)."""
         decision_points = []
         # state_valid: the caller also matches state to the visitor's session cookie. state passes through the
         # visitor's browser, so nothing inside it is ever trusted: the e-mail comes only from the provider.
@@ -624,11 +666,12 @@ class AuthSystem:
         """Flow 5: answer the MFA challenge login issued. Out: {status: "authenticated", session_id, token,
         refresh_token, user} or {error: "invalid_challenge" | "challenge_expired" | "invalid_code"}.
 
-        In: the challenge id and the code the user typed. The code's SHA-256 is compared in constant time with
+        In: the challenge id and the code the user typed. The code's HMAC-SHA256 is compared in constant time with
         the challenge's code_hash; wrong codes count and the challenge is deleted after mfa_max_attempts.
         [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2 (AUTH-16): the challenge stores only the code's
-        hash, and the new session's refresh_token is returned (stored only as its SHA-256).
-        Touches: SQLite (verification_codes, users, sessions, audit_log, why_chain_log)."""
+        hash, and the new session's refresh_token is returned (stored only as its HMAC-SHA256).
+        Touches: SQLite (verification_codes, users, sessions, audit_log, why_chain_log).
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: each stored or compared secret is now HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256)."""
         decision_points = []
         cursor = self.db.cursor()
         cursor.execute(
@@ -646,7 +689,7 @@ class AuthSystem:
             return {"error": "challenge_expired"}
         decision_points.append("challenge_valid")
         # Bytes, not str: compare_digest raises TypeError on non-ASCII text such as full-width digits (from review).
-        if not hmac.compare_digest(_sha256_hex(str(code)).encode("ascii"), str(stored_code).encode("utf-8")):
+        if not hmac.compare_digest(self._hash_secret(str(code)).encode("ascii"), str(stored_code).encode("utf-8")):
             # Each wrong code counts; after mfa_max_attempts the challenge is gone and the user signs in again, so a
             # six digit code cannot be guessed (2026-11-08, session f3daac6e, from review).
             cursor.execute("UPDATE verification_codes SET attempts = attempts + 1 WHERE id = ?", (challenge_id,))
@@ -685,13 +728,14 @@ class AuthSystem:
         """Flow 6: a new access token for a session's refresh token. Out: {status: "ok", token, expires_in} or
         {error: "invalid_token" | "token_expired" | "user_banned"}.
 
-        In: the refresh_token that login, mfa_challenge or oauth_callback returned. Its SHA-256 finds the session
+        In: the refresh_token that login, mfa_challenge or oauth_callback returned. Its HMAC-SHA256 finds the session
         and is compared with the stored refresh_token_hash in constant time.
         [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2 (AUTH-16): sessions keep only the hash; the
-        token was looked up in plain text. Touches: SQLite (sessions, users read; audit_log, why_chain_log)."""
+        token was looked up in plain text. Touches: SQLite (sessions, users read; audit_log, why_chain_log).
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: each stored or compared secret is now HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256)."""
         decision_points = []
         cursor = self.db.cursor()
-        supplied = _sha256_hex(refresh_token if isinstance(refresh_token, str) else "")
+        supplied = self._hash_secret(refresh_token if isinstance(refresh_token, str) else "")
         cursor.execute(
             """SELECT s.user_id, s.expires_at, u.status, u.tier, s.refresh_token_hash
                FROM sessions s

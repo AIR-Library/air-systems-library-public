@@ -11,6 +11,22 @@
 declare(strict_types=1);
 require_once 'auth_system_php.php';
 putenv('AUTH_JWT_SECRET=' . bin2hex(random_bytes(32)));
+// Fixed 32+ byte HMAC key for stored secrets (spec d270fa3: tests pass a fixed test key). 2026-11-10,
+// session_012zDydZCZ4AChqhEZ4oVtaP.
+const TEST_SECRET_KEY = 'test-secret-key-0123456789abcdef-auth';
+putenv('AUTH_SECRET_KEY=' . TEST_SECRET_KEY);
+/**
+ * The value the module stores for a secret: lowercase hex HMAC-SHA256(TEST_SECRET_KEY, $value).
+ * Input: the secret. Output: 64 hex characters. Why: spec d270fa3: keyed HMAC for stored secrets; the tests computed
+ * a plain SHA-256 here until 2026-11-10. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+ */
+function storedHash(string $value): string { return hash_hmac('sha256', $value, TEST_SECRET_KEY); }
+/**
+ * Plain, unkeyed SHA-256 hex of a secret, which the module must no longer store. Input: the secret. Output: 64 hex
+ * characters. Why: spec d270fa3: keyed HMAC for stored secrets (AUTH-16 asserts the stored value is not this).
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+ */
+function plainSha256(string $value): string { return hash('sha256', $value); }
 // In-memory database, captured e-mails and a fake OAuth provider; no network, no auth.db file (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
 Database::set(new PDO('sqlite::memory:'));
 $GLOBALS['sent_mail'] = [];
@@ -59,6 +75,7 @@ class TestRunner {
         $this->testRefreshTokensAndCodesStoredOnlyAsHashes();
         $this->testEveryFlowThatCreatesASessionReturnsARefreshToken();
         $this->testOauthStateIsSingleUseAndExpires();
+        $this->testServiceRefusesToStartWithoutSecretKey();
         echo "\nPassed: {$this->passed}, Failed: {$this->failed}\n";
         // A failed assertion must fail the run; it used to exit 0 whatever happened (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
         exit($this->failed > 0 ? 1 : 0);
@@ -114,10 +131,11 @@ class TestRunner {
         $this->assertEqual($row['status'],'unverified','signup creates an unverified user');
         // "email sent": exactly one e-mail, to the new address, carrying the stored code. The database keeps only
         // the code's hash since 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2), so the mailed code is checked
-        // against code_hash (the test read the plain code column).
+        // against code_hash (the test read the plain code column). Since spec d270fa3 (2026-11-10,
+        // session_012zDydZCZ4AChqhEZ4oVtaP) code_hash is the keyed HMAC, not a plain SHA-256.
         $this->assertEqual(count($GLOBALS['sent_mail']),1,'signup sends one e-mail');
         $this->assertEqual($GLOBALS['sent_mail'][0][0],'user@example.com','e-mail goes to the new address');
-        $this->assertEqual(hash('sha256', $this->mailedCode()),$row['code_hash'],'e-mail carries the verification code');
+        $this->assertEqual(storedHash($this->mailedCode()),$row['code_hash'],'e-mail carries the verification code');
     }
     // AUTH-02
     private function testSignupDuplicateEmail(): void {
@@ -375,6 +393,8 @@ class TestRunner {
         $this->assertEqual($res['body']['error'],'user_banned','token refresh banned error');
     }
     /**
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec d270fa3: keyed HMAC for stored secrets): each stored
+     * value must equal HMAC-SHA256(TEST_SECRET_KEY, value) and must not equal its plain SHA-256.
      * AUTH-16: login returns a refresh_token that token_refresh accepts; the sessions table holds only its SHA-256
      * (no column holds the token), and the e-mail verification code is stored only as its hash. A token made of the
      * stored hash is refused. Input: the in-memory database. Output: assertions.
@@ -390,8 +410,10 @@ class TestRunner {
         $this->assertEqual(strlen($code) >= 32, true, 'a verification code was mailed');
         $codes = json_encode($db->query('SELECT * FROM verification_codes')->fetchAll(PDO::FETCH_ASSOC));
         $this->assertEqual(str_contains($codes, $code), false, 'the code is not stored');
-        $this->assertEqual($db->query("SELECT code_hash FROM verification_codes WHERE type='email'")->fetchColumn(), hash('sha256', $code), 'code_hash = SHA-256 of the code');
-        $this->assertEqual(AuthSystem::verify_email('hash@example.com', hash('sha256', $code))['body']['error'] ?? null, 'code_invalid', 'the stored hash is not a usable code');
+        $this->assertEqual($db->query("SELECT code_hash FROM verification_codes WHERE type='email'")->fetchColumn(), storedHash($code), 'code_hash = HMAC-SHA256(test key, code)');
+        // spec d270fa3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): keyed, so not the code's plain SHA-256.
+        $this->assertEqual($db->query("SELECT code_hash FROM verification_codes WHERE type='email'")->fetchColumn() !== plainSha256($code), true, 'code_hash is not the plain SHA-256 of the code');
+        $this->assertEqual(AuthSystem::verify_email('hash@example.com', storedHash($code))['body']['error'] ?? null, 'code_invalid', 'the stored hash is not a usable code');
         $this->assertEqual(AuthSystem::verify_email('hash@example.com', $code)['status_code'], 200, 'the mailed code verifies');
 
         $login = AuthSystem::login('hash@example.com','StrongPassword123456','device1','127.0.0.1');
@@ -401,7 +423,8 @@ class TestRunner {
         $this->assertEqual(in_array('refresh_token', $columns, true), false, 'sessions has no refresh_token column');
         $sessions = $db->query('SELECT * FROM sessions')->fetchAll(PDO::FETCH_ASSOC);
         $this->assertEqual(str_contains(json_encode($sessions), $refresh), false, 'the token is not stored');
-        $this->assertEqual($sessions[0]['refresh_token_hash'], hash('sha256', $refresh), 'refresh_token_hash = SHA-256 of the token');
+        $this->assertEqual($sessions[0]['refresh_token_hash'], storedHash($refresh), 'refresh_token_hash = HMAC-SHA256(test key, token)');
+        $this->assertEqual($sessions[0]['refresh_token_hash'] !== plainSha256($refresh), true, 'refresh_token_hash is not the plain SHA-256 of the token');
         $res = AuthSystem::token_refresh($refresh);
         $this->assertEqual([$res['status_code'], $res['body']['status']], [200, 'ok'], 'token_refresh accepts the returned token');
         $this->assertEqual(AuthSystem::verify_access_token($res['body']['token'])['status_code'], 200, 'the new access token verifies');
@@ -409,7 +432,8 @@ class TestRunner {
     }
     /**
      * AUTH-16: every flow that creates a session (login, MFA challenge, OAuth callback) returns a refresh_token that
-     * token_refresh accepts, and each session row stores only its hash. Input: the in-memory database and the fake
+     * token_refresh accepts, and each session row stores only its hash (its keyed HMAC since spec d270fa3, 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP). Input: the in-memory database and the fake
      * provider. Output: assertions. Why: auth_system.md login amendment (Phase B.2). 2026-11-10,
      * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory database.
      */
@@ -428,7 +452,7 @@ class TestRunner {
         foreach (['mfa_challenge' => $mfa, 'oauth_callback' => $oauth] as $flow => $res) {
             $this->assertEqual($res['status_code'], 200, "$flow authenticated");
             $token = $res['body']['refresh_token'] ?? '';
-            $this->assertEqual((int)$db->query("SELECT COUNT(*) FROM sessions WHERE refresh_token_hash = '" . hash('sha256', $token) . "'")->fetchColumn(), 1, "$flow stored the token's hash");
+            $this->assertEqual((int)$db->query("SELECT COUNT(*) FROM sessions WHERE refresh_token_hash = '" . storedHash($token) . "'")->fetchColumn(), 1, "$flow stored the token's hash");
             $this->assertEqual(AuthSystem::token_refresh($token)['status_code'], 200, "$flow refresh_token accepted by token_refresh");
         }
         $this->assertEqual($mfa['body']['refresh_token'] !== $oauth['body']['refresh_token'], true, 'each session has its own token');
@@ -439,7 +463,8 @@ class TestRunner {
      * a made-up state is refused before the provider is asked; the provider's code is exchanged through the injected
      * client, never used as an identity. Input: the in-memory database, a settable clock and the fake provider.
      * Output: assertions. Why: AUTH-10/11 gate state_valid. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
-     * Touches: the in-memory database; the clock is restored afterwards.
+     * Touches: the in-memory database; the clock is restored afterwards. Changed 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP (spec d270fa3): the stored state is its HMAC-SHA256 under the test key.
      */
     // AUTH-10
     private function testOauthStateIsSingleUseAndExpires(): void {
@@ -461,7 +486,8 @@ class TestRunner {
             $start = AuthSystem::oauth_start('google');
             $state = $start['body']['state'];
             $this->assertEqual([$start['status_code'], $start['body']['expires_in'], strlen($state)], [200, 600, 64], 'oauth_start issues a 10-minute state');
-            $this->assertEqual($db->query('SELECT state_hash FROM oauth_states')->fetchColumn(), hash('sha256', $state), 'only the state hash is stored');
+            $this->assertEqual($db->query('SELECT state_hash FROM oauth_states')->fetchColumn(), storedHash($state), 'only the state hash is stored');
+            $this->assertEqual(storedHash($state) !== plainSha256($state), true, 'the stored state hash is keyed, not a plain SHA-256');
             $bad = AuthSystem::oauth_callback('google', 'code-s', 'made-up-state');
             $this->assertEqual([$bad['status_code'], $bad['body']['error']], [400, 'invalid_state'], 'a state oauth_start never issued is refused');
             $this->assertEqual(AuthSystem::oauth_callback('github', 'code-s', $state)['body']['error'] ?? null, 'invalid_state', 'a state is bound to its provider');
@@ -490,6 +516,30 @@ class TestRunner {
                 }
             );
         }
+    }
+    /**
+     * AUTH-16: the service refuses to start without a 32-byte key: configure() and secretHash() throw
+     * RuntimeException when AUTH_SECRET_KEY is unset, empty or 31 bytes, and work again with the test key.
+     * Input: the AUTH_SECRET_KEY environment variable. Output: assertions. Why: spec d270fa3: keyed HMAC for stored
+     * secrets ("the service refuses to start without it"). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches: the AUTH_SECRET_KEY environment variable (restored to the test key afterwards).
+     */
+    // AUTH-16
+    private function testServiceRefusesToStartWithoutSecretKey(): void {
+        try {
+            foreach (['unset' => false, 'empty' => '', '31 bytes' => str_repeat('k', 31)] as $label => $value) {
+                putenv($value === false ? 'AUTH_SECRET_KEY' : 'AUTH_SECRET_KEY=' . $value);
+                foreach (['configure' => fn() => AuthSystem::configure(), 'secretHash' => fn() => AuthSystem::secretHash('123456')] as $call => $fn) {
+                    $refused = false;
+                    try { $fn(); } catch (RuntimeException $e) { $refused = str_contains($e->getMessage(), 'AUTH_SECRET_KEY'); }
+                    $this->assertEqual($refused, true, "$call refuses with AUTH_SECRET_KEY $label");
+                }
+            }
+        } finally {
+            putenv('AUTH_SECRET_KEY=' . TEST_SECRET_KEY);
+        }
+        $this->assertEqual(AuthSystem::secretHash('123456'), storedHash('123456'), 'with a 32-byte key the stored hash is HMAC-SHA256(key, value)');
+        $this->assertEqual(AuthSystem::secretHash('123456') !== plainSha256('123456'), true, 'and not the plain SHA-256');
     }
 }
 $runner = new TestRunner();

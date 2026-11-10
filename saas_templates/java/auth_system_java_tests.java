@@ -16,8 +16,44 @@ public class AuthSystemTests {
     /** Last code the fake mailer was handed, by email (codes are only hashed in the database since AUTH-16, 2026-11-10). */
     static final Map<String, String> CODES = new java.util.concurrent.ConcurrentHashMap<>();
 
+    /** Fixed 32+ byte HMAC key for stored secrets (spec d270fa3: tests pass a fixed test key). 2026-11-10,
+     *  session_012zDydZCZ4AChqhEZ4oVtaP. */
+    static final String TEST_SECRET_KEY = "test-secret-key-0123456789abcdef-auth";
+
     static {
         System.setProperty("AUTH_JWT_SECRET", TEST_JWT_SECRET);
+        // spec d270fa3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): AuthSystem refuses to load without this key.
+        System.setProperty("AUTH_SECRET_KEY", TEST_SECRET_KEY);
+    }
+
+    /**
+     * The value the module stores for a secret: lowercase hex HMAC-SHA256(TEST_SECRET_KEY, value). In: the secret.
+     * Out: 64 hex characters. Why: spec d270fa3: keyed HMAC for stored secrets; the tests used the module's plain
+     * SHA-256 helper (AuthSystem.sha256Hex) until 2026-11-10. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches: nothing.
+     */
+    static String hmacHex(String value) {
+        try {
+            javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
+            mac.init(new javax.crypto.spec.SecretKeySpec(TEST_SECRET_KEY.getBytes(java.nio.charset.StandardCharsets.UTF_8), "HmacSHA256"));
+            return java.util.HexFormat.of().formatHex(mac.doFinal(value.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        } catch (java.security.GeneralSecurityException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    /**
+     * Plain, unkeyed SHA-256 hex of a secret, which the module must no longer store. In: the secret. Out: 64 hex
+     * characters. Why: spec d270fa3: keyed HMAC for stored secrets (AUTH-16 asserts the stored value is not this).
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+     */
+    static String plainSha256Hex(String value) {
+        try {
+            return java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(value.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        } catch (java.security.GeneralSecurityException e) {
+            throw new AssertionError(e);
+        }
     }
 
     /**
@@ -33,6 +69,12 @@ public class AuthSystemTests {
             byCode.put(code, new AuthSystem.OAuthIdentity(sub, email, verified));
             return this;
         }
+        /**
+         * Records the code and returns the identity registered for it, or null for an unknown code. In: the code.
+         * Out: the identity or null. @Override added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (code review on
+         * PR 21: it implements OAuthProvider.exchangeCode). Touches: memory only.
+         */
+        @Override
         public AuthSystem.OAuthIdentity exchangeCode(String code) {
             exchanged.add(code);
             return byCode.get(code);
@@ -401,6 +443,8 @@ public class AuthSystemTests {
     }
 
     /**
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec d270fa3: keyed HMAC for stored secrets): each stored
+     * value must equal HMAC-SHA256(TEST_SECRET_KEY, value) and must not equal its plain SHA-256.
      * AUTH-16: login returns a refresh_token that token_refresh accepts; sessions keep only its SHA-256; the email
      * verification code and the MFA challenge id are stored only as code_hash. Added 2026-11-10,
      * session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 spec amendment). Touches: H2 (reads sessions, verification_codes).
@@ -412,7 +456,11 @@ public class AuthSystemTests {
         String code = extractCodeFromEmail("hashes@example.com");
         assertNotNull(code);
         assertFalse(columns("verification_codes").contains("CODE"), "verification_codes must not have a plain code column");
-        assertEquals(AuthSystem.sha256Hex(code), queryString(
+        assertEquals(hmacHex(code), queryString(
+                "SELECT code_hash FROM verification_codes WHERE user_id = (SELECT id FROM users WHERE email = ?) AND type = 'email'",
+                "hashes@example.com"));
+        // spec d270fa3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): keyed, so not the code's plain SHA-256.
+        assertNotEquals(plainSha256Hex(code), queryString(
                 "SELECT code_hash FROM verification_codes WHERE user_id = (SELECT id FROM users WHERE email = ?) AND type = 'email'",
                 "hashes@example.com"));
         assertEquals("verified", AuthSystem.verifyEmail("hashes@example.com", code).get("status"));
@@ -423,7 +471,8 @@ public class AuthSystemTests {
         String sessionId = (String) loginRes.get("session_id");
         assertFalse(columns("sessions").contains("REFRESH_TOKEN"), "sessions must not have a plain refresh_token column");
         String stored = queryString("SELECT refresh_token_hash FROM sessions WHERE id = ?", sessionId);
-        assertEquals(AuthSystem.sha256Hex(refreshToken), stored);
+        assertEquals(hmacHex(refreshToken), stored);
+        assertNotEquals(plainSha256Hex(refreshToken), stored); // spec d270fa3, 2026-11-10
         assertNotEquals(refreshToken, stored);
         // The stored hash is not itself a usable refresh token.
         assertEquals("invalid_token", AuthSystem.tokenRefresh(stored).get("error"));
@@ -436,7 +485,7 @@ public class AuthSystemTests {
         AuthSystem.verifyEmail("hashes-mfa@example.com", extractCodeFromEmail("hashes-mfa@example.com"));
         enableMfa("hashes-mfa@example.com");
         String challengeId = (String) AuthSystem.login("hashes-mfa@example.com", "StrongPassword123456", "dev", "1.2.3.41").get("challenge_id");
-        assertEquals(AuthSystem.sha256Hex(challengeId), queryString(
+        assertEquals(hmacHex(challengeId), queryString(
                 "SELECT code_hash FROM verification_codes WHERE user_id = (SELECT id FROM users WHERE email = ?) AND type = 'mfa'",
                 "hashes-mfa@example.com"));
         Map<String, Object> mfa = AuthSystem.mfaChallenge(challengeId, generateTotpForUser("hashes-mfa@example.com"));
@@ -445,9 +494,51 @@ public class AuthSystemTests {
     }
 
     /**
+     * AUTH-16: the service refuses to start without a 32-byte key. Loading AuthSystem afresh (its own class loader,
+     * same class path) with AUTH_SECRET_KEY empty or 31 bytes fails in class initialisation with
+     * IllegalStateException, before the database is opened; secretKeyFrom refuses null, empty and 31-byte keys and
+     * accepts 32 bytes; the loaded service stores HMAC-SHA256(TEST_SECRET_KEY, value), not a plain SHA-256.
+     * In: the AUTH_SECRET_KEY system property (restored afterwards). Out: assertions. Why: spec d270fa3: keyed HMAC
+     * for stored secrets ("the service refuses to start without it"). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches: the AUTH_SECRET_KEY system property, a throwaway class loader.
+     */
+    // AUTH-16
+    @Test
+    public void testServiceRefusesToStartWithoutSecretKey() throws Exception {
+        assertThrows(IllegalStateException.class, () -> AuthSystem.secretKeyFrom(null));
+        assertThrows(IllegalStateException.class, () -> AuthSystem.secretKeyFrom(""));
+        assertThrows(IllegalStateException.class, () -> AuthSystem.secretKeyFrom("k".repeat(31)));
+        assertEquals(32, AuthSystem.secretKeyFrom("k".repeat(32)).length);
+
+        java.util.List<java.net.URL> urls = new java.util.ArrayList<>();
+        for (Class<?> c : new Class<?>[] { AuthSystem.class, JWT.class, org.mindrot.jbcrypt.BCrypt.class,
+                com.fasterxml.jackson.databind.ObjectMapper.class, com.fasterxml.jackson.core.type.TypeReference.class,
+                com.fasterxml.jackson.annotation.JsonProperty.class, Class.forName("org.h2.Driver") }) {
+            urls.add(c.getProtectionDomain().getCodeSource().getLocation());
+        }
+        try {
+            for (String bad : new String[] { "", "k".repeat(31) }) {
+                System.setProperty("AUTH_SECRET_KEY", bad);
+                try (java.net.URLClassLoader fresh = new java.net.URLClassLoader(
+                        urls.toArray(new java.net.URL[0]), ClassLoader.getPlatformClassLoader())) {
+                    ExceptionInInitializerError e = assertThrows(ExceptionInInitializerError.class,
+                            () -> Class.forName("AuthSystem", true, fresh));
+                    assertInstanceOf(IllegalStateException.class, e.getCause());
+                    assertTrue(e.getCause().getMessage().contains("AUTH_SECRET_KEY"), e.getCause().getMessage());
+                }
+            }
+        } finally {
+            System.setProperty("AUTH_SECRET_KEY", TEST_SECRET_KEY);
+        }
+        assertEquals(hmacHex("123456"), AuthSystem.secretHash("123456"));
+        assertNotEquals(plainSha256Hex("123456"), AuthSystem.secretHash("123456"));
+    }
+
+    /**
      * OAuth state: an unknown state, a reused state, a state older than 10 minutes and a state issued for another
      * provider are all refused with invalid_state, and the provider is never asked to exchange the code for them; the
-     * state is stored only as its SHA-256. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH spec "Secrets at
+     * state is stored only as its SHA-256 (its HMAC-SHA256 under the test key since spec d270fa3, 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP). Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH spec "Secrets at
      * rest" amendment; java SECURITY bug: the state was not validated). Touches: H2, the injected clock.
      */
     // AUTH-10
@@ -465,7 +556,9 @@ public class AuthSystemTests {
         assertEquals("invalid_state", AuthSystem.oauthCallback("statecheck", "c1", null).get("error"));
 
         String state = newState("statecheck");
-        assertEquals(AuthSystem.sha256Hex(state), queryString("SELECT state_hash FROM oauth_states WHERE state_hash = ?", AuthSystem.sha256Hex(state)));
+        assertEquals(hmacHex(state), queryString("SELECT state_hash FROM oauth_states WHERE state_hash = ?", hmacHex(state)));
+        // spec d270fa3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): the stored state hash is keyed, not a plain SHA-256.
+        assertEquals(0, countRows("SELECT COUNT(*) FROM oauth_states WHERE state_hash = ?", plainSha256Hex(state)));
         assertEquals(0, countRows("SELECT COUNT(*) FROM oauth_states WHERE state_hash = ?", state));
         assertEquals("authenticated", AuthSystem.oauthCallback("statecheck", "c1", state).get("status"));
         assertEquals("invalid_state", AuthSystem.oauthCallback("statecheck", "c2", state).get("error"), "a state is single-use");
@@ -512,7 +605,8 @@ public class AuthSystemTests {
 
     /**
      * Moves a code's expiry into the past. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16): matches the
-     * row by code_hash = SHA-256(code). Touches: H2.
+     * row by code_hash = SHA-256(code); since spec d270fa3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP) by
+     * code_hash = HMAC-SHA256(TEST_SECRET_KEY, code). Touches: H2.
      */
     private void expireCode(String code) {
         try {
@@ -520,7 +614,7 @@ public class AuthSystemTests {
             java.sql.PreparedStatement ps = conn.prepareStatement(
                     "UPDATE verification_codes SET expires_at = ? WHERE code_hash = ?");
             ps.setTimestamp(1, java.sql.Timestamp.from(java.time.Instant.now().minusSeconds(1)));
-            ps.setString(2, AuthSystem.sha256Hex(code));
+            ps.setString(2, hmacHex(code));
             assertEquals(1, ps.executeUpdate());
         } catch (java.sql.SQLException e) {
             throw new AssertionError(e);

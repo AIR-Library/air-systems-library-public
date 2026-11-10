@@ -1,6 +1,6 @@
 import speakeasy from 'speakeasy';
 import jwt from 'jsonwebtoken';
-import { createHash } from 'crypto';
+import { createHash, createHmac } from 'crypto';
 import AuthSystem, { OAuthIdentity } from './auth_system_typescript';
 
 /**
@@ -150,8 +150,25 @@ class FakeDb {
 const SECRET = 'test-secret';
 const STRONG = 'thisisaverygoodpassword123';
 
-/** SHA-256 hex, as the module stores secrets (AUTH-16). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+/** Fixed 32+ byte HMAC key for stored secrets (spec d270fa3: tests pass a fixed test key). 2026-11-10,
+ * session_012zDydZCZ4AChqhEZ4oVtaP. */
+const TEST_SECRET_KEY = 'test-secret-key-0123456789abcdef-auth';
+
+/**
+ * HMAC-SHA256(TEST_SECRET_KEY, value) as lowercase hex: the value the module stores for a secret (AUTH-16). In: the
+ * secret. Out: 64 hex characters. Why: spec d270fa3: keyed HMAC for stored secrets; this helper computed a plain
+ * SHA-256 until 2026-11-10 (changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). Touches nothing.
+ */
 function sha256(value: string): string {
+  return createHmac('sha256', TEST_SECRET_KEY).update(value, 'utf8').digest('hex');
+}
+
+/**
+ * Plain, unkeyed SHA-256 hex, which the module must no longer store. In: the secret. Out: 64 hex characters. Why:
+ * spec d270fa3: keyed HMAC for stored secrets (AUTH-16 asserts the stored value is not this). 2026-11-10,
+ * session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+ */
+function plainSha256(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
@@ -176,6 +193,8 @@ describe('AuthSystem', () => {
 
   // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): the service now takes an injected OAuth provider client
   // (a fake that answers from `identities`) and a clock (OAuth state expiry).
+  // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec d270fa3: keyed HMAC for stored secrets): and the fixed
+  // TEST_SECRET_KEY.
   beforeEach(() => {
     identities = {};
     exchanged = [];
@@ -196,7 +215,7 @@ describe('AuthSystem', () => {
       },
     };
     auth = new AuthSystem(db as any, sender as any, logger as any, {
-      jwtSecret: SECRET, bcryptSaltRounds: 4, oauthClient, now: () => clock,
+      jwtSecret: SECRET, secretKey: TEST_SECRET_KEY, bcryptSaltRounds: 4, oauthClient, now: () => clock,
     });
   });
 
@@ -408,6 +427,7 @@ describe('AuthSystem', () => {
       const start = await auth.oauth_start('google');
       expect(JSON.stringify(db.oauthStates)).not.toContain(start.state);
       expect(db.oauthStates[0].state_hash).toBe(sha256(start.state));
+      expect(db.oauthStates[0].state_hash).not.toBe(plainSha256(start.state)); // spec d270fa3, 2026-11-10: keyed
       expect(await auth.oauth_callback('github', 'code1', start.state)).toEqual(refused('invalid_state', 400));
       expect((await auth.oauth_callback('google', 'code1', start.state)).status).toBe('authenticated');
       expect(await auth.oauth_callback('google', 'code1', start.state)).toEqual(refused('invalid_state', 400));
@@ -518,6 +538,9 @@ describe('AuthSystem', () => {
    * the emailed verification code is stored only as its SHA-256 (no row holds the code) and still verifies.
    * In: the in-memory stand-in. Out: assertions only. Why: AUTH-16 and the spec's "Secrets at rest" line (Phase B.2,
    * 2026-11-10). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+   * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec d270fa3: keyed HMAC for stored secrets): stored values
+   * must equal HMAC-SHA256(TEST_SECRET_KEY, value) and not the plain SHA-256; and the service refuses to start
+   * without a 32-byte key.
    */
   describe('secrets at rest', () => {
     // AUTH-16
@@ -527,6 +550,7 @@ describe('AuthSystem', () => {
       expect(JSON.stringify(db.codes)).not.toContain(code);
       expect(db.codes).toHaveLength(1);
       expect(db.codes[0].code_hash).toBe(sha256(code));
+      expect(db.codes[0].code_hash).not.toBe(plainSha256(code)); // spec d270fa3 (2026-11-10): keyed, not plain SHA-256
       expect(db.codes[0]).not.toHaveProperty('code');
       expect(await auth.verify_email('hash@example.com', '000000' === code ? '111111' : '000000')).toEqual(refused('code_expired', 400));
       expect((await auth.verify_email('hash@example.com', code)).status).toBe('verified');
@@ -537,12 +561,39 @@ describe('AuthSystem', () => {
       expect(db.sessions).toHaveLength(1);
       expect(db.sessions[0]).toMatchObject({ id: session.session_id, refresh_token_hash: sha256(session.refresh_token) });
       expect(db.sessions[0]).not.toHaveProperty('refresh_token');
+      expect(db.sessions[0].refresh_token_hash).not.toBe(plainSha256(session.refresh_token)); // spec d270fa3
       expect(JSON.stringify(db.sessions)).not.toContain(session.refresh_token);
 
       const refreshed = await auth.token_refresh(session.refresh_token);
       expect(refreshed).toEqual({ status: 'ok', token: expect.any(String), expires_in: 900 });
       expect((jwt.verify(refreshed.token, SECRET) as { userId: number }).userId).toBe(db.users[0].id);
       expect(await auth.token_refresh(db.sessions[0].refresh_token_hash)).toEqual(refused('invalid_token', 401));
+    });
+
+    /**
+     * The service refuses to start without a 32-byte key: the constructor throws with no secretKey and no
+     * AUTH_SECRET_KEY, with an empty key and with a 31-byte key (option or environment); a 32-byte AUTH_SECRET_KEY is
+     * accepted. In: the in-memory stand-in, process.env. Out: assertions only. Why: spec d270fa3: keyed HMAC for
+     * stored secrets ("the service refuses to start without it"). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches: process.env (restored afterwards), memory only.
+     */
+    // AUTH-16
+    it('refuses to start without an AUTH_SECRET_KEY of at least 32 bytes', async () => {
+      const saved = process.env.AUTH_SECRET_KEY;
+      const make = (secretKey?: string) => new AuthSystem(new FakeDb() as any, {} as any, {} as any,
+        secretKey === undefined ? { jwtSecret: SECRET } : { jwtSecret: SECRET, secretKey });
+      try {
+        delete process.env.AUTH_SECRET_KEY;
+        expect(() => make()).toThrow(/AUTH_SECRET_KEY/);
+        expect(() => make('')).toThrow(/AUTH_SECRET_KEY/);
+        expect(() => make('k'.repeat(31))).toThrow(/AUTH_SECRET_KEY/);
+        process.env.AUTH_SECRET_KEY = 'k'.repeat(31);
+        expect(() => make()).toThrow(/AUTH_SECRET_KEY/);
+        process.env.AUTH_SECRET_KEY = TEST_SECRET_KEY;
+        expect(make()).toBeInstanceOf(AuthSystem);
+      } finally {
+        if (saved === undefined) delete process.env.AUTH_SECRET_KEY; else process.env.AUTH_SECRET_KEY = saved;
+      }
     });
   });
 });

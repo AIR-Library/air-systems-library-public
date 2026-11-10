@@ -5,6 +5,7 @@ import os
 import json
 from datetime import datetime, timedelta, timezone
 import hashlib
+import hmac
 import pyotp
 from auth_system_python import AuthSystem
 
@@ -14,8 +15,22 @@ from auth_system_python import AuthSystem
 # code_hash; OAuth tests get their state from oauth_start() and pass a fake provider client.
 
 
+# Fixed 32+ byte HMAC key the tests pass to the module (spec d270fa3: tests pass a fixed test key).
+# 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+TEST_SECRET_KEY = 'test-secret-key-0123456789abcdef-auth'
+
+
 def _sha(value):
-    """SHA-256 hex of a secret, as the module stores it. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP."""
+    """HMAC-SHA256(TEST_SECRET_KEY, value) as lowercase hex: the value the module stores for a secret. In: the
+    secret. Out: 64 hex chars. Why: spec d270fa3: keyed HMAC for stored secrets; this helper computed a plain
+    SHA-256 until 2026-11-10 (changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). Touches nothing."""
+    return hmac.new(TEST_SECRET_KEY.encode('utf-8'), value.encode('utf-8'), hashlib.sha256).hexdigest()
+
+
+def _plain_sha256(value):
+    """Plain, unkeyed SHA-256 hex of a secret, which the module must no longer store. In: the secret. Out: 64 hex
+    chars. Why: spec d270fa3: keyed HMAC for stored secrets (AUTH-16 asserts the stored value is not this).
+    2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing."""
     return hashlib.sha256(value.encode('utf-8')).hexdigest()
 
 
@@ -23,11 +38,12 @@ def _sha(value):
 def auth_system():
     """An AuthSystem on an in-memory database whose email sender records (email, code) in auth.sent_codes.
     Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2: codes are no longer readable from the
-    database). Touches: in-memory SQLite only."""
+    database). Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec d270fa3: keyed HMAC for stored secrets):
+    passes the fixed TEST_SECRET_KEY. Touches: in-memory SQLite only."""
     # Create an in-memory database
     db_connection = sqlite3.connect(':memory:')
     db_connection.row_factory = sqlite3.Row
-    auth = AuthSystem(db_connection, jwt_secret='test_secret', bcrypt_rounds=4)
+    auth = AuthSystem(db_connection, jwt_secret='test_secret', bcrypt_rounds=4, secret_key=TEST_SECRET_KEY)
     auth.sent_codes = []
     auth.email_sender = lambda email, code: auth.sent_codes.append((email, code))
     yield auth
@@ -470,7 +486,9 @@ def test_every_session_flow_returns_a_refresh_token_stored_only_as_its_hash(auth
     sessions table has refresh_token_hash (no refresh_token column) holding each token's SHA-256, and no table
     holds a refresh token or the emailed verification code in plain text (verification_codes keeps code_hash).
     In: the fixture, a fake OAuth client. Out: assertions. Why: AUTH-16 and the Phase B.2 python bug (login
-    returned no refresh token). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite only."""
+    returned no refresh token). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite only.
+    Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec d270fa3: keyed HMAC for stored secrets): every
+    stored value must equal HMAC-SHA256(TEST_SECRET_KEY, value) and must not equal its plain SHA-256."""
     auth_system.signup('sixteen@example.com', 'a' * 16, 'Sixteen', '127.0.0.1')
     code = _sent_code(auth_system, 'sixteen@example.com')
     cursor = auth_system.db.cursor()
@@ -478,6 +496,8 @@ def test_every_session_flow_returns_a_refresh_token_stored_only_as_its_hash(auth
     assert 'code_hash' in columns and 'code' not in columns
     stored = cursor.execute("SELECT code_hash FROM verification_codes WHERE type = 'email'").fetchone()['code_hash']
     assert stored == _sha(code)
+    # spec d270fa3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): keyed HMAC, not a plain SHA-256.
+    assert stored != _plain_sha256(code)
     assert code not in _all_rows_text(auth_system)
     auth_system.verify_email('sixteen@example.com', code)
 
@@ -492,7 +512,7 @@ def test_every_session_flow_returns_a_refresh_token_stored_only_as_its_hash(auth
     mfa_code = pyotp.TOTP(mfa_secret).now()
     challenge_hash = cursor.execute("SELECT code_hash FROM verification_codes WHERE id = ?",
                                     (challenge['challenge_id'],)).fetchone()['code_hash']
-    assert challenge_hash == _sha(mfa_code)
+    assert challenge_hash == _sha(mfa_code) and challenge_hash != _plain_sha256(mfa_code)  # spec d270fa3
     tokens.append(auth_system.mfa_challenge(challenge['challenge_id'], mfa_code)['refresh_token'])
 
     auth_system.oauth_profile = FakeOAuthClient({'c16': {'id': 'g-16', 'email': 'o16@example.com', 'email_verified': True}})
@@ -502,6 +522,7 @@ def test_every_session_flow_returns_a_refresh_token_stored_only_as_its_hash(auth
     assert 'refresh_token_hash' in columns and 'refresh_token' not in columns
     hashes = {row['refresh_token_hash'] for row in cursor.execute("SELECT refresh_token_hash FROM sessions")}
     assert hashes == {_sha(t) for t in tokens}
+    assert hashes.isdisjoint({_plain_sha256(t) for t in tokens})  # spec d270fa3, 2026-11-10
     text = _all_rows_text(auth_system)
     for token in tokens:
         assert isinstance(token, str) and len(token) >= 43
@@ -537,6 +558,7 @@ def test_oauth_state_single_use_expires_in_10_minutes_and_code_is_exchanged(auth
     assert issued['expires_in'] == 600
     cursor = auth_system.db.cursor()
     assert [r['state_hash'] for r in cursor.execute("SELECT state_hash FROM oauth_states")] == [_sha(issued['state'])]
+    assert _sha(issued['state']) != _plain_sha256(issued['state'])  # spec d270fa3, 2026-11-10: keyed, not plain
 
     assert auth_system.oauth_callback('google', 'good', 'never-issued') == {'error': 'invalid_state'}
     assert auth_system.oauth_callback('github', 'good', issued['state']) == {'error': 'invalid_state'}  # spent too
@@ -559,3 +581,25 @@ def test_oauth_state_single_use_expires_in_10_minutes_and_code_is_exchanged(auth
     fresh = auth_system.oauth_start('google')['state']
     now[0] = now[0] + timedelta(minutes=9, seconds=59)
     assert auth_system.oauth_callback('google', 'good', fresh)['user']['id'] == first['user']['id']
+
+
+# AUTH-16
+@pytest.mark.parametrize('key', [None, '', 'k' * 31, b'k' * 31])
+def test_service_refuses_to_start_without_a_32_byte_secret_key(monkeypatch, key):
+    """AuthSystem refuses to start (raises ValueError) when neither secret_key nor AUTH_SECRET_KEY gives a key,
+    or the key is shorter than 32 bytes; a 32-byte key from AUTH_SECRET_KEY is accepted and keys the stored HMAC.
+    In: pytest's monkeypatch, a missing or short key. Out: assertions. Why: spec d270fa3: keyed HMAC for stored
+    secrets ("the service refuses to start without it"). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    Touches: the process environment (patched), in-memory SQLite only."""
+    monkeypatch.delenv('AUTH_SECRET_KEY', raising=False)
+    db_connection = sqlite3.connect(':memory:')
+    with pytest.raises(ValueError):
+        AuthSystem(db_connection, jwt_secret='test_secret', bcrypt_rounds=4, secret_key=key)
+    if key is not None:
+        monkeypatch.setenv('AUTH_SECRET_KEY', key if isinstance(key, str) else key.decode())
+        with pytest.raises(ValueError):
+            AuthSystem(db_connection, jwt_secret='test_secret', bcrypt_rounds=4)
+    monkeypatch.setenv('AUTH_SECRET_KEY', TEST_SECRET_KEY)
+    from_env = AuthSystem(db_connection, jwt_secret='test_secret', bcrypt_rounds=4)
+    assert from_env._hash_secret('123456') == _sha('123456') != _plain_sha256('123456')
+    db_connection.close()

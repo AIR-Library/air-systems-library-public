@@ -2,6 +2,9 @@ package auth
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -11,6 +14,28 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/pquerna/otp/totp"
 )
+
+// testSecretKey is the fixed 32+ byte HMAC key every test instance gets (spec d270fa3: tests pass a fixed
+// test key). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+var testSecretKey = []byte("test-secret-key-0123456789abcdef-auth")
+
+// sha256Hex is the value the module stores for a secret: lowercase hex HMAC-SHA256(testSecretKey, s).
+// In: the secret. Out: 64 hex characters. Why: spec d270fa3: keyed HMAC for stored secrets; the tests used
+// the module's plain SHA-256 helper of this name until 2026-11-10 (changed 2026-11-10,
+// session_012zDydZCZ4AChqhEZ4oVtaP). Touches nothing.
+func sha256Hex(s string) string {
+	m := hmac.New(sha256.New, testSecretKey)
+	m.Write([]byte(s))
+	return hex.EncodeToString(m.Sum(nil))
+}
+
+// plainSHA256Hex is the plain, unkeyed SHA-256 hex of s, which the module must no longer store. In: the
+// secret. Out: 64 hex characters. Why: spec d270fa3: keyed HMAC for stored secrets (AUTH-16 asserts the
+// stored value is not this). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+func plainSHA256Hex(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:])
+}
 
 // fakeMailer records verification emails instead of sending them (no network in tests).
 // Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-01 "email sent").
@@ -58,9 +83,12 @@ func (a *AuthSystem) getLatestVerificationCode(ctx context.Context, userID int64
 // newTestAuth builds an AuthSystem with the fake mailer and OAuth provider.
 // Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: NewAuthSystem alone has no email sender, and
 // signup refuses rather than pretend to send. Touches: in-memory SQLite.
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec d270fa3: keyed HMAC for stored secrets):
+// passes the fixed testSecretKey.
 func newTestAuth(t *testing.T) (*AuthSystem, error) {
 	t.Helper()
 	return NewAuthSystemWithOptions(Options{
+		SecretKey: testSecretKey,
 		Email: &fakeMailer{sent: map[string]string{}},
 		OAuth: &fakeOAuth{ids: map[string]OAuthIdentity{
 			"code-new":      {ProviderUserID: "g-1", Email: "newuser@example.com", EmailVerified: true},
@@ -89,7 +117,7 @@ func TestSignupHappyPath(t *testing.T) {
 		t.Fatalf("user not created: %v", err)
 	}
 	// Corrected 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, AUTH-16): the code is stored only as
-	// its SHA-256, so the test checks the stored code_hash is the hash of the code that was emailed (it read
+	// its SHA-256 (its keyed HMAC since spec d270fa3, 2026-11-10), so the test checks the stored code_hash is the hash of the code that was emailed (it read
 	// a plain-text code column).
 	var storedHash string
 	if err := as.db.QueryRowContext(ctx, `SELECT code_hash FROM verification_codes WHERE user_id = ? AND type = 'email'`, userID).Scan(&storedHash); err != nil {
@@ -589,7 +617,8 @@ func TestTokenRefreshBannedUser(t *testing.T) {
 	rt, _ := generateRandomString(32)
 	now := time.Now().UTC()
 	// Corrected 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, AUTH-16): the column is now
-	// refresh_token_hash and holds the token's SHA-256.
+	// refresh_token_hash and holds the token's SHA-256. Since spec d270fa3 (2026-11-10,
+	// session_012zDydZCZ4AChqhEZ4oVtaP) that is the keyed HMAC-SHA256 under testSecretKey (sha256Hex below).
 	_, err = as.db.ExecContext(ctx,
 		`INSERT INTO sessions (id, user_id, refresh_token_hash, created_at, expires_at, ip, device_id)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -754,7 +783,8 @@ func createTokenWithSecret(userID int64, tier, secret string) string {
 // session_012zDydZCZ4AChqhEZ4oVtaP). Touches: in-memory SQLite.
 func TestMFAChallengeBoundToItsUser(t *testing.T) {
 	fixed := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC) // a fixed clock: the two codes below differ at it
-	as, err := NewAuthSystemWithOptions(Options{Email: &fakeMailer{sent: map[string]string{}}, Now: func() time.Time { return fixed }})
+	// spec d270fa3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): the fixed test HMAC key.
+	as, err := NewAuthSystemWithOptions(Options{SecretKey: testSecretKey, Email: &fakeMailer{sent: map[string]string{}}, Now: func() time.Time { return fixed }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -820,11 +850,13 @@ func TestLoginFailureLimitEnforced(t *testing.T) {
 // are stored only as their hashes; the MFA and OAuth flows return a refresh_token TokenRefresh accepts too.
 // Input: none; output: test failures. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2).
 // Touches: in-memory SQLite, the fake mailer and OAuth provider.
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec d270fa3: keyed HMAC for stored secrets): each
+// stored value must equal HMAC-SHA256(testSecretKey, value) and must not equal its plain SHA-256.
 // AUTH-16
 func TestRefreshTokenAndSecretsAtRest(t *testing.T) {
 	fixed := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
 	mailer := &fakeMailer{sent: map[string]string{}}
-	as, err := NewAuthSystemWithOptions(Options{Email: mailer, Now: func() time.Time { return fixed },
+	as, err := NewAuthSystemWithOptions(Options{SecretKey: testSecretKey, Email: mailer, Now: func() time.Time { return fixed },
 		OAuth: &fakeOAuth{ids: map[string]OAuthIdentity{"code-rt": {ProviderUserID: "g-rt", Email: "rt@example.com", EmailVerified: true}}}})
 	if err != nil {
 		t.Fatal(err)
@@ -839,7 +871,11 @@ func TestRefreshTokenAndSecretsAtRest(t *testing.T) {
 		t.Fatal(err)
 	}
 	if codeHash != sha256Hex(sent) || strings.Contains(dumpTable(t, as, "verification_codes"), sent) {
-		t.Fatalf("the email code must be stored only as its SHA-256")
+		t.Fatalf("the email code must be stored only as its HMAC-SHA256 under the test key")
+	}
+	// spec d270fa3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): keyed, so not the plain SHA-256.
+	if codeHash == plainSHA256Hex(sent) {
+		t.Fatalf("the email code must not be stored as its plain SHA-256")
 	}
 	if r := as.VerifyEmail(ctx, "quinn@example.com", codeHash); r["error"] != "code_invalid" {
 		t.Fatalf("the stored hash must not verify the email: %v", r)
@@ -861,7 +897,10 @@ func TestRefreshTokenAndSecretsAtRest(t *testing.T) {
 		t.Fatalf("dumpTable must show the stored values as text, or the checks below prove nothing")
 	}
 	if stored != sha256Hex(rt) || strings.Contains(dumpTable(t, as, "sessions"), rt) {
-		t.Fatalf("sessions must hold only the refresh token's SHA-256")
+		t.Fatalf("sessions must hold only the refresh token's HMAC-SHA256 under the test key")
+	}
+	if stored == plainSHA256Hex(rt) { // spec d270fa3, 2026-11-10
+		t.Fatalf("sessions must not hold the refresh token's plain SHA-256")
 	}
 	if r := as.TokenRefresh(ctx, rt); r["status"] != "ok" || r["token"] == "" {
 		t.Fatalf("TokenRefresh must accept login's refresh_token: %v", r)
@@ -892,6 +931,10 @@ func TestRefreshTokenAndSecretsAtRest(t *testing.T) {
 	}
 	if strings.Contains(dumpTable(t, as, "oauth_states"), state) {
 		t.Fatalf("the OAuth state must be stored only as its hash")
+	}
+	// spec d270fa3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): the state's keyed HMAC is stored, not its plain SHA-256.
+	if states := dumpTable(t, as, "oauth_states"); !strings.Contains(states, sha256Hex(state)) || strings.Contains(states, plainSHA256Hex(state)) {
+		t.Fatalf("the OAuth state must be stored as its HMAC-SHA256 under the test key")
 	}
 	oa := as.OAuthCallback(ctx, "google", "code-rt", state)
 	if ort, _ := oa["refresh_token"].(string); oa["status"] != "authenticated" || as.TokenRefresh(ctx, ort)["status"] != "ok" {
@@ -940,4 +983,34 @@ func dumpTable(t *testing.T, as *AuthSystem, table string) string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// TestServiceRefusesToStartWithoutSecretKey proves the service refuses to start without a 32-byte HMAC
+// key: NewAuthSystemWithOptions and NewAuthSystem return an error when neither Options.SecretKey nor
+// AUTH_SECRET_KEY is set, or the key is 31 bytes; a 32-byte AUTH_SECRET_KEY starts it, and secrets are
+// stored as HMAC-SHA256 under that key, not as a plain SHA-256. Input: none; output: test failures.
+// Why: spec d270fa3: keyed HMAC for stored secrets ("the service refuses to start without it").
+// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the AUTH_SECRET_KEY environment variable (t.Setenv
+// restores it), in-memory SQLite.
+// AUTH-16
+func TestServiceRefusesToStartWithoutSecretKey(t *testing.T) {
+	t.Setenv("AUTH_SECRET_KEY", "")
+	if as, err := NewAuthSystem(); err == nil || as != nil || !strings.Contains(err.Error(), "AUTH_SECRET_KEY") {
+		t.Fatalf("NewAuthSystem without a key must refuse to start: %v", err)
+	}
+	if _, err := NewAuthSystemWithOptions(Options{SecretKey: []byte(strings.Repeat("k", 31))}); err == nil {
+		t.Fatalf("a 31-byte Options.SecretKey must refuse to start")
+	}
+	t.Setenv("AUTH_SECRET_KEY", strings.Repeat("k", 31))
+	if _, err := NewAuthSystem(); err == nil {
+		t.Fatalf("a 31-byte AUTH_SECRET_KEY must refuse to start")
+	}
+	t.Setenv("AUTH_SECRET_KEY", string(testSecretKey))
+	as, err := NewAuthSystem()
+	if err != nil {
+		t.Fatalf("a 32-byte AUTH_SECRET_KEY must start the service: %v", err)
+	}
+	if got := as.hashSecret("123456"); got != sha256Hex("123456") || got == plainSHA256Hex("123456") {
+		t.Fatalf("stored hash must be HMAC-SHA256(AUTH_SECRET_KEY, value), got %s", got)
+	}
 }

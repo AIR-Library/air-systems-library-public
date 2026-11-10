@@ -1,5 +1,10 @@
+// Fixed 32+ byte HMAC key for stored secrets (spec d270fa3: tests pass a fixed test key). The module reads
+// AUTH_SECRET_KEY when it loads, so it is set before the require below. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+const TEST_SECRET_KEY = 'test-secret-key-0123456789abcdef-auth';
+process.env.AUTH_SECRET_KEY = TEST_SECRET_KEY;
+const crypto = require('crypto');
 const { initDB, configure, signup, verify_email, login, oauth_start, oauth_callback, mfa_challenge, token_refresh, dbPromise,
-  resetRateLimits, sentEmails, sha256 } = require('./auth_system_javascript');
+  resetRateLimits, sentEmails } = require('./auth_system_javascript');
 const { expect } = require('@jest/globals');
 const speakeasy = require('speakeasy');
 
@@ -13,6 +18,24 @@ const fakeGoogle = {
     return oauthIdentities.get(code);
   },
 };
+/**
+ * The value the module stores for a secret: lowercase hex HMAC-SHA256(TEST_SECRET_KEY, value). In: a string. Out: 64
+ * hex characters. Why: spec d270fa3: keyed HMAC for stored secrets; the tests used the module's plain SHA-256 helper
+ * before 2026-11-10. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+ */
+function sha256(value) {
+  return crypto.createHmac('sha256', TEST_SECRET_KEY).update(String(value), 'utf8').digest('hex');
+}
+
+/**
+ * Plain, unkeyed SHA-256 hex of a secret, which the module must no longer store. In: a string. Out: 64 hex chars.
+ * Why: spec d270fa3: keyed HMAC for stored secrets (AUTH-16 asserts the stored value is not this). 2026-11-10,
+ * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+ */
+function plainSha256(value) {
+  return crypto.createHash('sha256').update(String(value), 'utf8').digest('hex');
+}
+
 let clock = null; // null: the real clock; a number: a fixed time the test moves
 
 beforeAll(async () => {
@@ -248,6 +271,8 @@ describe('Auth System Tests', () => {
   });
 
   /**
+   * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec d270fa3: keyed HMAC for stored secrets): stored values
+   * must equal HMAC-SHA256(TEST_SECRET_KEY, value) and not the plain SHA-256.
    * AUTH-16: login returns a refresh_token that token_refresh accepts; the sessions table holds only its SHA-256 (no
    * column holds the token); a verification code is stored only as its hash (no column holds the e-mailed code); a
    * wrong or altered refresh token is 401 invalid_token. In: the module with the test clock. Out: assertions.
@@ -262,6 +287,7 @@ describe('Auth System Tests', () => {
     const user = await db.get(`SELECT id FROM users WHERE email = ?`, email);
     const codeRow = await db.get(`SELECT * FROM verification_codes WHERE user_id = ? AND type = 'email'`, user.id);
     expect(codeRow.code_hash).toBe(sha256(code));
+    expect(codeRow.code_hash).not.toBe(plainSha256(code)); // spec d270fa3 (2026-11-10): keyed, not plain SHA-256
     expect(Object.values(codeRow)).not.toContain(code);
     const codeColumns = (await db.all(`PRAGMA table_info(verification_codes)`)).map(c => c.name);
     expect(codeColumns).toContain('code_hash');
@@ -272,6 +298,7 @@ describe('Auth System Tests', () => {
     expect(res.refresh_token).toMatch(/^[0-9a-f-]{36}\.[0-9a-f]{64}$/);
     const row = await db.get(`SELECT * FROM sessions WHERE id = ?`, res.session_id);
     expect(row.refresh_token_hash).toBe(sha256(res.refresh_token));
+    expect(row.refresh_token_hash).not.toBe(plainSha256(res.refresh_token)); // spec d270fa3 (2026-11-10)
     expect(JSON.stringify(row)).not.toContain(res.refresh_token.split('.')[1]);
     const sessionColumns = (await db.all(`PRAGMA table_info(sessions)`)).map(c => c.name);
     expect(sessionColumns).toContain('refresh_token_hash');
@@ -288,6 +315,8 @@ describe('Auth System Tests', () => {
   });
 
   /**
+   * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec d270fa3): the stored state is its HMAC-SHA256 under
+   * TEST_SECRET_KEY, not its plain SHA-256.
    * AUTH-16 / auth spec "Secrets at rest" for OAuth: the state is stored only as its SHA-256; it works once (a reused
    * state is 400 invalid_state), expires after 10 minutes, and a made-up state is refused; the callback exchanges the
    * code through the provider client, so the code is never an identity (a code that is an e-mail address logs nobody
@@ -303,6 +332,7 @@ describe('Auth System Tests', () => {
     expect(expires_in).toBe(600);
     const stored = await db.get(`SELECT * FROM oauth_states WHERE state_hash = ?`, sha256(state));
     expect(stored).toBeDefined();
+    expect(sha256(state)).not.toBe(plainSha256(state)); // spec d270fa3 (2026-11-10): the state's keyed HMAC is stored
     expect(JSON.stringify(stored)).not.toContain(state);
 
     const ok = await oauth_callback('google', 'code-ok', state, ip, device);
@@ -329,6 +359,33 @@ describe('Auth System Tests', () => {
     expect(unverified).toMatchObject({ error: 'email_not_verified', status: 403 });
     expect(await db.get(`SELECT id FROM users WHERE email = 'unverified@example.com'`)).toBeUndefined();
     expect(await oauth_start('nope')).toMatchObject({ error: 'unknown_provider', status: 400 });
+  });
+
+  /**
+   * AUTH-16: the service refuses to start without a 32-byte AUTH_SECRET_KEY: loading the module throws when the
+   * variable is unset, empty or 31 bytes, and loads with a 32-byte key. In: process.env, a fresh module registry.
+   * Out: assertions. Why: spec d270fa3: keyed HMAC for stored secrets ("the service refuses to start without it").
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: process.env (restored afterwards); opens one extra
+   * in-memory SQLite handle for the 32-byte load.
+   */
+  // AUTH-16
+  test('the module refuses to start without an AUTH_SECRET_KEY of at least 32 bytes', () => {
+    const saved = process.env.AUTH_SECRET_KEY;
+    try {
+      for (const bad of [undefined, '', 'k'.repeat(31)]) {
+        if (bad === undefined) delete process.env.AUTH_SECRET_KEY; else process.env.AUTH_SECRET_KEY = bad;
+        jest.isolateModules(() => {
+          expect(() => require('./auth_system_javascript')).toThrow(/AUTH_SECRET_KEY/);
+        });
+      }
+      process.env.AUTH_SECRET_KEY = 'k'.repeat(32);
+      jest.isolateModules(() => {
+        expect(require('./auth_system_javascript').hashSecret('123456'))
+          .toBe(crypto.createHmac('sha256', 'k'.repeat(32)).update('123456').digest('hex'));
+      });
+    } finally {
+      process.env.AUTH_SECRET_KEY = saved;
+    }
   });
 });
 
