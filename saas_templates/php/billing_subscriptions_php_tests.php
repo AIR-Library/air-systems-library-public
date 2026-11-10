@@ -1,20 +1,32 @@
 <?php
 declare(strict_types=1);
 
+use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
-use Stripe\StripeClient;
-use Stripe\Webhook;
-use Stripe\Exception\SignatureVerificationException;
 
-require_once __DIR__ . '/vendor/autoload.php';
+// The composer autoloader (phpunit, stripe-php) is loaded by the runner's bootstrap, as in every
+// other PHP suite; a vendor/ folder next to this file does not exist (the cause of the failure).
 require_once __DIR__ . '/billing_subscriptions_php.php';
 
+/**
+ * Billing & Subscriptions tests (spec template #4, ten required tests).
+ *
+ * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. The setup could not run:
+ * $this->createMock() inside the static setUpBeforeClass, self::$pdo never assigned, and the
+ * Stripe client's magic `subscriptions` property cannot be mocked (Stripe\Subscriptions does not
+ * exist). Stripe is now the StripeGateway interface, mocked with the same once()/with()
+ * expectations; each test gets a fresh in-memory database (the tests insert the same ids, which
+ * collided in one shared database); webhooks carry a real Stripe signature made with the test
+ * secret (the old "dummy signature" called Webhook::constructEvent, which throws on it).
+ * Touches: an in-memory SQLite database only; no network.
+ */
 class BillingSystemTest extends TestCase
 {
     private static PDO $pdo;
-    private static StripeClient $stripeMock;
+    /** @var StripeGateway&MockObject */
+    private StripeGateway $stripeMock;
 
-    public static function setUpBeforeClass(): void
+    protected function setUp(): void
     {
         putenv('STRIPE_SECRET_KEY=test_secret');
         putenv('STRIPE_WEBHOOK_SECRET=test_webhook_secret');
@@ -22,12 +34,22 @@ class BillingSystemTest extends TestCase
         putenv('DB_USER=');
         putenv('DB_PASS=');
 
-        // Initialize BillingSystem (creates in-memory DB)
+        // Initialize BillingSystem (creates a fresh in-memory DB)
         BillingSystem::init();
+        self::$pdo = BillingSystem::pdo();
 
-        // Replace Stripe client with mock
-        self::$stripeMock = $this->createMock(StripeClient::class);
-        BillingSystem::$stripe = self::$stripeMock;
+        // Replace Stripe with a mock of the gateway interface
+        $this->stripeMock = $this->createMock(StripeGateway::class);
+        BillingSystem::$stripe = $this->stripeMock;
+    }
+
+    /**
+     * A valid Stripe-Signature header for $payload (t=..., v1=HMAC-SHA256 of "t.payload").
+     */
+    private function sign(string $payload, string $secret = 'test_webhook_secret'): string
+    {
+        $t = time();
+        return 't=' . $t . ',v1=' . hash_hmac('sha256', $t . '.' . $payload, $secret);
     }
 
     public function testCreateSubscriptionHappyPath()
@@ -40,10 +62,7 @@ class BillingSystemTest extends TestCase
         $stripeSub->current_period_end = time() + 30 * 24 * 60 * 60;
 
         $this->stripeMock->expects($this->once())
-            ->method('subscriptions')
-            ->willReturn($this->createMock(Stripe\Subscriptions::class));
-        $this->stripeMock->subscriptions->expects($this->once())
-            ->method('create')
+            ->method('createSubscription')
             ->with([
                 'customer' => $customerId,
                 'items' => [['price' => BillingSystem::PRICE_IDS[$tier]]],
@@ -66,6 +85,7 @@ class BillingSystemTest extends TestCase
 
     public function testCreateSubscriptionInvalidTier()
     {
+        $this->stripeMock->expects($this->never())->method('createSubscription');
         $result = BillingSystem::createSubscription('cus_test', 'invalid');
         $this->assertArrayHasKey('error', $result);
         $this->assertEquals('invalid_tier', $result['error']);
@@ -93,16 +113,15 @@ class BillingSystemTest extends TestCase
         $stripeSub->proration_details = [];
 
         $this->stripeMock->expects($this->once())
-            ->method('subscriptions')
-            ->willReturn($this->createMock(Stripe\Subscriptions::class));
-        $this->stripeMock->subscriptions->expects($this->once())
-            ->method('update')
+            ->method('updateSubscription')
             ->with('sub_test', ['items' => [['price' => BillingSystem::PRICE_IDS[$newTier]]]])
             ->willReturn($stripeSub);
 
         $result = BillingSystem::changePlan('sub_test', $newTier);
         $this->assertTrue($result['success']);
         $this->assertEquals('team', $result['new_tier']);
+        $this->assertEquals('solo', $result['old_tier']);
+        $this->assertSame(0, $result['proration_credit']);
 
         // Verify DB update
         $stmt = self::$pdo->prepare('SELECT tier FROM subscriptions WHERE stripe_subscription_id = :id');
@@ -153,6 +172,11 @@ class BillingSystemTest extends TestCase
         $result = BillingSystem::queueRefund('inv_test', 1500, 'overcharge', 'admin');
         $this->assertArrayHasKey('error', $result);
         $this->assertEquals('refund_exceeds_invoice', $result['error']);
+
+        // Partial refunds add up: 600 fits, a second 600 would exceed the 1000 invoice
+        $this->assertTrue(BillingSystem::queueRefund('inv_test', 600, 'partial', 'admin')['success']);
+        $result = BillingSystem::queueRefund('inv_test', 600, 'partial again', 'admin');
+        $this->assertEquals('refund_exceeds_invoice', $result['error']);
     }
 
     public function testHandleWebhookPaymentSucceeded()
@@ -170,7 +194,7 @@ class BillingSystemTest extends TestCase
             ],
         ]);
 
-        $sigHeader = Webhook::constructEvent($payload, 'sig', 'test_webhook_secret')->id; // dummy signature
+        $sigHeader = $this->sign($payload); // was a "dummy signature" that constructEvent rejects
 
         $result = BillingSystem::handleStripeWebhook($payload, ['Stripe-Signature' => $sigHeader]);
         $this->assertTrue($result['received']);
@@ -198,7 +222,7 @@ class BillingSystemTest extends TestCase
             ],
         ]);
 
-        $sigHeader = Webhook::constructEvent($payload, 'sig', 'test_webhook_secret')->id; // dummy signature
+        $sigHeader = $this->sign($payload); // was a "dummy signature" that constructEvent rejects
 
         // First call
         $result1 = BillingSystem::handleStripeWebhook($payload, ['Stripe-Signature' => $sigHeader]);
@@ -213,6 +237,10 @@ class BillingSystemTest extends TestCase
         $stmt->execute([':id' => 'inv_dup']);
         $row = $stmt->fetch();
         $this->assertEquals(1, $row['cnt']);
+
+        // ...and the event's effects (its audit entry) happened once
+        $cnt = self::$pdo->query("SELECT COUNT(*) FROM audit_logs WHERE action = 'payment_succeeded'")->fetchColumn();
+        $this->assertEquals(1, $cnt);
     }
 
     public function testHandleWebhookSubscriptionUpdated()
@@ -254,7 +282,7 @@ class BillingSystemTest extends TestCase
             ],
         ]);
 
-        $sigHeader = Webhook::constructEvent($payload, 'sig', 'test_webhook_secret')->id; // dummy signature
+        $sigHeader = $this->sign($payload); // was a "dummy signature" that constructEvent rejects
 
         $result = BillingSystem::handleStripeWebhook($payload, ['Stripe-Signature' => $sigHeader]);
         $this->assertTrue($result['received']);
@@ -272,6 +300,12 @@ class BillingSystemTest extends TestCase
         $result = BillingSystem::handleStripeWebhook($payload, ['Stripe-Signature' => 'invalid_sig']);
         $this->assertArrayHasKey('error', $result);
         $this->assertEquals('invalid_signature', $result['error']);
+
+        // A well-formed signature made with the wrong secret is rejected too
+        $result = BillingSystem::handleStripeWebhook($payload, ['Stripe-Signature' => $this->sign($payload, 'wrong_secret')]);
+        $this->assertEquals('invalid_signature', $result['error']);
+        $cnt = self::$pdo->query('SELECT COUNT(*) FROM events')->fetchColumn();
+        $this->assertEquals(0, $cnt);
     }
 
     public function testWebhookResponseTime()
@@ -289,7 +323,7 @@ class BillingSystemTest extends TestCase
             ],
         ]);
 
-        $sigHeader = Webhook::constructEvent($payload, 'sig', 'test_webhook_secret')->id; // dummy signature
+        $sigHeader = $this->sign($payload); // was a "dummy signature" that constructEvent rejects
 
         $start = microtime(true);
         $result = BillingSystem::handleStripeWebhook($payload, ['Stripe-Signature' => $sigHeader]);
@@ -299,4 +333,3 @@ class BillingSystemTest extends TestCase
         $this->assertLessThan(3, $duration);
     }
 }
-?>
