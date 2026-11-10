@@ -50,6 +50,7 @@ class TestQuotaEngineBase(unittest.TestCase):
 
 class TestApiCallQuota(TestQuotaEngineBase):
 
+    # QUOTA-01
     def test_api_quota_pass_call_succeeds_usage_incremented(self) -> None:
         """✓ api_quota PASS → call succeeds, usage incremented"""
         user = User(user_id="u1", tier="solo", ip="10.0.0.1")
@@ -64,6 +65,7 @@ class TestApiCallQuota(TestQuotaEngineBase):
         usage = self.engine.get_usage("u1")
         self.assertEqual(usage["call_count"], 1)
 
+    # QUOTA-02
     def test_api_quota_fail_call_rejected_429(self) -> None:
         """✓ api_quota FAIL → call rejected 429"""
         user = User(user_id="u2", tier="solo", ip="10.0.0.2")
@@ -116,6 +118,7 @@ class TestApiCallQuota(TestQuotaEngineBase):
         self.assertFalse(decision2.allowed)
         self.assertEqual(decision2.status_code, 429)
 
+    # QUOTA-13
     def test_api_quota_enterprise_unlimited(self) -> None:
         """Enterprise tier has unlimited API calls."""
         user = User(user_id="u4", tier="enterprise", ip="10.0.0.4")
@@ -142,6 +145,7 @@ class TestApiCallQuota(TestQuotaEngineBase):
 
 class TestStorageQuota(TestQuotaEngineBase):
 
+    # QUOTA-03
     def test_storage_quota_pass_file_stored(self) -> None:
         """✓ storage_quota PASS → file stored"""
         user = User(user_id="s1", tier="solo", ip="10.0.0.10")
@@ -157,6 +161,7 @@ class TestStorageQuota(TestQuotaEngineBase):
         usage = self.engine.get_usage("s1")
         self.assertEqual(usage["storage_bytes"], file_size)
 
+    # QUOTA-04
     def test_storage_quota_fail_upload_rejected_413(self) -> None:
         """✓ storage_quota FAIL → upload rejected 413"""
         user = User(user_id="s2", tier="solo", ip="10.0.0.11")
@@ -203,6 +208,7 @@ class TestStorageQuota(TestQuotaEngineBase):
         decision = self.engine.check_request(user, endpoint="/v1/upload", incoming_file_size=file_size)
         self.assertTrue(decision.allowed)
 
+    # QUOTA-13
     def test_storage_quota_enterprise_unlimited(self) -> None:
         """Enterprise tier has unlimited storage."""
         user = User(user_id="s4", tier="enterprise", ip="10.0.0.13")
@@ -231,6 +237,7 @@ class TestStorageQuota(TestQuotaEngineBase):
 
 class TestRateLimitPerUser(TestQuotaEngineBase):
 
+    # QUOTA-05
     def test_rate_limit_per_user_pass_under_100_per_min(self) -> None:
         """✓ rate_limit_per_user PASS → < 100/min allowed"""
         user = User(user_id="r1", tier="solo", ip="10.0.0.20")
@@ -245,6 +252,7 @@ class TestRateLimitPerUser(TestQuotaEngineBase):
         decision = self.engine.check_request(user, endpoint="/v1/data/50")
         self.assertTrue(decision.allowed)
 
+    # QUOTA-06
     def test_rate_limit_per_user_fail_100_plus_per_min(self) -> None:
         """✓ rate_limit_per_user FAIL → 100+/min rejected 429"""
         user = User(user_id="r2", tier="solo", ip="10.0.0.21")
@@ -277,6 +285,7 @@ class TestRateLimitPerUser(TestQuotaEngineBase):
 
 class TestRateLimitPerIp(TestQuotaEngineBase):
 
+    # QUOTA-07
     def test_rate_limit_per_ip_pass_under_10_per_sec(self) -> None:
         """✓ rate_limit_per_ip PASS → < 10/sec allowed"""
         user = User(user_id="ip1", tier="solo", ip="10.0.0.40")
@@ -289,6 +298,7 @@ class TestRateLimitPerIp(TestQuotaEngineBase):
         decision = self.engine.check_request(user, endpoint="/v1/data/5")
         self.assertTrue(decision.allowed)
 
+    # QUOTA-08
     def test_rate_limit_per_ip_fail_10_plus_per_sec(self) -> None:
         """✓ rate_limit_per_ip FAIL → 10+/sec rejected 429"""
         user = User(user_id="ip2", tier="solo", ip="10.0.0.41")
@@ -328,6 +338,7 @@ class TestRateLimitPerIp(TestQuotaEngineBase):
 
 class TestFeatureGateByTier(TestQuotaEngineBase):
 
+    # QUOTA-09
     def test_feature_gate_pass_feature_available_in_tier(self) -> None:
         """✓ feature_gate PASS → feature available in tier"""
         # feature_c is available to all tiers
@@ -347,6 +358,7 @@ class TestFeatureGateByTier(TestQuotaEngineBase):
         decision = self.engine.check_request(user, endpoint="/v1/feature_b", feature="feature_b")
         self.assertTrue(decision.allowed)
 
+    # QUOTA-10
     def test_feature_gate_fail_feature_unavailable_403(self) -> None:
         """✓ feature_gate FAIL → feature unavailable, 403 with upgrade hint"""
         # feature_a not available for solo
@@ -382,6 +394,7 @@ class TestFeatureGateByTier(TestQuotaEngineBase):
 
 class TestMonthRollover(TestQuotaEngineBase):
 
+    # QUOTA-11
     def test_month_rollover_usage_metrics_reset(self) -> None:
         """✓ month rollover → usage_metrics reset for new month"""
         user = User(user_id="mr1", tier="solo", ip="10.0.0.80")
@@ -399,6 +412,39 @@ class TestMonthRollover(TestQuotaEngineBase):
         usage_after = self.engine.get_usage("mr1")
         self.assertEqual(usage_after["call_count"], 0)
         self.assertEqual(usage_after["storage_bytes"], 0)
+
+    # QUOTA-11
+    def test_month_rollover_with_injected_clock_resets_quota(self) -> None:
+        """A solo user at the monthly limit in January is allowed again on 1 February, with zero usage.
+
+        In: an engine on an injected clock at 2026-01-31T23:59:59Z, 1000 recorded solo calls. Out: asserts a
+        429 quota_exceeded with reset_date 2026-02-01T00:00:00Z, then, with the clock moved to February,
+        call_count 0 and an allowed request; January's row is kept.
+        Why: QUOTA-11 ("month rollover -> usage_metrics reset for new month"); the older test only called
+        reset_monthly_usage() by hand, because the engine read the wall clock.
+        2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: an in-memory SQLite database only.
+        """
+        now = [datetime(2026, 1, 31, 23, 59, 59, tzinfo=timezone.utc)]
+        engine = QuotaEngine(db_path=":memory:", clock=lambda: now[0])
+        try:
+            user = User(user_id="mr3", tier="solo", ip="10.0.0.82")
+            conn = engine._get_conn()
+            conn.execute(
+                "INSERT INTO usage_metrics (user_id, month, call_count, storage_bytes, updated_at) VALUES (?, ?, ?, 0, ?)",
+                ("mr3", "2026-01", API_CALL_LIMITS["solo"], now[0].isoformat()),
+            )
+            conn.commit()
+            blocked = engine.check_request(user, endpoint="/v1/data")
+            self.assertEqual(blocked.status_code, 429)
+            self.assertEqual(blocked.body["error"], "quota_exceeded")
+            self.assertEqual(blocked.body["reset_date"], "2026-02-01T00:00:00Z")
+
+            now[0] = datetime(2026, 2, 1, 0, 0, 1, tzinfo=timezone.utc)
+            self.assertEqual(engine.get_usage("mr3")["call_count"], 0)
+            self.assertTrue(engine.check_request(user, endpoint="/v1/data").allowed)
+            self.assertEqual(engine.get_usage("mr3", month="2026-01")["call_count"], API_CALL_LIMITS["solo"])
+        finally:
+            engine.close()
 
     def test_month_rollover_new_month_new_counters(self) -> None:
         """Usage in a new month starts from zero."""
@@ -426,6 +472,7 @@ class TestMonthRollover(TestQuotaEngineBase):
 
 class TestTierUpgrade(TestQuotaEngineBase):
 
+    # QUOTA-12
     def test_tier_upgrade_limits_updated_immediately(self) -> None:
         """✓ tier upgrade → limits updated immediately"""
         user = User(user_id="tu1", tier="solo", ip="10.0.0.90")

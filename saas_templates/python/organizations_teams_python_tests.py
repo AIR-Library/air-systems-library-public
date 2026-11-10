@@ -32,6 +32,7 @@ def assert_error(fn, code: str, status: int):
     assert ei.value.code == code
     assert ei.value.status == status
 
+# ORG-01
 def test_non_member_cannot_read_members_of_another_org():
     users = make_users()
     clock = [T0]
@@ -62,6 +63,7 @@ def test_non_member_cannot_read_members_of_another_org():
     assert_error(lambda: svc.list_members(anon, alpha.id), "UNAUTHENTICATED", 401)
     assert_error(lambda: svc.create_org(anon, "Gamma"), "UNAUTHENTICATED", 401)
 
+# ORG-02
 def test_member_cannot_invite_admin_can():
     users = make_users()
     clock = [T0]
@@ -81,6 +83,7 @@ def test_member_cannot_invite_admin_can():
 
     assert_error(lambda: svc.invite(users['admin'], org.id, "another@example.com", "owner"), "FORBIDDEN", 403)
 
+# ORG-03
 def test_admin_cannot_remove_owner_and_last_owner_cannot_leave():
     users = make_users()
     clock = [T0]
@@ -105,6 +108,7 @@ def test_admin_cannot_remove_owner_and_last_owner_cannot_leave():
     members = svc.list_members(users['owner'], org.id)
     assert any(m.user_id == users['owner'].id and m.role == "owner" for m in members)
 
+# ORG-04
 def test_invitation_works_once_second_use_fails():
     users = make_users()
     clock = [T0]
@@ -122,6 +126,7 @@ def test_invitation_works_once_second_use_fails():
     token2 = svc.invite(users['owner'], org.id, "x@example.com", "member")
     assert_error(lambda: svc.accept_invitation(users['x'], token2), "ALREADY_MEMBER", 409)
 
+# ORG-05
 def test_expired_invitation_fails():
     users = make_users()
     clock = [T0]
@@ -133,6 +138,7 @@ def test_expired_invitation_fails():
     members = svc.list_members(users['owner'], org.id)
     assert len(members) == 1
 
+# ORG-05
 def test_accept_with_different_email_fails():
     users = make_users()
     clock = [T0]
@@ -143,6 +149,7 @@ def test_accept_with_different_email_fails():
     mem = svc.accept_invitation(users['x'], token)
     assert mem.role == "member"
 
+# ORG-06
 def test_raw_token_not_stored_in_database():
     clock = [T0]
     rand = counter_random()

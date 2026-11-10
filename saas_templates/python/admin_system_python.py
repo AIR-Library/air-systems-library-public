@@ -4,6 +4,8 @@
 # continuity handoff, then reviewed by Claude. 2026-11-03, session c6ee9a72.
 # Touches: SQLite only.
 import os
+import hmac
+import secrets
 import re
 import uuid
 import json
@@ -13,7 +15,17 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # ---------- Configuration ----------
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "sk_test_dummy")
-CSRF_TOKEN = "valid_csrf_token"
+# [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] The CSRF token is no longer the hard-coded "valid_csrf_token"
+# (docs/specs/README.md: no secret is hard-coded). It comes from ADMIN_CSRF_TOKEN or is random per process; a real
+# app issues one per session and passes it in.
+CSRF_TOKEN = os.getenv("ADMIN_CSRF_TOKEN") or secrets.token_urlsafe(32)
+# Billing plan tiers and their Stripe prices, as in billing_subscriptions.md (a customer's plan is a billing tier,
+# not a staff role). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-12).
+PLAN_PRICE_IDS = {
+    "solo": "price_1UIxxxxxx_solo",
+    "team": "price_1UIxxxxxx_team",
+    "enterprise": "price_1UIxxxxxx_enterprise",
+}
 SAFETY_FLAGS = {"can_publish": True}
 ALLOWED_TIERS = {"owner", "admin", "user"}
 
@@ -27,7 +39,11 @@ class HTTPError(Exception):
 
 # ---------- Helper Functions ----------
 def verify_csrf(token: str) -> None:
-    if token != CSRF_TOKEN:
+    """Refuse a request whose CSRF token is not the expected one.
+
+    In: the token the request carried. Out: None, or HTTPError 403 csrf_invalid. Compared in constant time
+    (docs/specs/README.md; was `!=` until 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). Touches nothing."""
+    if not isinstance(token, str) or not hmac.compare_digest(token.encode("utf-8"), CSRF_TOKEN.encode("utf-8")):
         raise HTTPError(403, "csrf_invalid", "Invalid CSRF token")
 
 def validate_email(email: str) -> None:
@@ -47,7 +63,14 @@ def now() -> str:
 
 # ---------- Core System ----------
 class AdminSystem:
-    def __init__(self):
+    def __init__(self, stripe_client: Any = None):
+        """In-memory admin system.
+
+        In: (added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP) an optional Stripe client exposing
+        Subscription.retrieve / Subscription.modify; default the `stripe` package, imported on first use.
+        Tests pass a fake (no network). Why: ADMIN-12, the plan change now really calls Stripe with the item id.
+        Touches: in-memory SQLite; Stripe (money) only through the client."""
+        self._stripe_client = stripe_client
         self.conn = sqlite3.connect(":memory:")
         self.conn.row_factory = sqlite3.Row
         self._create_schema()
@@ -342,10 +365,20 @@ class AdminSystem:
 
     def _customers_change_plan(self, actor: sqlite3.Row, customer_id: int,
                                payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Change a customer's plan through Stripe (billing_subscriptions.md flow 2), then record it.
+
+        In: the acting owner's row, the customer id, payload {new_tier}. Out: {success, customer_id, old_tier,
+        new_tier, effective_date}; HTTPError 400 invalid_tier (not a billing tier), 404 customer_not_found,
+        400 no_stripe_subscription, 409 subscription_item_ambiguous (not exactly one item), 502 stripe_error.
+        invalid_tier and subscription_item_ambiguous are decided before any Stripe update.
+        Why: ADMIN-12 as amended 2026-11-10: update the existing item ({id, price}), never a bare {price}, which
+        adds a second item and bills both plans; it used to validate against staff roles and call no Stripe.
+        2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: Stripe (money), SQLite (customers, audit_log)."""
         new_tier = payload.get("new_tier")
         if not new_tier:
             raise HTTPError(400, "missing_fields", "new_tier required")
-        validate_tier(new_tier)
+        if new_tier not in PLAN_PRICE_IDS:
+            raise HTTPError(400, "invalid_tier", f"Plan tier must be one of {sorted(PLAN_PRICE_IDS)}")
 
         cur = self.conn.cursor()
         cur.execute("SELECT * FROM customers WHERE id = ?", (customer_id,))
@@ -357,7 +390,6 @@ class AdminSystem:
         if not stripe_sub_id:
             raise HTTPError(400, "no_stripe_subscription", "Customer has no Stripe subscription")
 
-        # Mock Stripe call
         self._stripe_update_subscription(stripe_sub_id, new_tier)
 
         cur.execute("UPDATE customers SET tier = ? WHERE id = ?",
@@ -376,10 +408,38 @@ class AdminSystem:
             "effective_date": now()
         }
 
+    def _stripe(self) -> Any:
+        """The Stripe client: the injected one, else the `stripe` package with STRIPE_SECRET_KEY.
+        2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: imports stripe on first use."""
+        if self._stripe_client is None:
+            import stripe
+            stripe.api_key = STRIPE_SECRET_KEY
+            self._stripe_client = stripe
+        return self._stripe_client
+
     def _stripe_update_subscription(self, subscription_id: str, new_tier: str) -> None:
-        # In real implementation, call Stripe API.
-        # Here we just simulate success.
-        pass
+        """Replace the price on the subscription's one item: retrieve it, require exactly one item, then
+        Subscription.modify(id, items=[{id: item_id, price}], proration_behavior="create_prorations").
+
+        In: the Stripe subscription id and a valid plan tier. Out: None; HTTPError 409
+        subscription_item_ambiguous before any update, or 502 stripe_error. Why: ADMIN-12 / BILL-03 (amended
+        2026-11-10); this was a no-op stub. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: Stripe (money)."""
+        client = self._stripe()
+        try:
+            current = client.Subscription.retrieve(subscription_id)
+        except Exception as e:  # a Stripe or network error is reported, never swallowed
+            raise HTTPError(502, "stripe_error", str(e))
+        items = current["items"]["data"]
+        if len(items) != 1:
+            raise HTTPError(409, "subscription_item_ambiguous", "The subscription does not have exactly one item")
+        try:
+            client.Subscription.modify(
+                subscription_id,
+                items=[{"id": items[0]["id"], "price": PLAN_PRICE_IDS[new_tier]}],
+                proration_behavior="create_prorations",
+            )
+        except Exception as e:
+            raise HTTPError(502, "stripe_error", str(e))
 
     def _customers_queue_refund(self, actor: sqlite3.Row, payload: Dict[str, Any]) -> Dict[str, Any]:
         invoice_id = payload.get("invoice_id")

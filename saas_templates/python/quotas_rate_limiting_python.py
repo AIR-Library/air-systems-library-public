@@ -131,13 +131,17 @@ class WhyChainLogger:
     In production this would ship to a structured log sink (e.g. ELK, Datadog).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, clock: Optional[Any] = None) -> None:
+        """In: an optional clock returning an aware UTC datetime (added 2026-11-10,
+        session_012zDydZCZ4AChqhEZ4oVtaP, so entry timestamps follow the engine's injected clock). Touches memory."""
+        self._now = clock or (lambda: datetime.now(timezone.utc))
         self._lock = threading.Lock()
         self._entries: List[Dict[str, Any]] = []
 
     def log(self, gate: str, **kwargs: Any) -> None:
+        """Append one why-chain entry stamped with the injected clock ([2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP]). Touches memory."""
         entry = {
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": self._now().isoformat(),
             "gate": gate,
             **kwargs,
         }
@@ -173,10 +177,17 @@ class QuotaEngine:
                                response_time_ms=12)
     """
 
-    def __init__(self, db_path: str = ":memory:") -> None:
+    def __init__(self, db_path: str = ":memory:", clock: Optional[Any] = None) -> None:
+        """Open the engine on one SQLite database.
+
+        In: db_path, and (added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP) an optional clock, a function
+        returning an aware UTC datetime; default the wall clock. Why: docs/specs/README.md ("time comes from an
+        injectable clock"), so QUOTA-11 can prove a real month rollover and no test depends on the date.
+        Touches: SQLite (creates the schema)."""
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._db_path = db_path
         self._local = threading.local()
-        self._logger = WhyChainLogger()
+        self._logger = WhyChainLogger(self._clock)
         self._init_db()
 
     # -- database helpers ---------------------------------------------------
@@ -200,13 +211,20 @@ class QuotaEngine:
 
     # -- month helper -------------------------------------------------------
 
-    @staticmethod
-    def _current_month() -> str:
-        return datetime.now(timezone.utc).strftime("%Y-%m")
+    def _now(self) -> datetime:
+        """The engine's current UTC time from the injected clock. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP
+        (deterministic tests, docs/specs/README.md). Touches nothing."""
+        return self._clock()
 
-    @staticmethod
-    def _next_month_reset_date() -> str:
-        now = datetime.now(timezone.utc)
+    def _current_month(self) -> str:
+        """The current month key "YYYY-MM" from the injected clock (was the wall clock until 2026-11-10,
+        session_012zDydZCZ4AChqhEZ4oVtaP; QUOTA-11). Touches nothing."""
+        return self._now().strftime("%Y-%m")
+
+    def _next_month_reset_date(self) -> str:
+        """The first instant of next month, ISO-8601 UTC, from the injected clock (2026-11-10,
+        session_012zDydZCZ4AChqhEZ4oVtaP). Touches nothing."""
+        now = self._now()
         if now.month == 12:
             reset = datetime(now.year + 1, 1, 1, tzinfo=timezone.utc)
         else:
@@ -294,8 +312,10 @@ class QuotaEngine:
     # -- gate 3: rate_limit_per_user ----------------------------------------
 
     def _check_rate_limit_per_user(self, user: User) -> GateResult:
+        """Gate 3: under 100 calls in the last 60 s for this user, by the injected clock ([2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP]).
+        Out: GateResult (429 rate_limit_exceeded). Touches: SQLite (read)."""
         conn = self._get_conn()
-        now = datetime.now(timezone.utc)
+        now = self._now()
         one_min_ago = now.timestamp() - 60
         row = conn.execute(
             "SELECT COUNT(*) FROM api_calls WHERE user_id = ? AND timestamp > ?",
@@ -327,8 +347,10 @@ class QuotaEngine:
     # -- gate 4: rate_limit_per_ip ------------------------------------------
 
     def _check_rate_limit_per_ip(self, user: User) -> GateResult:
+        """Gate 4: under 10 calls in the last second from this IP, by the injected clock ([2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP]).
+        Out: GateResult (429). Touches: SQLite (read)."""
         conn = self._get_conn()
-        now = datetime.now(timezone.utc)
+        now = self._now()
         one_sec_ago = now.timestamp() - 1
         row = conn.execute(
             "SELECT COUNT(*) FROM api_calls WHERE ip = ? AND timestamp > ?",
@@ -458,7 +480,7 @@ class QuotaEngine:
         """
         conn = self._get_conn()
         month = self._current_month()
-        now_iso = datetime.now(timezone.utc).isoformat()
+        now_iso = self._now().isoformat()
 
         # Upsert usage_metrics
         conn.execute(
@@ -489,7 +511,7 @@ class QuotaEngine:
         """Record storage usage for a file upload."""
         conn = self._get_conn()
         month = self._current_month()
-        now_iso = datetime.now(timezone.utc).isoformat()
+        now_iso = self._now().isoformat()
 
         conn.execute(
             """
@@ -537,7 +559,7 @@ class QuotaEngine:
         month = self._current_month()
         conn.execute(
             "UPDATE usage_metrics SET call_count = 0, storage_bytes = 0, updated_at = ? WHERE user_id = ? AND month = ?",
-            (datetime.now(timezone.utc).isoformat(), user_id, month),
+            (self._now().isoformat(), user_id, month),
         )
         conn.commit()
 

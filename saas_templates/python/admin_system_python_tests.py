@@ -8,9 +8,39 @@ import os
 import json
 from admin_system_python import AdminSystem, HTTPError, CSRF_TOKEN
 
+class FakeStripe:
+    """A fake Stripe client: Subscription.retrieve returns the given items, Subscription.modify records its call.
+    2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-12). Touches nothing; no network."""
+
+    class _Subscription:
+        def __init__(self, items):
+            """Hold the items retrieve() returns and the calls modify() received. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP."""
+            self.items = items
+            self.modified = []
+
+        def retrieve(self, subscription_id):
+            """Return the subscription with the configured items (Stripe's shape). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP."""
+            return {"id": subscription_id, "items": {"data": list(self.items)}}
+
+        def modify(self, subscription_id, **params):
+            """Record (subscription_id, params) and return an active subscription. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP."""
+            self.modified.append((subscription_id, params))
+            return {"id": subscription_id, "status": "active"}
+
+    def __init__(self, items):
+        """A fake client whose Subscription returns `items`. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP."""
+        self.Subscription = self._Subscription(items)
+
+
 class TestAdminSystem(unittest.TestCase):
     def setUp(self):
+        """A fresh AdminSystem (no Stripe client) with an owner and a normal user. Split 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite only."""
         self.sys = AdminSystem()
+        self.setUp_users()
+
+    def setUp_users(self):
+        """Insert the owner and the normal user into self.sys. Split out of setUp 2026-11-10,
+        session_012zDydZCZ4AChqhEZ4oVtaP, so a test can rebuild self.sys with a fake Stripe client."""
         # Create an owner user
         cur = self.sys.conn.cursor()
         cur.execute(
@@ -32,6 +62,7 @@ class TestAdminSystem(unittest.TestCase):
         return "2023-01-01T00:00:00Z"
 
     # ----- USERS DOMAIN TESTS -----
+    # ADMIN-01
     def test_create_user_happy_path(self):
         payload = {
             "email": "newuser@example.com",
@@ -47,6 +78,7 @@ class TestAdminSystem(unittest.TestCase):
         # Verify email sent
         self.assertTrue(any(email == payload["email"] for email, _ in self.sys.email_outbox))
 
+    # ADMIN-02
     def test_create_user_duplicate_email(self):
         payload = {
             "email": "owner@example.com",
@@ -59,6 +91,7 @@ class TestAdminSystem(unittest.TestCase):
         self.assertEqual(ctx.exception.status, 409)
         self.assertEqual(ctx.exception.code, "email_exists")
 
+    # ADMIN-03
     def test_create_user_non_owner(self):
         payload = {
             "email": "another@example.com",
@@ -71,6 +104,7 @@ class TestAdminSystem(unittest.TestCase):
         self.assertEqual(ctx.exception.status, 403)
         self.assertEqual(ctx.exception.code, "owner_only")
 
+    # ADMIN-04
     def test_reset_password_happy_path(self):
         payload = {"user_id": self.user_id}
         resp = self.sys.users_action(CSRF_TOKEN, self.owner_id, "reset_password", payload)
@@ -80,6 +114,7 @@ class TestAdminSystem(unittest.TestCase):
         target_email = self.sys._get_user_by_id(self.user_id)["email"]
         self.assertTrue(any(email == target_email for email, _ in self.sys.email_outbox))
 
+    # ADMIN-05
     def test_reset_password_own_account(self):
         payload = {"user_id": self.owner_id}
         with self.assertRaises(HTTPError) as ctx:
@@ -87,6 +122,7 @@ class TestAdminSystem(unittest.TestCase):
         self.assertEqual(ctx.exception.status, 400)
         self.assertEqual(ctx.exception.code, "cannot_reset_own_password")
 
+    # ADMIN-06
     def test_change_role_happy_path(self):
         payload = {"user_id": self.user_id, "new_tier": "admin"}
         resp = self.sys.users_action(CSRF_TOKEN, self.owner_id, "change_role", payload)
@@ -102,6 +138,7 @@ class TestAdminSystem(unittest.TestCase):
         self.assertEqual(details["old_tier"], "user")
         self.assertEqual(details["new_tier"], "admin")
 
+    # ADMIN-07
     def test_change_role_last_owner(self):
         # Create a second owner, suspend the first owner, then try to demote the second owner
         cur = self.sys.conn.cursor()
@@ -122,6 +159,7 @@ class TestAdminSystem(unittest.TestCase):
         self.assertEqual(ctx.exception.status, 400)
         self.assertEqual(ctx.exception.code, "cannot_demote_last_owner")
 
+    # ADMIN-08
     def test_suspend_user_happy_path(self):
         payload = {"user_id": self.user_id, "reason": "violation"}
         resp = self.sys.users_action(CSRF_TOKEN, self.owner_id, "suspend", payload)
@@ -131,6 +169,7 @@ class TestAdminSystem(unittest.TestCase):
         cur.execute("SELECT status FROM users WHERE id = ?", (self.user_id,))
         self.assertEqual(cur.fetchone()["status"], "suspended")
 
+    # ADMIN-09
     def test_suspend_own_account(self):
         payload = {"user_id": self.owner_id, "reason": "self"}
         with self.assertRaises(HTTPError) as ctx:
@@ -139,6 +178,7 @@ class TestAdminSystem(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "cannot_suspend_yourself")
 
     # ----- CUSTOMERS DOMAIN TESTS -----
+    # ADMIN-10
     def test_customers_list_pagination(self):
         cur = self.sys.conn.cursor()
         for i in range(5):
@@ -153,6 +193,7 @@ class TestAdminSystem(unittest.TestCase):
         self.assertIn("email", result[0])
         self.assertIn("signup_date", result[0])
 
+    # ADMIN-11
     def test_customers_detail_fields(self):
         cur = self.sys.conn.cursor()
         cur.execute(
@@ -166,23 +207,64 @@ class TestAdminSystem(unittest.TestCase):
         self.assertEqual(detail["email"], "cust@example.com")
         self.assertEqual(detail["stripe_subscription_id"], "sub_123")
 
+    # ADMIN-12
+    # [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Changed for the amended ADMIN-12: a plan is a billing tier
+    # (solo/team/enterprise), not a staff role ("user" -> "admin" before), and the test now checks the Stripe call:
+    # the existing item id with the new price, no second item.
     def test_change_plan_stripe_called_and_audit(self):
+        """change_plan updates the subscription's one existing item with the new price, then audits.
+        In: a fake Stripe client. Out: assertions. Why: ADMIN-12. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        Touches: in-memory SQLite, a fake Stripe client (no network)."""
+        stripe_fake = FakeStripe([{"id": "si_1", "price": {"id": "price_1UIxxxxxx_solo"}}])
+        self.sys = AdminSystem(stripe_client=stripe_fake)
+        self.setUp_users()
         cur = self.sys.conn.cursor()
         cur.execute(
             """INSERT INTO customers (email, name, tier, signup_date, stripe_subscription_id)
-               VALUES ('cust2@example.com','Cust2','user','2023-01-01','sub_456')"""
+               VALUES ('cust2@example.com','Cust2','solo','2023-01-01','sub_456')"""
         )
         cust_id = cur.lastrowid
         self.sys.conn.commit()
-        payload = {"new_tier": "admin"}
+        payload = {"new_tier": "team"}
         resp = self.sys.customers_action(CSRF_TOKEN, self.owner_id, cust_id, "change_plan", payload)
         self.assertTrue(resp["success"])
-        self.assertEqual(resp["old_tier"], "user")
-        self.assertEqual(resp["new_tier"], "admin")
+        self.assertEqual(resp["old_tier"], "solo")
+        self.assertEqual(resp["new_tier"], "team")
+        self.assertEqual(stripe_fake.Subscription.modified, [(
+            "sub_456",
+            {"items": [{"id": "si_1", "price": "price_1UIxxxxxx_team"}], "proration_behavior": "create_prorations"},
+        )])
         # Verify audit
         cur.execute("SELECT * FROM audit_log WHERE action='plan_changed'")
         self.assertIsNotNone(cur.fetchone())
 
+    # ADMIN-12
+    def test_change_plan_unknown_tier_or_ambiguous_items_never_update(self):
+        """An unknown plan tier is 400 invalid_tier, and a subscription with two items is 409
+        subscription_item_ambiguous; neither updates Stripe, the customer row or the audit log.
+        In: a fake Stripe client with two items. Out: assertions. Why: ADMIN-12 / BILL-03 (amended 2026-11-10).
+        2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite, a fake Stripe client."""
+        stripe_fake = FakeStripe([{"id": "si_1"}, {"id": "si_2"}])
+        self.sys = AdminSystem(stripe_client=stripe_fake)
+        self.setUp_users()
+        cur = self.sys.conn.cursor()
+        cur.execute(
+            """INSERT INTO customers (email, name, tier, signup_date, stripe_subscription_id)
+               VALUES ('cust3@example.com','Cust3','solo','2023-01-01','sub_789')"""
+        )
+        cust_id = cur.lastrowid
+        self.sys.conn.commit()
+        for tier, status, code in (("admin", 400, "invalid_tier"), ("team", 409, "subscription_item_ambiguous")):
+            with self.assertRaises(HTTPError) as cm:
+                self.sys.customers_action(CSRF_TOKEN, self.owner_id, cust_id, "change_plan", {"new_tier": tier})
+            self.assertEqual((cm.exception.status, cm.exception.code), (status, code))
+        self.assertEqual(stripe_fake.Subscription.modified, [])
+        cur.execute("SELECT tier FROM customers WHERE id = ?", (cust_id,))
+        self.assertEqual(cur.fetchone()["tier"], "solo")
+        cur.execute("SELECT COUNT(*) FROM audit_log WHERE action='plan_changed'")
+        self.assertEqual(cur.fetchone()[0], 0)
+
+    # ADMIN-13
     def test_queue_refund_record_created(self):
         payload = {"invoice_id": 1, "amount": 50.0, "reason": "overcharge"}
         resp = self.sys.customers_action(CSRF_TOKEN, self.owner_id, 0, "queue_refund", payload)
@@ -195,6 +277,7 @@ class TestAdminSystem(unittest.TestCase):
         self.assertEqual(row["amount"], 50.0)
 
     # ----- DEPLOYMENTS DOMAIN TESTS -----
+    # ADMIN-14
     def test_create_deployment(self):
         # Need a customer first
         cur = self.sys.conn.cursor()
@@ -215,6 +298,7 @@ class TestAdminSystem(unittest.TestCase):
         self.assertEqual(resp["domain"], "example.com")
         # Verify config init (no explicit check needed)
 
+    # ADMIN-15
     def test_publish_deployment_double_gate(self):
         # Setup deployment
         cur = self.sys.conn.cursor()
@@ -237,6 +321,7 @@ class TestAdminSystem(unittest.TestCase):
         self.assertIn("public_url", resp)
 
     # ----- GOVERNANCE DOMAIN TESTS -----
+    # ADMIN-16
     def test_governance_approve_executes_action(self):
         # Create a pending change_role action via governance
         action_id = self.sys.create_governance_action(
@@ -255,6 +340,7 @@ class TestAdminSystem(unittest.TestCase):
         cur.execute("SELECT tier FROM users WHERE id = ?", (self.user_id,))
         self.assertEqual(cur.fetchone()["tier"], "admin")
 
+    # ADMIN-17
     def test_governance_reject(self):
         action_id = self.sys.create_governance_action(
             actor_id=self.owner_id,
@@ -274,6 +360,7 @@ class TestAdminSystem(unittest.TestCase):
         self.assertEqual(row["status"], "rejected")
         self.assertEqual(row["rejection_reason"], "Not needed")
 
+    # ADMIN-18
     def test_audit_log_search_filters_and_pagination(self):
         # Insert some audit logs with distinct timestamps for deterministic ordering
         cur = self.sys.conn.cursor()

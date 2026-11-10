@@ -77,6 +77,7 @@ def redis_client():
     """Create a fresh Redis client for each test."""
     return fakeredis.FakeRedis()
 
+# KEYS-01
 def test_create_key_with_scopes():
     """Test creating an API key with scopes"""
     response = client.post(
@@ -107,6 +108,7 @@ def test_create_key_with_scopes():
     assert api_key.rate_limit == TEST_RATE_LIMIT
     assert api_key.is_active == True
 
+# KEYS-02
 def test_use_key_request_succeeds():
     """Test using a valid API key succeeds"""
     # Create key
@@ -136,6 +138,7 @@ def test_use_key_request_succeeds():
     db.refresh(validated_key)
     assert validated_key.last_used_at is not None
 
+# KEYS-03
 def test_revoke_key_subsequent_requests_401():
     """Test that revoked key returns 401"""
     # Create key
@@ -165,6 +168,7 @@ def test_revoke_key_subsequent_requests_401():
         )
     assert exc_info.value.status_code == 401
 
+# KEYS-04
 def test_rate_limit_1001st_request_429():
     """Test rate limiting: 1001st request in hour returns 429"""
     # Create key with low rate limit for testing
@@ -208,6 +212,7 @@ def test_rate_limit_1001st_request_429():
         )
     assert exc_info.value.status_code == 429
 
+# KEYS-05
 def test_scope_check_key_cannot_write_deployments():
     """Test key with read:deployments cannot write deployments (403)"""
     # Create key with only read scope
@@ -241,6 +246,7 @@ def test_scope_check_key_cannot_write_deployments():
         )
     assert exc_info.value.status_code == 403
 
+# KEYS-06
 def test_rotate_new_key_works_old_stops_after_grace():
     """Test rotation: new key works, old key stops after grace period"""
     # Create key
@@ -304,6 +310,7 @@ def test_rotate_new_key_works_old_stops_after_grace():
         )
     assert exc_info.value.status_code == 401
 
+# KEYS-07
 def test_expired_key_after_expires_at_returns_401():
     """Test expired key returns 401 after expires_at"""
     # Create key with short expiration
@@ -333,6 +340,7 @@ def test_expired_key_after_expires_at_returns_401():
         )
     assert exc_info.value.status_code == 401
 
+# KEYS-08
 def test_usage_stats_requests_counted_per_endpoint():
     """Test usage stats: requests counted per endpoint"""
     # Create key
@@ -388,6 +396,7 @@ def test_usage_stats_requests_counted_per_endpoint():
     assert stats["rate_limit_hits"] == 0
     assert stats["errors"] == {}
 
+# KEYS-09
 def test_admin_audit_all_keys_visible():
     """Test admin can see all API keys"""
     # Create two keys for different users
@@ -451,6 +460,7 @@ def test_management_routes_require_login_and_admin():
     assert len(listed) == 1 and listed[0]["is_active"] is True
     assert "key" not in listed[0] and "key_secret_hash" not in listed[0]
 
+# KEYS-02
 def test_bearer_request_succeeds_and_is_logged():
     """Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: spec endpoint 5 over HTTP, with
     Authorization: Bearer; a missing scope is 403 and both calls land in the usage stats."""

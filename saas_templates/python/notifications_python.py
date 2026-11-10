@@ -2,7 +2,17 @@
 # Why: the suite failed on CI (it was listed in ci/baseline.json). Fixed by a free model from a
 # continuity handoff, then reviewed by Claude. 2026-11-03, session c6ee9a72.
 # Touches: SQLite, SMTP and SMS (mocked in tests).
+# Amended 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-02/05/11/12, spec amended after review on PR 19 and an
+#   independent security review): default preferences have no quiet hours and SMS off; unsubscribe links carry
+#   an HMAC-SHA256 token (secret >= 32 bytes from configuration, else the service refuses to start), GET only
+#   confirms and POST unsubscribes; quiet hours and future sends are stored 'queued' with scheduled_at and sent
+#   by deliver_due(now) (claim with a conditional update, re-check preferences, re-queue stale 'sending' rows),
+#   never by an in-process timer; time comes from an injectable clock; senders and the retry sleep are
+#   injectable so tests use no network and do not wait.
+import hashlib
+import hmac
 import json
+import os
 import smtplib
 import sqlite3
 import threading
@@ -36,15 +46,18 @@ CREATE TABLE IF NOT EXISTS notification_logs (
     clicked_at TEXT,
     bounced INTEGER DEFAULT 0,
     error TEXT,
-    status TEXT,            -- sent, queued, skipped, failed
-    attempt INTEGER DEFAULT 0
+    status TEXT,            -- queued, sending, sent, skipped, failed (plus opened, clicked tracking)
+    attempt INTEGER DEFAULT 0,
+    scheduled_at TEXT,      -- when a queued row is due (quiet hours end or a future send)
+    claimed_at TEXT         -- when deliver_due claimed it ('sending')
 );
+CREATE INDEX IF NOT EXISTS idx_notification_logs_due ON notification_logs (status, scheduled_at, id);
 
 CREATE TABLE IF NOT EXISTS user_notification_preferences (
     user_id INTEGER PRIMARY KEY,
     do_not_disturb INTEGER DEFAULT 0,
-    quiet_hours_start TEXT,   -- "22:00"
-    quiet_hours_end TEXT,     -- "08:00"
+    quiet_hours_start TEXT,   -- "22:00" (UTC) or NULL
+    quiet_hours_end TEXT,     -- "08:00" (UTC) or NULL
     channels_enabled TEXT     -- JSON object e.g. {"email":true,"sms":false,"in_app":true}
 );
 """
@@ -125,19 +138,52 @@ DEFAULT_TEMPLATES = [
 ]
 
 # ---------- Helper Functions ----------
+CHANNELS = ("email", "sms", "in_app")
+DEFAULT_CHANNELS_ENABLED = {"email": True, "sms": False, "in_app": True}
+STALE_CLAIM_SECONDS = 300
+MIN_SECRET_BYTES = 32
+_HEX = frozenset("0123456789abcdef")
+
+
+def _iso(dt: datetime) -> str:
+    """An aware datetime as fixed-width UTC ISO-8601 ("2026-11-10T12:00:00.000000Z"), so stored times compare
+    correctly as text. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing."""
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _parse_iso(value: str) -> datetime:
+    """Parse an ISO-8601 time (a trailing Z or no offset means UTC) to an aware datetime. Touches nothing."""
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 def _parse_time(t_str: str) -> dtime:
     return datetime.strptime(t_str, "%H:%M").time()
 
-def _in_quiet_hours(start: str, end: str, now: dtime) -> bool:
+def _in_quiet_hours(start: Optional[str], end: Optional[str], now: dtime) -> bool:
+    """True if `now` (UTC time of day) is inside [start, end), which may wrap midnight; False when either bound is
+    unset (the default: no quiet hours, NOTIF-05 as amended 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)."""
+    if not start or not end:
+        return False
     start_t = _parse_time(start)
     end_t = _parse_time(end)
+    if start_t == end_t:
+        return False
     if start_t < end_t:
         return start_t <= now < end_t
     else:  # wraps midnight
         return now >= start_t or now < end_t
+
+
+def _quiet_hours_end_after(now: datetime, end: str) -> datetime:
+    """The next time of day `end` (UTC) after `now`: when a message queued in quiet hours is due.
+    2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-05). Touches nothing."""
+    end_t = _parse_time(end)
+    target = now.astimezone(timezone.utc).replace(hour=end_t.hour, minute=end_t.minute, second=0, microsecond=0)
+    return target if target > now else target + timedelta(days=1)
 
 def _render_template(text: str, variables: Dict[str, Any]) -> str:
     return text.format(**variables)
@@ -164,7 +210,28 @@ def _send_sms(to_number: str, body: str) -> None:
 
 # ---------- Core Service ----------
 class NotificationService:
-    def __init__(self, db_path: str = DB_PATH):
+    def __init__(self, db_path: str = DB_PATH, unsubscribe_secret: Optional[Any] = None, clock=None,
+                 email_sender=None, sms_sender=None, sleep=None, base_url: str = "https://example.com"):
+        """Open the notification store.
+
+        In: db_path; unsubscribe_secret (bytes or str; default the NOTIFICATIONS_UNSUBSCRIBE_SECRET environment
+        variable), at least 32 bytes or ValueError: the service refuses to start (an empty key makes a forgeable
+        HMAC); clock (aware UTC datetime; default the wall clock); email_sender(to, subject, text, html) and
+        sms_sender(to, body) (default the module's _send_email/_send_sms, looked up at call time); sleep(seconds)
+        for retry backoff (default time.sleep); base_url for unsubscribe links.
+        Why: NOTIF-11/12 (spec amended 2026-11-10) and docs/specs/README.md (injectable clock and senders).
+        2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite (creates tables, seeds templates).
+        """
+        secret = unsubscribe_secret if unsubscribe_secret is not None else os.environ.get("NOTIFICATIONS_UNSUBSCRIBE_SECRET", "")
+        secret_bytes = secret.encode("utf-8") if isinstance(secret, str) else bytes(secret)
+        if len(secret_bytes) < MIN_SECRET_BYTES:
+            raise ValueError("unsubscribe secret must be at least 32 bytes (set NOTIFICATIONS_UNSUBSCRIBE_SECRET)")
+        self._unsubscribe_key = secret_bytes
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self._email_sender = email_sender or (lambda *a: _send_email(*a))
+        self._sms_sender = sms_sender or (lambda *a: _send_sms(*a))
+        self._sleep = sleep or time.sleep
+        self.base_url = base_url.rstrip("/")
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._init_db()
@@ -191,6 +258,10 @@ class NotificationService:
 
     # ---------- Preference Management ----------
     def get_user_preferences(self, user_id: int) -> Dict[str, Any]:
+        """The user's preferences; a user who has set none gets (and stores) the defaults: do_not_disturb false,
+        no quiet hours, channels {email: true, sms: false, in_app: true}.
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] NOTIF-02/05 as amended: the defaults were quiet hours
+        22:00-08:00 and SMS on (SMS is opt-in: it costs money and needs prior consent). Touches: SQLite."""
         cur = self.conn.cursor()
         cur.execute(
             "SELECT * FROM user_notification_preferences WHERE user_id = ?", (user_id,)
@@ -209,12 +280,12 @@ class NotificationService:
             default = {
                 "user_id": user_id,
                 "do_not_disturb": False,
-                "quiet_hours_start": "22:00",
-                "quiet_hours_end": "08:00",
-                "channels_enabled": {"email": True, "sms": True, "in_app": True},
+                "quiet_hours_start": None,
+                "quiet_hours_end": None,
+                "channels_enabled": dict(DEFAULT_CHANNELS_ENABLED),
             }
             cur.execute(
-                "INSERT INTO user_notification_preferences (user_id, do_not_disturb, quiet_hours_start, quiet_hours_end, channels_enabled) "
+                "INSERT OR IGNORE INTO user_notification_preferences (user_id, do_not_disturb, quiet_hours_start, quiet_hours_end, channels_enabled) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (
                     user_id,
@@ -244,7 +315,97 @@ class NotificationService:
         )
         self.conn.commit()
 
+    # ---------- Unsubscribe links (NOTIF-11) ----------
+    def unsubscribe_token(self, user_id: Any, channel: str) -> str:
+        """Lowercase hex HMAC-SHA256(secret, "unsubscribe:" + user_id + ":" + channel). 2026-11-10,
+        session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-11). Touches nothing."""
+        message = f"unsubscribe:{user_id}:{channel}".encode("utf-8")
+        return hmac.new(self._unsubscribe_key, message, hashlib.sha256).hexdigest()
+
+    def unsubscribe_link(self, user_id: Any, channel: str) -> str:
+        """<base_url>/unsubscribe?user_id=<id>&channel=<channel>&token=<token>. 2026-11-10,
+        session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-11). Touches nothing."""
+        return (f"{self.base_url}/unsubscribe?user_id={user_id}&channel={channel}"
+                f"&token={self.unsubscribe_token(user_id, channel)}")
+
+    def handle_unsubscribe(self, method: str, user_id: Any, channel: Any, token: Any) -> Dict[str, Any]:
+        """The unsubscribe link's handler. Out: {status, body}.
+
+        A token that is not exactly 64 chars of [0-9a-f], an unknown channel, or a token that does not match
+        (constant-time compare) all get 403 {error: "invalid_unsubscribe_token"}, before any user lookup and
+        without raising on unequal lengths. Then GET only returns a confirmation (changes nothing; mail scanners
+        follow links) and POST sets channels_enabled[channel] = false. Other methods: 405.
+        Why: NOTIF-11 (spec amended 2026-11-10: an unsigned link lets anyone unsubscribe anyone).
+        2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite (preferences) on POST only."""
+        refused = {"status": 403, "body": {"error": "invalid_unsubscribe_token"}}
+        if not isinstance(token, str) or len(token) != 64 or not set(token) <= _HEX:
+            return refused
+        if channel not in CHANNELS:
+            return refused
+        expected = self.unsubscribe_token(user_id, channel)
+        if not hmac.compare_digest(token.encode("ascii"), expected.encode("ascii")):
+            return refused
+        verb = (method or "").upper()
+        if verb == "GET":
+            return {"status": 200, "body": {"confirm": True, "user_id": user_id, "channel": channel,
+                                            "message": f"Press the button to stop {channel} notifications."}}
+        if verb != "POST":
+            return {"status": 405, "body": {"error": "method_not_allowed"}}
+        pref = self.get_user_preferences(user_id)
+        channels = dict(pref["channels_enabled"])
+        channels[channel] = False
+        self.update_user_preferences(user_id, {"channels_enabled": channels})
+        return {"status": 200, "body": {"success": True, "channel": channel, "unsubscribed": True}}
+
     # ---------- Notification Sending ----------
+    def _skip_reason(self, pref: Dict[str, Any], channel: Optional[str], tmpl: sqlite3.Row) -> Tuple[Optional[str], Optional[str]]:
+        """Pick the channel or the reason to skip. Out: (channel, None) or (None, "do_not_disturb" |
+        "channel_disabled" | "no_enabled_channel"). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: shared by the
+        immediate send and deliver_due, which re-checks preferences at delivery time (NOTIF-12). Touches nothing."""
+        if pref["do_not_disturb"]:
+            return None, "do_not_disturb"
+        channels_enabled = pref["channels_enabled"]
+        if channel:
+            if not channels_enabled.get(channel, False):
+                return None, "channel_disabled"
+            return channel, None
+        for ch in json.loads(tmpl["channels_default"]):
+            if channels_enabled.get(ch, False):
+                return ch, None
+        return None, "no_enabled_channel"
+
+    def _dispatch(self, user_id: int, tmpl: sqlite3.Row, channel: str, vars: Dict[str, Any]) -> Optional[str]:
+        """Render and send one message with up to 3 attempts and exponential backoff (2 s, 4 s via the injected
+        sleep). Emails carry the signed unsubscribe link. Out: None on success, else the last error text.
+        2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (factored out of send_notification; adds the unsubscribe
+        link, NOTIF-11). Touches: the email / SMS sender (network in production)."""
+        subject = _render_template(tmpl["subject"], vars)
+        body_text = _render_template(tmpl["body_text"], vars)
+        body_html = _render_template(tmpl["body_html"], vars)
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if channel == "email":
+                    # In real implementation, retrieve user's email address
+                    to_address = f"user{user_id}@example.com"
+                    link = self.unsubscribe_link(user_id, "email")
+                    self._email_sender(to_address, subject, f"{body_text}\n\nUnsubscribe: {link}",
+                                       f'{body_html}<p><a href="{link}">Unsubscribe</a></p>')
+                elif channel == "sms":
+                    # Retrieve phone number placeholder
+                    to_number = f"+100000000{user_id%10}"
+                    self._sms_sender(to_number, body_text)
+                elif channel == "in_app":
+                    pass  # in-app is the stored log row itself
+                else:
+                    raise ValueError("Unsupported channel")
+                return None
+            except Exception as e:
+                if attempt >= max_attempts:
+                    return str(e) or e.__class__.__name__
+                self._sleep(2 ** attempt)
+        return "unreachable"
+
     def send_notification(
         self,
         user_id: int,
@@ -253,140 +414,101 @@ class NotificationService:
         vars: Optional[Dict[str, Any]] = None,
         scheduled_at: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """POST /notifications/send. Out: {success, message_id, status 'sent'|'queued'|'skipped'|'failed'}.
+
+        Do-not-disturb and disabled channels are logged 'skipped'. A send with scheduled_at in the future, or
+        one that falls in the user's quiet hours, is stored 'queued' with scheduled_at (the requested time, or
+        quiet_hours_end) and sent later by deliver_due(); nothing is held in memory.
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] NOTIF-05/12 as amended: quiet hours and the clock use the
+        injected clock, queued rows keep scheduled_at (they were dropped) and the channel (it was stored as
+        "queued"), and future sends are honoured. Touches: SQLite, the senders."""
         vars = vars or {}
+        now = self.clock()
         pref = self.get_user_preferences(user_id)
 
         # Do Not Disturb check
         if pref["do_not_disturb"]:
-            self._log(
-                user_id,
-                template_key,
-                "skipped",
-                vars,
-                error="do_not_disturb",
-                status="skipped",
-            )
-            return {"success": True, "message_id": None, "status": "skipped"}
+            log_id = self._log(user_id, template_key, channel, vars, error="do_not_disturb", status="skipped")
+            return {"success": True, "message_id": str(log_id), "status": "skipped"}
 
-        # Quiet hours check
-        now_time = datetime.now(timezone.utc).time()
-        if _in_quiet_hours(
-            pref["quiet_hours_start"], pref["quiet_hours_end"], now_time
-        ):
-            # Queue for end of quiet hours
-            end_time = _parse_time(pref["quiet_hours_end"])
-            today = datetime.now(timezone.utc).date()
-            if pref["quiet_hours_start"] > pref["quiet_hours_end"]:  # wraps midnight
-                # End is tomorrow
-                target_dt = datetime.combine(today + timedelta(days=1), end_time)
-            else:
-                target_dt = datetime.combine(today, end_time)
-            scheduled_iso = target_dt.isoformat() + "Z"
-            self._log(
-                user_id,
-                template_key,
-                "queued",
-                vars,
-                error=None,
-                status="queued",
-                scheduled_at=scheduled_iso,
-            )
-            return {"success": True, "message_id": None, "status": "queued"}
+        # Scheduled for later, or quiet hours: queue for deliver_due
+        due = _parse_iso(scheduled_at) if scheduled_at else None
+        if due is None and _in_quiet_hours(pref["quiet_hours_start"], pref["quiet_hours_end"], now.astimezone(timezone.utc).time()):
+            due = _quiet_hours_end_after(now, pref["quiet_hours_end"])
+        if due is not None and due > now:
+            if not self._get_template(template_key):
+                return {"success": False, "error": "template_not_found"}
+            log_id = self._log(user_id, template_key, channel, vars, error=None, status="queued",
+                               scheduled_at=_iso(due), sent=False)
+            return {"success": True, "message_id": str(log_id), "status": "queued"}
 
         # Resolve template
         tmpl = self._get_template(template_key)
         if not tmpl:
             return {"success": False, "error": "template_not_found"}
 
-        # Determine channel
-        channels_enabled = pref["channels_enabled"]
-        if channel:
-            if not channels_enabled.get(channel, False):
-                self._log(
-                    user_id,
-                    template_key,
-                    "skipped",
-                    vars,
-                    error="channel_disabled",
-                    status="skipped",
-                )
-                return {"success": True, "message_id": None, "status": "skipped"}
-            chosen_channel = channel
-        else:
-            default_channels = json.loads(tmpl["channels_default"])
-            chosen_channel = None
-            for ch in default_channels:
-                if channels_enabled.get(ch, False):
-                    chosen_channel = ch
-                    break
-            if not chosen_channel:
-                self._log(
-                    user_id,
-                    template_key,
-                    "skipped",
-                    vars,
-                    error="no_enabled_channel",
-                    status="skipped",
-                )
-                return {"success": True, "message_id": None, "status": "skipped"}
+        chosen_channel, reason = self._skip_reason(pref, channel, tmpl)
+        if reason:
+            log_id = self._log(user_id, template_key, channel, vars, error=reason, status="skipped")
+            return {"success": True, "message_id": str(log_id), "status": "skipped"}
 
-        # Render content
-        subject = _render_template(tmpl["subject"], vars)
-        body_text = _render_template(tmpl["body_text"], vars)
-        body_html = _render_template(tmpl["body_html"], vars)
+        error = self._dispatch(user_id, tmpl, chosen_channel, vars)
+        if error is None:
+            log_id = self._log(user_id, template_key, chosen_channel, vars, error=None, status="sent", sent=True)
+            return {"success": True, "message_id": str(log_id), "status": "sent"}
+        log_id = self._log(user_id, template_key, chosen_channel, vars, error=error, status="failed", attempt=3)
+        return {"success": False, "message_id": str(log_id), "status": "failed", "error": error}
 
-        # Send with retry
-        max_attempts = 3
-        attempt = 0
-        while attempt < max_attempts:
-            try:
-                if chosen_channel == "email":
-                    # In real implementation, retrieve user's email address
-                    to_address = f"user{user_id}@example.com"
-                    _send_email(to_address, subject, body_text, body_html)
-                elif chosen_channel == "sms":
-                    # Retrieve phone number placeholder
-                    to_number = f"+100000000{user_id%10}"
-                    _send_sms(to_number, body_text)
-                elif chosen_channel == "in_app":
-                    # In-app just logs; no external send
-                    pass
+    def deliver_due(self, now: Optional[datetime] = None) -> Dict[str, int]:
+        """Send every queued message that is due, exactly once (call from a scheduled job, never a timer).
+
+        In: now (default the clock). Out: {requeued, sent, skipped, failed}. In order:
+        1. 'sending' rows with claimed_at + 300 s < now go back to 'queued' (a crashed worker);
+        2. 'queued' rows with scheduled_at <= now, by scheduled_at then insertion order, are claimed one by one
+           with UPDATE ... SET status='sending', claimed_at=now WHERE id=? AND status='queued' (a row another
+           worker claimed first is skipped);
+        3. preferences are checked NOW: unsubscribed, channel off or do-not-disturb -> 'skipped';
+        4. the final write is UPDATE ... WHERE id=? AND status='sending' AND claimed_at=<this claim>.
+        Why: NOTIF-12 (spec amended 2026-11-10). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        Touches: SQLite (notification_logs), the senders."""
+        now = now or self.clock()
+        now_s = _iso(now)
+        counts = {"requeued": 0, "sent": 0, "skipped": 0, "failed": 0}
+        stale = _iso(now - timedelta(seconds=STALE_CLAIM_SECONDS))
+        cur = self.conn.execute(
+            "UPDATE notification_logs SET status = 'queued', claimed_at = NULL "
+            "WHERE status = 'sending' AND claimed_at < ?", (stale,))
+        counts["requeued"] = cur.rowcount
+        self.conn.commit()
+        due_ids = [r["id"] for r in self.conn.execute(
+            "SELECT id FROM notification_logs WHERE status = 'queued' AND scheduled_at IS NOT NULL "
+            "AND scheduled_at <= ? ORDER BY scheduled_at, id", (now_s,)).fetchall()]
+        for log_id in due_ids:
+            claimed = self.conn.execute(
+                "UPDATE notification_logs SET status = 'sending', claimed_at = ? WHERE id = ? AND status = 'queued'",
+                (now_s, log_id)).rowcount
+            self.conn.commit()
+            if claimed != 1:
+                continue
+            row = self.conn.execute("SELECT * FROM notification_logs WHERE id = ?", (log_id,)).fetchone()
+            tmpl = self._get_template(row["template_key"])
+            vars = json.loads(row["vars_used"] or "{}")
+            if tmpl is None:
+                status, channel, error = "failed", row["channel"], "template_not_found"
+            else:
+                channel, reason = self._skip_reason(self.get_user_preferences(row["user_id"]), row["channel"], tmpl)
+                if reason:
+                    status, channel, error = "skipped", row["channel"], reason
                 else:
-                    raise ValueError("Unsupported channel")
-                # Success
-                log_id = self._log(
-                    user_id,
-                    template_key,
-                    chosen_channel,
-                    vars,
-                    error=None,
-                    status="sent",
-                )
-                return {
-                    "success": True,
-                    "message_id": str(log_id),
-                    "status": "sent",
-                }
-            except Exception as e:
-                attempt += 1
-                if attempt >= max_attempts:
-                    log_id = self._log(
-                        user_id,
-                        template_key,
-                        chosen_channel,
-                        vars,
-                        error=str(e),
-                        status="failed",
-                        attempt=attempt,
-                    )
-                    return {
-                        "success": False,
-                        "message_id": str(log_id),
-                        "status": "failed",
-                        "error": str(e),
-                    }
-                backoff = 2 ** attempt
-                time.sleep(backoff)
+                    error = self._dispatch(row["user_id"], tmpl, channel, vars)
+                    status = "sent" if error is None else "failed"
+            self.conn.execute(
+                "UPDATE notification_logs SET status = ?, channel = ?, error = ?, sent_at = ? "
+                "WHERE id = ? AND status = 'sending' AND claimed_at = ?",
+                (status, channel, error, _iso(self.clock()) if status == "sent" else None, log_id, now_s))
+            self.conn.commit()
+            counts[status] += 1
+        return counts
 
     def send_batch(self, notifications: List[Dict[str, Any]]) -> Dict[str, Any]:
         sent = 0
@@ -435,6 +557,19 @@ class NotificationService:
             "clicked_at": row["clicked_at"],
         }
 
+    def record_click(self, message_id: int) -> Dict[str, Any]:
+        """The tracked link was clicked: set clicked_at, and opened_at if unset, and mark the message 'opened'.
+
+        In: message id. Out: the track_message() view, or {error: "message_not_found"}. Only a sent (or already
+        opened) message changes. Why: NOTIF-07 ("message marked as opened when user clicks link"); nothing ever
+        set opened_at. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite."""
+        now = _iso(self.clock())
+        self.conn.execute(
+            "UPDATE notification_logs SET clicked_at = ?, opened_at = COALESCE(opened_at, ?), status = 'opened' "
+            "WHERE id = ? AND status IN ('sent', 'opened')", (now, now, message_id))
+        self.conn.commit()
+        return self.track_message(message_id)
+
     # ---------- Internal Helpers ----------
     def _get_template(self, key: str) -> Optional[sqlite3.Row]:
         cur = self.conn.cursor()
@@ -447,26 +582,31 @@ class NotificationService:
         self,
         user_id: int,
         template_key: str,
-        channel: str,
+        channel: Optional[str],
         vars_used: Dict[str, Any],
         error: Optional[str],
         status: str,
         attempt: int = 0,
         scheduled_at: Optional[str] = None,
+        sent: bool = False,
     ) -> int:
+        """Insert one notification_logs row. sent_at is set only for a sent message; scheduled_at is kept for a
+        queued one. [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] NOTIF-12: scheduled_at was accepted and
+        dropped, and sent_at was written for skipped and queued rows too. Touches: SQLite."""
         cur = self.conn.cursor()
         cur.execute(
-            "INSERT INTO notification_logs (user_id, template_key, channel, vars_used, sent_at, error, status, attempt) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO notification_logs (user_id, template_key, channel, vars_used, sent_at, error, status, attempt, scheduled_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 user_id,
                 template_key,
                 channel,
                 json.dumps(vars_used),
-                _now_iso(),
+                _iso(self.clock()) if sent else None,
                 error,
                 status,
                 attempt,
+                scheduled_at,
             ),
         )
         self.conn.commit()

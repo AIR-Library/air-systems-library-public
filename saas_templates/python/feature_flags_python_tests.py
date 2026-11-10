@@ -64,6 +64,7 @@ def assert_details(d: EvaluationDetails, value, reason, variant, error_code, msg
     assert_equal(d.flag_key, d.flag_key, f"{msg} flag_key")
 
 
+# FLAG-01
 def test_unknown_flag_returns_default():
     store = InMemoryFlagStore()
     client = FeatureFlagClient(store)
@@ -72,6 +73,7 @@ def test_unknown_flag_returns_default():
     assert_equal(client.get_string_value("missing_flag", "fallback", None), "fallback", "unknown string")
 
 
+# FLAG-02
 def test_string_method_on_boolean_flag_is_type_mismatch():
     store = InMemoryFlagStore()
     client = FeatureFlagClient(store, FeatureFlagOptions(clock=lambda: T0))
@@ -86,6 +88,7 @@ def test_string_method_on_boolean_flag_is_type_mismatch():
     assert_details(d, "fallback", REASON_ERROR, None, ERROR_TYPE_MISMATCH, "string on disabled boolean")
 
 
+# FLAG-03
 def test_disabled_flag_returns_caller_default():
     store = InMemoryFlagStore()
     client = FeatureFlagClient(store, FeatureFlagOptions(clock=lambda: T0))
@@ -101,6 +104,7 @@ def test_disabled_flag_returns_caller_default():
     assert_equal(client.get_number_value("limit", 1, {}), 1, "number default disabled")
 
 
+# FLAG-04
 def test_matching_rule_and_non_matching_rule():
     store = InMemoryFlagStore()
     client = FeatureFlagClient(store, FeatureFlagOptions(clock=lambda: T0))
@@ -113,6 +117,7 @@ def test_matching_rule_and_non_matching_rule():
     assert_details(d, False, REASON_DEFAULT, None, None, "empty context")
 
 
+# FLAG-05
 def test_rollout_30_percent_deterministic_and_distributed():
     store = InMemoryFlagStore()
     client = FeatureFlagClient(store, FeatureFlagOptions(clock=lambda: T0))
@@ -131,6 +136,7 @@ def test_rollout_30_percent_deterministic_and_distributed():
     assert_details(d, False, REASON_DEFAULT, None, None, "user-26 outside rollout")
 
 
+# FLAG-06
 def test_user_outside_rollout_falls_through():
     store = InMemoryFlagStore()
     client = FeatureFlagClient(store, FeatureFlagOptions(clock=lambda: T0))
@@ -145,6 +151,7 @@ def test_user_outside_rollout_falls_through():
     assert_details(d, "classic", REASON_DEFAULT, None, None, "alice no tier")
 
 
+# FLAG-07
 def test_corrupt_rules_json_returns_parse_error():
     store = InMemoryFlagStore()
     client = FeatureFlagClient(store)
@@ -171,6 +178,7 @@ def test_corrupt_rules_json_returns_parse_error():
     assert_equal(len(store.list_audit("new_flag")), 0, "audit empty after failed set_flag")
 
 
+# FLAG-08
 def test_set_flag_writes_audit_rows():
     store = InMemoryFlagStore()
     clock = [T0]

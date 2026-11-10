@@ -17,7 +17,15 @@ class AuthSystem:
                  mfa_challenge_expires_minutes: int = 5, signup_rate_limit: int = 24,
                  signup_rate_limit_max: int = 5, login_rate_limit: int = 15,
                  login_rate_limit_max: int = 5,
-                 oauth_profile: Optional[Callable[[str, str], Dict[str, Any]]] = None):
+                 oauth_profile: Optional[Callable[[str, str], Dict[str, Any]]] = None,
+                 email_sender: Optional[Callable[[str, str], None]] = None):
+        """Set up the auth system on one SQLite connection.
+
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] New optional email_sender(email, code): signup sends the
+        verification code through it (AUTH-01 "email sent"; docs/specs/README.md: email goes through an
+        injectable sender, tests pass a fake). The default sends nothing; wire a real mailer in production.
+        Touches: SQLite (creates tables); network only through the injected sender/oauth_profile."""
+        self.email_sender = email_sender or (lambda email, code: None)
         self.db = db_connection
         # Exchanges a provider's one-time code for the user's verified profile. Replace this with a real call to the
         # provider. The default invents a user, so the template runs without one.
@@ -214,7 +222,40 @@ class AuthSystem:
         )
         self.db.commit()
 
+    # Bundled common passwords (lower-case). Only entries of 15+ characters can ever be the deciding check,
+    # because too_short runs first; the short ones are kept so the list reads as the familiar one.
+    PASSWORD_BLOCKLIST = frozenset([
+        "password", "123456", "12345678", "qwerty", "abc123", "monkey", "letmein", "dragon", "baseball",
+        "iloveyou", "passwordpassword", "123456789012345", "1234567890123456", "qwertyuiopasdfgh",
+        "qwertyuiopasdfghjkl", "iloveyouiloveyou", "letmeinletmeinletmein", "aaaaaaaaaaaaaaa",
+    ])
+    SERVICE_NAME = "SaasAuth"
+
+    def _password_rejection(self, password: str, email: str, name: str) -> Optional[str]:
+        """The reason a signup password is rejected, or None if it is accepted.
+
+        In: the password, and the user's email and name. Out: "too_short" (< 15 chars), "too_long" (> 64),
+        "blocklisted" (in the bundled list, or equal to the email, the name or the service name, ignoring
+        case), or None. Checks run in that order and the first failure wins.
+        Why: AUTH-03 as amended 2026-11-10 (NIST SP 800-63B rules in docs/specs/auth_system.md).
+        2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing."""
+        if len(password) < 15:
+            return "too_short"
+        if len(password) > 64:
+            return "too_long"
+        lowered = password.lower()
+        if (lowered in self.PASSWORD_BLOCKLIST or lowered == email.lower()
+                or lowered == (name or "").lower() or lowered == self.SERVICE_NAME.lower()):
+            return "blocklisted"
+        return None
+
     def signup(self, email: str, password: str, name: str, ip: str) -> Dict[str, Any]:
+        """Flow 1: create an unverified user and send the verification code.
+
+        In: email, password, name, the server-observed IP. Out: {status: "pending_verification", email, message} or
+        {error: "too_many_signups_from_ip" | "email_already_exists" | "password_rejected", reason}.
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Password checks run too_short, too_long, blocklisted (AUTH-03 as amended) and the code is sent
+        through the injected email_sender (AUTH-01). Touches: SQLite, the email sender."""
         decision_points = []
         # rate_limit_ip_24h
         if self._is_rate_limited(ip, ip, 'signup'):
@@ -229,24 +270,14 @@ class AuthSystem:
             self._log_why_chain("signup", decision_points + ["email_unique:failed"])
             return {"error": "email_already_exists"}
         decision_points.append("email_unique")
-        # password_strength: blocklist first (includes email, name, service name)
-        blocklist = ["password", "123456", "12345678", "qwerty", "abc123", "monkey", "letmein", "dragon", "baseball", "iloveyou"]
-        service_name = "SaasAuth"
-        if (password in blocklist or 
-            password.lower() == email.lower() or 
-            password.lower() == name.lower() or 
-            password.lower() == service_name.lower()):
+        # password_strength -- [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] AUTH-03 as amended: the checks run
+        # too_short, too_long, blocklisted, and the first failure wins ("password123" is too_short, not
+        # blocklisted). The blocklist used to run first. Touches nothing but this request.
+        rejection = self._password_rejection(password, email, name)
+        if rejection is not None:
             self._log_why_chain("signup", decision_points + ["password_strength:failed"])
-            return {"error": "password_rejected", "reason": "blocklisted"}
-        decision_points.append("password_strength:blocklist")
-        # password length
-        if len(password) < 15:
-            self._log_why_chain("signup", decision_points + ["password_strength:failed"])
-            return {"error": "password_rejected", "reason": "too_short"}
-        if len(password) > 64:
-            self._log_why_chain("signup", decision_points + ["password_strength:failed"])
-            return {"error": "password_rejected", "reason": "too_long"}
-        decision_points.append("password_strength:length")
+            return {"error": "password_rejected", "reason": rejection}
+        decision_points.append("password_strength")
         # All gates passed
         password_hash = self._hash_password(password)
         now_iso = self._now_iso()
@@ -265,12 +296,21 @@ class AuthSystem:
              (self._now() + timedelta(hours=self.email_verification_expires_hours)).isoformat(), 'email')
         )
         self.db.commit()
+        # [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] AUTH-01: the verification email goes out through the
+        # injected sender, after the user and code are committed.
+        self.email_sender(email, code)
         self._log_why_chain("signup", decision_points)
         self._log_audit_log("user_created", actor_id=user_id, resource_type="user", resource_id=user_id,
                            old_value=None, new_value={"email": email, "status": "unverified"})
         return {"status": "pending_verification", "email": email, "message": "check email"}
 
     def verify_email(self, email: str, code_or_token: str) -> Dict[str, Any]:
+        """Flow 2: mark the user verified when the emailed code matches and has not expired.
+
+        In: email, the code. Out: {status: "verified", user_id, message} or {error: "invalid_email" |
+        "email_already_verified" | "code_expired"}. [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] The code is now
+        compared in constant time in Python (docs/specs/README.md); it was matched with "code = ?" in SQL.
+        Touches: SQLite (users, verification_codes, audit_log)."""
         decision_points = []
         cursor = self.db.cursor()
         cursor.execute("SELECT id, email_verified_at FROM users WHERE email = ?", (email,))
@@ -284,11 +324,15 @@ class AuthSystem:
             return {"error": "email_already_verified"}
         decision_points.append("user_unverified")
         cursor.execute(
-            """SELECT id, expires_at FROM verification_codes
-               WHERE user_id = ? AND code = ? AND type = 'email' AND expires_at > ?""",
-            (user_id, code_or_token, self._now_iso())
+            """SELECT id, code FROM verification_codes
+               WHERE user_id = ? AND type = 'email' AND expires_at > ? ORDER BY id""",
+            (user_id, self._now_iso())
         )
-        code_record = cursor.fetchone()
+        supplied = (code_or_token if isinstance(code_or_token, str) else "").encode("utf-8")
+        code_record = None
+        for candidate in cursor.fetchall():
+            if hmac.compare_digest(str(candidate[1]).encode("utf-8"), supplied):
+                code_record = candidate
         if not code_record:
             self._log_why_chain("verify_email", decision_points + ["code_valid:failed"])
             return {"error": "code_expired"}

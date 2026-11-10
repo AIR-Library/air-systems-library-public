@@ -3,6 +3,11 @@
 # Why: the suite failed on CI (it was listed in ci/baseline.json). Fixed by a free model from a
 # continuity handoff, then reviewed by Claude. 2026-11-03, session c6ee9a72.
 # Touches: SQLite only.
+# Amended 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (TRIAL-09/10/11/14/15, spec amended after review on PR 19):
+#   the device gate counts OTHER users null-safely and decides FAIL >= 5, PASS < 2, PASS for a device the user
+#   already has, else CHALLENGE; its row is written after the decision and only for PASS/CHALLENGE, and signup
+#   runs it before recording anything. Payment timing is measured from the end of the trial (trial_days,
+#   default 14) with floor division. All times come from an injectable clock.
 import sqlite3
 import datetime
 import hashlib
@@ -13,8 +18,30 @@ TRIAL_DAYS = 14
 CHALLENGE_RETRY_AFTER = 86400  # 24 hours in seconds
 
 
+def _iso(dt: datetime.datetime) -> str:
+    """An aware datetime as UTC ISO-8601 with microseconds, so stored times compare correctly as text.
+    2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (the signups table mixed SQLite's 'YYYY-MM-DD HH:MM:SS' with
+    ISO 'T' strings, which compare wrongly). Touches nothing."""
+    return dt.astimezone(datetime.timezone.utc).isoformat(timespec="microseconds")
+
+
+def _parse(value: str) -> datetime.datetime:
+    """A stored time as an aware UTC datetime (a naive value is taken as UTC). 2026-11-10,
+    session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing."""
+    dt = datetime.datetime.fromisoformat(value)
+    return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)
+
+
 class TrialAbusePrevention:
-    def __init__(self, db_path: str = ":memory:"):
+    def __init__(self, db_path: str = ":memory:", clock=None, trial_days: int = TRIAL_DAYS):
+        """Open the gates' database.
+
+        In: db_path; (added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP) clock, a function returning an aware
+        UTC datetime (default the wall clock), and trial_days (default 14; spec gate 5 "trial_days is
+        configuration"). Why: deterministic tests (docs/specs/README.md) and TRIAL-10/11/15.
+        Touches: SQLite (creates the tables)."""
+        self.clock = clock or (lambda: datetime.datetime.now(datetime.timezone.utc))
+        self.trial_days = trial_days
         self.conn = sqlite3.connect(db_path)
         self.conn.row_factory = sqlite3.Row
         self._create_tables()
@@ -175,15 +202,18 @@ class TrialAbusePrevention:
 
     # Gate 3: IP_SIGNUP_RATE_LIMIT
     def check_ip_signup_rate_limit(self, ip: str) -> Dict[str, Any]:
-        now = datetime.datetime.now(datetime.timezone.utc)
+        """Gate 3: signups from this IP in the last 24 h: < 5 PASS, 5-9 CHALLENGE, >= 10 FAIL.
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Uses the injected clock and compares ISO strings written
+        by _iso (it compared SQLite's datetime() text with an ISO 'T' string). Touches: SQLite."""
+        now = self.clock()
         cutoff = now - datetime.timedelta(hours=24)
         count = self._fetchone(
             """
             SELECT COUNT(*) as cnt FROM signups
             WHERE ip = ?
-              AND datetime(created_at) > ?
+              AND created_at > ?
             """,
-            (ip, cutoff.isoformat()),
+            (ip, _iso(cutoff)),
         )
         signup_count = count["cnt"] if count else 0
         if signup_count < 5:
@@ -203,82 +233,113 @@ class TrialAbusePrevention:
         return {"decision": decision, "count": signup_count}
 
     # Gate 4: DEVICE_FINGERPRINT
-    def check_device_fingerprint(self, user_id: int, device: Dict[str, str]) -> Dict[str, Any]:
-        device_hash = self._hash_device(device)
-        # Count distinct OTHER users with this device_hash
-        count = self._fetchone(
+    def _device_decision(self, user_id: Optional[int], device_hash: str) -> Tuple[str, int, bool]:
+        """Decide gate 4 without writing anything. Out: (decision, other users on the device, user has it).
+
+        Counts distinct OTHER users on the device, null-safe (a None user_id counts every user). Decision, in
+        this order: FAIL if count >= 5; PASS if count < 2; PASS if this user already has a row for the device;
+        CHALLENGE otherwise. Why: TRIAL-09/14 as amended 2026-11-10 (the old CHALLENGE range <= 5 overlapped
+        FAIL at exactly 5). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite (read)."""
+        row = self._fetchone(
             """
             SELECT COUNT(DISTINCT user_id) as cnt FROM device_fingerprints
-            WHERE device_hash = ? AND user_id != ?
+            WHERE device_hash = ? AND (? IS NULL OR user_id != ?)
             """,
-            (device_hash, user_id),
+            (device_hash, user_id, user_id),
         )
-        matching_users = count["cnt"] if count else 0
-
-        if matching_users < 2:
-            decision = "PASS"
-        elif matching_users <= 5:
-            decision = "CHALLENGE"
-        else:
+        others = row["cnt"] if row else 0
+        known = False
+        if user_id is not None:
+            known = self._fetchone(
+                "SELECT 1 FROM device_fingerprints WHERE device_hash = ? AND user_id = ? LIMIT 1",
+                (device_hash, user_id),
+            ) is not None
+        if others >= 5:
             decision = "FAIL"
+        elif others < 2 or known:
+            decision = "PASS"
+        else:
+            decision = "CHALLENGE"
+        return decision, others, known
 
+    def _record_device(self, user_id: int, device: Dict[str, str], device_hash: str) -> None:
+        """Write the user's device row unless it already exists. Called only after a PASS or CHALLENGE.
+        2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (TRIAL-14). Touches: SQLite (device_fingerprints)."""
+        if self._fetchone("SELECT 1 FROM device_fingerprints WHERE device_hash = ? AND user_id = ? LIMIT 1",
+                          (device_hash, user_id)) is not None:
+            return
+        self._execute(
+            """
+            INSERT INTO device_fingerprints
+            (user_id, device_hash, user_agent, screen_resolution, timezone, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, device_hash, device.get("user_agent", ""), device.get("screen_resolution", ""),
+             device.get("timezone", ""), _iso(self.clock())),
+        )
+
+    def check_device_fingerprint(self, user_id: Optional[int], device: Dict[str, str]) -> Dict[str, Any]:
+        """Gate 4 for a known (or, with None, a not yet created) user; records the device row after a PASS or
+        CHALLENGE for a known user, never after a FAIL.
+
+        In: user_id (or None), device {user_agent, screen_resolution, timezone, browser_language}.
+        Out: {decision, matching_users}. Why: TRIAL-08/09/14 as amended 2026-11-10.
+        2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite (device_fingerprints, gate_decisions)."""
+        device_hash = self._hash_device(device)
+        decision, matching_users, known = self._device_decision(user_id, device_hash)
         self.why_chain(
-            user_id=user_id,
+            user_id=user_id if user_id is not None else 0,
             gate_name="device_fingerprint",
             decision=decision,
-            rule_inputs={"device_hash": device_hash, "matching_users": matching_users},
+            rule_inputs={"device_hash": device_hash, "matching_users": matching_users, "known_device": known},
             rule_outputs={},
         )
+        if decision != "FAIL" and user_id is not None:
+            self._record_device(user_id, device, device_hash)
         return {"decision": decision, "matching_users": matching_users}
 
     # Gate 5: TRIAL_PAYMENT_TIMING
     def check_trial_payment_timing(self, user_id: int) -> Dict[str, Any]:
+        """Gate 5, judged as a payment method is added (the payment date is now, from the clock).
+
+        trial_end = the user's trial start + trial_days; days_after_trial = floor((now - trial_end) / 1 day),
+        rounding toward negative infinity; earlier_payment = the ledger already has a payment_added_date for
+        the user. PASS if days_after_trial < 5; FAIL if >= 90 and no earlier payment; CHALLENGE otherwise.
+        A user with no ledger row is FAIL "user_not_found" (unchanged: fail closed).
+        Out: {decision, days_after_trial, earlier_payment}. Why: TRIAL-10/11/15 as amended 2026-11-10 (it used
+        days since the trial START with ad-hoc windows). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        Touches: SQLite (read; gate_decisions)."""
         user = self._fetchone(
             """
-            SELECT trial_started_at, payment_added_date FROM trial_abuse_ledger
-            WHERE user_id = ?
+            SELECT MIN(COALESCE(trial_started_at, signup_date)) AS started,
+                   COUNT(payment_added_date) AS payments
+            FROM trial_abuse_ledger WHERE user_id = ?
             """,
             (user_id,),
         )
-        if not user:
+        if not user or user["started"] is None:
             return {"decision": "FAIL", "reason": "user_not_found"}
 
-        trial_start = datetime.datetime.fromisoformat(user["trial_started_at"])
-        now = datetime.datetime.now(datetime.timezone.utc)
-        # Ensure trial_start is timezone-aware for subtraction
-        if trial_start.tzinfo is None:
-            trial_start = trial_start.replace(tzinfo=datetime.timezone.utc)
-        days_elapsed = (now - trial_start).days
-
-        payment_added = user["payment_added_date"]
-        payment_added_date = (
-            datetime.datetime.fromisoformat(payment_added) if payment_added else None
-        )
-        if payment_added_date and payment_added_date.tzinfo is None:
-            payment_added_date = payment_added_date.replace(tzinfo=datetime.timezone.utc)
-
-        if payment_added_date and payment_added_date > trial_start:
-            if days_elapsed < TRIAL_DAYS + 5:
-                decision = "PASS"
-            elif days_elapsed > TRIAL_DAYS + 30 and payment_added_date > trial_start + datetime.timedelta(days=TRIAL_DAYS):
-                decision = "CHALLENGE"
-            else:
-                decision = "PASS"
+        trial_end = _parse(user["started"]) + datetime.timedelta(days=self.trial_days)
+        delta = self.clock() - trial_end
+        days_after_trial = (delta.days * 86400 + delta.seconds) // 86400  # floor toward -infinity
+        earlier_payment = user["payments"] > 0
+        if days_after_trial < 5:
+            decision = "PASS"
+        elif days_after_trial >= 90 and not earlier_payment:
+            decision = "FAIL"
         else:
-            # No payment added yet
-            if days_elapsed > 90:
-                decision = "FAIL"
-            else:
-                decision = "PASS"
+            decision = "CHALLENGE"
 
         self.why_chain(
             user_id=user_id,
             gate_name="trial_payment_timing",
             decision=decision,
-            rule_inputs={"trial_duration": days_elapsed, "payment_delay": payment_added_date.isoformat() if payment_added_date else None},
+            rule_inputs={"trial_duration": self.trial_days, "payment_delay": days_after_trial,
+                         "earlier_payment": earlier_payment},
             rule_outputs={},
         )
-        return {"decision": decision}
+        return {"decision": decision, "days_after_trial": days_after_trial, "earlier_payment": earlier_payment}
 
     # Gate 6: CHARGEBACK_HISTORY
     def check_chargeback_history(self, user_id: int) -> Dict[str, Any]:
@@ -324,6 +385,14 @@ class TrialAbusePrevention:
 
     # Signup flow
     def signup(self, email: str, password: str, ip: str, device: Dict[str, str]) -> Dict[str, Any]:
+        """Run the signup gates, then record the user, the signup and the device.
+
+        In: email, password (not stored here), the server-observed IP, the device. Out: {success: True,
+        challenge?} or a FAIL body {error, code}: email 409, IP 429 (retry_after), device 403
+        device_suspected_fraud. Every gate runs BEFORE anything is recorded, so a FAIL records no ledger,
+        signup or device row. [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] The device gate now runs here
+        (TRIAL-09/14): signup used to record the device first, so a device farm never failed.
+        Touches: SQLite (trial_abuse_ledger, signups, device_fingerprints, gate_decisions)."""
         email_gate = self.check_email_trial_history(email)
         ip_gate = self.check_ip_signup_rate_limit(ip)
 
@@ -331,22 +400,28 @@ class TrialAbusePrevention:
             return {"error": "email_has_trial_history", "code": 409}
         if ip_gate["decision"] == "FAIL":
             return {"error": "too_many_signups_from_ip", "code": 429, "retry_after": CHALLENGE_RETRY_AFTER}
+        device_gate = self.check_device_fingerprint(None, device)
+        if device_gate["decision"] == "FAIL":
+            return {"error": "device_suspected_fraud", "code": 403}
 
         # Create user record
-        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        now = _iso(self.clock())
         cur = self._execute(
             """
             INSERT INTO trial_abuse_ledger
-            (email, ip, signup_date, trial_started_at, subscription_status, gate_flags)
-            VALUES (?, ?, ?, ?, ?, ?)
+            (email, ip, device_fingerprint, signup_date, trial_started_at, subscription_status, gate_flags, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 email,
                 ip,
+                self._hash_device(device),
                 now,
                 now,
                 None,
-                json.dumps({"email": email_gate["decision"], "ip": ip_gate["decision"]}),
+                json.dumps({"email": email_gate["decision"], "ip": ip_gate["decision"],
+                            "device": device_gate["decision"]}),
+                now,
             ),
         )
         user_id = cur.lastrowid
@@ -357,32 +432,15 @@ class TrialAbusePrevention:
         )
 
         # Record signup for IP rate limiting
-        self._execute(
-            """
-            INSERT INTO signups (ip) VALUES (?)
-            """,
-            (ip,),
-        )
+        self._execute("INSERT INTO signups (ip, created_at) VALUES (?, ?)", (ip, now))
 
-        # Record device fingerprint
-        device_hash = self._hash_device(device)
-        self._execute(
-            """
-            INSERT INTO device_fingerprints
-            (user_id, device_hash, user_agent, screen_resolution, timezone)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                user_id,
-                device_hash,
-                device.get("user_agent", ""),
-                device.get("screen_resolution", ""),
-                device.get("timezone", ""),
-            ),
-        )
+        # Record the device AFTER its gate decided PASS or CHALLENGE
+        self._record_device(user_id, device, self._hash_device(device))
 
         # Challenge handling
-        response = {"success": True}
+        response = {"success": True, "user_id": user_id}
+        if device_gate["decision"] == "CHALLENGE":
+            response["challenge"] = "email_confirm"  # spec: send "new device login detected"
         if email_gate["decision"] == "CHALLENGE":
             response["challenge"] = "email_confirm"
             # Flag user
@@ -401,6 +459,11 @@ class TrialAbusePrevention:
 
     # Payment flow
     def subscription_created(self, user_id: int, stripe_payment_method_id: str) -> Dict[str, Any]:
+        """Payment flow: run gates 2, 5 and 6; on any FAIL return its 403 body, else record the payment.
+
+        In: user_id, the payment method id. Out: {success: True} or {error, code: 403}.
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] The payment date comes from the injected clock.
+        Touches: SQLite (trial_abuse_ledger, stripe_events, gate_decisions)."""
         payment_gate = self.check_payment_method_history(stripe_payment_method_id)
         timing_gate = self.check_trial_payment_timing(user_id)
         chargeback_gate = self.check_chargeback_history(user_id)
@@ -412,7 +475,7 @@ class TrialAbusePrevention:
         if chargeback_gate["decision"] == "FAIL":
             return {"error": "chargeback_history_requires_prepayment", "code": 403}
 
-        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        now = _iso(self.clock())
         # Update ledger
         self._execute(
             """

@@ -152,12 +152,17 @@ class BackgroundJobSystem:
 
     def __init__(self, db_path: str = "background_jobs.db",
                  email_sender: Optional[EmailSender] = None,
-                 webhook_sender: Optional[WebhookSender] = None):
+                 webhook_sender: Optional[WebhookSender] = None,
+                 clock: Optional[Callable[[], datetime]] = None):
         """Open/create the schema at ``db_path`` and register the built-in task handlers.
 
-        ``email_sender`` / ``webhook_sender`` default to the in-memory fakes. 2026-11-10, session
+        ``email_sender`` / ``webhook_sender`` default to the in-memory fakes. ``clock`` (added 2026-11-10,
+        session_012zDydZCZ4AChqhEZ4oVtaP) returns an aware UTC datetime and defaults to the wall clock; with
+        ``run_pending()`` it makes retry timing testable without threads or sleeps (JOBS-03/04,
+        docs/specs/README.md "time comes from an injectable clock"). 2026-11-10, session
         session_012zDydZCZ4AChqhEZ4oVtaP. Touches the database (CREATE TABLE IF NOT EXISTS).
         """
+        self._clock = clock or _utc_now
         self.db_path = db_path
         self.email_sender = email_sender or InMemoryEmailSender()
         self.webhook_sender = webhook_sender or InMemoryWebhookSender()
@@ -306,7 +311,7 @@ class BackgroundJobSystem:
             conn.execute(
                 "INSERT INTO jobs (id, task_type, params, status, created_at, max_retries, scheduled_at) "
                 "VALUES (?, ?, ?, 'enqueued', ?, ?, ?)",
-                (job_id, task_type, params_str, _iso(_utc_now()), max_retries, scheduled),
+                (job_id, task_type, params_str, _iso(self._clock()), max_retries, scheduled),
             )
         return {"success": True, "job_id": job_id, "status": "enqueued"}
 
@@ -377,7 +382,7 @@ class BackgroundJobSystem:
                 raise ValueError(f"Cannot retry job {job_id}: only failed jobs can be retried (status is {row['status']})")
             conn.execute(
                 "INSERT INTO jobs (id, task_type, params, status, created_at, max_retries) VALUES (?, ?, ?, 'enqueued', ?, ?)",
-                (new_job_id, row["task_type"], row["params"], _iso(_utc_now()), row["max_retries"]),
+                (new_job_id, row["task_type"], row["params"], _iso(self._clock()), row["max_retries"]),
             )
         return {"success": True, "new_job_id": new_job_id, "status": "enqueued"}
 
@@ -445,7 +450,7 @@ class BackgroundJobSystem:
         session_012zDydZCZ4AChqhEZ4oVtaP: the old claim had no ORDER BY and wrote a made-up
         '0/100' progress. Touches the database.
         """
-        now = _iso(_utc_now())
+        now = _iso(self._clock())
         conn = sqlite3.connect(self.db_path, timeout=15, isolation_level=None)
         conn.row_factory = sqlite3.Row
         try:
@@ -489,10 +494,21 @@ class BackgroundJobSystem:
         database and whatever the handler touches.
         """
         job_id = job["id"]
+        last_written = {"percent": None}
 
         def progress_callback(current: int, total: int) -> None:
+            """Store 'current/total' when the whole percentage changes, and always at 0 and at total.
+
+            [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] One write per percent instead of one per item: a
+            10,000-item job (JOBS-08) made 10,000 commits and took over 20 s; it now makes at most 101 and the
+            status still moves in real time (JOBS-06). Touches the database."""
+            current, total = int(current), int(total)
+            percent = (current * 100 // total) if total > 0 else None
+            if percent is not None and percent == last_written["percent"] and current != total:
+                return
+            last_written["percent"] = percent
             with self._conn() as conn:
-                conn.execute("UPDATE jobs SET progress = ? WHERE id = ?", (f"{int(current)}/{int(total)}", job_id))
+                conn.execute("UPDATE jobs SET progress = ? WHERE id = ?", (f"{current}/{total}", job_id))
 
         handler = self._handlers.get(job["task_type"])
         if handler is None:
@@ -507,7 +523,7 @@ class BackgroundJobSystem:
         except Exception as e:  # any handler failure is retried with backoff
             self._handle_failure(job, str(e) or e.__class__.__name__, retryable=True)
             return
-        completed_at = _iso(_utc_now())
+        completed_at = _iso(self._clock())
         with self._conn() as conn:
             conn.execute(
                 "UPDATE jobs SET status = 'completed', completed_at = ?, result = ?, error = NULL, next_retry_at = NULL "
@@ -525,7 +541,7 @@ class BackgroundJobSystem:
         the Java implementation (the old code waited 2**retry_count before the increment). Touches
         the database.
         """
-        now = _utc_now()
+        now = self._clock()
         completed_at = _iso(now)
         run_result = json.dumps({"error": error_msg})
         next_retry = job["retry_count"] + 1
@@ -626,7 +642,7 @@ class BackgroundJobSystem:
         this database, never fabricated metrics. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP:
         the method was missing. Touches the database (read).
         """
-        end = _normalize_scheduled_at(params.get("as_of")) or _iso(_utc_now())
+        end = _normalize_scheduled_at(params.get("as_of")) or _iso(self._clock())
         start = _iso(datetime.fromisoformat(end) - timedelta(days=1))
         with self._conn() as conn:
             rows = conn.execute(
@@ -649,7 +665,7 @@ class BackgroundJobSystem:
         days = params.get("days", 30)
         if isinstance(days, bool) or not isinstance(days, int) or days < 1:
             raise NonRetryableJobError("days must be a positive integer")
-        cutoff = _iso(_utc_now() - timedelta(days=days))
+        cutoff = _iso(self._clock() - timedelta(days=days))
         with self._conn() as conn:
             deleted = conn.execute("DELETE FROM sessions WHERE created_at < ?", (cutoff,)).rowcount
         progress_callback(1, 1)

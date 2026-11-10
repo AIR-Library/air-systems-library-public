@@ -16,7 +16,15 @@ def auth_system():
     yield auth
     db_connection.close()
 
+# AUTH-01
 def test_signup_happy_path(auth_system):
+    # [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Also asserts the verification email is sent, through a fake
+    # sender (AUTH-01 "email sent").
+    """Signup creates an unverified user and sends the stored code to the email.
+    In: the test fixtures. Out: assertions. Why: AUTH-01. Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: checks the fake email sender.
+    Touches: in-memory SQLite only."""
+    sent = []
+    auth_system.email_sender = lambda email, code: sent.append((email, code))
     result = auth_system.signup('test@example.com', 'a' * 16, 'Test User', '127.0.0.1')
     assert result['status'] == 'pending_verification'
     assert result['email'] == 'test@example.com'
@@ -29,12 +37,16 @@ def test_signup_happy_path(auth_system):
     # Check verification code exists
     cursor.execute("SELECT COUNT(*) FROM verification_codes WHERE user_id = ?", (user['id'],))
     assert cursor.fetchone()[0] == 1
+    cursor.execute("SELECT code FROM verification_codes WHERE user_id = ?", (user['id'],))
+    assert sent == [('test@example.com', cursor.fetchone()['code'])]
 
+# AUTH-02
 def test_signup_duplicate_email(auth_system):
     auth_system.signup('test@example.com', 'a' * 16, 'Test User', '127.0.0.1')
     result = auth_system.signup('test@example.com', 'b' * 16, 'Test User 2', '127.0.0.1')
     assert result['error'] == 'email_already_exists'
 
+# AUTH-03
 def test_signup_weak_password_too_short(auth_system):
     result = auth_system.signup('test@example.com', 'short', 'Test User', '127.0.0.1')
     assert result['error'] == 'password_rejected'
@@ -45,20 +57,32 @@ def test_signup_weak_password_too_long(auth_system):
     assert result['error'] == 'password_rejected'
     assert result['reason'] == 'too_long'
 
+# AUTH-03
+# [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Changed for the amended AUTH-03: checks run too_short, too_long,
+# blocklisted and the first failure wins, so the old short blocklisted passwords ("password", "SaasAuth") are
+# now too_short; blocklisted is proved with passwords of 15+ characters.
 def test_signup_weak_password_blocklisted(auth_system):
+    """A 15-64 char password that is common, or equals the email or name, is "blocklisted"; a short common one
+    is "too_short". In: the auth_system fixture. Out: assertions only. Why: AUTH-03 (amended 2026-11-10).
+    2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the fixture's in-memory SQLite database."""
     result = auth_system.signup('test@example.com', 'password', 'Test User', '127.0.0.1')
+    assert result == {'error': 'password_rejected', 'reason': 'too_short'}
+    result = auth_system.signup('test1@example.com', 'password123', 'Test User', '127.0.0.1')
+    assert result == {'error': 'password_rejected', 'reason': 'too_short'}
+    result = auth_system.signup('test@example.com', 'PasswordPassword', 'Test User', '127.0.0.1')
     assert result['error'] == 'password_rejected'
     assert result['reason'] == 'blocklisted'
-    result = auth_system.signup('test2@example.com', 'test2@example.com', 'Test User', '127.0.0.1')
+    result = auth_system.signup('longaddress2@example.com', 'LongAddress2@example.com', 'Test User', '127.0.0.1')
     assert result['error'] == 'password_rejected'
     assert result['reason'] == 'blocklisted'
-    result = auth_system.signup('test3@example.com', 'Test User', 'Test User', '127.0.0.1')
+    result = auth_system.signup('test3@example.com', 'Theodora Winterbottom', 'Theodora Winterbottom', '127.0.0.1')
     assert result['error'] == 'password_rejected'
     assert result['reason'] == 'blocklisted'
-    result = auth_system.signup('test4@example.com', 'SaasAuth', 'Test User', '127.0.0.1')
-    assert result['error'] == 'password_rejected'
-    assert result['reason'] == 'blocklisted'
+    cursor = auth_system.db.cursor()
+    cursor.execute("SELECT COUNT(*) FROM users")
+    assert cursor.fetchone()[0] == 0
 
+# AUTH-04
 def test_signup_ip_rate_limit(auth_system):
     ip = '192.168.1.100'
     for i in range(6):
@@ -68,6 +92,7 @@ def test_signup_ip_rate_limit(auth_system):
         else:
             assert result['error'] == 'too_many_signups_from_ip', f"Signup {i} should be rate limited: {result}"
 
+# AUTH-05
 def test_verify_email_happy_path(auth_system):
     # First signup
     auth_system.signup('test@example.com', 'a' * 16, 'Test User', '127.0.0.1')
@@ -92,6 +117,7 @@ def test_verify_email_happy_path(auth_system):
     cursor.execute("SELECT COUNT(*) FROM verification_codes WHERE user_id = ? AND type = 'email'", (user_id,))
     assert cursor.fetchone()[0] == 0
 
+# AUTH-06
 def test_verify_email_expired_code(auth_system):
     auth_system.signup('test@example.com', 'a' * 16, 'Test User', '127.0.0.1')
     cursor = auth_system.db.cursor()
@@ -107,6 +133,7 @@ def test_verify_email_expired_code(auth_system):
     result = auth_system.verify_email('test@example.com', 'expired')
     assert result['error'] == 'code_expired'
 
+# AUTH-07
 def test_login_happy_path_no_mfa(auth_system):
     # Create verified user
     auth_system.signup('test@example.com', 'a' * 16, 'Test User', '127.0.0.1')
@@ -127,6 +154,7 @@ def test_login_happy_path_no_mfa(auth_system):
     cursor.execute("SELECT COUNT(*) FROM sessions WHERE user_id = ?", (user_id,))
     assert cursor.fetchone()[0] == 1
 
+# AUTH-08
 def test_login_with_mfa_enabled(auth_system):
     # We need to enable MFA for a user. Since there's no direct method, we'll manually set mfa_secret and mfa_enabled
     auth_system.signup('test@example.com', 'a' * 16, 'Test User', '127.0.0.1')
@@ -157,6 +185,7 @@ def test_login_with_mfa_enabled(auth_system):
     assert 'token' in mfa_result
     assert mfa_result['user']['id'] == user_id
 
+# AUTH-09
 def test_login_invalid_password(auth_system):
     auth_system.signup('test@example.com', 'a' * 16, 'Test User', '127.0.0.1')
     cursor = auth_system.db.cursor()
@@ -189,6 +218,7 @@ def test_login_rate_limit(auth_system):
     result = auth_system.login('test@example.com', 'wrongpassword', 'device123', ip)
     assert result['error'] == 'too_many_failed_logins'
 
+# AUTH-10
 def test_oauth_callback_new_user(auth_system):
     result = auth_system.oauth_callback('google', 'auth_code', 'state')
     assert result['status'] == 'authenticated'
@@ -216,6 +246,7 @@ def test_oauth_callback_ignores_email_in_state(auth_system):
     assert result['user']['email'] != 'victim@example.com'
 
 
+# AUTH-11
 def test_oauth_callback_existing_user(auth_system):
     # First create a user via email
     auth_system.signup('existing@example.com', 'a' * 16, 'Existing User', '127.0.0.1')
@@ -239,6 +270,7 @@ def test_oauth_callback_existing_user(auth_system):
     cursor.execute("SELECT COUNT(*) FROM users WHERE email = 'existing@example.com'")
     assert cursor.fetchone()[0] == 1
 
+# AUTH-12
 def test_mfa_challenge_happy_path(auth_system):
     # Setup user with MFA enabled
     auth_system.signup('test@example.com', 'a' * 16, 'Test User', '127.0.0.1')
@@ -276,6 +308,7 @@ def test_mfa_challenge_happy_path(auth_system):
     cursor.execute("SELECT COUNT(*) FROM verification_codes WHERE id = ?", (challenge_id,))
     assert cursor.fetchone()[0] == 0
 
+# AUTH-13
 def test_mfa_challenge_wrong_code(auth_system):
     auth_system.signup('test@example.com', 'a' * 16, 'Test User', '127.0.0.1')
     cursor = auth_system.db.cursor()
@@ -304,12 +337,49 @@ def test_mfa_challenge_wrong_code(auth_system):
     result = auth_system.mfa_challenge(challenge_id, '000000')
     assert result['error'] == 'invalid_code'
 
-def test_token_refresh_happy_path(auth_system):
-    # Create verified user and login to get refresh token
+def _login_and_get_refresh_token(auth_system):
+    """Sign up, verify and log in test@example.com; return (user_id, the session's refresh token).
+
+    In: the auth_system fixture. Out: (user_id, refresh_token) read from the sessions table (login does not
+    return it). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the fixture's in-memory SQLite database."""
     auth_system.signup('test@example.com', 'a' * 16, 'Test User', '127.0.0.1')
     cursor = auth_system.db.cursor()
     cursor.execute("SELECT id FROM users WHERE email = 'test@example.com'")
-    cursor.fetchone()
+    user_id = cursor.fetchone()['id']
+    cursor.execute("SELECT code FROM verification_codes WHERE user_id = ? AND type = 'email'", (user_id,))
+    auth_system.verify_email('test@example.com', cursor.fetchone()['code'])
+    assert auth_system.login('test@example.com', 'a' * 16, 'device123', '192.168.1.1')['status'] == 'authenticated'
+    cursor.execute("SELECT refresh_token FROM sessions WHERE user_id = ?", (user_id,))
+    return user_id, cursor.fetchone()['refresh_token']
+
+
+# AUTH-14
+# [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Completed: the test stopped after signup and never called
+# token_refresh.
+def test_token_refresh_happy_path(auth_system):
+    """A valid refresh token gets a new access token that verifies as the same user.
+    In: the fixture. Out: assertions. Why: AUTH-14. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    Touches: the fixture's in-memory SQLite database."""
+    user_id, refresh_token = _login_and_get_refresh_token(auth_system)
+    result = auth_system.token_refresh(refresh_token)
+    assert result['status'] == 'ok'
+    assert result['expires_in'] == 15 * 60
+    verified = auth_system.verify_access_token(result['token'])
+    assert verified['status'] == 'ok'
+    assert verified['user']['id'] == user_id
+    assert auth_system.token_refresh('not-a-real-token') == {'error': 'invalid_token'}
+
+
+# AUTH-15
+def test_token_refresh_banned_user(auth_system):
+    """A banned user's refresh token gets {error: "user_banned"} and no token.
+    In: the fixture. Out: assertions. Why: AUTH-15 had no test. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    Touches: the fixture's in-memory SQLite database."""
+    user_id, refresh_token = _login_and_get_refresh_token(auth_system)
+    auth_system.db.execute("UPDATE users SET status = 'banned' WHERE id = ?", (user_id,))
+    auth_system.db.commit()
+    result = auth_system.token_refresh(refresh_token)
+    assert result == {'error': 'user_banned'}
 
 
 def test_oauth_callback_refuses_an_unverified_email(auth_system):

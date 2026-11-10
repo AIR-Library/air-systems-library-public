@@ -31,6 +31,7 @@ def err(fn, code, status):
     assert e.value.code == code
     assert e.value.status == status
 
+# UPLOAD-01
 def test_exe_rejected_by_extension_and_magic_bytes():
     uploads, store, options = svc()
     err(lambda: uploads.upload('alice', 'org1', 'setup.exe', EXE, 'application/octet-stream'),
@@ -39,6 +40,7 @@ def test_exe_rejected_by_extension_and_magic_bytes():
         'CONTENT_MISMATCH', 415)
     assert len(os.listdir(options.storage_dir)) == 0
 
+# UPLOAD-02
 def test_real_png_stored_under_generated_name():
     uploads, store, options = svc()
     r = uploads.upload('alice', 'org1', 'photo.png', PNG, 'image/png')
@@ -60,6 +62,7 @@ def test_real_png_stored_under_generated_name():
     assert info.sha256 == hashlib.sha256(PNG).hexdigest()
     assert info.created_at == 1000
 
+# UPLOAD-03
 def test_path_traversal_name_stored_safely():
     uploads, store, options = svc()
     r1 = uploads.upload('alice', 'org1', '../../etc/passwd.png', PNG, 'image/png')
@@ -69,6 +72,7 @@ def test_path_traversal_name_stored_safely():
     files = os.listdir(options.storage_dir)
     assert set(files) == {r1.file_id, r2.file_id}
 
+# UPLOAD-04
 def test_file_over_size_limit_rejected():
     uploads, store, options = svc()
     store2 = InMemoryFileStore()
@@ -88,6 +92,7 @@ def test_file_over_size_limit_rejected():
     err(lambda: uploads.upload('alice', 'org1', 'big.png', PNG + b'\x00'*10485694, 'image/png'),
         'FILE_TOO_LARGE', 413)
 
+# UPLOAD-05
 def test_non_member_cannot_upload_or_download():
     uploads, store, options = svc()
     err(lambda: uploads.upload('bob', 'org1', 'test.png', PNG, 'image/png'),
@@ -103,6 +108,7 @@ def test_non_member_cannot_upload_or_download():
     assert resp.content_type == 'image/png'
     assert resp.body == PNG
 
+# UPLOAD-06
 def test_expired_and_tampered_links_rejected():
     uploads, store, options = svc()
     r = uploads.upload('alice', 'org1', 'test.png', PNG, 'image/png')
@@ -124,6 +130,7 @@ def test_expired_and_tampered_links_rejected():
     err(lambda: uploads.download('alice', tampered2),
         'INVALID_LINK', 400)
 
+# UPLOAD-07
 def test_deleted_file_cannot_be_linked_or_downloaded():
     uploads, store, options = svc()
     r = uploads.upload('alice', 'org1', 'test.png', PNG, 'image/png')
