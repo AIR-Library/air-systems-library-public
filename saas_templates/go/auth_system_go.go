@@ -11,6 +11,13 @@ package auth
 // checks a single-use state and takes the email from an injectable provider exchange (it used to take
 // the email from the client's code); the login failure limit is enforced (it was counted, never
 // checked). Touches: SQLite, the injected email sender and OAuth provider (network in production).
+//
+// Phase B.2, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16 and the spec's "Secrets at rest" line):
+// every flow that creates a session (login, MFA, OAuth) returns its refresh_token, which TokenRefresh
+// accepts; sessions keep only refresh_token_hash (SHA-256) and verification_codes only code_hash (the email
+// code's SHA-256, or the MFA challenge id's), so a database read hands out no usable credential. OAuth state
+// stays single-use, 10 minutes, stored as its hash, and the provider code is exchanged through the injected
+// OAuthProvider.
 import (
 	"context"
 	"crypto/rand"
@@ -68,7 +75,7 @@ var schema = []string{
 	`CREATE TABLE IF NOT EXISTS sessions (
 		id TEXT PRIMARY KEY,
 		user_id INTEGER NOT NULL,
-		refresh_token TEXT NOT NULL,
+		refresh_token_hash TEXT NOT NULL UNIQUE, -- SHA-256 of the refresh token; the token itself is never stored (Phase B.2, 2026-11-10)
 		created_at TEXT NOT NULL,
 		expires_at TEXT NOT NULL,
 		ip TEXT,
@@ -87,7 +94,7 @@ var schema = []string{
 	`CREATE TABLE IF NOT EXISTS verification_codes (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		user_id INTEGER NOT NULL,
-		code TEXT NOT NULL,
+		code_hash TEXT NOT NULL, -- SHA-256 of the email code or MFA challenge id; never the value (Phase B.2, 2026-11-10)
 		created_at TEXT NOT NULL,
 		expires_at TEXT NOT NULL,
 		type TEXT NOT NULL,
@@ -354,15 +361,6 @@ func NewAuthSystemWithOptions(opts Options) (*AuthSystem, error) {
 		signups: &rateLimiter{buckets: map[string]*rateBucket{}}, loginFail: &rateLimiter{buckets: map[string]*rateBucket{}}}, nil
 }
 
-// getLatestVerificationCode is a test helper to retrieve the most recent verification code for a user.
-func (a *AuthSystem) getLatestVerificationCode(ctx context.Context, userID int64, codeType string) (string, error) {
-	var code string
-	err := a.db.QueryRowContext(ctx,
-		`SELECT code FROM verification_codes WHERE user_id = ? AND type = ? ORDER BY id DESC LIMIT 1`,
-		userID, codeType).Scan(&code)
-	return code, err
-}
-
 // getUserIDByEmail retrieves user ID by email (test helper).
 func (a *AuthSystem) getUserIDByEmail(ctx context.Context, email string) (int64, error) {
 	var userID int64
@@ -370,28 +368,31 @@ func (a *AuthSystem) getUserIDByEmail(ctx context.Context, email string) (int64,
 	return userID, err
 }
 
-// createSession stores a session with a fresh refresh token and returns its id and an access token.
-// In: user id, tier, ip and device id. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (one place
-// for login, OAuth and MFA, which each repeated it). Touches: SQLite (sessions).
-func (a *AuthSystem) createSession(ctx context.Context, userID int64, tier, ip, deviceID string) (string, string, error) {
+// createSession stores a session with a fresh refresh token and returns its id, an access token and the
+// refresh token. Only the refresh token's SHA-256 is stored (refresh_token_hash); the caller hands the
+// token itself to the client, once. In: user id, tier, ip and device id. Out: session id, access token,
+// refresh token, error. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (one place for login, OAuth and
+// MFA, which each repeated it). Changed the same day (Phase B.2, AUTH-16): it stored the refresh token in
+// plain text and returned none, so no flow could hand it out. Touches: SQLite (sessions); crypto/rand.
+func (a *AuthSystem) createSession(ctx context.Context, userID int64, tier, ip, deviceID string) (string, string, string, error) {
 	sessionID, err := generateRandomString(24)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	refreshToken, err := generateRandomString(32)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	now := a.now().UTC()
 	if _, err = a.db.ExecContext(ctx,
-		`INSERT INTO sessions (id, user_id, refresh_token, created_at, expires_at, ip, device_id)
+		`INSERT INTO sessions (id, user_id, refresh_token_hash, created_at, expires_at, ip, device_id)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		sessionID, userID, refreshToken, now.Format(time.RFC3339), now.Add(refreshTokenTTL).Format(time.RFC3339),
+		sessionID, userID, sha256Hex(refreshToken), now.Format(time.RFC3339), now.Add(refreshTokenTTL).Format(time.RFC3339),
 		ip, deviceID); err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	token, err := a.createAccessToken(userID, tier)
-	return sessionID, token, err
+	return sessionID, token, refreshToken, err
 }
 
 // Signup creates an unverified user and emails a verification code.
@@ -400,7 +401,9 @@ func (a *AuthSystem) createSession(ctx context.Context, userID int64, tier, ip, 
 // (with reason) | email_unavailable | internal_error}.
 // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-01, AUTH-03): password_rejected with a
 // reason replaces password_too_weak; the verification email is really sent through EmailSender, and a
-// failed send rolls the user back so the address can sign up again. Touches: SQLite, the email sender.
+// failed send rolls the user back so the address can sign up again. Changed the same day (Phase B.2,
+// AUTH-16): the code is stored only as its SHA-256 (code_hash); the email carries the code itself.
+// Touches: SQLite, the email sender.
 func (a *AuthSystem) Signup(ctx context.Context, email, password, name, ip string) jsonResponse {
 	decision := []string{}
 	if !a.signups.hit(ip, maxSignupPerIP24h, 24*time.Hour, a.now()) {
@@ -450,8 +453,8 @@ func (a *AuthSystem) Signup(ctx context.Context, email, password, name, ip strin
 	}
 	userID, _ := res.LastInsertId()
 	if _, err = tx.ExecContext(ctx,
-		`INSERT INTO verification_codes (user_id, code, created_at, expires_at, type) VALUES (?, ?, ?, ?, 'email')`,
-		userID, code, now.Format(time.RFC3339), now.Add(verificationTTL).Format(time.RFC3339)); err != nil {
+		`INSERT INTO verification_codes (user_id, code_hash, created_at, expires_at, type) VALUES (?, ?, ?, ?, 'email')`,
+		userID, sha256Hex(code), now.Format(time.RFC3339), now.Add(verificationTTL).Format(time.RFC3339)); err != nil {
 		return jsonError("internal_error", "database error")
 	}
 	if err := a.email.SendVerificationEmail(ctx, email, code); err != nil {
@@ -475,23 +478,24 @@ func (a *AuthSystem) Signup(ctx context.Context, email, password, name, ip strin
 // VerifyEmail marks a user verified when the code matches (constant time) and has not expired.
 // In: email and code. Out: {success, status: "verified", user_id, message} or {error: code_invalid |
 // code_expired}. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: constant-time compare and the
-// injectable clock. Touches: SQLite.
+// injectable clock; the same day (Phase B.2, AUTH-16) the SHA-256 of the given code is compared, in constant
+// time, with the stored code_hash (the code was stored in plain text). Touches: SQLite.
 func (a *AuthSystem) VerifyEmail(ctx context.Context, email, code string) jsonResponse {
 	decision := []string{}
 	var userID int64
-	var storedCode, expiresAt string
+	var storedHash, expiresAt string
 	var emailVerifiedAt sql.NullString
 	err := a.db.QueryRowContext(ctx,
-		`SELECT vc.user_id, vc.code, vc.expires_at, u.email_verified_at
+		`SELECT vc.user_id, vc.code_hash, vc.expires_at, u.email_verified_at
 		 FROM verification_codes vc
 		 JOIN users u ON u.id = vc.user_id
 		 WHERE u.email = ? AND vc.type = 'email' ORDER BY vc.id DESC LIMIT 1`,
-		email).Scan(&userID, &storedCode, &expiresAt, &emailVerifiedAt)
+		email).Scan(&userID, &storedHash, &expiresAt, &emailVerifiedAt)
 	if err != nil {
 		whyChain("verify_email", []string{"code_valid"})
 		return jsonError("code_invalid", "Invalid verification code")
 	}
-	if !constantTimeEqual(storedCode, code) {
+	if !constantTimeEqual(storedHash, sha256Hex(code)) {
 		whyChain("verify_email", []string{"code_valid"})
 		return jsonError("code_invalid", "Invalid verification code")
 	}
@@ -525,8 +529,9 @@ func (a *AuthSystem) VerifyEmail(ctx context.Context, email, code string) jsonRe
 
 // Login checks the password and either opens a session or, with MFA on, starts a challenge.
 // In: email, password, device id, IP. Out: {success, status: "authenticated", session_id, token,
-// expires_in, user} or {success, status: "mfa_required", challenge_id} or {error: invalid_credentials |
-// too_many_login_attempts | internal_error}.
+// refresh_token, expires_in, user} or {success, status: "mfa_required", challenge_id} or {error:
+// invalid_credentials | too_many_login_attempts | internal_error}. refresh_token added 2026-11-10,
+// session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, AUTH-16: login returned none).
 // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the 5-failures-per-15-minutes limit per
 // ip+email is now enforced before the password is checked (it was counted, never read); the MFA
 // challenge row stores the SHA-256 of a random challenge id, and the code is checked later against the
@@ -570,7 +575,7 @@ func (a *AuthSystem) Login(ctx context.Context, email, password, deviceID, ip st
 		}
 		now := a.now().UTC()
 		if _, err := a.db.ExecContext(ctx,
-			`INSERT INTO verification_codes (user_id, code, created_at, expires_at, type) VALUES (?, ?, ?, ?, 'mfa')`,
+			`INSERT INTO verification_codes (user_id, code_hash, created_at, expires_at, type) VALUES (?, ?, ?, ?, 'mfa')`,
 			userID, sha256Hex(challengeID), now.Format(time.RFC3339), now.Add(mfaChallengeTTL).Format(time.RFC3339)); err != nil {
 			return jsonError("internal_error", "database error")
 		}
@@ -581,7 +586,7 @@ func (a *AuthSystem) Login(ctx context.Context, email, password, deviceID, ip st
 		})
 	}
 	decision = append(decision, "mfa_gate")
-	sessionID, accessToken, err := a.createSession(ctx, userID, tier, ip, deviceID)
+	sessionID, accessToken, refreshToken, err := a.createSession(ctx, userID, tier, ip, deviceID)
 	if err != nil {
 		return jsonError("internal_error", "session error")
 	}
@@ -590,10 +595,11 @@ func (a *AuthSystem) Login(ctx context.Context, email, password, deviceID, ip st
 		"session_created", "session", sql.NullInt64{Int64: userID, Valid: true}, "", "")
 
 	return jsonSuccess(map[string]interface{}{
-		"status":     "authenticated",
-		"session_id": sessionID,
-		"token":      accessToken,
-		"expires_in": int(accessTokenTTL.Seconds()),
+		"status":        "authenticated",
+		"session_id":    sessionID,
+		"token":         accessToken,
+		"refresh_token": refreshToken,
+		"expires_in":    int(accessTokenTTL.Seconds()),
 		"user": map[string]interface{}{
 			"id":    userID,
 			"email": email,
@@ -621,8 +627,11 @@ func (a *AuthSystem) StartOAuth(ctx context.Context, provider string) (string, e
 // whose email the provider must have verified. Case A: a new email creates a verified user. Case B:
 // an existing email links the provider to that account. Either way the provider identity is linked
 // in oauth_accounts and a session is opened.
-// In: provider, code, state. Out: {success, status: "authenticated", session_id, token, user} or
-// {error: invalid_state | oauth_unavailable | oauth_exchange_failed | email_not_verified | internal_error}.
+// In: provider, code, state. Out: {success, status: "authenticated", session_id, token, refresh_token,
+// expires_in, user} or {error: invalid_state | oauth_unavailable | oauth_exchange_failed |
+// email_not_verified | oauth_account_conflict | internal_error}. refresh_token and expires_in added
+// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, AUTH-16: every flow that creates a session
+// returns its refresh token).
 // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the old callback skipped the state check and
 // used the client's code AS the email, so anyone could sign in as any account. Touches: SQLite, the
 // OAuth provider (network in production).
@@ -688,7 +697,7 @@ func (a *AuthSystem) OAuthCallback(ctx context.Context, provider, code, state st
 	if err := tx.Commit(); err != nil {
 		return jsonError("internal_error", "database error")
 	}
-	sessionID, accessToken, err := a.createSession(ctx, userID, tier, "", "")
+	sessionID, accessToken, refreshToken, err := a.createSession(ctx, userID, tier, "", "")
 	if err != nil {
 		return jsonError("internal_error", "session error")
 	}
@@ -697,9 +706,11 @@ func (a *AuthSystem) OAuthCallback(ctx context.Context, provider, code, state st
 		"oauth_login", "session", sql.NullInt64{Int64: userID, Valid: true}, "", provider)
 
 	return jsonSuccess(map[string]interface{}{
-		"status":     "authenticated",
-		"session_id": sessionID,
-		"token":      accessToken,
+		"status":        "authenticated",
+		"session_id":    sessionID,
+		"token":         accessToken,
+		"refresh_token": refreshToken,
+		"expires_in":    int(accessTokenTTL.Seconds()),
 		"user": map[string]interface{}{
 			"id":    userID,
 			"email": id.Email,
@@ -712,9 +723,11 @@ func (a *AuthSystem) OAuthCallback(ctx context.Context, provider, code, state st
 // and the code must be a valid TOTP for that challenge's user (30 s steps, one step of skew). The
 // challenge is consumed on success.
 // In: challenge id (from Login) and the 6-digit code. Out: {success, status: "authenticated",
-// session_id, token, user} or {error: invalid_code | code_expired}.
+// session_id, token, refresh_token, expires_in, user} or {error: invalid_code | code_expired}.
 // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: it used to ignore challenge_id and compare the
-// code with the newest MFA row of ANY user, so one user's code could log in as another. Touches: SQLite.
+// code with the newest MFA row of ANY user, so one user's code could log in as another. Changed again the
+// same day (Phase B.2, AUTH-16): the answer carries refresh_token (and expires_in), and the challenge is
+// found by its code_hash. Touches: SQLite.
 func (a *AuthSystem) MFAChallenge(ctx context.Context, challengeID, code string) jsonResponse {
 	var rowID, userID int64
 	var expiresAt string
@@ -722,7 +735,7 @@ func (a *AuthSystem) MFAChallenge(ctx context.Context, challengeID, code string)
 	var tier string
 	err := a.db.QueryRowContext(ctx,
 		`SELECT vc.id, vc.user_id, vc.expires_at, u.mfa_secret, u.tier FROM verification_codes vc
-		 JOIN users u ON u.id = vc.user_id WHERE vc.type = 'mfa' AND vc.code = ?`,
+		 JOIN users u ON u.id = vc.user_id WHERE vc.type = 'mfa' AND vc.code_hash = ?`,
 		sha256Hex(challengeID)).Scan(&rowID, &userID, &expiresAt, &secret, &tier)
 	if err != nil || !secret.Valid || secret.String == "" {
 		whyChain("mfa_challenge", []string{"challenge_valid"})
@@ -747,7 +760,7 @@ func (a *AuthSystem) MFAChallenge(ctx context.Context, challengeID, code string)
 	if n, _ := res.RowsAffected(); n != 1 {
 		return jsonError("invalid_code", "Challenge already used")
 	}
-	sessionID, accessToken, err := a.createSession(ctx, userID, tier, "", "")
+	sessionID, accessToken, refreshToken, err := a.createSession(ctx, userID, tier, "", "")
 	if err != nil {
 		return jsonError("internal_error", "session error")
 	}
@@ -756,9 +769,11 @@ func (a *AuthSystem) MFAChallenge(ctx context.Context, challengeID, code string)
 		"mfa_verified", "user", sql.NullInt64{Int64: userID, Valid: true}, "", "")
 
 	return jsonSuccess(map[string]interface{}{
-		"status":     "authenticated",
-		"session_id": sessionID,
-		"token":      accessToken,
+		"status":        "authenticated",
+		"session_id":    sessionID,
+		"token":         accessToken,
+		"refresh_token": refreshToken,
+		"expires_in":    int(accessTokenTTL.Seconds()),
 		"user": map[string]interface{}{
 			"id":   userID,
 			"tier": tier,
@@ -769,15 +784,18 @@ func (a *AuthSystem) MFAChallenge(ctx context.Context, challengeID, code string)
 // TokenRefresh issues a new access token for a valid, unexpired refresh token of an active user.
 // In: the refresh token. Out: {success, status: "ok", token, expires_in} or {error: invalid_token |
 // token_expired | user_banned}. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the instance's
-// secret and clock. Touches: SQLite.
+// secret and clock. Changed again the same day (Phase B.2, AUTH-16): the session is found by the SHA-256 of
+// the given token (refresh_token_hash), and the stored hash is compared with it in constant time; the
+// table no longer holds the token itself. Touches: SQLite.
 func (a *AuthSystem) TokenRefresh(ctx context.Context, refreshToken string) jsonResponse {
 	decision := []string{}
 	var userID int64
-	var expiresAt string
+	var storedHash, expiresAt string
+	given := sha256Hex(refreshToken)
 	err := a.db.QueryRowContext(ctx,
-		`SELECT user_id, expires_at FROM sessions WHERE refresh_token = ?`,
-		refreshToken).Scan(&userID, &expiresAt)
-	if err != nil || refreshToken == "" {
+		`SELECT user_id, refresh_token_hash, expires_at FROM sessions WHERE refresh_token_hash = ?`,
+		given).Scan(&userID, &storedHash, &expiresAt)
+	if err != nil || refreshToken == "" || !constantTimeEqual(storedHash, given) {
 		whyChain("token_refresh", []string{"token_valid"})
 		return jsonError("invalid_token", "Refresh token not found")
 	}

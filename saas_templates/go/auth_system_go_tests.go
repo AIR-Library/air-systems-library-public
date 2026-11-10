@@ -35,6 +35,26 @@ func (f *fakeOAuth) ExchangeCode(_ context.Context, _ string, code string) (OAut
 	return id, nil
 }
 
+// getLatestVerificationCode returns the email verification code the fake mailer sent to the user (the
+// database keeps only its SHA-256, so the code can no longer be read back from verification_codes). In: the
+// user id and the code type (only "email" is sent by mail). Out: the code, or an error when none was sent.
+// Moved here from the implementation 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, AUTH-16:
+// verification codes are stored only as code_hash). Touches: in-memory SQLite (one read of users).
+func (a *AuthSystem) getLatestVerificationCode(ctx context.Context, userID int64, codeType string) (string, error) {
+	if codeType != "email" {
+		return "", fmt.Errorf("only email codes are sent by mail, not %q", codeType)
+	}
+	var email string
+	if err := a.db.QueryRowContext(ctx, `SELECT email FROM users WHERE id = ?`, userID).Scan(&email); err != nil {
+		return "", err
+	}
+	code, ok := a.email.(*fakeMailer).sent[email]
+	if !ok {
+		return "", fmt.Errorf("no verification email was sent to %s", email)
+	}
+	return code, nil
+}
+
 // newTestAuth builds an AuthSystem with the fake mailer and OAuth provider.
 // Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: NewAuthSystem alone has no email sender, and
 // signup refuses rather than pretend to send. Touches: in-memory SQLite.
@@ -68,12 +88,15 @@ func TestSignupHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("user not created: %v", err)
 	}
-	code, err := as.getLatestVerificationCode(ctx, userID, "email")
-	if err != nil {
+	// Corrected 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, AUTH-16): the code is stored only as
+	// its SHA-256, so the test checks the stored code_hash is the hash of the code that was emailed (it read
+	// a plain-text code column).
+	var storedHash string
+	if err := as.db.QueryRowContext(ctx, `SELECT code_hash FROM verification_codes WHERE user_id = ? AND type = 'email'`, userID).Scan(&storedHash); err != nil {
 		t.Fatalf("no verification code: %v", err)
 	}
-	if sent := as.email.(*fakeMailer).sent["alice@example.com"]; sent == "" || sent != code {
-		t.Fatalf("verification email not sent with the stored code: sent %q, stored %q", sent, code)
+	if sent := as.email.(*fakeMailer).sent["alice@example.com"]; sent == "" || storedHash != sha256Hex(sent) {
+		t.Fatalf("verification email not sent with the stored code: sent %q, stored hash %q", sent, storedHash)
 	}
 }
 
@@ -523,13 +546,11 @@ func TestTokenRefreshHappyPath(t *testing.T) {
 		t.Fatalf("login failed: %v", loginResp)
 	}
 
-	// fetch refresh token from sessions
-	var rt string
-	err = as.db.QueryRowContext(ctx,
-		`SELECT refresh_token FROM sessions WHERE user_id = ?`,
-		userID).Scan(&rt)
-	if err != nil {
-		t.Fatalf("fetch refresh_token failed: %v", err)
+	// Corrected 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, AUTH-16): the refresh token comes from
+	// the login answer; the sessions table no longer holds it (the test read it from there).
+	rt, _ := loginResp["refresh_token"].(string)
+	if rt == "" {
+		t.Fatalf("login returned no refresh_token: %v", loginResp)
 	}
 
 	resp = as.TokenRefresh(ctx, rt)
@@ -567,10 +588,12 @@ func TestTokenRefreshBannedUser(t *testing.T) {
 	sessionID, _ := generateRandomString(24)
 	rt, _ := generateRandomString(32)
 	now := time.Now().UTC()
+	// Corrected 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, AUTH-16): the column is now
+	// refresh_token_hash and holds the token's SHA-256.
 	_, err = as.db.ExecContext(ctx,
-		`INSERT INTO sessions (id, user_id, refresh_token, created_at, expires_at, ip, device_id)
+		`INSERT INTO sessions (id, user_id, refresh_token_hash, created_at, expires_at, ip, device_id)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		sessionID, userID, rt,
+		sessionID, userID, sha256Hex(rt),
 		now.Format(time.RFC3339),
 		now.Add(refreshTokenTTL).Format(time.RFC3339),
 		ip, "dev7")
@@ -789,4 +812,132 @@ func TestLoginFailureLimitEnforced(t *testing.T) {
 	if r := as.Login(ctx, "p@example.com", "StrongPassword!12345", "d", ip); r["error"] != "too_many_login_attempts" {
 		t.Fatalf("expected too_many_login_attempts, got %v", r)
 	}
+}
+
+// TestRefreshTokenAndSecretsAtRest proves AUTH-16: login returns a refresh_token that TokenRefresh accepts;
+// the sessions table holds only its SHA-256 (no column holds the token, so a database read hands out nothing
+// usable: the stored hash itself is refused by TokenRefresh); a verification code and an MFA challenge id
+// are stored only as their hashes; the MFA and OAuth flows return a refresh_token TokenRefresh accepts too.
+// Input: none; output: test failures. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2).
+// Touches: in-memory SQLite, the fake mailer and OAuth provider.
+// AUTH-16
+func TestRefreshTokenAndSecretsAtRest(t *testing.T) {
+	fixed := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	mailer := &fakeMailer{sent: map[string]string{}}
+	as, err := NewAuthSystemWithOptions(Options{Email: mailer, Now: func() time.Time { return fixed },
+		OAuth: &fakeOAuth{ids: map[string]OAuthIdentity{"code-rt": {ProviderUserID: "g-rt", Email: "rt@example.com", EmailVerified: true}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if r := as.Signup(ctx, "quinn@example.com", "StrongPassword!12345", "Quinn", "203.0.113.16"); r["success"] != true {
+		t.Fatalf("signup: %v", r)
+	}
+	sent := mailer.sent["quinn@example.com"]
+	var codeHash string
+	if err := as.db.QueryRowContext(ctx, `SELECT code_hash FROM verification_codes WHERE type = 'email'`).Scan(&codeHash); err != nil {
+		t.Fatal(err)
+	}
+	if codeHash != sha256Hex(sent) || strings.Contains(dumpTable(t, as, "verification_codes"), sent) {
+		t.Fatalf("the email code must be stored only as its SHA-256")
+	}
+	if r := as.VerifyEmail(ctx, "quinn@example.com", codeHash); r["error"] != "code_invalid" {
+		t.Fatalf("the stored hash must not verify the email: %v", r)
+	}
+	if r := as.VerifyEmail(ctx, "quinn@example.com", sent); r["status"] != "verified" {
+		t.Fatalf("verify: %v", r)
+	}
+
+	login := as.Login(ctx, "quinn@example.com", "StrongPassword!12345", "dev", "203.0.113.16")
+	rt, _ := login["refresh_token"].(string)
+	if login["status"] != "authenticated" || len(rt) < 32 {
+		t.Fatalf("login must return a refresh_token: %v", login)
+	}
+	var stored string
+	if err := as.db.QueryRowContext(ctx, `SELECT refresh_token_hash FROM sessions WHERE id = ?`, login["session_id"]).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(dumpTable(t, as, "sessions"), stored) {
+		t.Fatalf("dumpTable must show the stored values as text, or the checks below prove nothing")
+	}
+	if stored != sha256Hex(rt) || strings.Contains(dumpTable(t, as, "sessions"), rt) {
+		t.Fatalf("sessions must hold only the refresh token's SHA-256")
+	}
+	if r := as.TokenRefresh(ctx, rt); r["status"] != "ok" || r["token"] == "" {
+		t.Fatalf("TokenRefresh must accept login's refresh_token: %v", r)
+	}
+	if r := as.TokenRefresh(ctx, stored); r["error"] != "invalid_token" {
+		t.Fatalf("the stored hash must not work as a refresh token: %v", r)
+	}
+
+	// MFA: the challenge id is stored only as its hash, and the session it opens has a working refresh token.
+	if _, err := as.db.ExecContext(ctx, `UPDATE users SET mfa_enabled = 1, mfa_secret = 'JBSWY3DPEHPK3PXP' WHERE email = 'quinn@example.com'`); err != nil {
+		t.Fatal(err)
+	}
+	ch := as.Login(ctx, "quinn@example.com", "StrongPassword!12345", "dev", "203.0.113.16")
+	challengeID, _ := ch["challenge_id"].(string)
+	if challengeID == "" || strings.Contains(dumpTable(t, as, "verification_codes"), challengeID) {
+		t.Fatalf("the MFA challenge id must be stored only as its hash: %v", ch)
+	}
+	code, _ := totp.GenerateCode("JBSWY3DPEHPK3PXP", fixed)
+	mfa := as.MFAChallenge(ctx, challengeID, code)
+	if mrt, _ := mfa["refresh_token"].(string); mfa["status"] != "authenticated" || as.TokenRefresh(ctx, mrt)["status"] != "ok" {
+		t.Fatalf("MFA must return a refresh_token TokenRefresh accepts: %v", mfa)
+	}
+
+	// OAuth: the state is single use and lives 10 minutes; the callback's session has a working refresh token.
+	state, err := as.StartOAuth(ctx, "google")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(dumpTable(t, as, "oauth_states"), state) {
+		t.Fatalf("the OAuth state must be stored only as its hash")
+	}
+	oa := as.OAuthCallback(ctx, "google", "code-rt", state)
+	if ort, _ := oa["refresh_token"].(string); oa["status"] != "authenticated" || as.TokenRefresh(ctx, ort)["status"] != "ok" {
+		t.Fatalf("OAuth must return a refresh_token TokenRefresh accepts: %v", oa)
+	}
+	if r := as.OAuthCallback(ctx, "google", "code-rt", state); r["error"] != "invalid_state" {
+		t.Fatalf("a used state: expected invalid_state, got %v", r)
+	}
+	late, _ := as.StartOAuth(ctx, "google")
+	as.now = func() time.Time { return fixed.Add(10 * time.Minute) }
+	if r := as.OAuthCallback(ctx, "google", "code-rt", late); r["error"] != "invalid_state" {
+		t.Fatalf("a state 10 minutes old: expected invalid_state, got %v", r)
+	}
+	as.now = func() time.Time { return fixed }
+	inTime, _ := as.StartOAuth(ctx, "google")
+	as.now = func() time.Time { return fixed.Add(10*time.Minute - time.Second) }
+	if r := as.OAuthCallback(ctx, "google", "code-rt", inTime); r["status"] != "authenticated" {
+		t.Fatalf("a state just under 10 minutes old must work: %v", r)
+	}
+}
+
+// dumpTable returns every value of every row of table as one string, so a test can prove a secret appears
+// nowhere in it. In: the test, the system and a table name from this file. Out: the text.
+// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, AUTH-16). Touches: in-memory SQLite (read).
+func dumpTable(t *testing.T, as *AuthSystem, table string) string {
+	t.Helper()
+	rows, err := as.db.Query("SELECT * FROM " + table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	cols, _ := rows.Columns()
+	var b strings.Builder
+	for rows.Next() {
+		vals := make([]interface{}, len(cols))
+		ptrs := make([]interface{}, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			t.Fatal(err)
+		}
+		for _, v := range vals {
+			fmt.Fprintf(&b, "%v|", v)
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
 }

@@ -249,11 +249,14 @@ func TestDeviceFingerprint_Fail_SharedByManyUsers(t *testing.T) {
 
 // timingAt plants a user whose trial started at start (with an optional earlier payment) on a service
 // whose clock reads now, and returns the payment-timing gate with the default 14-day trial.
-// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (TRIAL-10/11/15 as amended). Touches: in-memory SQLite.
+// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (TRIAL-10/11/15 as amended). Changed the same day
+// (Phase B.2): it also plants the users row with created_at = start, since the trial now starts at
+// users.created_at. Touches: in-memory SQLite.
 func timingAt(t *testing.T, start, now time.Time, earlierPayment bool) GateResult {
 	t.Helper()
 	tap := setupTestDB(t)
 	tap.SetClock(func() time.Time { return now })
+	plantUser(t, tap, "u", start)
 	var paid any
 	if earlierPayment {
 		paid = start.Add(24 * time.Hour)
@@ -264,6 +267,70 @@ func timingAt(t *testing.T, start, now time.Time, earlierPayment bool) GateResul
 		t.Fatalf("insert: %v", err)
 	}
 	return tap.CheckTrialPaymentTiming(context.Background(), "u", 0)
+}
+
+// plantUser inserts a users row (id, email, created_at). In: the test, the service, the id and created_at.
+// Out: nothing (fails the test on error). Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2:
+// payment timing reads users.created_at). Touches: in-memory SQLite.
+func plantUser(t *testing.T, tap *TrialAbusePrevention, id string, created time.Time) {
+	t.Helper()
+	if _, err := tap.db.ExecContext(context.Background(),
+		`INSERT INTO users (id, email, created_at) VALUES (?, ?, ?)`, id, id+"@example.com", created); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+}
+
+// TestTrialPaymentTiming_UserNotFound_FailsClosed proves the Phase B.2 amendment: a user with no users row
+// gets FAIL {error: "user_not_found"} (fail closed), even when a ledger row exists for that id, and
+// OnSubscriptionCreated refuses with that code and records no payment. Input: none; output: test failures.
+// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite.
+// TRIAL-11
+func TestTrialPaymentTiming_UserNotFound_FailsClosed(t *testing.T) {
+	tap := setupTestDB(t)
+	ctx := context.Background()
+	start := time.Date(2026, 1, 1, 9, 0, 0, 0, time.UTC)
+	tap.SetClock(func() time.Time { return start.Add(24 * time.Hour) })
+	if _, err := tap.db.ExecContext(ctx,
+		`INSERT INTO trial_abuse_ledger (user_id, email, ip, signup_date, trial_started_at, subscription_status, created_at)
+		 VALUES ('ghost', 'ghost@example.com', '1.2.3.4', ?, ?, 'trial', ?)`, start, start, start); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	r := tap.CheckTrialPaymentTiming(ctx, "ghost", 0)
+	if r.Decision != DecisionFail || r.Reason != "user_not_found" || r.Code != 403 || r.Meta["error"] != "user_not_found" {
+		t.Fatalf("expected FAIL user_not_found 403, got %s %q %d %v", r.Decision, r.Reason, r.Code, r.Meta)
+	}
+	_, _, _, err := tap.OnSubscriptionCreated(ctx, PaymentInput{UserID: "ghost", StripePaymentMethodID: "pm_x", StripeCustomerID: "cus_x"}, 0)
+	var ge *GateError
+	if !errors.As(err, &ge) || ge.ErrorCode != "user_not_found" {
+		t.Fatalf("expected GateError user_not_found, got %v", err)
+	}
+	var paid int
+	_ = tap.db.QueryRowContext(ctx, `SELECT COUNT(payment_added_date) FROM trial_abuse_ledger WHERE user_id = 'ghost'`).Scan(&paid)
+	if paid != 0 {
+		t.Fatalf("a refused subscription must record no payment, found %d", paid)
+	}
+}
+
+// TestTrialPaymentTiming_NoLedgerRow_JudgedFromUsersCreatedAt proves the Phase B.2 amendment: a user with a
+// users row and no ledger row is judged from users.created_at with no earlier payment (4 days after the trial
+// -> PASS, 90 days -> FAIL trial_ended_no_payment_cannot_retry). Input: none; output: test failures.
+// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite.
+// TRIAL-10
+func TestTrialPaymentTiming_NoLedgerRow_JudgedFromUsersCreatedAt(t *testing.T) {
+	start := time.Date(2026, 1, 1, 9, 0, 0, 0, time.UTC)
+	trialEnd := start.Add(14 * 24 * time.Hour)
+	for _, c := range []struct {
+		days int
+		want Decision
+	}{{4, DecisionPass}, {90, DecisionFail}} {
+		tap := setupTestDB(t)
+		tap.SetClock(func() time.Time { return trialEnd.Add(time.Duration(c.days) * 24 * time.Hour) })
+		plantUser(t, tap, "solo", start)
+		r := tap.CheckTrialPaymentTiming(context.Background(), "solo", 0)
+		if r.Decision != c.want || r.Meta["days_after_trial"] != int64(c.days) || r.Meta["earlier_payment"] != false {
+			t.Errorf("%d days after, no ledger row: expected %s, got %s %v", c.days, c.want, r.Decision, r.Meta)
+		}
+	}
 }
 
 // Rewritten 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the amended TRIAL-10 is a FIRST payment 4 days
@@ -397,6 +464,16 @@ func TestOnSignup_NewUserAllowed(t *testing.T) {
 	if ipGate.Decision != DecisionPass {
 		t.Errorf("ip gate: expected PASS, got %s", ipGate.Decision)
 	}
+	// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): signup writes the users row whose
+	// created_at starts the trial, so the new user's payment timing is judged (PASS during the trial).
+	var n int
+	_ = tap.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE id = ? AND email = ?`, userID, input.Email).Scan(&n)
+	if n != 1 {
+		t.Fatalf("expected one users row for %s, got %d", userID, n)
+	}
+	if r := tap.CheckTrialPaymentTiming(ctx, userID, 0); r.Decision != DecisionPass {
+		t.Fatalf("a payment during the trial must PASS, got %s %q", r.Decision, r.Reason)
+	}
 }
 
 func TestOnSignup_EmailChallenge_Flagged(t *testing.T) {
@@ -479,6 +556,9 @@ func TestOnSubscriptionCreated_Success(t *testing.T) {
 	userID := "user_sub_success"
 	now := time.Now().UTC()
 	trialStart := now.Add(-5 * 24 * time.Hour)
+	// Users row added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): payment timing reads
+	// users.created_at, and a user with no users row now fails closed with user_not_found.
+	plantUser(t, tap, userID, trialStart)
 	_, err := tap.db.ExecContext(ctx,
 		`INSERT INTO trial_abuse_ledger (user_id, email, ip, signup_date, trial_started_at, subscription_status, created_at)
 		 VALUES (?, ?, ?, ?, ?, 'trial', ?)`,
@@ -515,6 +595,9 @@ func TestOnSubscriptionCreated_PaymentFail_Rejected(t *testing.T) {
 	userID := "user_sub_fail"
 	now := time.Now().UTC()
 	trialStart := now.Add(-5 * 24 * time.Hour)
+	// Users row added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2), so the refusal comes from the
+	// shared card and not from a missing user.
+	plantUser(t, tap, userID, trialStart)
 	for i := 0; i < 3; i++ {
 		_, err := tap.db.ExecContext(ctx,
 			`INSERT INTO trial_abuse_ledger (user_id, email, ip, stripe_payment_method_id, signup_date, trial_started_at, subscription_status, created_at)
@@ -542,6 +625,11 @@ func TestOnSubscriptionCreated_PaymentFail_Rejected(t *testing.T) {
 	_, _, _, err = tap.OnSubscriptionCreated(ctx, input, 14)
 	if err == nil {
 		t.Fatal("expected error for payment method reuse")
+	}
+	// Tightened 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): the refusal must name the card gate.
+	var ge *GateError
+	if !errors.As(err, &ge) || ge.ErrorCode != "payment_method_used_for_multiple_trials" {
+		t.Fatalf("expected payment_method_used_for_multiple_trials, got %v", err)
 	}
 }
 

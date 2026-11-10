@@ -134,6 +134,17 @@ func TestCreateUserHappyPath(t *testing.T) {
 	if invite == "" || !tokenStored(t, invite, "invite") {
 		t.Fatalf("invite not sent, or its token not stored as a hash: %q", invite)
 	}
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, admin spec "TIERS"): a user's tier is a staff
+	// role; a plan name is 400 invalid_tier and nothing is created.
+	bad := doRequest(mux, http.MethodPost, "/admin/users/action", map[string]string{"action": "create",
+		"email": "plan@example.com", "name": "Plan User", "tier": "enterprise"}, ownerID, "owner", nil)
+	var badOut map[string]interface{}
+	_ = json.NewDecoder(bad.Body).Decode(&badOut)
+	var n int
+	db.QueryRow(`SELECT COUNT(*) FROM users WHERE email='plan@example.com'`).Scan(&n)
+	if bad.Code != http.StatusBadRequest || badOut["error"] != "invalid_tier" || n != 0 {
+		t.Fatalf("a plan as a user tier: expected 400 invalid_tier and no user, got %d %v (%d users)", bad.Code, badOut, n)
+	}
 }
 
 // ADMIN-02
@@ -271,6 +282,16 @@ func TestChangeRoleHappyPath(t *testing.T) {
 	if role != "admin" || audits != 1 {
 		t.Fatalf("role %q, role_changed audit rows %d", role, audits)
 	}
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, admin spec "TIERS"): a plan name is not a staff
+	// role: 400 invalid_tier, and the role stays.
+	bad := doRequest(mux, http.MethodPost, "/admin/users/action", map[string]string{"action": "change_role",
+		"user_id": strconv.FormatInt(userID, 10), "new_tier": "team"}, ownerID, "owner", nil)
+	var badOut map[string]interface{}
+	_ = json.NewDecoder(bad.Body).Decode(&badOut)
+	db.QueryRow(`SELECT role FROM users WHERE id=?`, userID).Scan(&role)
+	if bad.Code != http.StatusBadRequest || badOut["error"] != "invalid_tier" || role != "admin" {
+		t.Fatalf("a plan as a role: expected 400 invalid_tier and no change, got %d %v (role %q)", bad.Code, badOut, role)
+	}
 }
 
 // ADMIN-07
@@ -347,7 +368,7 @@ func TestCustomersListPagination(t *testing.T) {
 	// insert 3 customers
 	for i := 1; i <= 3; i++ {
 		_, _ = db.Exec(`INSERT INTO customers (email,name,tier,signup_date,invoice_count,status) VALUES (?,?,?,?,?,?)`,
-			"c"+strconv.Itoa(i)+"@example.com", "Cust"+strconv.Itoa(i), "user", time.Now().UTC(), i, "active")
+			"c"+strconv.Itoa(i)+"@example.com", "Cust"+strconv.Itoa(i), "solo", time.Now().UTC(), i, "active") // a plan (Phase B.2, 2026-11-10)
 	}
 	resp := doRequest(mux, http.MethodGet, "/admin/customers?limit=2&offset=1", nil, ownerID, "owner", nil)
 	if resp.Code != http.StatusOK {
@@ -374,7 +395,7 @@ func TestCustomersDetail(t *testing.T) {
 	mux := setupTestEnv(t)
 	ownerID := seedOwner(t)
 	_, _ = db.Exec(`INSERT INTO customers (email,name,tier,signup_date,invoice_count,status) VALUES (?,?,?,?,?,?)`,
-		"detail@example.com", "Detail", "admin", time.Now().UTC(), 5, "active")
+		"detail@example.com", "Detail", "team", time.Now().UTC(), 5, "active") // a plan, not a role (Phase B.2, 2026-11-10)
 	row := db.QueryRow(`SELECT id FROM customers WHERE email=?`, "detail@example.com")
 	var cid int64
 	row.Scan(&cid)
@@ -400,6 +421,12 @@ func TestCustomersDetail(t *testing.T) {
 }
 
 // ADMIN-12
+// TestChangePlanStripeCalled proves change_plan updates the subscription's one item to the new plan's price
+// and logs it; a staff role or unknown value is 400 invalid_tier; two items is 409. Input: none; output: test
+// failures. Corrected 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, admin spec "TIERS"): the
+// customer's tier is a plan (solo/team/enterprise), so the test changes solo -> team (it used the staff
+// roles user -> admin, which the spec now refuses), and a staff role is checked to be refused.
+// Touches: the test SQLite database and the fake billing provider.
 func TestChangePlanStripeCalled(t *testing.T) {
 	// Stripe sits behind the PlanChanger interface; the in-memory fake proves it was called without
 	// any network call (a dummy key against the real API can only fail).
@@ -410,14 +437,14 @@ func TestChangePlanStripeCalled(t *testing.T) {
 	mux := setupTestEnv(t)
 	ownerID := seedOwner(t)
 	_, _ = db.Exec(`INSERT INTO customers (email,name,tier,signup_date,invoice_count,status,stripe_subscription_id) VALUES (?,?,?,?,?,?,?)`,
-		"plan@example.com", "PlanUser", "user", time.Now().UTC(), 0, "active", "sub_123")
+		"plan@example.com", "PlanUser", "solo", time.Now().UTC(), 0, "active", "sub_123")
 	row := db.QueryRow(`SELECT id FROM customers WHERE email=?`, "plan@example.com")
 	var cid int64
 	row.Scan(&cid)
 
 	payload := map[string]string{
 		"action":    "change_plan",
-		"new_tier":  "admin",
+		"new_tier":  "team",
 	}
 	resp := doRequest(mux, http.MethodPost, "/admin/customers/"+strconv.FormatInt(cid, 10)+"/action", payload, ownerID, "owner", nil)
 	if resp.Code != http.StatusOK {
@@ -425,13 +452,13 @@ func TestChangePlanStripeCalled(t *testing.T) {
 	}
 	var out map[string]interface{}
 	_ = json.NewDecoder(resp.Body).Decode(&out)
-	if out["new_tier"] != "admin" {
-		t.Fatalf("plan not changed")
+	if out["new_tier"] != "team" || out["old_tier"] != "solo" {
+		t.Fatalf("plan not changed: %v", out)
 	}
 	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-12, amended): the update carries the existing item
 	// id and the new price, so no second item is added.
-	if len(fake.calls) != 1 || fake.calls[0] != "sub_123|si_sub_123|price_admin" {
-		t.Fatalf("expected one update of item si_sub_123 to price_admin, got %v", fake.calls)
+	if len(fake.calls) != 1 || fake.calls[0] != "sub_123|si_sub_123|price_team" {
+		t.Fatalf("expected one update of item si_sub_123 to price_team, got %v", fake.calls)
 	}
 	var audits int
 	db.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='plan_changed' AND resource_id=?`, cid).Scan(&audits)
@@ -440,11 +467,16 @@ func TestChangePlanStripeCalled(t *testing.T) {
 	}
 	// An unknown tier is 400, a subscription with two items is 409; neither reaches the update.
 	path := "/admin/customers/" + strconv.FormatInt(cid, 10) + "/action"
-	if r := doRequest(mux, http.MethodPost, path, map[string]string{"action": "change_plan", "new_tier": "platinum"}, ownerID, "owner", nil); r.Code != http.StatusBadRequest {
-		t.Fatalf("unknown tier: expected 400, got %d", r.Code)
+	for _, bad := range []string{"platinum", "owner", "admin", "user"} {
+		r := doRequest(mux, http.MethodPost, path, map[string]string{"action": "change_plan", "new_tier": bad}, ownerID, "owner", nil)
+		var o map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&o)
+		if r.Code != http.StatusBadRequest || o["error"] != "invalid_tier" {
+			t.Fatalf("new_tier %q: expected 400 invalid_tier, got %d %v", bad, r.Code, o)
+		}
 	}
 	fake.items = map[string][]string{"sub_123": {"si_a", "si_b"}}
-	r := doRequest(mux, http.MethodPost, path, map[string]string{"action": "change_plan", "new_tier": "user"}, ownerID, "owner", nil)
+	r := doRequest(mux, http.MethodPost, path, map[string]string{"action": "change_plan", "new_tier": "enterprise"}, ownerID, "owner", nil)
 	var amb map[string]interface{}
 	_ = json.NewDecoder(r.Body).Decode(&amb)
 	if r.Code != http.StatusConflict || amb["error"] != "subscription_item_ambiguous" {
@@ -462,7 +494,7 @@ func TestQueueRefund(t *testing.T) {
 	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: queue_refund now checks the invoice (spec: "invoice exists,
 	// status='succeeded'"), so the test seeds a real invoice of customer 1 instead of a fake refund row.
 	_, _ = db.Exec(`INSERT INTO customers (id,email,name,tier,signup_date,invoice_count,status) VALUES (1,?,?,?,?,?,?)`,
-		"ref@example.com", "Ref", "user", time.Now().UTC(), 1, "active")
+		"ref@example.com", "Ref", "solo", time.Now().UTC(), 1, "active") // a plan (Phase B.2, 2026-11-10)
 	_, _ = db.Exec(`INSERT INTO invoices (id, customer_id, amount, status) VALUES (1, 1, 1000, 'succeeded')`)
 	_, _ = db.Exec(`INSERT INTO invoices (id, customer_id, amount, status) VALUES (2, 1, 1000, 'failed')`)
 	payload := map[string]string{
@@ -509,11 +541,15 @@ func TestQueueRefund(t *testing.T) {
 }
 
 // ADMIN-14
+// TestCreateDeployment proves create makes the deployment and its config. Corrected 2026-11-10,
+// session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, admin spec "TIERS"): a deployment's tier is a plan, so the
+// test creates a "solo" deployment (it used the staff role "user"), checks a staff role is 400 invalid_tier,
+// and checks a new deployment's domain starts unverified. Touches: the test SQLite database.
 func TestCreateDeployment(t *testing.T) {
 	mux := setupTestEnv(t)
 	ownerID := seedOwner(t)
 	_, _ = db.Exec(`INSERT INTO customers (email,name,tier,signup_date,invoice_count,status) VALUES (?,?,?,?,?,?)`,
-		"dep@example.com", "DepCust", "user", time.Now().UTC(), 0, "active")
+		"dep@example.com", "DepCust", "solo", time.Now().UTC(), 0, "active")
 	row := db.QueryRow(`SELECT id FROM customers WHERE email=?`, "dep@example.com")
 	var cid int64
 	row.Scan(&cid)
@@ -522,7 +558,7 @@ func TestCreateDeployment(t *testing.T) {
 		"action":      "create",
 		"customer_id": strconv.FormatInt(cid, 10),
 		"domain":      "example.com",
-		"tier":        "user",
+		"tier":        "solo",
 		"theme_id":    "1",
 	}
 	resp := doRequest(mux, http.MethodPost, "/admin/deployments/action", payload, ownerID, "owner", nil)
@@ -539,17 +575,51 @@ func TestCreateDeployment(t *testing.T) {
 	if err := db.QueryRow(`SELECT theme_id FROM deployment_configs WHERE deployment_id=?`, int64(out["deployment_id"].(float64))).Scan(&theme); err != nil || theme != 1 {
 		t.Fatalf("deployment config not initialised: %d (%v)", theme, err)
 	}
+	var verified bool
+	db.QueryRow(`SELECT domain_verified FROM deployments WHERE id=?`, int64(out["deployment_id"].(float64))).Scan(&verified)
+	if verified || out["tier"] != "solo" {
+		t.Fatalf("a new deployment is on its plan with an unverified domain: tier %v, verified %v", out["tier"], verified)
+	}
+	role := doRequest(mux, http.MethodPost, "/admin/deployments/action", map[string]string{"action": "create",
+		"customer_id": strconv.FormatInt(cid, 10), "domain": "role.example.com", "tier": "user", "theme_id": "1"}, ownerID, "owner", nil)
+	var roleOut map[string]interface{}
+	_ = json.NewDecoder(role.Body).Decode(&roleOut)
+	var n int
+	db.QueryRow(`SELECT COUNT(*) FROM deployments WHERE domain='role.example.com'`).Scan(&n)
+	if role.Code != http.StatusBadRequest || roleOut["error"] != "invalid_tier" || n != 0 {
+		t.Fatalf("a staff role as a deployment tier: expected 400 invalid_tier and nothing created, got %d %v (%d rows)", role.Code, roleOut, n)
+	}
 }
 
 // ADMIN-15
+// TestPublishDeployment proves the publish double gate and, since Phase B.2, that publish needs
+// domain_verified: an unverified draft is 400 domain_not_verified and stays a draft; once SetDomainVerified
+// marks it, publish succeeds. Corrected 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, admin spec
+// "TIERS"): the seeded deployments are on a plan ("solo", was the staff role "user") and the happy path
+// verifies its domain first. Touches: the test SQLite database.
 func TestPublishDeployment(t *testing.T) {
 	mux := setupTestEnv(t)
 	ownerID := seedOwner(t)
 	_, _ = db.Exec(`INSERT INTO deployments (customer_id,domain,tier,theme_id,status) VALUES (?,?,?,?,?)`,
-		1, "pub.com", "user", 1, "draft")
+		1, "pub.com", "solo", 1, "draft")
 	row := db.QueryRow(`SELECT id FROM deployments WHERE domain=?`, "pub.com")
 	var depID int64
 	row.Scan(&depID)
+	unverified := doRequest(mux, http.MethodPost, "/admin/deployments/action",
+		map[string]string{"action": "publish", "deployment_id": strconv.FormatInt(depID, 10)}, ownerID, "owner", nil)
+	var uv map[string]interface{}
+	_ = json.NewDecoder(unverified.Body).Decode(&uv)
+	var draft string
+	db.QueryRow(`SELECT status FROM deployments WHERE id=?`, depID).Scan(&draft)
+	if unverified.Code != http.StatusBadRequest || uv["error"] != "domain_not_verified" || draft != "draft" {
+		t.Fatalf("unverified domain: expected 400 domain_not_verified and still draft, got %d %v (%s)", unverified.Code, uv, draft)
+	}
+	if err := SetDomainVerified(depID, true); err != nil {
+		t.Fatalf("SetDomainVerified: %v", err)
+	}
+	if err := SetDomainVerified(999999, true); err != sql.ErrNoRows {
+		t.Fatalf("SetDomainVerified on an unknown deployment: expected sql.ErrNoRows, got %v", err)
+	}
 
 	payload := map[string]string{
 		"action":        "publish",
@@ -569,7 +639,7 @@ func TestPublishDeployment(t *testing.T) {
 	}
 	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: ADMIN-15 says "double-gate checked": with the server-side
 	// flag off, an owner still cannot publish (the request header is ignored), and an admin never can.
-	_, _ = db.Exec(`INSERT INTO deployments (customer_id,domain,tier,theme_id,status) VALUES (?,?,?,?,?)`, 1, "gate.com", "user", 1, "draft")
+	_, _ = db.Exec(`INSERT INTO deployments (customer_id,domain,tier,theme_id,status,domain_verified) VALUES (?,?,?,?,?,1)`, 1, "gate.com", "solo", 1, "draft")
 	var gateID int64
 	db.QueryRow(`SELECT id FROM deployments WHERE domain='gate.com'`).Scan(&gateID)
 	gate := map[string]string{"action": "publish", "deployment_id": strconv.FormatInt(gateID, 10)}
@@ -827,6 +897,57 @@ func seedOwner(t *testing.T) int64 {
 	var id int64
 	row.Scan(&id)
 	return id
+}
+
+// TestSuspendedCallerRefused proves ADMIN-19: a suspended owner calling any admin action gets 403
+// {error: "account_suspended"} before any gate (even with a bad CSRF token, the CSRF gate's 403 csrf_invalid
+// is never reached) and nothing changes: no user, no deployment, no audit row; reads are refused too.
+// Input: none; output: test failures. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, admin
+// spec "EVERY ACTION"; a suspended caller used to get 401 unauthenticated). Touches: the test SQLite database.
+// ADMIN-19
+func TestSuspendedCallerRefused(t *testing.T) {
+	mux := setupTestEnv(t)
+	seedOwner(t) // an active owner exists, so the suspended one is not the last
+	res, _ := db.Exec(`INSERT INTO users (email,name,role,status,created_at) VALUES (?,?,?,?,?)`,
+		"suspended.owner@example.com", "Suspended", "owner", "suspended", time.Now().UTC())
+	suspendedID, _ := res.LastInsertId()
+	_, _ = db.Exec(`INSERT INTO customers (id,email,name,tier,signup_date,invoice_count,status) VALUES (7,?,?,?,?,?,?)`,
+		"c7@example.com", "C7", "solo", time.Now().UTC(), 0, "active")
+	var auditsBefore, usersBefore int
+	db.QueryRow(`SELECT COUNT(*) FROM audit_log`).Scan(&auditsBefore)
+	db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&usersBefore)
+
+	calls := []struct {
+		method, path string
+		body         map[string]string
+		headers      map[string]string
+	}{
+		{http.MethodPost, "/admin/users/action", map[string]string{"action": "create", "email": "x@example.com", "name": "Xavier", "tier": "user"}, nil},
+		{http.MethodPost, "/admin/users/action", map[string]string{"action": "create", "email": "y@example.com", "name": "Yvonne", "tier": "user"},
+			map[string]string{csrfHeader: "wrong-token"}},
+		{http.MethodPost, "/admin/deployments/action", map[string]string{"action": "create", "customer_id": "7", "domain": "s.example.com", "tier": "solo", "theme_id": "1"}, nil},
+		{http.MethodPost, "/admin/customers/7/action", map[string]string{"action": "change_plan", "new_tier": "team"}, nil},
+		{http.MethodGet, "/admin/customers", nil, nil},
+		{http.MethodGet, "/admin/governance/audit-log", nil, nil},
+	}
+	for _, c := range calls {
+		r := doRequest(mux, c.method, c.path, c.body, suspendedID, "owner", c.headers)
+		var out map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&out)
+		if r.Code != http.StatusForbidden || out["error"] != "account_suspended" {
+			t.Errorf("%s %s by a suspended owner: expected 403 account_suspended, got %d %v", c.method, c.path, r.Code, out)
+		}
+	}
+	var auditsAfter, usersAfter, deps int
+	var plan string
+	db.QueryRow(`SELECT COUNT(*) FROM audit_log`).Scan(&auditsAfter)
+	db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&usersAfter)
+	db.QueryRow(`SELECT COUNT(*) FROM deployments`).Scan(&deps)
+	db.QueryRow(`SELECT tier FROM customers WHERE id=7`).Scan(&plan)
+	if auditsAfter != auditsBefore || usersAfter != usersBefore || deps != 0 || plan != "solo" {
+		t.Fatalf("a suspended caller changed something: audit %d->%d, users %d->%d, deployments %d, plan %s",
+			auditsBefore, auditsAfter, usersBefore, usersAfter, deps, plan)
+	}
 }
 
 // ---------- End of Tests ----------

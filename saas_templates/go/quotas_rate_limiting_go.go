@@ -37,7 +37,10 @@ var (
 	ErrStorageQuotaExceeded = errors.New("storage_quota_exceeded")
 	ErrRateLimitExceeded  = errors.New("rate_limit_exceeded")
 	ErrIPRateLimitExceeded = errors.New("ip_rate_limit_exceeded")
-	ErrFeatureNotAvailable = errors.New("feature_not_available")
+	// ErrFeatureNotAvailable carries the spec's one name for the feature-gate refusal. Renamed 2026-11-10,
+	// session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, quotas spec: "feature_not_available_in_tier" in every
+	// language; was "feature_not_available"). Touches nothing.
+	ErrFeatureNotAvailable = errors.New("feature_not_available_in_tier")
 )
 
 // Config configures a Limiter. Now is the injectable clock (nil = time.Now), added 2026-11-10,
@@ -325,8 +328,11 @@ func (l *Limiter) CheckRateLimitPerIP(ip string) (bool, *QuotaError) {
 }
 
 // CheckFeatureGate allows a feature when the tier is in its allowed list; else a 403 QuotaError
-// {feature_not_available, tier, minimum_tier, upgrade_url}. Changed 2026-11-10,
-// session_012zDydZCZ4AChqhEZ4oVtaP: Status 403. Touches nothing.
+// {feature_not_available_in_tier, tier, minimum_tier, upgrade_url}. Inputs: the user id, the user's tier and
+// the feature name. Output: (true, nil, nil) when allowed, (false, refusal, nil) when not, and an error for an
+// unknown feature. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: Status 403; later the same day
+// (Phase B.2, quotas spec amendment) the code became "feature_not_available_in_tier", one name in every
+// language. Touches nothing.
 func (l *Limiter) CheckFeatureGate(ctx context.Context, userID string, tier Tier, feature string) (bool, *QuotaError, error) {
 	allowedTiers, ok := featureGates[feature]
 	if !ok {
@@ -348,7 +354,7 @@ func (l *Limiter) CheckFeatureGate(ctx context.Context, userID string, tier Tier
 		}
 		return false, &QuotaError{
 			Status:  403,
-			Code:    "feature_not_available",
+			Code:    "feature_not_available_in_tier",
 			Message: "Feature not available in current tier",
 			Details: map[string]interface{}{
 				"tier":          string(tier),

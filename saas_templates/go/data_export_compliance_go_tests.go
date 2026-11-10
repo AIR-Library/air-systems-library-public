@@ -448,3 +448,84 @@ func TestDeletionConfirmationRules(t *testing.T) {
 		t.Errorf("a reused token must be refused")
 	}
 }
+
+// TestDeletionRefusalCodes proves EXPORT-15: a wrong, a reused and an expired confirmation token all get the
+// same 400 invalid_confirmation_token; confirm or cancel of a cancelled request gets 409 deletion_not_pending;
+// another user's request is 404 not_found; and a refused call changes nothing. A completed request's
+// user_id is NULL (EXPORT-13), so the ownership check answers 404 for it before any status check: see the
+// last block. Input: none; output: test failures. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP
+// (Phase B.2). Touches: memory only (fake mailer and eraser).
+// EXPORT-15
+func TestDeletionRefusalCodes(t *testing.T) {
+	svc, mailer, _ := newFixedService(t0)
+
+	// wrong, reused and expired tokens: one error, one status.
+	wrongReq, _ := svc.RequestDeletion(70, "user_requested")
+	_, wrongErr := svc.ConfirmDeletion(70, wrongReq.ID, strings.Repeat("a", 64))
+
+	reusedReq, _ := svc.RequestDeletion(71, "user_requested")
+	if _, err := svc.ConfirmDeletion(71, reusedReq.ID, mailer.tokens[reusedReq.ID]); err != nil {
+		t.Fatalf("first confirm: %v", err)
+	}
+	_, reusedErr := svc.ConfirmDeletion(71, reusedReq.ID, mailer.tokens[reusedReq.ID])
+
+	expiredReq, _ := svc.RequestDeletion(72, "user_requested")
+	svc.nowFunc = func() time.Time { return t0.Add(tokenTTL) }
+	_, expiredErr := svc.ConfirmDeletion(72, expiredReq.ID, mailer.tokens[expiredReq.ID])
+	svc.nowFunc = func() time.Time { return t0 }
+
+	for name, err := range map[string]error{"wrong": wrongErr, "reused": reusedErr, "expired": expiredErr} {
+		if !errors.Is(err, ErrInvalidToken) || err.Error() != "invalid_confirmation_token" || HTTPStatus(err) != 400 {
+			t.Errorf("%s token: expected 400 invalid_confirmation_token, got %d %v", name, HTTPStatus(err), err)
+		}
+	}
+	if wrongReq.Status != "pending" || expiredReq.Status != "pending" || reusedReq.Status != "approved" {
+		t.Errorf("a refused confirm must change nothing: %s %s %s", wrongReq.Status, expiredReq.Status, reusedReq.Status)
+	}
+
+	// a cancelled request: confirm (even with its valid, unused token) and cancel are 409.
+	cancelled, _ := svc.RequestDeletion(73, "user_requested")
+	if _, err := svc.CancelDeletion(73, cancelled.ID); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	_, confirmErr := svc.ConfirmDeletion(73, cancelled.ID, mailer.tokens[cancelled.ID])
+	_, cancelErr := svc.CancelDeletion(73, cancelled.ID)
+	for name, err := range map[string]error{"confirm": confirmErr, "cancel": cancelErr} {
+		if !errors.Is(err, ErrNotPending) || err.Error() != "deletion_not_pending" || HTTPStatus(err) != 409 {
+			t.Errorf("%s of a cancelled request: expected 409 deletion_not_pending, got %d %v", name, HTTPStatus(err), err)
+		}
+	}
+	if cancelled.Status != "cancelled" {
+		t.Errorf("a refused call must leave the request cancelled, got %s", cancelled.Status)
+	}
+
+	// another user's request: 404 not_found for confirm and cancel, whatever the token.
+	_, otherConfirm := svc.ConfirmDeletion(99, wrongReq.ID, mailer.tokens[wrongReq.ID])
+	_, otherCancel := svc.CancelDeletion(99, wrongReq.ID)
+	for name, err := range map[string]error{"confirm": otherConfirm, "cancel": otherCancel} {
+		if !errors.Is(err, ErrNotFound) || err.Error() != "not_found" || HTTPStatus(err) != 404 {
+			t.Errorf("another user's %s: expected 404 not_found, got %d %v", name, HTTPStatus(err), err)
+		}
+	}
+	if wrongReq.Status != "pending" {
+		t.Errorf("another user's call must change nothing, got %s", wrongReq.Status)
+	}
+
+	// a completed (statutory) request: refused for confirm and cancel and left completed. Its user_id is
+	// NULL once completed (EXPORT-13), so the ownership check answers first with 404 not_found; see the
+	// report for this spec point (EXPORT-13 vs EXPORT-15).
+	done, _ := svc.RequestDeletion(74, "gdpr_request")
+	if _, err := svc.ConfirmDeletion(74, done.ID, mailer.tokens[done.ID]); err != nil || done.Status != "completed" {
+		t.Fatalf("statutory confirm: %v %s", err, done.Status)
+	}
+	_, doneConfirm := svc.ConfirmDeletion(74, done.ID, mailer.tokens[done.ID])
+	_, doneCancel := svc.CancelDeletion(74, done.ID)
+	for name, err := range map[string]error{"confirm": doneConfirm, "cancel": doneCancel} {
+		if HTTPStatus(err) != 404 {
+			t.Errorf("%s of a completed request: expected 404 (user_id is NULL), got %d %v", name, HTTPStatus(err), err)
+		}
+	}
+	if done.Status != "completed" || done.UserID != nil {
+		t.Errorf("a completed request must stay completed with no user id, got %s %v", done.Status, done.UserID)
+	}
+}

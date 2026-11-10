@@ -503,14 +503,18 @@ func nullIfEmpty(v string) interface{} {
 // Quiet hours
 // ---------------------------------------------------------------------------
 
-// quietHoursEnd reports whether now falls in [start, end) (wrapping midnight when start > end) and,
-// if so, the next moment the window ends, in now's location. Equal start and end mean no quiet
-// hours. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (returns the release time so
-// the message is queued, per the spec). Touches: nothing.
+// quietHoursEnd reports whether now falls in [start, end) (wrapping midnight when start > end, as in
+// 22:00-08:00) and, if so, the next moment the window ends. start and end are "HH:MM" in UTC and now is
+// compared in UTC, whatever its location; the release time is returned in UTC. Equal start and end mean no
+// quiet hours. In: now, start, end. Out: (release, true) inside the window, (zero, false) outside it.
+// Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (returns the release time so the message is
+// queued, per the spec). Changed again the same day (Phase B.2, NOTIF-05): quiet hours are UTC; they were
+// compared in now's own location, so the answer depended on the server's time zone. Touches: nothing.
 func quietHoursEnd(now time.Time, start, end string) (time.Time, bool) {
 	if !hhmm.MatchString(start) || !hhmm.MatchString(end) || start == end {
 		return time.Time{}, false
 	}
+	now = now.UTC()
 	nowHM := now.Format("15:04")
 	in := false
 	if start < end {
@@ -567,8 +571,9 @@ func timeOrNil(t *time.Time) interface{} {
 
 // Send sends (or skips, or queues) one notification and logs it. Order: template and channel
 // resolution; skipped if do-not-disturb, the channel is disabled or the user unsubscribed from it;
-// queued if scheduled_at is in the future or the user is in quiet hours (released at
-// quiet_hours_end); otherwise delivered with up to 3 attempts and exponential backoff. Output:
+// queued if scheduled_at is in the future or the user is in quiet hours (UTC; released at
+// quiet_hours_end); otherwise delivered with up to 3 retries after the first attempt (4 attempts, waiting
+// 1 s, 2 s, 4 s; Phase B.2, NOTIF-08). Output:
 // SendResponse with the log's message id; an error only for bad input or storage failure.
 // Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database, providers (network).
 func (s *Service) Send(ctx context.Context, req *SendRequest) (*SendResponse, error) {
@@ -649,10 +654,13 @@ func (s *Service) Send(ctx context.Context, req *SendRequest) (*SendResponse, er
 	return &SendResponse{Success: true, MessageID: id, Status: StatusSent}, nil
 }
 
-// deliver renders the template and hands it to the channel's provider, retrying failures up to 3
-// attempts with backoff 100 ms, 200 ms. In-app messages are delivered by being logged. Output: the
-// number of attempts and the last error. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.
-// Touches: providers (network).
+// deliver renders the template and hands it to the channel's provider. A failure is retried up to 3 times
+// after the first attempt (at most 4 attempts), waiting 1 s, 2 s and 4 s, the same counting as background
+// jobs; a 4th failure is returned and the caller marks the message failed. In-app messages are delivered by
+// being logged. In: the template, the request and the channel. Output: the number of attempts and the last
+// error. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Changed the same day (Phase B.2,
+// NOTIF-08): it made 3 attempts in all, waiting 100 ms and 200 ms. Touches: providers (network), the sleep
+// function.
 func (s *Service) deliver(ctx context.Context, tmpl Template, req *SendRequest, ch Channel) (int, error) {
 	if ch == ChannelInApp {
 		return 0, nil
@@ -680,18 +688,22 @@ func (s *Service) deliver(ctx context.Context, tmpl Template, req *SendRequest, 
 		}
 		send = func() error { return s.sms.Send(ctx, phone, bodyText) }
 	}
-	const maxAttempts = 3
 	var lastErr error
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
+	for attempt := 1; attempt <= MaxDeliveryAttempts; attempt++ {
 		if lastErr = send(); lastErr == nil {
 			return attempt, nil
 		}
-		if attempt < maxAttempts {
-			s.sleep(time.Duration(1<<uint(attempt-1)) * 100 * time.Millisecond)
+		if attempt < MaxDeliveryAttempts {
+			s.sleep(time.Duration(1<<uint(attempt-1)) * time.Second) // 1 s, 2 s, 4 s
 		}
 	}
-	return maxAttempts, lastErr
+	return MaxDeliveryAttempts, lastErr
 }
+
+// MaxDeliveryAttempts is the first attempt plus up to 3 retries (spec: retry up to 3 times, at most 4
+// attempts, waiting 1 s, 2 s and 4 s). Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2,
+// NOTIF-08). Touches nothing.
+const MaxDeliveryAttempts = 4
 
 // ClaimTimeout is how long a 'sending' claim may last before DeliverDue re-queues it (spec: a single send
 // must finish in under 300 s). Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
@@ -702,8 +714,10 @@ const ClaimTimeout = 300 * time.Second
 //  2. 'queued' rows with scheduled_at <= now, by scheduled_at then insertion order, are claimed one by
 //     one with UPDATE ... SET status = 'sending', claimed_at = now WHERE id = ? AND status = 'queued'
 //     (a row another worker claimed first is skipped);
-//  3. preferences are checked NOW: unsubscribed, channel off or do-not-disturb -> 'skipped' (and a
-//     message that is due inside the user's current quiet hours goes back to 'queued' until they end);
+//  3. preferences are checked NOW, not when the message was queued: unsubscribed, channel off or
+//     do-not-disturb -> 'skipped'; inside the user's quiet hours (UTC) -> back to 'queued' with
+//     scheduled_at = quiet_hours_end (reviewed against the Phase B.2 wording, 2026-11-10,
+//     session_012zDydZCZ4AChqhEZ4oVtaP: it already did this; the comparison is now in UTC);
 //  4. the final write is UPDATE ... WHERE id = ? AND status = 'sending' AND claimed_at = <this claim>.
 //
 // Each message is sent exactly once when no worker crashes, at least once after a crash. No in-process
@@ -915,18 +929,37 @@ func nullTimePtr(t sql.NullTime) *time.Time {
 	return &v
 }
 
-// MarkOpened records the first open of a delivered message (status opened unless already clicked).
-// Output: sql.ErrNoRows if no delivered message has that id. Changed 2026-11-10, session
-// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
-func (s *Service) MarkOpened(ctx context.Context, messageID string) error {
+// OpenMessage records that a delivered message was opened (GET /notifications/open/:message_id, the
+// tracking pixel or link). The first time only, it sets opened_at = now and status 'opened'; a second call,
+// an already clicked message (a click records the open), an undelivered message or an unknown id changes
+// nothing. In: the public message id. Out: whether this call recorded the open, or a database error.
+// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, NOTIF-07). Touches: database.
+func (s *Service) OpenMessage(ctx context.Context, messageID string) (bool, error) {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE notification_logs SET opened_at = COALESCE(opened_at, ?),
-			status = CASE WHEN status = 'clicked' THEN status ELSE 'opened' END
-		 WHERE message_id = ? AND status IN ('sent','opened','clicked')`, s.now().UTC(), messageID)
+		`UPDATE notification_logs SET opened_at = ?, status = 'opened'
+		 WHERE message_id = ? AND opened_at IS NULL AND status = 'sent'`, s.now().UTC(), messageID)
 	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
+}
+
+// MarkOpened records the first open of a delivered message, as OpenMessage, for the older
+// /notifications/opened/{id} route. Output: nil once the message is recorded as opened (by this call or an
+// earlier one), sql.ErrNoRows if no delivered message has that id. Changed 2026-11-10, session
+// session_012zDydZCZ4AChqhEZ4oVtaP. Changed again the same day (Phase B.2, NOTIF-07): it now records the open
+// once only, through OpenMessage (it rewrote the status on every call). Touches: database.
+func (s *Service) MarkOpened(ctx context.Context, messageID string) error {
+	if _, err := s.OpenMessage(ctx, messageID); err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	var n int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM notification_logs
+		WHERE message_id = ? AND status IN ('sent','opened','clicked')`, messageID).Scan(&n); err != nil {
+		return err
+	}
+	if n == 0 {
 		return sql.ErrNoRows
 	}
 	return nil
@@ -1198,6 +1231,22 @@ func (s *Service) handleMark(prefix string, mark func(context.Context, string) e
 	}
 }
 
+// HandleOpen serves GET /notifications/open/{message_id}: it records the first open (OpenMessage) and answers
+// 204 No Content whether or not this call changed anything, so the reply never says whether the id exists.
+// Any other method is 405; a database failure is 500. In: the request. Out: the response.
+// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, NOTIF-07). Touches: database.
+func (s *Service) HandleOpen(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", nil)
+		return
+	}
+	if _, err := s.OpenMessage(r.Context(), lastSegment(r.URL.Path, "/notifications/open/")); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // HandleMarkOpened serves /notifications/opened/{message_id}.
 func (s *Service) HandleMarkOpened(w http.ResponseWriter, r *http.Request) {
 	s.handleMark("/notifications/opened/", s.MarkOpened)(w, r)
@@ -1208,8 +1257,10 @@ func (s *Service) HandleMarkClicked(w http.ResponseWriter, r *http.Request) {
 	s.handleMark("/notifications/clicked/", s.MarkClicked)(w, r)
 }
 
-// RegisterRoutes mounts the API on mux. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.
+// RegisterRoutes mounts the API on mux. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP; the
+// same day (Phase B.2, NOTIF-07) GET /notifications/open/{message_id} was added. Touches: mux only.
 func (s *Service) RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/notifications/open/", s.HandleOpen)
 	mux.HandleFunc("/notifications/send", s.HandleSend)
 	mux.HandleFunc("/notifications/send-batch", s.HandleSendBatch)
 	mux.HandleFunc("/notifications/track/", s.HandleTrack)

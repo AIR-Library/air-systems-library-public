@@ -39,7 +39,8 @@ func (f *failingEmailProvider) Send(ctx context.Context, to, subject, bodyText, 
 // testNoon is the fixed instant the service clock reads in tests: midday, outside the default
 // 22:00-08:00 quiet hours. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: with the wall
 // clock every send was "queued" whenever the suite ran at night (it failed at 04:25).
-func testNoon() time.Time { return time.Date(2026, time.January, 15, 12, 0, 0, 0, time.Local) }
+// Changed the same day (Phase B.2, NOTIF-05): noon UTC, not local noon, because quiet hours are now UTC.
+func testNoon() time.Time { return time.Date(2026, time.January, 15, 12, 0, 0, 0, time.UTC) }
 
 // testSecret is a 32-byte unsubscribe secret for tests. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP:
 // the service now refuses a missing or short secret.
@@ -213,6 +214,10 @@ func TestBatchSend1000(t *testing.T) {
 }
 
 // NOTIF-05
+// TestQuietHoursSkip proves a send inside the user's quiet hours is not sent now but queued with
+// scheduled_at = quiet_hours_end, and DeliverDue sends it then. Input: none; output: test failures.
+// Corrected 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, NOTIF-05 as amended): quiet hours are
+// UTC, so the expected release time is compared in UTC (it used the clock's own location). Touches: in-memory SQLite.
 func TestQuietHoursSkip(t *testing.T) {
 	s, _ := setupService(t)
 	ctx := context.Background()
@@ -249,9 +254,8 @@ func TestQuietHoursSkip(t *testing.T) {
 	if err := s.db.QueryRow(`SELECT scheduled_at FROM notification_logs WHERE message_id = ?`, resp.MessageID).Scan(&scheduled); err != nil {
 		t.Fatalf("scheduled_at: %v", err)
 	}
-	wantEnd, _ := time.ParseInLocation("15:04", end, now.Location())
-	if scheduled.In(now.Location()).Format("15:04") != wantEnd.Format("15:04") {
-		t.Errorf("expected scheduled_at at quiet_hours_end %s, got %v", end, scheduled)
+	if want := now.UTC().Add(time.Hour); !scheduled.Equal(want) {
+		t.Errorf("expected scheduled_at at quiet_hours_end %s UTC (%v), got %v", end, want, scheduled)
 	}
 	if n, _ := s.DeliverDue(ctx, now.Add(30*time.Minute)); n != 0 {
 		t.Errorf("nothing may be sent inside quiet hours")
@@ -289,6 +293,9 @@ func TestDoNotDisturbSkip(t *testing.T) {
 }
 
 // NOTIF-07
+// TestTrackMessageOpened proves the older MarkOpened path records an open. The GET
+// /notifications/open/:message_id rules are proven by TestOpenEndpointRecordsOnce. Doc block added
+// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2). Touches: in-memory SQLite.
 func TestTrackMessageOpened(t *testing.T) {
 	s, _ := setupService(t)
 	ctx := context.Background()
@@ -325,38 +332,202 @@ func TestTrackMessageOpened(t *testing.T) {
 }
 
 // NOTIF-08
+// TestRetryFailedEmail proves NOTIF-08 as amended: a failed email is retried at most 3 times after the first
+// attempt (4 attempts in all), waiting 1 s, 2 s and 4 s; it is sent when the sender recovers on the 4th
+// attempt, and a 4th failure marks it failed with no 5th attempt. Input: none; output: test failures.
+// Corrected 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): it expected 3 attempts in all (2
+// failures + 1 success); the spec now counts 3 retries, so the sender fails 3 times and succeeds on the 4th,
+// and the waits are checked. Touches: in-memory SQLite.
 func TestRetryFailedEmail(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatalf("open db: %v", err)
+	run := func(failures int) (*SendResponse, *failingEmailProvider, []time.Duration, *Service) {
+		t.Helper()
+		db, err := sql.Open("sqlite3", ":memory:")
+		if err != nil {
+			t.Fatalf("open db: %v", err)
+		}
+		db.SetMaxOpenConns(1) // every new connection to :memory: would be a separate, empty database
+		provider := &failingEmailProvider{failures: failures}
+		s, err := NewServiceWithSecret(db, provider, NullSMSProvider{}, testSecret)
+		if err != nil {
+			t.Fatalf("new service: %v", err)
+		}
+		var waits []time.Duration
+		s.sleep = func(d time.Duration) { waits = append(waits, d) } // recorded, not waited for
+		s.SetClock(testNoon)
+		if err := s.InitDB(context.Background()); err != nil {
+			t.Fatalf("init db: %v", err)
+		}
+		resp, err := s.Send(context.Background(), &SendRequest{
+			UserID:      400,
+			TemplateKey: "welcome_email",
+			Channel:     ptrChannel(ChannelEmail),
+			Vars:        map[string]interface{}{"app_name": "TestApp"},
+		})
+		if err != nil {
+			t.Fatalf("send: %v", err)
+		}
+		return resp, provider, waits, s
 	}
-	db.SetMaxOpenConns(1) // every new connection to :memory: would be a separate, empty database
-	provider := &failingEmailProvider{failures: 2}
-	s, err := NewServiceWithSecret(db, provider, NullSMSProvider{}, testSecret)
-	if err != nil {
-		t.Fatalf("new service: %v", err)
-	}
-	s.sleep = func(time.Duration) {} // the backoff is not waited for in tests
-	s.SetClock(testNoon) // outside the default quiet hours, whatever the time of day
-	if err := s.InitDB(context.Background()); err != nil {
-		t.Fatalf("init db: %v", err)
-	}
-	ctx := context.Background()
+	wantWaits := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second}
 
-	resp, err := s.Send(ctx, &SendRequest{
-		UserID:      400,
-		TemplateKey: "welcome_email",
-		Channel:     ptrChannel(ChannelEmail),
-		Vars:        map[string]interface{}{"app_name": "TestApp"},
-	})
-	if err != nil {
-		t.Fatalf("send: %v", err)
-	}
+	resp, provider, waits, _ := run(3)
 	if resp.Status != StatusSent {
-		t.Errorf("expected status sent after retries, got %s", resp.Status)
+		t.Errorf("expected status sent after 3 retries, got %s", resp.Status)
 	}
-	if provider.calls != 3 {
-		t.Errorf("expected 3 calls (2 failures + 1 success), got %d", provider.calls)
+	if provider.calls != 4 {
+		t.Errorf("expected 4 calls (3 failures + 1 success), got %d", provider.calls)
+	}
+	if fmt.Sprint(waits) != fmt.Sprint(wantWaits) {
+		t.Errorf("expected waits %v, got %v", wantWaits, waits)
+	}
+
+	resp, provider, waits, s := run(4)
+	if resp.Status != StatusFailed {
+		t.Errorf("a 4th failure must mark the message failed, got %s", resp.Status)
+	}
+	if provider.calls != 4 {
+		t.Errorf("expected exactly 4 attempts, got %d", provider.calls)
+	}
+	if fmt.Sprint(waits) != fmt.Sprint(wantWaits) {
+		t.Errorf("expected waits %v, got %v", wantWaits, waits)
+	}
+	var status string
+	var attempts int
+	if err := s.db.QueryRow(`SELECT status, attempts FROM notification_logs WHERE message_id = ?`, resp.MessageID).Scan(&status, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" || attempts != 4 {
+		t.Errorf("expected the row failed after 4 attempts, got %s after %d", status, attempts)
+	}
+}
+
+// TestQuietHoursCrossMidnightUTC proves NOTIF-05 as amended: quiet hours are HH:MM in UTC and may cross
+// midnight. With 22:00-08:00, a send at 23:30 UTC and one at 03:00 UTC (given on a clock in another time
+// zone) are queued with scheduled_at = 08:00 UTC; 08:00 and 21:59 UTC are sent now. DeliverDue re-queues a
+// due message inside the window with scheduled_at = quiet_hours_end (step 3). Input: none; output: test
+// failures. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2). Touches: in-memory SQLite.
+// NOTIF-05
+func TestQuietHoursCrossMidnightUTC(t *testing.T) {
+	s, _ := setupService(t)
+	ctx := context.Background()
+	start, end := "22:00", "08:00"
+	if err := s.UpdatePreferences(ctx, 150, &UpdatePreferencesRequest{QuietHoursStart: &start, QuietHoursEnd: &end}); err != nil {
+		t.Fatalf("update prefs: %v", err)
+	}
+	tokyo := time.FixedZone("UTC+9", 9*3600)
+	day := time.Date(2026, time.March, 3, 0, 0, 0, 0, time.UTC)
+	cases := []struct {
+		now     time.Time
+		queued  bool
+		release time.Time
+	}{
+		{day.Add(23*time.Hour + 30*time.Minute), true, day.Add(32 * time.Hour)},
+		{day.Add(3 * time.Hour).In(tokyo), true, day.Add(8 * time.Hour)}, // 12:00 in Tokyo is 03:00 UTC
+		{day.Add(8 * time.Hour), false, time.Time{}},
+		{day.Add(21*time.Hour + 59*time.Minute).In(tokyo), false, time.Time{}},
+	}
+	for _, c := range cases {
+		now := c.now
+		s.SetClock(func() time.Time { return now })
+		resp, err := s.Send(ctx, &SendRequest{UserID: 150, TemplateKey: "welcome_email", Channel: ptrChannel(ChannelInApp),
+			Vars: map[string]interface{}{"app_name": "TestApp"}})
+		if err != nil {
+			t.Fatalf("send at %v: %v", now, err)
+		}
+		if c.queued {
+			var scheduled time.Time
+			if err := s.db.QueryRow(`SELECT scheduled_at FROM notification_logs WHERE message_id = ?`, resp.MessageID).Scan(&scheduled); err != nil {
+				t.Fatal(err)
+			}
+			if resp.Status != StatusQueued || !scheduled.Equal(c.release) {
+				t.Errorf("at %v UTC: expected queued until %v, got %s until %v", now.UTC(), c.release, resp.Status, scheduled)
+			}
+		} else if resp.Status != StatusSent {
+			t.Errorf("at %v UTC: expected sent, got %s", now.UTC(), resp.Status)
+		}
+	}
+
+	// DeliverDue step 3: a message due at 21:00 UTC, delivered at 23:00 UTC, is inside the window: it goes
+	// back to 'queued' with scheduled_at = 08:00 UTC the next day and is sent then.
+	s.SetClock(func() time.Time { return day.Add(12 * time.Hour) })
+	due := day.Add(21 * time.Hour)
+	resp, err := s.Send(ctx, &SendRequest{UserID: 150, TemplateKey: "welcome_email", Channel: ptrChannel(ChannelInApp),
+		Vars: map[string]interface{}{"app_name": "TestApp"}, ScheduledAt: &due})
+	if err != nil || resp.Status != StatusQueued {
+		t.Fatalf("scheduled send: %v %+v", err, resp)
+	}
+	if n, err := s.DeliverDue(ctx, day.Add(23*time.Hour)); err != nil || n != 0 {
+		t.Fatalf("inside quiet hours DeliverDue must send nothing, sent %d (%v)", n, err)
+	}
+	var status string
+	var scheduled time.Time
+	if err := s.db.QueryRow(`SELECT status, scheduled_at FROM notification_logs WHERE message_id = ?`, resp.MessageID).Scan(&status, &scheduled); err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" || !scheduled.Equal(day.Add(32*time.Hour)) {
+		t.Errorf("expected re-queued until 08:00 UTC, got %s until %v", status, scheduled)
+	}
+}
+
+// TestOpenEndpointRecordsOnce proves NOTIF-07 as amended: GET /notifications/open/:message_id sets opened_at
+// and status 'opened' the first time and answers 204; a second call answers 204 and changes nothing; an
+// unknown id answers 204 too; a non-GET is 405. Input: none; output: test failures.
+// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2). Touches: in-memory SQLite, a local test server.
+// NOTIF-07
+func TestOpenEndpointRecordsOnce(t *testing.T) {
+	s, _ := setupService(t)
+	ctx := context.Background()
+	resp, err := s.Send(ctx, &SendRequest{UserID: 310, TemplateKey: "welcome_email", Channel: ptrChannel(ChannelEmail),
+		Vars: map[string]interface{}{"app_name": "TestApp"}})
+	if err != nil || resp.Status != StatusSent {
+		t.Fatalf("send: %v %+v", err, resp)
+	}
+	mux := http.NewServeMux()
+	s.RegisterRoutes(mux)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	get := func(id string) int {
+		t.Helper()
+		r, err := http.Get(server.URL + "/notifications/open/" + id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Body.Close()
+		return r.StatusCode
+	}
+
+	first := time.Date(2026, time.January, 15, 12, 5, 0, 0, time.UTC)
+	s.SetClock(func() time.Time { return first })
+	if code := get(resp.MessageID); code != http.StatusNoContent {
+		t.Fatalf("first open: expected 204, got %d", code)
+	}
+	tr, err := s.Track(ctx, resp.MessageID)
+	if err != nil || tr.Status != StatusOpened || tr.OpenedAt == nil || !tr.OpenedAt.Equal(first) {
+		t.Fatalf("first open must set opened_at and status opened: %+v (%v)", tr, err)
+	}
+
+	s.SetClock(func() time.Time { return first.Add(time.Hour) })
+	if code := get(resp.MessageID); code != http.StatusNoContent {
+		t.Fatalf("second open: expected 204, got %d", code)
+	}
+	tr2, _ := s.Track(ctx, resp.MessageID)
+	if tr2.Status != StatusOpened || tr2.OpenedAt == nil || !tr2.OpenedAt.Equal(first) {
+		t.Errorf("a second open must change nothing: %+v", tr2)
+	}
+	if changed, err := s.OpenMessage(ctx, resp.MessageID); err != nil || changed {
+		t.Errorf("OpenMessage on an opened message must change nothing: %v %v", changed, err)
+	}
+
+	if code := get("no-such-message"); code != http.StatusNoContent {
+		t.Errorf("unknown id: expected 204, got %d", code)
+	}
+	r, err := http.Post(server.URL+"/notifications/open/"+resp.MessageID, "text/plain", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Body.Close()
+	if r.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("POST: expected 405, got %d", r.StatusCode)
 	}
 }
 
