@@ -141,6 +141,9 @@ DEFAULT_TEMPLATES = [
 CHANNELS = ("email", "sms", "in_app")
 DEFAULT_CHANNELS_ENABLED = {"email": True, "sms": False, "in_app": True}
 STALE_CLAIM_SECONDS = 300
+# Email/SMS retries after the first attempt (4 attempts in all, waiting 1 s / 2 s / 4 s). NOTIF-08 as amended in
+# Phase B.2, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP; the same counting as background jobs.
+MAX_RETRIES = 3
 MIN_SECRET_BYTES = 32
 _HEX = frozenset("0123456789abcdef")
 
@@ -375,14 +378,17 @@ class NotificationService:
         return None, "no_enabled_channel"
 
     def _dispatch(self, user_id: int, tmpl: sqlite3.Row, channel: str, vars: Dict[str, Any]) -> Optional[str]:
-        """Render and send one message with up to 3 attempts and exponential backoff (2 s, 4 s via the injected
-        sleep). Emails carry the signed unsubscribe link. Out: None on success, else the last error text.
-        2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (factored out of send_notification; adds the unsubscribe
-        link, NOTIF-11). Touches: the email / SMS sender (network in production)."""
+        """Render and send one message: the first attempt plus up to MAX_RETRIES (3) retries, so at most 4
+        attempts, waiting 1 s, 2 s and 4 s between them (via the injected sleep). Emails carry the signed
+        unsubscribe link. In: user_id, the template row, the channel, the template vars. Out: None on success,
+        else the last error text. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (factored out of
+        send_notification; adds the unsubscribe link, NOTIF-11). Updated 2026-11-10,
+        session_012zDydZCZ4AChqhEZ4oVtaP: NOTIF-08 as amended in Phase B.2 (it made 3 attempts in all, waiting
+        2 s and 4 s). Touches: the email / SMS sender (network in production)."""
         subject = _render_template(tmpl["subject"], vars)
         body_text = _render_template(tmpl["body_text"], vars)
         body_html = _render_template(tmpl["body_html"], vars)
-        max_attempts = 3
+        max_attempts = MAX_RETRIES + 1
         for attempt in range(1, max_attempts + 1):
             try:
                 if channel == "email":
@@ -403,7 +409,7 @@ class NotificationService:
             except Exception as e:
                 if attempt >= max_attempts:
                     return str(e) or e.__class__.__name__
-                self._sleep(2 ** attempt)
+                self._sleep(2 ** (attempt - 1))  # 1 s, 2 s, 4 s
         return "unreachable"
 
     def send_notification(
@@ -456,7 +462,8 @@ class NotificationService:
         if error is None:
             log_id = self._log(user_id, template_key, chosen_channel, vars, error=None, status="sent", sent=True)
             return {"success": True, "message_id": str(log_id), "status": "sent"}
-        log_id = self._log(user_id, template_key, chosen_channel, vars, error=error, status="failed", attempt=3)
+        log_id = self._log(user_id, template_key, chosen_channel, vars, error=error, status="failed",
+                           attempt=MAX_RETRIES + 1)
         return {"success": False, "message_id": str(log_id), "status": "failed", "error": error}
 
     def deliver_due(self, now: Optional[datetime] = None) -> Dict[str, int]:
@@ -467,10 +474,12 @@ class NotificationService:
         2. 'queued' rows with scheduled_at <= now, by scheduled_at then insertion order, are claimed one by one
            with UPDATE ... SET status='sending', claimed_at=now WHERE id=? AND status='queued' (a row another
            worker claimed first is skipped);
-        3. preferences are checked NOW: unsubscribed, channel off or do-not-disturb -> 'skipped';
+        3. preferences are checked NOW: unsubscribed, channel off or do-not-disturb -> 'skipped'; inside the
+           user's quiet hours -> back to 'queued' with scheduled_at = quiet_hours_end (counted in "requeued");
         4. the final write is UPDATE ... WHERE id=? AND status='sending' AND claimed_at=<this claim>.
         Why: NOTIF-12 (spec amended 2026-11-10). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
-        Touches: SQLite (notification_logs), the senders."""
+        Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: step 3's quiet-hours re-queue (NOTIF-05, Phase B.2;
+        a due message used to be sent inside quiet hours). Touches: SQLite (notification_logs), the senders."""
         now = now or self.clock()
         now_s = _iso(now)
         counts = {"requeued": 0, "sent": 0, "skipped": 0, "failed": 0}
@@ -493,12 +502,22 @@ class NotificationService:
             row = self.conn.execute("SELECT * FROM notification_logs WHERE id = ?", (log_id,)).fetchone()
             tmpl = self._get_template(row["template_key"])
             vars = json.loads(row["vars_used"] or "{}")
+            pref = self.get_user_preferences(row["user_id"])
             if tmpl is None:
                 status, channel, error = "failed", row["channel"], "template_not_found"
             else:
-                channel, reason = self._skip_reason(self.get_user_preferences(row["user_id"]), row["channel"], tmpl)
+                channel, reason = self._skip_reason(pref, row["channel"], tmpl)
                 if reason:
                     status, channel, error = "skipped", row["channel"], reason
+                elif _in_quiet_hours(pref["quiet_hours_start"], pref["quiet_hours_end"],
+                                     now.astimezone(timezone.utc).time()):
+                    self.conn.execute(
+                        "UPDATE notification_logs SET status = 'queued', claimed_at = NULL, scheduled_at = ? "
+                        "WHERE id = ? AND status = 'sending' AND claimed_at = ?",
+                        (_iso(_quiet_hours_end_after(now, pref["quiet_hours_end"])), log_id, now_s))
+                    self.conn.commit()
+                    counts["requeued"] += 1
+                    continue
                 else:
                     error = self._dispatch(row["user_id"], tmpl, channel, vars)
                     status = "sent" if error is None else "failed"
@@ -570,6 +589,24 @@ class NotificationService:
         self.conn.commit()
         return self.track_message(message_id)
 
+    def open_message(self, message_id: Any) -> Dict[str, Any]:
+        """GET /notifications/open/:message_id: the tracking pixel or link says the message was opened.
+
+        Sets opened_at (the clock) and status 'opened' the first time only, for a message that was sent; a
+        second call, an unknown id or an id that is not a number changes nothing. In: message_id. Out:
+        {status: 204, body: None} either way, so the answer never says whether the id exists.
+        Why: NOTIF-07 as amended in Phase B.2 (2026-11-10): only a click (record_click) set opened_at.
+        2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite (notification_logs)."""
+        try:
+            mid = int(message_id)
+        except (TypeError, ValueError):
+            return {"status": 204, "body": None}
+        self.conn.execute(
+            "UPDATE notification_logs SET opened_at = ?, status = 'opened' "
+            "WHERE id = ? AND opened_at IS NULL AND status = 'sent'", (_iso(self.clock()), mid))
+        self.conn.commit()
+        return {"status": 204, "body": None}
+
     # ---------- Internal Helpers ----------
     def _get_template(self, key: str) -> Optional[sqlite3.Row]:
         cur = self.conn.cursor()
@@ -629,6 +666,12 @@ class NotificationService:
 
     def api_track(self, message_id: str) -> Dict[str, Any]:
         return self.track_message(int(message_id))
+
+    def api_open(self, message_id: str) -> Dict[str, Any]:
+        """GET /notifications/open/:message_id (this template has no router). In: the path's message_id.
+        Out: {status: 204, body: None}. Why: NOTIF-07 (Phase B.2). 2026-11-10,
+        session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite, through open_message()."""
+        return self.open_message(message_id)
 
     def api_get_preferences(self, user_id: int) -> Dict[str, Any]:
         return self.get_user_preferences(user_id)

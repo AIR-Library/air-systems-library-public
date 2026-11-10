@@ -140,6 +140,14 @@ class TestAdminSystem(unittest.TestCase):
 
     # ADMIN-07
     def test_change_role_last_owner(self):
+        """Demoting the last active owner is 400 cannot_demote_last_owner and changes nothing.
+        In: the test fixtures. Out: assertions. Why: ADMIN-07.
+        Corrected 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, ADMIN-19): the old scenario had a
+        SUSPENDED owner do the demoting, which ADMIN-19 now refuses first with 403 account_suspended (asserted
+        below). An active owner cannot reach the last-owner refusal through action=change_role (the target is
+        another owner, so two are active, and demoting yourself is cannot_change_own_role), so the refusal is now
+        proven where it is reachable: the remaining owner approving a governance change_role that demotes them.
+        Touches: in-memory SQLite only."""
         # Create a second owner, suspend the first owner, then try to demote the second owner
         cur = self.sys.conn.cursor()
         cur.execute(
@@ -148,16 +156,30 @@ class TestAdminSystem(unittest.TestCase):
             (self._now(), self._now())
         )
         owner2_id = cur.lastrowid
+        action_id = self.sys.create_governance_action(self.owner_id, "change_role", "user", owner2_id,
+                                                      {"new_tier": "admin"})
         # Suspend the original owner (actor) so owner2 becomes the last active owner
         cur.execute("UPDATE users SET status = 'suspended' WHERE id = ?", (self.owner_id,))
         self.sys.conn.commit()
 
-        # Now actor (original owner, suspended but still tier=owner) tries to demote owner2
+        # The suspended original owner is refused before any gate (ADMIN-19).
         payload = {"user_id": owner2_id, "new_tier": "admin"}
         with self.assertRaises(HTTPError) as ctx:
             self.sys.users_action(CSRF_TOKEN, self.owner_id, "change_role", payload)
+        self.assertEqual((ctx.exception.status, ctx.exception.code), (403, "account_suspended"))
+
+        # owner2, the last active owner, approving their own demotion.
+        with self.assertRaises(HTTPError) as ctx:
+            self.sys.decide_governance_action(CSRF_TOKEN, owner2_id, action_id, "approve", {})
         self.assertEqual(ctx.exception.status, 400)
         self.assertEqual(ctx.exception.code, "cannot_demote_last_owner")
+        self.assertEqual(self.sys._get_user_by_id(owner2_id)["tier"], "owner")
+        cur.execute("SELECT status FROM governance_actions WHERE id = ?", (action_id,))
+        self.assertEqual(cur.fetchone()[0], "pending")
+        # and demoting themselves directly is the own-account gate
+        with self.assertRaises(HTTPError) as ctx:
+            self.sys.users_action(CSRF_TOKEN, owner2_id, "change_role", {"user_id": owner2_id, "new_tier": "admin"})
+        self.assertEqual(ctx.exception.code, "cannot_change_own_role")
 
     # ADMIN-08
     def test_suspend_user_happy_path(self):
@@ -264,10 +286,27 @@ class TestAdminSystem(unittest.TestCase):
         cur.execute("SELECT COUNT(*) FROM audit_log WHERE action='plan_changed'")
         self.assertEqual(cur.fetchone()[0], 0)
 
+    def _customer_with_invoice(self, amount=100.0, status="succeeded", email="refund@example.com"):
+        """Insert a customer and one invoice of theirs. In: the invoice amount and status. Out: (customer id,
+        invoice id). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 queue_refund bug). Touches: the
+        test database."""
+        cur = self.sys.conn.cursor()
+        cur.execute("INSERT INTO customers (email, name, tier, signup_date) VALUES (?, 'Refund', 'solo', ?)",
+                    (email, self._now()))
+        cust_id = cur.lastrowid
+        cur.execute("INSERT INTO invoices (customer_id, amount, status) VALUES (?, ?, ?)", (cust_id, amount, status))
+        self.sys.conn.commit()
+        return cust_id, cur.lastrowid
+
     # ADMIN-13
     def test_queue_refund_record_created(self):
-        payload = {"invoice_id": 1, "amount": 50.0, "reason": "overcharge"}
-        resp = self.sys.customers_action(CSRF_TOKEN, self.owner_id, 0, "queue_refund", payload)
+        """A refund of a succeeded invoice of the customer is queued.
+        In: the test fixtures. Out: assertions. Why: ADMIN-13. Corrected 2026-11-10,
+        session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 bug fix): it refunded invoice 1 of customer 0, neither of which
+        existed; queue_refund now requires the invoice, so the test creates one. Touches: in-memory SQLite only."""
+        cust_id, invoice_id = self._customer_with_invoice()
+        payload = {"invoice_id": invoice_id, "amount": 50.0, "reason": "overcharge"}
+        resp = self.sys.customers_action(CSRF_TOKEN, self.owner_id, cust_id, "queue_refund", payload)
         self.assertTrue(resp["success"])
         self.assertEqual(resp["status"], "queued")
         cur = self.sys.conn.cursor()
@@ -276,9 +315,53 @@ class TestAdminSystem(unittest.TestCase):
         self.assertEqual(row["status"], "queued")
         self.assertEqual(row["amount"], 50.0)
 
+    # ADMIN-13
+    def test_queue_refund_checks_the_invoice(self):
+        """queue_refund refuses, writing nothing: an unknown invoice and another customer's invoice (404
+        invoice_not_found), an invoice that did not succeed (400 invalid_invoice_status), a non-positive amount
+        (400 invalid_amount) and refunds above the invoice amount (400 refund_exceeds_invoice); refunds up to the
+        amount are queued. In: the test fixtures. Out: assertions. Why: Phase B.2 python bug (it assumed every
+        invoice existed and had succeeded). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        Touches: in-memory SQLite only."""
+        cust_id, invoice_id = self._customer_with_invoice(amount=100.0)
+        other_cust, other_invoice = self._customer_with_invoice(email="other@example.com")
+        _, failed_invoice = self._customer_with_invoice(status="failed", email="failed@example.com")
+        cur = self.sys.conn.cursor()
+        cur.execute("UPDATE invoices SET customer_id = ? WHERE id = ?", (cust_id, failed_invoice))
+        self.sys.conn.commit()
+
+        def refund(invoice, amount, customer=cust_id):
+            return self.sys.customers_action(CSRF_TOKEN, self.owner_id, customer, "queue_refund",
+                                             {"invoice_id": invoice, "amount": amount, "reason": "r"})
+        for invoice, amount, status, code in (
+            (9999, 10.0, 404, "invoice_not_found"),
+            (other_invoice, 10.0, 404, "invoice_not_found"),
+            (failed_invoice, 10.0, 400, "invalid_invoice_status"),
+            (invoice_id, 0, 400, "invalid_amount"),
+            (invoice_id, -5.0, 400, "invalid_amount"),
+            (invoice_id, 100.01, 400, "refund_exceeds_invoice"),
+        ):
+            with self.assertRaises(HTTPError) as cm:
+                refund(invoice, amount)
+            self.assertEqual((cm.exception.status, cm.exception.code), (status, code), (invoice, amount))
+        cur.execute("SELECT COUNT(*) FROM refunds")
+        self.assertEqual(cur.fetchone()[0], 0)
+        cur.execute("SELECT COUNT(*) FROM audit_log WHERE action = 'refund_queued'")
+        self.assertEqual(cur.fetchone()[0], 0)
+        self.assertEqual(refund(invoice_id, 60.0)["status"], "queued")
+        with self.assertRaises(HTTPError) as cm:
+            refund(invoice_id, 40.01)
+        self.assertEqual(cm.exception.code, "refund_exceeds_invoice")
+        self.assertEqual(refund(invoice_id, 40.0)["status"], "queued")
+        self.assertEqual(refund(other_invoice, 1.0, customer=other_cust)["status"], "queued")
+
     # ----- DEPLOYMENTS DOMAIN TESTS -----
     # ADMIN-14
     def test_create_deployment(self):
+        """A deployment is created for a customer on a PLAN tier, unverified; a staff role as its tier is 400
+        invalid_tier and creates nothing. In: the test fixtures. Out: assertions. Why: ADMIN-14.
+        Corrected 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 "TIERS"): it used the staff role "user" as
+        a deployment's tier, which the spec now refuses; the tier is the plan "solo". Touches: in-memory SQLite."""
         # Need a customer first
         cur = self.sys.conn.cursor()
         cur.execute(
@@ -293,13 +376,26 @@ class TestAdminSystem(unittest.TestCase):
             "tier": "user",
             "theme_id": 1
         }
+        with self.assertRaises(HTTPError) as cm:
+            self.sys.deployments_action(CSRF_TOKEN, self.owner_id, "create", payload)
+        self.assertEqual((cm.exception.status, cm.exception.code), (400, "invalid_tier"))
+        self.assertEqual(self.sys.list_deployments(self.owner_id), [])
+        payload["tier"] = "solo"
         resp = self.sys.deployments_action(CSRF_TOKEN, self.owner_id, "create", payload)
         self.assertTrue(resp["success"])
         self.assertEqual(resp["domain"], "example.com")
+        self.assertEqual(resp["tier"], "solo")
+        cur.execute("SELECT domain_verified FROM deployments WHERE id = ?", (resp["deployment_id"],))
+        self.assertEqual(cur.fetchone()[0], 0)
         # Verify config init (no explicit check needed)
 
     # ADMIN-15
     def test_publish_deployment_double_gate(self):
+        """Publish needs a draft whose domain is verified: unverified is 400 domain_not_verified and stays
+        draft; once mark_domain_verified() ran it goes live. In: the test fixtures. Out: assertions.
+        Why: ADMIN-15. Corrected 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): deployments now carry
+        domain_verified (default false) and publish requires it, so the test verifies the domain first; its
+        deployment tier "user" (a staff role) is now the plan "solo". Touches: in-memory SQLite only."""
         # Setup deployment
         cur = self.sys.conn.cursor()
         cur.execute(
@@ -309,12 +405,18 @@ class TestAdminSystem(unittest.TestCase):
         cust_id = cur.lastrowid
         cur.execute(
             """INSERT INTO deployments (customer_id, domain, tier, theme_id, status)
-               VALUES (?, 'pub.com', 'user', 1, 'draft')""",
+               VALUES (?, 'pub.com', 'solo', 1, 'draft')""",
             (cust_id,)
         )
         dep_id = cur.lastrowid
         self.sys.conn.commit()
         payload = {"deployment_id": dep_id}
+        with self.assertRaises(HTTPError) as cm:
+            self.sys.deployments_action(CSRF_TOKEN, self.owner_id, "publish", payload)
+        self.assertEqual((cm.exception.status, cm.exception.code), (400, "domain_not_verified"))
+        cur.execute("SELECT status FROM deployments WHERE id = ?", (dep_id,))
+        self.assertEqual(cur.fetchone()[0], "draft")
+        self.sys.mark_domain_verified(dep_id)
         resp = self.sys.deployments_action(CSRF_TOKEN, self.owner_id, "publish", payload)
         self.assertTrue(resp["success"])
         self.assertEqual(resp["status"], "live")
@@ -381,6 +483,110 @@ class TestAdminSystem(unittest.TestCase):
         # Ordered by timestamp DESC, then id DESC: timestamps are 00,01,02,03,04 -> DESC gives 04,03,02,01,00
         # offset=1 skips 04 (resource_id=4), first result is 03 (resource_id=3)
         self.assertEqual(results[0]["resource_id"], 3)  # because ordered DESC
+
+    # ADMIN-06
+    def test_role_and_plan_tiers_never_mix(self):
+        """users.tier takes a staff role only and a plan takes a plan only: a plan value in create, change_role or
+        a governance change_role, and a staff role in change_plan or create_deployment, are 400 invalid_tier and
+        change nothing. In: the test fixtures. Out: assertions. Why: spec "TIERS" (Phase B.2).
+        2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite only."""
+        cur = self.sys.conn.cursor()
+        cur.execute("INSERT INTO customers (email, name, tier, signup_date, stripe_subscription_id) "
+                    "VALUES ('t@example.com', 'T', 'solo', ?, 'sub_t')", (self._now(),))
+        cust_id = cur.lastrowid
+        self.sys.conn.commit()
+        action_id = self.sys.create_governance_action(self.owner_id, "change_role", "user", self.user_id,
+                                                      {"new_tier": "enterprise"})
+        calls = [
+            lambda: self.sys.users_action(CSRF_TOKEN, self.owner_id, "create",
+                                          {"email": "t2@example.com", "name": "T", "tier": "team"}),
+            lambda: self.sys.users_action(CSRF_TOKEN, self.owner_id, "change_role",
+                                          {"user_id": self.user_id, "new_tier": "team"}),
+            lambda: self.sys.decide_governance_action(CSRF_TOKEN, self.owner_id, action_id, "approve", {}),
+            lambda: self.sys.customers_action(CSRF_TOKEN, self.owner_id, cust_id, "change_plan", {"new_tier": "owner"}),
+            lambda: self.sys.deployments_action(CSRF_TOKEN, self.owner_id, "create",
+                                                {"customer_id": cust_id, "domain": "t.com", "tier": "admin",
+                                                 "theme_id": 1}),
+        ]
+        for call in calls:
+            with self.assertRaises(HTTPError) as cm:
+                call()
+            self.assertEqual((cm.exception.status, cm.exception.code), (400, "invalid_tier"))
+        self.assertEqual(self.sys._get_user_by_id(self.user_id)["tier"], "user")
+        self.assertIsNone(self.sys._get_user_by_email("t2@example.com"))
+        cur.execute("SELECT status FROM governance_actions WHERE id = ?", (action_id,))
+        self.assertEqual(cur.fetchone()[0], "pending")
+        self.assertEqual(self.sys.get_customer_detail(self.owner_id, cust_id)["tier"], "solo")
+        self.assertEqual(self.sys.list_deployments(self.owner_id), [])
+        cur.execute("SELECT COUNT(*) FROM audit_log")
+        self.assertEqual(cur.fetchone()[0], 0)
+
+    # ADMIN-19
+    def test_suspended_owner_refused_before_any_gate(self):
+        """A suspended owner calling any admin action, read or write, gets 403 account_suspended, before any gate
+        (even with a wrong CSRF token), and nothing changes: no table row, email or Stripe call.
+        In: the test fixtures and a fake Stripe client. Out: assertions. Why: ADMIN-19 (Phase B.2, 2026-11-10).
+        2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite, a fake Stripe client."""
+        stripe_fake = FakeStripe([{"id": "si_1"}])
+        self.sys = AdminSystem(stripe_client=stripe_fake)
+        self.setUp_users()
+        cur = self.sys.conn.cursor()
+        cur.execute("INSERT INTO users (email, name, tier, status, created_at, last_active_at) "
+                    "VALUES ('susp@example.com', 'Susp', 'owner', 'suspended', ?, ?)", (self._now(), self._now()))
+        susp = cur.lastrowid
+        cur.execute("INSERT INTO customers (email, name, tier, signup_date, stripe_subscription_id) "
+                    "VALUES ('c19@example.com', 'C', 'solo', ?, 'sub_19')", (self._now(),))
+        cust_id = cur.lastrowid
+        cur.execute("INSERT INTO invoices (customer_id, amount, status) VALUES (?, 100, 'succeeded')", (cust_id,))
+        invoice_id = cur.lastrowid
+        cur.execute("INSERT INTO deployments (customer_id, domain, tier, theme_id, status, domain_verified) "
+                    "VALUES (?, 'd19.com', 'solo', 1, 'draft', 1)", (cust_id,))
+        dep_id = cur.lastrowid
+        self.sys.conn.commit()
+        action_id = self.sys.create_governance_action(self.owner_id, "change_role", "user", self.user_id,
+                                                      {"new_tier": "admin"})
+
+        def snapshot():
+            tables = [r[0] for r in self.sys.conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' "
+                                                          "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+            return {t: [tuple(r) for r in self.sys.conn.execute(f"SELECT * FROM {t} ORDER BY rowid")] for t in tables}
+        before = snapshot()
+        calls = []
+        for csrf in (CSRF_TOKEN, "wrong-token"):
+            calls += [
+                lambda c=csrf: self.sys.users_action(c, susp, "create",
+                                                     {"email": "n@example.com", "name": "N", "tier": "user", "notify": True}),
+                lambda c=csrf: self.sys.users_action(c, susp, "reset_password", {"user_id": self.user_id}),
+                lambda c=csrf: self.sys.users_action(c, susp, "change_role", {"user_id": self.user_id, "new_tier": "admin"}),
+                lambda c=csrf: self.sys.users_action(c, susp, "suspend", {"user_id": self.user_id, "reason": "x"}),
+                lambda c=csrf: self.sys.customers_action(c, susp, cust_id, "change_plan", {"new_tier": "team"}),
+                lambda c=csrf: self.sys.customers_action(c, susp, cust_id, "queue_refund",
+                                                         {"invoice_id": invoice_id, "amount": 10, "reason": "r"}),
+                lambda c=csrf: self.sys.deployments_action(c, susp, "create", {"customer_id": cust_id, "domain": "n.com",
+                                                                               "tier": "solo", "theme_id": 1}),
+                lambda c=csrf: self.sys.deployments_action(c, susp, "publish", {"deployment_id": dep_id}),
+                lambda c=csrf: self.sys.deployments_action(c, susp, "suspend", {"deployment_id": dep_id, "reason": "x"}),
+                lambda c=csrf: self.sys.deployments_action(c, susp, "retire", {"deployment_id": dep_id}),
+                lambda c=csrf: self.sys.decide_governance_action(c, susp, action_id, "approve", {}),
+                lambda c=csrf: self.sys.decide_governance_action(c, susp, action_id, "reject", {"reason": "no"}),
+            ]
+        calls += [
+            lambda: self.sys.list_customers(susp),
+            lambda: self.sys.get_customer_detail(susp, cust_id),
+            lambda: self.sys.list_deployments(susp),
+            lambda: self.sys.list_pending_governance_actions(susp),
+            lambda: self.sys.search_audit_log(susp, {}),
+        ]
+        for call in calls:
+            with self.assertRaises(HTTPError) as cm:
+                call()
+            self.assertEqual((cm.exception.status, cm.exception.code), (403, "account_suspended"))
+        self.assertEqual(snapshot(), before)
+        self.assertEqual(self.sys.email_outbox, [])
+        self.assertEqual(stripe_fake.Subscription.modified, [])
+        # The active owner is unaffected.
+        self.assertTrue(self.sys.list_customers(self.owner_id))
+
 
 if __name__ == "__main__":
     unittest.main()

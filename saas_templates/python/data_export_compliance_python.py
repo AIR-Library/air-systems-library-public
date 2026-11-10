@@ -119,10 +119,11 @@ SIGNED_URL_TTL = timedelta(days=7)
 class ComplianceError(ValueError):
     """A refused compliance request with an HTTP status and an error code.
 
-    Subclasses ValueError so callers that caught ValueError keep working. Codes: deletion_not_found (404),
-    invalid_confirmation_token (400), confirmation_token_expired (410), deletion_not_pending (409),
-    cannot_cancel (409), grace_period_over (409), admin_only (403). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
-    Touches nothing."""
+    Subclasses ValueError so callers that caught ValueError keep working. Codes: not_found (404),
+    invalid_confirmation_token (400, for a wrong, reused or expired token alike), deletion_not_pending (409),
+    grace_period_over (409), admin_only (403). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    Updated 2026-11-10 (Phase B.2, EXPORT-15): 404 is not_found, the expired-token 410 and cancel's
+    cannot_cancel are gone (one answer in every language). Touches nothing."""
 
     def __init__(self, status: int, code: str, message: str = ""):
         """Hold the HTTP status and error code. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing."""
@@ -382,36 +383,51 @@ class ComplianceManager:
         return user_data.get('profile', {}).get('email', 'user@example.com')
 
     def _own_deletion(self, user_id: uuid.UUID, deletion_id: uuid.UUID) -> DeletionRequest:
-        """The caller's own deletion request, or ComplianceError 404 deletion_not_found (also for anyone else's,
-        so another user's request is indistinguishable from none). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP
-        (EXPORT-14). Touches: database (read)."""
+        """The caller's own deletion request, or ComplianceError 404 not_found (also for anyone else's, so
+        another user's request is indistinguishable from none). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP
+        (EXPORT-14; code renamed deletion_not_found -> not_found for EXPORT-15, Phase B.2).
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Spec clarification 3abb340: a COMPLETED request has no owner
+        (user_id is NULL, EXPORT-13), so it is 404 not_found to every caller; a completed row that still names
+        its user is treated the same. Touches: database (read)."""
         deletion_request = self.db_session.query(DeletionRequest).filter_by(id=deletion_id, user_id=user_id).first()
-        if deletion_request is None or user_id is None:
-            raise ComplianceError(404, 'deletion_not_found', "Deletion request not found")
+        if deletion_request is None or user_id is None or deletion_request.status == DeletionRequestStatus.COMPLETED:
+            raise ComplianceError(404, 'not_found', "Deletion request not found")
         return deletion_request
+
+    @staticmethod
+    def _refuse_if_closed(deletion_request: DeletionRequest) -> None:
+        """Refuse a cancelled request: ComplianceError 409 deletion_not_pending. In: the caller's own request
+        (a completed one never gets here: _own_deletion answers it 404). Out: None or the raise. Why: EXPORT-15
+        (Phase B.2, as clarified in 3abb340: a cancelled request is 409, checked before the token, so a spent
+        token on it does not read as a wrong token). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        Touches nothing."""
+        if deletion_request.status == DeletionRequestStatus.CANCELLED:
+            raise ComplianceError(409, 'deletion_not_pending', "Deletion request is not pending")
     
     def confirm_deletion(self, user_id: uuid.UUID, deletion_id: uuid.UUID, confirmation_token: str) -> Dict[str, Any]:
         """POST /compliance/delete/:id/confirm for the authenticated user.
 
         In: user_id (the verified caller, never from the body), deletion_id, the emailed token. Checks, in order:
-        the request is the caller's (else 404 deletion_not_found); the token's SHA-256 equals the stored hash in
-        constant time (else 400 invalid_confirmation_token; a spent token's hash is cleared, so reuse fails the
-        same way); the token is under 24 h old (else 410 confirmation_token_expired); the request is pending
-        (else 409 deletion_not_pending). Then pending -> approved and the token is spent. For a statutory reason
-        the cascade runs before this returns (status completed, deleted_at = deletion_scheduled_for = now).
+        the request is the caller's and not completed (else 404 not_found); it is not cancelled (else 409
+        deletion_not_pending); the token's SHA-256 equals the stored hash in constant time and the token is under
+        24 h old (else 400 invalid_confirmation_token: a wrong, reused (its hash is cleared once spent) or expired
+        token all get that one answer); the request is pending (else 409 deletion_not_pending). Then pending ->
+        approved and the token is spent. For a statutory reason the cascade runs before this returns (status
+        completed, deleted_at = deletion_scheduled_for = now).
         Out: {success, deletion_scheduled_for}. Why: EXPORT-09/12/14 as amended 2026-11-10 (it compared the
-        plain token with != and let anyone confirm anyone's request). 2026-11-10,
-        session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database, audit logger; for a statutory reason also S3, the
-        cascade function and the audit eraser."""
+        plain token with != and let anyone confirm anyone's request), and EXPORT-15 (Phase B.2, 2026-11-10: an
+        expired token was 410 confirmation_token_expired, which told the caller which case it was).
+        2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database, audit logger; for a statutory reason
+        also S3, the cascade function and the audit eraser."""
         deletion_request = self._own_deletion(user_id, deletion_id)
+        self._refuse_if_closed(deletion_request)
         stored = deletion_request.confirmation_token or ''
         supplied = _token_hash(confirmation_token if isinstance(confirmation_token, str) else '')
-        if not hmac.compare_digest(supplied.encode('ascii'), stored.encode('ascii', 'replace')) or not stored:
-            raise ComplianceError(400, 'invalid_confirmation_token', "Invalid confirmation token")
+        token_matches = hmac.compare_digest(supplied.encode('ascii'), stored.encode('ascii', 'replace'))
         now = self.clock()
         expires = _ensure_utc_aware(deletion_request.token_expires_at)
-        if expires is None or now >= expires:
-            raise ComplianceError(410, 'confirmation_token_expired', "The confirmation link has expired")
+        if not stored or not token_matches or expires is None or now >= expires:
+            raise ComplianceError(400, 'invalid_confirmation_token', "Invalid confirmation token")
         if deletion_request.status != DeletionRequestStatus.PENDING:
             raise ComplianceError(409, 'deletion_not_pending', "Deletion request is not pending")
 
@@ -440,15 +456,13 @@ class ComplianceManager:
         """DELETE /compliance/delete/:id for the authenticated user, within the grace period.
 
         In: user_id (the verified caller), deletion_id. Out: {success, status 'cancelled'}; ComplianceError 404
-        deletion_not_found for anyone else's request, 409 cannot_cancel (not pending/approved) or 409
+        not_found for anyone else's or a completed request, 409 deletion_not_pending (already cancelled) or 409
         grace_period_over (now >= will_delete_at). The token is spent. Why: EXPORT-06/14 (amended 2026-11-10:
-        only the caller's own request). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        only the caller's own request) and EXPORT-15 (Phase B.2, 2026-11-10: a closed request was 409
+        cannot_cancel; now deletion_not_pending, as for confirm). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
         Touches: database, audit logger."""
         deletion_request = self._own_deletion(user_id, deletion_id)
-        
-        if deletion_request.status != DeletionRequestStatus.PENDING and \
-           deletion_request.status != DeletionRequestStatus.APPROVED:
-            raise ComplianceError(409, 'cannot_cancel', "Deletion request cannot be cancelled")
+        self._refuse_if_closed(deletion_request)
         
         # Ensure both datetimes are timezone-aware for comparison
         now_utc = self.clock()

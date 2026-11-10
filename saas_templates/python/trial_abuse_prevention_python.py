@@ -66,6 +66,14 @@ class TrialAbusePrevention:
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
+        -- [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] users: the account row gate 5 reads (users.created_at
+        -- starts the trial; no row -> FAIL user_not_found). Phase B.2 amendment to trial_abuse_prevention.md gate 5.
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT,
+            created_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS device_fingerprints (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -302,28 +310,26 @@ class TrialAbusePrevention:
     def check_trial_payment_timing(self, user_id: int) -> Dict[str, Any]:
         """Gate 5, judged as a payment method is added (the payment date is now, from the clock).
 
-        trial_end = the user's trial start + trial_days; days_after_trial = floor((now - trial_end) / 1 day),
+        trial_end = users.created_at + trial_days; days_after_trial = floor((now - trial_end) / 1 day),
         rounding toward negative infinity; earlier_payment = the ledger already has a payment_added_date for
         the user. PASS if days_after_trial < 5; FAIL if >= 90 and no earlier payment; CHALLENGE otherwise.
-        A user with no ledger row is FAIL "user_not_found" (unchanged: fail closed).
-        Out: {decision, days_after_trial, earlier_payment}. Why: TRIAL-10/11/15 as amended 2026-11-10 (it used
-        days since the trial START with ad-hoc windows). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
-        Touches: SQLite (read; gate_decisions)."""
-        user = self._fetchone(
-            """
-            SELECT MIN(COALESCE(trial_started_at, signup_date)) AS started,
-                   COUNT(payment_added_date) AS payments
-            FROM trial_abuse_ledger WHERE user_id = ?
-            """,
-            (user_id,),
-        )
-        if not user or user["started"] is None:
+        A user with no users row is FAIL "user_not_found" (fail closed); a user with a users row but no ledger
+        row is judged from users.created_at with no earlier payment.
+        Out: {decision, days_after_trial, earlier_payment} or {decision: FAIL, reason: user_not_found}.
+        Why: TRIAL-10/11/15 as amended 2026-11-10 (it used days since the trial START with ad-hoc windows), and
+        the Phase B.2 amendment (2026-11-10): the trial now starts at users.created_at, and a missing ledger row
+        no longer FAILs as user_not_found. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        Touches: SQLite (read users and trial_abuse_ledger; write gate_decisions)."""
+        user = self._fetchone("SELECT created_at FROM users WHERE id = ?", (user_id,))
+        if not user or user["created_at"] is None:
             return {"decision": "FAIL", "reason": "user_not_found"}
+        ledger = self._fetchone(
+            "SELECT COUNT(payment_added_date) AS payments FROM trial_abuse_ledger WHERE user_id = ?", (user_id,))
 
-        trial_end = _parse(user["started"]) + datetime.timedelta(days=self.trial_days)
+        trial_end = _parse(user["created_at"]) + datetime.timedelta(days=self.trial_days)
         delta = self.clock() - trial_end
         days_after_trial = (delta.days * 86400 + delta.seconds) // 86400  # floor toward -infinity
-        earlier_payment = user["payments"] > 0
+        earlier_payment = bool(ledger and ledger["payments"] > 0)
         if days_after_trial < 5:
             decision = "PASS"
         elif days_after_trial >= 90 and not earlier_payment:
@@ -392,7 +398,9 @@ class TrialAbusePrevention:
         device_suspected_fraud. Every gate runs BEFORE anything is recorded, so a FAIL records no ledger,
         signup or device row. [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] The device gate now runs here
         (TRIAL-09/14): signup used to record the device first, so a device farm never failed.
-        Touches: SQLite (trial_abuse_ledger, signups, device_fingerprints, gate_decisions)."""
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2: signup now creates the users row whose
+        created_at starts the trial (gate 5); the returned user_id is users.id.
+        Touches: SQLite (users, trial_abuse_ledger, signups, device_fingerprints, gate_decisions)."""
         email_gate = self.check_email_trial_history(email)
         ip_gate = self.check_ip_signup_rate_limit(ip)
 
@@ -404,15 +412,19 @@ class TrialAbusePrevention:
         if device_gate["decision"] == "FAIL":
             return {"error": "device_suspected_fraud", "code": 403}
 
-        # Create user record
+        # Create the users row (its created_at starts the trial, gate 5), then its ledger row.
+        # [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2: user_id is users.id (was the ledger row id).
         now = _iso(self.clock())
-        cur = self._execute(
+        user_id = self._execute("INSERT INTO users (email, created_at) VALUES (?, ?)", (email, now)).lastrowid
+        self._execute(
             """
             INSERT INTO trial_abuse_ledger
-            (email, ip, device_fingerprint, signup_date, trial_started_at, subscription_status, gate_flags, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (user_id, email, ip, device_fingerprint, signup_date, trial_started_at, subscription_status, gate_flags,
+             created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                user_id,
                 email,
                 ip,
                 self._hash_device(device),
@@ -423,12 +435,6 @@ class TrialAbusePrevention:
                             "device": device_gate["decision"]}),
                 now,
             ),
-        )
-        user_id = cur.lastrowid
-        # Set user_id column to match the primary key id
-        self._execute(
-            "UPDATE trial_abuse_ledger SET user_id = ? WHERE id = ?",
-            (user_id, user_id),
         )
 
         # Record signup for IP rate limiting
@@ -463,7 +469,9 @@ class TrialAbusePrevention:
 
         In: user_id, the payment method id. Out: {success: True} or {error, code: 403}.
         [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] The payment date comes from the injected clock.
-        Touches: SQLite (trial_abuse_ledger, stripe_events, gate_decisions)."""
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2: a user with no users row is refused 403
+        user_not_found; a user with no ledger row gets one, so the payment is recorded.
+        Touches: SQLite (users read, trial_abuse_ledger, stripe_events, gate_decisions)."""
         payment_gate = self.check_payment_method_history(stripe_payment_method_id)
         timing_gate = self.check_trial_payment_timing(user_id)
         chargeback_gate = self.check_chargeback_history(user_id)
@@ -471,11 +479,20 @@ class TrialAbusePrevention:
         if payment_gate["decision"] == "FAIL":
             return {"error": "payment_method_used_for_multiple_trials", "code": 403}
         if timing_gate["decision"] == "FAIL":
+            if timing_gate.get("reason") == "user_not_found":
+                return {"error": "user_not_found", "code": 403}
             return {"error": "trial_ended_no_payment_cannot_retry", "code": 403}
         if chargeback_gate["decision"] == "FAIL":
             return {"error": "chargeback_history_requires_prepayment", "code": 403}
 
         now = _iso(self.clock())
+        # A user with no ledger row yet gets one, so the payment is recorded (Phase B.2, 2026-11-10).
+        if self._fetchone("SELECT 1 FROM trial_abuse_ledger WHERE user_id = ?", (user_id,)) is None:
+            self._execute(
+                "INSERT INTO trial_abuse_ledger (user_id, email, gate_flags, created_at) "
+                "SELECT id, email, '{}', ? FROM users WHERE id = ?",
+                (now, user_id),
+            )
         # Update ledger
         self._execute(
             """
@@ -503,6 +520,15 @@ class TrialAbusePrevention:
         return {"success": True}
 
     # Utility methods for tests
+    def add_user(self, email: str, created_at: Optional[datetime.datetime] = None) -> int:
+        """Insert a users row only (no ledger row), e.g. an account created before this system existed.
+
+        In: email, created_at (default the clock). Out: the new users.id. Why: the Phase B.2 amendment to gate 5
+        (a user with no ledger row is judged from users.created_at). 2026-11-10,
+        session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite (users)."""
+        return self._execute("INSERT INTO users (email, created_at) VALUES (?, ?)",
+                             (email, _iso(created_at or self.clock()))).lastrowid
+
     def add_refund(self, user_id: int, status: str):
         self._execute(
             """

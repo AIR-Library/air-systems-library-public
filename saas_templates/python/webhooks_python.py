@@ -468,6 +468,9 @@ def verify(
 
 
 RETRY_SCHEDULE = [5, 300, 1800, 7200, 18000, 36000, 36000]  # seconds
+# An endpoint is disabled after this many consecutive fully-failed messages (every attempt failed). Spec rule;
+# 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2: it was 5 failed attempts).
+MAX_CONSECUTIVE_FAILED_MESSAGES = 5
 
 
 def deliver(
@@ -478,6 +481,15 @@ def deliver(
     """
     Deliver a webhook. sender(url, headers, body) -> (status_code, response_body).
     Updates and returns the delivery.
+
+    In: one delivery attempt (attempt 0 is the first; each retry is a new delivery row with attempt + 1), the
+    store and the sender. Out: the updated delivery. A 2xx marks success and resets the endpoint's
+    failure_count; any other result schedules the next attempt from RETRY_SCHEDULE. Only when the LAST attempt
+    of a message fails (attempt == len(RETRY_SCHEDULE), no retry left) is the message fully failed: then
+    failure_count (consecutive fully-failed messages) goes up by one, and at 5 the endpoint is disabled.
+    [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2 bug fix: it counted every failed ATTEMPT, so one
+    message's first five retries disabled the endpoint; the spec says 5 consecutive fully-failed MESSAGES.
+    Touches: the store (endpoint and delivery rows) and the network through the sender.
     """
     endpoint = store.get_endpoint(delivery.endpoint_id)
     if not endpoint:
@@ -523,9 +535,10 @@ def deliver(
             delivery.next_attempt_at = time.time() + delay
         else:
             delivery.next_attempt_at = None
-        endpoint.failure_count += 1
-        if endpoint.failure_count >= 5:
-            endpoint.active = False
+            # The message has fully failed for this endpoint: no retry is left.
+            endpoint.failure_count += 1
+            if endpoint.failure_count >= MAX_CONSECUTIVE_FAILED_MESSAGES:
+                endpoint.active = False
 
     store.update_endpoint(endpoint)
     store.update_delivery(delivery)

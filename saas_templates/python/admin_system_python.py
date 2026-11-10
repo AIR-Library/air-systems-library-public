@@ -27,7 +27,11 @@ PLAN_PRICE_IDS = {
     "enterprise": "price_1UIxxxxxx_enterprise",
 }
 SAFETY_FLAGS = {"can_publish": True}
+# users.tier is the STAFF ROLE; a customer's or deployment's tier is the PLAN (PLAN_PRICE_IDS' keys). The two are
+# never mixed: a value from the wrong set is 400 invalid_tier. Spec "TIERS", Phase B.2, 2026-11-10,
+# session_012zDydZCZ4AChqhEZ4oVtaP (create_deployment validated a plan against the staff roles).
 ALLOWED_TIERS = {"owner", "admin", "user"}
+PLAN_TIERS = frozenset(PLAN_PRICE_IDS)
 
 # ---------- Exceptions ----------
 class HTTPError(Exception):
@@ -55,8 +59,22 @@ def validate_name(name: str) -> None:
         raise HTTPError(400, "invalid_name", "Name length must be 1-100 characters")
 
 def validate_tier(tier: str) -> None:
+    """Refuse a staff role that is not owner / admin / user (a plan value such as 'team' included).
+
+    In: the role given for users.tier. Out: None, or HTTPError 400 invalid_tier. Why: spec "TIERS" (Phase B.2,
+    2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: users.tier is the staff role). Touches nothing."""
     if tier not in ALLOWED_TIERS:
-        raise HTTPError(400, "invalid_tier", f"Tier must be one of {ALLOWED_TIERS}")
+        raise HTTPError(400, "invalid_tier", f"Tier must be one of {sorted(ALLOWED_TIERS)}")
+
+
+def validate_plan_tier(tier: str) -> None:
+    """Refuse a plan that is not solo / team / enterprise (a staff role such as 'admin' included).
+
+    In: the plan given for a customer or a deployment. Out: None, or HTTPError 400 invalid_tier. Why: spec
+    "TIERS" (Phase B.2, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: create_deployment took staff roles).
+    Touches nothing."""
+    if tier not in PLAN_TIERS:
+        raise HTTPError(400, "invalid_tier", f"Plan tier must be one of {sorted(PLAN_TIERS)}")
 
 def now() -> str:
     return datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
@@ -109,9 +127,20 @@ class AdminSystem:
             tier TEXT NOT NULL,
             theme_id INTEGER NOT NULL,
             status TEXT NOT NULL DEFAULT 'draft',
+            -- [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2: publish requires a verified domain.
+            domain_verified INTEGER NOT NULL DEFAULT 0,
             published_at TEXT,
             suspend_reason TEXT,
             archived_at TEXT,
+            FOREIGN KEY(customer_id) REFERENCES customers(id)
+        );
+        -- [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2: queue_refund checks the invoice it refunds
+        -- (it assumed every invoice existed and had succeeded). amount is in the same unit as refunds.amount.
+        CREATE TABLE invoices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL,
+            amount REAL NOT NULL,
+            status TEXT NOT NULL,
             FOREIGN KEY(customer_id) REFERENCES customers(id)
         );
         CREATE TABLE refunds (
@@ -154,6 +183,17 @@ class AdminSystem:
         self.conn.commit()
 
     # ----- Gate Checks -----
+    def _caller(self, current_user_id: int) -> sqlite3.Row:
+        """The verified session user, refused if suspended, before any gate (CSRF included).
+
+        In: the caller's user id. Out: their users row; HTTPError 404 user_not_found, or 403 account_suspended
+        when users.status is 'suspended'. Why: ADMIN-19 (Phase B.2, 2026-11-10): a suspended owner kept every
+        admin power. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite (read)."""
+        user = self._get_user_by_id(current_user_id)
+        if user["status"] == "suspended":
+            raise HTTPError(403, "account_suspended", "Your account is suspended")
+        return user
+
     def _require_owner(self, user: sqlite3.Row) -> None:
         if user["tier"] != "owner":
             raise HTTPError(403, "owner_only", "Owner privileges required")
@@ -198,8 +238,14 @@ class AdminSystem:
     # ----- USERS DOMAIN -----
     def users_action(self, csrf_token: str, current_user_id: int,
                      action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /admin/users/action: create, reset_password, change_role or suspend.
+
+        In: the CSRF token, the verified caller's id, the action, its payload. Out: the action's result; HTTPError
+        403 account_suspended (a suspended caller, before any gate), 403 csrf_invalid, 403 owner_only, 400
+        invalid_action, or the action's own refusals. Why: ADMIN-01..09; ADMIN-19 added in Phase B.2.
+        Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite, the email outbox."""
+        cur_user = self._caller(current_user_id)  # ADMIN-19: before any gate (Phase B.2, 2026-11-10)
         verify_csrf(csrf_token)
-        cur_user = self._get_user_by_id(current_user_id)
         self._require_owner(cur_user)
 
         if action == "create":
@@ -326,7 +372,10 @@ class AdminSystem:
 
     # ----- CUSTOMERS DOMAIN -----
     def list_customers(self, current_user_id: int, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
-        cur_user = self._get_user_by_id(current_user_id)
+        """GET /admin/customers (admin or owner). In: caller id, limit, offset. Out: a page of customers.
+        HTTPError 403 account_suspended first (ADMIN-19, Phase B.2), then 403 admin_or_owner_required.
+        Why: ADMIN-10. Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite (read)."""
+        cur_user = self._caller(current_user_id)  # ADMIN-19 (Phase B.2, 2026-11-10)
         self._require_admin_or_owner(cur_user)
         cur = self.conn.cursor()
         cur.execute(
@@ -338,7 +387,10 @@ class AdminSystem:
         return [dict(row) for row in rows]
 
     def get_customer_detail(self, current_user_id: int, customer_id: int) -> Dict[str, Any]:
-        cur_user = self._get_user_by_id(current_user_id)
+        """GET /admin/customers/{customer_id} (admin or owner). In: caller id, customer id. Out: the
+        customer row; HTTPError 403 account_suspended first (ADMIN-19, Phase B.2), 403 admin_or_owner_required,
+        404 customer_not_found. Why: ADMIN-11. Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite (read)."""
+        cur_user = self._caller(current_user_id)  # ADMIN-19 (Phase B.2, 2026-11-10)
         self._require_admin_or_owner(cur_user)
         cur = self.conn.cursor()
         cur.execute(
@@ -352,14 +404,20 @@ class AdminSystem:
 
     def customers_action(self, csrf_token: str, current_user_id: int,
                          customer_id: int, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /admin/customers/{customer_id}/action: change_plan or queue_refund (owner only).
+
+        In: CSRF token, caller id, customer id, action, payload. Out: the action's result; HTTPError 403
+        account_suspended (before any gate, ADMIN-19), 403 csrf_invalid, 403 owner_only, 400 invalid_action.
+        queue_refund now receives the customer id, so the invoice must be this customer's (Phase B.2 bug).
+        Why: ADMIN-12/13/19. Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite, Stripe (money) for change_plan."""
+        cur_user = self._caller(current_user_id)  # ADMIN-19: before any gate (Phase B.2, 2026-11-10)
         verify_csrf(csrf_token)
-        cur_user = self._get_user_by_id(current_user_id)
         self._require_owner(cur_user)
 
         if action == "change_plan":
             return self._customers_change_plan(cur_user, customer_id, payload)
         elif action == "queue_refund":
-            return self._customers_queue_refund(cur_user, payload)
+            return self._customers_queue_refund(cur_user, customer_id, payload)
         else:
             raise HTTPError(400, "invalid_action", "Unsupported action")
 
@@ -441,15 +499,39 @@ class AdminSystem:
         except Exception as e:
             raise HTTPError(502, "stripe_error", str(e))
 
-    def _customers_queue_refund(self, actor: sqlite3.Row, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _customers_queue_refund(self, actor: sqlite3.Row, customer_id: int,
+                                payload: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /admin/customers/{customer_id}/action, action=queue_refund: queue a refund of one invoice.
+
+        In: the acting owner's row, the customer id from the path, payload {invoice_id, amount, reason}.
+        Out: {success, refund_id, status 'queued', amount}. Refusals (HTTPError): 400 missing_fields; 400
+        invalid_amount (not a positive number); 404 invoice_not_found (no such invoice, or it belongs to another
+        customer); 400 invalid_invoice_status (not 'succeeded'); 400 refund_exceeds_invoice (queued and executed
+        refunds plus this one would exceed the invoice amount). Nothing is written on a refusal.
+        Why: Phase B.2 python bug (2026-11-10): it assumed the invoice existed and had succeeded, so any amount
+        could be refunded against any invoice id; the spec's Check is "invoice exists, status='succeeded'", and the
+        Go template's codes are used. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        Touches: SQLite (invoices read; refunds, audit_log written). Money: only queues; nothing is paid out here."""
         invoice_id = payload.get("invoice_id")
         amount = payload.get("amount")
         reason = payload.get("reason")
-        if not all([invoice_id, amount, reason]):
+        if invoice_id is None or amount is None or not reason:
             raise HTTPError(400, "missing_fields", "invoice_id, amount, and reason required")
+        if isinstance(amount, bool) or not isinstance(amount, (int, float)) or not amount > 0:
+            raise HTTPError(400, "invalid_amount", "amount must be a positive number")
 
-        # Simulate invoice check
-        # For simplicity assume invoice exists and succeeded
+        invoice = self.conn.execute("SELECT amount, status FROM invoices WHERE id = ? AND customer_id = ?",
+                                    (invoice_id, customer_id)).fetchone()
+        if invoice is None:
+            raise HTTPError(404, "invoice_not_found", "Invoice not found")
+        if invoice["status"] != "succeeded":
+            raise HTTPError(400, "invalid_invoice_status", "Only a succeeded invoice can be refunded")
+        refunded = self.conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM refunds WHERE invoice_id = ? AND status IN ('queued', 'executed')",
+            (invoice_id,)).fetchone()[0]
+        if refunded + amount > invoice["amount"]:
+            raise HTTPError(400, "refund_exceeds_invoice", "Refunds would exceed the invoice amount")
+
         cur = self.conn.cursor()
         cur.execute(
             """INSERT INTO refunds (invoice_id, amount, reason, status, created_by, created_at)
@@ -472,7 +554,10 @@ class AdminSystem:
 
     # ----- DEPLOYMENTS DOMAIN -----
     def list_deployments(self, current_user_id: int) -> List[Dict[str, Any]]:
-        cur_user = self._get_user_by_id(current_user_id)
+        """GET /admin/deployments (admin or owner). In: caller id. Out: every deployment.
+        HTTPError 403 account_suspended first (ADMIN-19, Phase B.2), then 403 admin_or_owner_required.
+        Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite (read)."""
+        cur_user = self._caller(current_user_id)  # ADMIN-19 (Phase B.2, 2026-11-10)
         self._require_admin_or_owner(cur_user)
         cur = self.conn.cursor()
         cur.execute(
@@ -484,8 +569,13 @@ class AdminSystem:
 
     def deployments_action(self, csrf_token: str, current_user_id: int,
                            action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /admin/deployments/action: create, publish, suspend or retire (owner only).
+
+        In: CSRF token, caller id, action, payload. Out: the action's result; HTTPError 403 account_suspended
+        (before any gate, ADMIN-19), 403 csrf_invalid, 403 owner_only, 400 invalid_action. Why: ADMIN-14/15/19.
+        Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite."""
+        cur_user = self._caller(current_user_id)  # ADMIN-19: before any gate (Phase B.2, 2026-11-10)
         verify_csrf(csrf_token)
-        cur_user = self._get_user_by_id(current_user_id)
         self._require_owner(cur_user)
 
         if action == "create":
@@ -500,13 +590,20 @@ class AdminSystem:
             raise HTTPError(400, "invalid_action", "Unsupported action")
 
     def _deployments_create(self, actor: sqlite3.Row, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """action=create: a draft deployment for a customer. In: the acting owner's row, payload {customer_id,
+        domain, tier (a PLAN: solo/team/enterprise), theme_id}. Out: {success, deployment_id, domain, tier};
+        HTTPError 400 missing_fields, 400 invalid_tier (a staff role or unknown value), 404 customer_not_found,
+        409 domain_exists. The domain starts unverified. Why: ADMIN-14; spec "TIERS" (Phase B.2: it validated
+        the plan against staff roles). Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite (deployments, audit_log)."""
         customer_id = payload.get("customer_id")
         domain = payload.get("domain")
         tier = payload.get("tier")
         theme_id = payload.get("theme_id")
         if not all([customer_id, domain, tier, theme_id]):
             raise HTTPError(400, "missing_fields", "All fields required")
-        validate_tier(tier)
+        # [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2: a deployment's tier is the PLAN; it was checked
+        # against the staff roles, so 'user' passed and 'team' was refused.
+        validate_plan_tier(tier)
 
         cur = self.conn.cursor()
         cur.execute("SELECT * FROM customers WHERE id = ?", (customer_id,))
@@ -533,6 +630,11 @@ class AdminSystem:
         return {"success": True, "deployment_id": deployment_id, "domain": domain, "tier": tier}
 
     def _deployments_publish(self, actor: sqlite3.Row, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """action=publish: make a draft deployment live. Double gate: owner (checked by the caller) and
+        SAFETY_FLAGS['can_publish']. In: the acting owner's row, payload {deployment_id}. Out: {success,
+        deployment_id, status 'live', public_url}; HTTPError 400 missing_fields, 403 publish_not_allowed, 404
+        deployment_not_found, 400 invalid_status (not draft), 400 domain_not_verified. Why: ADMIN-15; Phase B.2
+        (domain_verified was assumed). Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite (deployments, audit_log)."""
         deployment_id = payload.get("deployment_id")
         if not deployment_id:
             raise HTTPError(400, "missing_fields", "deployment_id required")
@@ -546,7 +648,10 @@ class AdminSystem:
             raise HTTPError(404, "deployment_not_found", "Deployment does not exist")
         if dep["status"] != "draft":
             raise HTTPError(400, "invalid_status", "Only draft deployments can be published")
-        # Assume domain_verified and theme_set checks passed
+        # [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2: the spec's domain_verified check (it was assumed).
+        # theme_set holds by construction: theme_id is NOT NULL and create requires it.
+        if not dep["domain_verified"]:
+            raise HTTPError(400, "domain_not_verified", "The deployment's domain is not verified")
 
         cur.execute(
             "UPDATE deployments SET status = 'live', published_at = ? WHERE id = ?",
@@ -563,6 +668,18 @@ class AdminSystem:
             "status": "live",
             "public_url": f"https://{dep['domain']}"
         }
+
+    def mark_domain_verified(self, deployment_id: int) -> None:
+        """Record that a deployment's domain passed verification (called by the domain-verification job, e.g.
+        after a DNS TXT check; not an admin action, so no gate). In: deployment id. Out: None, or HTTPError 404
+        deployment_not_found. Why: spec "TIERS" paragraph (Phase B.2, 2026-11-10): deployments carry
+        domain_verified, default false, and publish needs it. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        Touches: SQLite (deployments)."""
+        cur = self.conn.execute("UPDATE deployments SET domain_verified = 1 WHERE id = ?", (deployment_id,))
+        if cur.rowcount != 1:
+            self.conn.rollback()
+            raise HTTPError(404, "deployment_not_found", "Deployment does not exist")
+        self.conn.commit()
 
     def _deployments_suspend(self, actor: sqlite3.Row, payload: Dict[str, Any]) -> Dict[str, Any]:
         deployment_id = payload.get("deployment_id")
@@ -603,7 +720,10 @@ class AdminSystem:
 
     # ----- GOVERNANCE DOMAIN -----
     def list_pending_governance_actions(self, current_user_id: int, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
-        cur_user = self._get_user_by_id(current_user_id)
+        """GET /admin/governance/actions (owner or admin). In: caller id, limit, offset. Out: pending
+        actions. HTTPError 403 account_suspended first (ADMIN-19, Phase B.2), then 403 owner_or_admin_required.
+        Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite (read)."""
+        cur_user = self._caller(current_user_id)  # ADMIN-19 (Phase B.2, 2026-11-10)
         if cur_user["tier"] not in {"owner", "admin"}:
             raise HTTPError(403, "owner_or_admin_required", "Owner or Admin required")
         cur = self.conn.cursor()
@@ -617,8 +737,15 @@ class AdminSystem:
 
     def decide_governance_action(self, csrf_token: str, current_user_id: int,
                                  action_id: int, decide: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /admin/governance/actions/{action_id}/decide: approve (runs the action) or reject.
+
+        In: CSRF token, caller id, action id, decide, payload {reason} for reject. Out: {success, action_id,
+        status}; HTTPError 403 account_suspended (before any gate, ADMIN-19), 403 csrf_invalid, 403 owner_only,
+        404 governance_action_not_found, 400 action_already_decided, 400 invalid_tier (a change_role to a plan
+        value, Phase B.2 "TIERS"), 400 cannot_demote_last_owner (Phase B.2: the change_role Check now applies to
+        an approved change too), 400 invalid_decision. Why: ADMIN-16/17/19. Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite."""
+        actor = self._caller(current_user_id)  # ADMIN-19: before any gate (Phase B.2, 2026-11-10)
         verify_csrf(csrf_token)
-        actor = self._get_user_by_id(current_user_id)
         self._require_owner(actor)
 
         cur = self.conn.cursor()
@@ -635,7 +762,15 @@ class AdminSystem:
             if ga["action_type"] == "change_role":
                 target_user_id = ga["target_resource_id"]
                 new_tier = params["new_tier"]
+                # [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2 "TIERS": a role change takes a staff
+                # role only (a plan value such as 'team' is 400 invalid_tier), as action=change_role does.
+                validate_tier(new_tier)
                 target_user = self._get_user_by_id(target_user_id)
+                # Same last-owner Check as action=change_role (Phase B.2, 2026-11-10): an approved role change
+                # may not demote the last active owner (e.g. the approver approving their own demotion after the
+                # other owner was suspended).
+                if target_user["tier"] == "owner" and new_tier != "owner" and self._count_active_owners() == 1:
+                    raise HTTPError(400, "cannot_demote_last_owner", "Cannot demote last active owner")
                 old_tier = target_user["tier"]
                 cur.execute("UPDATE users SET tier = ?, last_active_at = ? WHERE id = ?",
                             (new_tier, now(), target_user_id))
@@ -679,7 +814,11 @@ class AdminSystem:
 
     def search_audit_log(self, current_user_id: int,
                          filters: Dict[str, Any]) -> List[Dict[str, Any]]:
-        cur_user = self._get_user_by_id(current_user_id)
+        """GET /admin/governance/audit-log (owner or admin). In: caller id, filters {action_type,
+        resource_id, date_range, limit, offset}. Out: matching rows, newest first. HTTPError 403
+        account_suspended first (ADMIN-19, Phase B.2), then 403 owner_or_admin_required. Why: ADMIN-18.
+        Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite (read)."""
+        cur_user = self._caller(current_user_id)  # ADMIN-19 (Phase B.2, 2026-11-10)
         if cur_user["tier"] not in {"owner", "admin"}:
             raise HTTPError(403, "owner_or_admin_required", "Owner or Admin required")
         limit = filters.get("limit", 100)

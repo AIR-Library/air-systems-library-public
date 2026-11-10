@@ -160,11 +160,15 @@ class AuditLogger:
         """POST /audit/log (an internal, service-authenticated call; actor_id is the verified caller's).
 
         In: the actor (actor_id, actor_type 'user'|'service'|'api_key', actor_user_id = the api key's owner,
-        actor_service = the service name, default str(actor_id)), the action and resource, old/new values,
+        actor_service = the service name, required for a service actor), the action and resource, old/new values,
         why_chain_id, metadata (only feature_flag / erased_rows), subject_user_id (required unless resource_type
         is 'user': a user id or 'none'), and the request's ip, user_agent and request_id.
-        Out: {success: True, log_id}. Errors (AuditError 400): invalid_actor_type, metadata_key_not_allowed,
-        subject_required, subject_mismatch, actor_user_required.
+        Out: {success: True, log_id}. Errors (AuditError 400): invalid_actor_type, actor_required (a 'user' actor
+        without actor_id), actor_service_required (a 'service' actor without actor_service), metadata_key_not_allowed,
+        subject_required, subject_mismatch, actor_user_required (an api_key actor without actor_user_id).
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2: a 'user' actor without actor_id was
+        actor_user_required, and a 'service' actor without actor_service silently took str(actor_id) as its name;
+        the spec now names actor_required and actor_service_required.
         Writes in ONE transaction: the subject(s) in audit_subjects, the audit_log event (resource fields only
         when the subject is 'none'), the 'subject' row {resource_id, old_value, new_value, why_chain_id} and the
         'actor' row {actor_id, ip, user_agent, request_id} (user / api_key actors).
@@ -188,15 +192,16 @@ class AuditLogger:
             subject = None if str(subject_user_id) == "none" else str(subject_user_id)
         actor_owner: Optional[str] = None
         if actor_type == "user":
-            if actor_id is None:
-                raise AuditError(400, "actor_user_required", "a user actor needs actor_id")
+            if actor_id is None or str(actor_id) == "":
+                raise AuditError(400, "actor_required", "a user actor needs actor_id")
             actor_owner = str(actor_id)
         elif actor_type == "api_key":
             if actor_user_id is None or str(actor_user_id) == "":
                 raise AuditError(400, "actor_user_required", "an api_key entry needs actor_user_id (the key's owner)")
             actor_owner = str(actor_user_id)
-        service_name = (actor_service or (str(actor_id) if actor_id is not None else None)) \
-            if actor_type == "service" else None
+        elif actor_service is None or str(actor_service) == "":
+            raise AuditError(400, "actor_service_required", "a service actor needs actor_service (its name)")
+        service_name = str(actor_service) if actor_type == "service" else None
 
         log_id = str(uuid.uuid4())
         now = _iso(self.clock())
@@ -408,17 +413,22 @@ class AuditLogger:
         old_value), has_diverged (a later entry for the same resource left a different new_value)}; for an entry
         whose subject rows are gone: {log_id, timestamp, erased: True, resource_state_at_time: None,
         has_diverged: None}. AuditError 404 log_not_found. [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP]
-        AUDIT-02/08 as amended. Touches: SQLite (read)."""
+        AUDIT-02/08 as amended. [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2 bug fix: `erased` now
+        follows the entry's SUBJECT row only; it was reported when just the actor row was gone (an erased admin
+        hid the state of a user who was not erased). Touches: SQLite (read)."""
         self._require_admin(caller)
         with self._lock:
             row = self.conn.execute("SELECT * FROM audit_log WHERE id = ?", (log_id,)).fetchone()
             if not row:
                 raise AuditError(404, "log_not_found", f"Log entry with id {log_id} not found.")
             entry = self._present([row])[0]
-            if entry["personal_erased"] and "subject" in (row["personal_roles"] or ""):
+            roles = [x for x in (row["personal_roles"] or "").split(",") if x]
+            subject_gone = "subject" in roles and self.conn.execute(
+                "SELECT 1 FROM audit_personal WHERE log_id = ? AND role = 'subject'", (log_id,)).fetchone() is None
+            if subject_gone:
                 return {"log_id": log_id, "timestamp": row["timestamp"], "erased": True,
                         "resource_state_at_time": None, "has_diverged": None}
-            if "subject" in (row["personal_roles"] or ""):
+            if "subject" in roles:
                 ref = self.conn.execute("SELECT subject_ref FROM audit_personal WHERE log_id = ? AND role = 'subject'",
                                         (log_id,)).fetchone()[0]
                 latest = self.conn.execute(
