@@ -132,10 +132,22 @@ namespace BillingSubscriptions
     }
 
     /// <summary>
+    /// A payment provider refused or failed a call. Implementations of <see cref="IStripeService"/> report provider
+    /// failures with this type, so billing answers "stripe_error" for those and lets any other exception (a bug)
+    /// surface instead of hiding it as a provider error. In: a message and the provider's own exception. Added
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, for code scanning ("generic catch clause", PR 19). Touches nothing.
+    /// </summary>
+    public class PaymentProviderException : Exception
+    {
+        /// <summary>Creates the exception with the provider's message and, if any, its original exception.</summary>
+        public PaymentProviderException(string message, Exception inner = null) : base(message, inner) { }
+    }
+
+    /// <summary>
     /// The Stripe calls billing makes. Production uses <see cref="StripeService"/>; tests use a fake, so no test touches
     /// the network. Changed 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP) to return local types (it returned
     /// Stripe.net types typed as the local entities, which did not compile). Touches: Stripe (network, money) in
-    /// production implementations.
+    /// production implementations. Provider failures are thrown as <see cref="PaymentProviderException"/>.
     /// </summary>
     public interface IStripeService
     {
@@ -171,8 +183,15 @@ namespace BillingSubscriptions
                 Customer = customerId,
                 Items = new List<Stripe.SubscriptionItemOptions> { new Stripe.SubscriptionItemOptions { Price = priceId } }
             };
-            var stripeSub = await new Stripe.SubscriptionService(_client).CreateAsync(options);
-            return Map(stripeSub, 0);
+            try
+            {
+                var stripeSub = await new Stripe.SubscriptionService(_client).CreateAsync(options);
+                return Map(stripeSub, 0);
+            }
+            catch (Stripe.StripeException e)
+            {
+                throw new PaymentProviderException(e.Message, e);
+            }
         }
 
         /// <summary>
@@ -182,16 +201,32 @@ namespace BillingSubscriptions
         public async Task<StripeSubscriptionInfo> UpdateSubscriptionAsync(string subscriptionId, string newPriceId)
         {
             var service = new Stripe.SubscriptionService(_client);
-            var current = await service.GetAsync(subscriptionId);
+            Stripe.Subscription current;
+            try
+            {
+                current = await service.GetAsync(subscriptionId);
+            }
+            catch (Stripe.StripeException e)
+            {
+                throw new PaymentProviderException(e.Message, e);
+            }
             var itemId = current.Items?.Data?.FirstOrDefault()?.Id
-                ?? throw new InvalidOperationException("Subscription has no item to change");
+                ?? throw new PaymentProviderException("Subscription has no item to change");
             var options = new Stripe.SubscriptionUpdateOptions
             {
                 Items = new List<Stripe.SubscriptionItemOptions> { new Stripe.SubscriptionItemOptions { Id = itemId, Price = newPriceId } },
                 ProrationBehavior = "always_invoice",
                 Expand = new List<string> { "latest_invoice" }
             };
-            var stripeSub = await service.UpdateAsync(subscriptionId, options);
+            Stripe.Subscription stripeSub;
+            try
+            {
+                stripeSub = await service.UpdateAsync(subscriptionId, options);
+            }
+            catch (Stripe.StripeException e)
+            {
+                throw new PaymentProviderException(e.Message, e);
+            }
             var credit = stripeSub.LatestInvoice?.Lines?.Data?
                 .Where(l => l.Proration && l.Amount < 0)
                 .Sum(l => -l.Amount) ?? 0;
@@ -201,7 +236,15 @@ namespace BillingSubscriptions
         /// <summary>stripe.invoices.retrieve. Output: the invoice. Touches: Stripe (network).</summary>
         public async Task<StripeInvoiceInfo> RetrieveInvoiceAsync(string invoiceId)
         {
-            var invoice = await new Stripe.InvoiceService(_client).GetAsync(invoiceId);
+            Stripe.Invoice invoice;
+            try
+            {
+                invoice = await new Stripe.InvoiceService(_client).GetAsync(invoiceId);
+            }
+            catch (Stripe.StripeException e)
+            {
+                throw new PaymentProviderException(e.Message, e);
+            }
             return invoice == null ? null : new StripeInvoiceInfo
             {
                 Id = invoice.Id,
@@ -347,7 +390,7 @@ namespace BillingSubscriptions
             {
                 stripeSub = await _stripe.CreateSubscriptionAsync(customerId, priceId);
             }
-            catch (Exception ex)
+            catch (PaymentProviderException ex)
             {
                 _logger.LogError(ex, "Error creating subscription");
                 return Fail("stripe_error", "The payment provider rejected the request");
@@ -398,7 +441,7 @@ namespace BillingSubscriptions
             {
                 stripeSub = await _stripe.UpdateSubscriptionAsync(subscriptionId, newPriceId);
             }
-            catch (Exception ex)
+            catch (PaymentProviderException ex)
             {
                 _logger.LogError(ex, "Error changing plan");
                 return Fail("stripe_error", "The payment provider rejected the request");
