@@ -794,6 +794,9 @@ final class Screener
     /**
      * Detector 13: key = value assignments, matched on the ASCII lower case; the value is read from the
      * original text. In: text, its ASCII lower case. Out: [[start, end]] byte spans of values.
+     * 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP, SCREEN-14 "token=$" * 28571): value ends come from one cached
+     * forward scan and the instant refusals (under 8 bytes, a leading $ < { % *, a call or index) run first;
+     * answers unchanged.
      * Why: SCREEN-05. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
      */
     private function generic(string $text, string $lower): array
@@ -802,6 +805,8 @@ final class Screener
         $n = strlen($text);
         $out = [];
         $pos = 0;
+        $scanFrom = 1;
+        $scanEnd = 0;
         while ($pos <= $n) {
             $m = self::match($re, $lower, $pos);
             if ($m === null) {
@@ -821,19 +826,30 @@ final class Screener
                 $pos = $s + 1;
                 continue;
             }
-            $v = $e;
-            while ($v < $n) {
-                $c = $text[$v];
-                if (strpos(" \t\n\r\f\v'\";", $c) !== false) {
-                    break;
-                }
-                if ($c === '\\' && $v + 1 < $n && strpos(" \t\n\r\f\v'\"", $text[$v + 1]) !== false) {
-                    break;
-                }
-                $v++;
+            // Where the value ends depends only on the text from $e on, and $e only grows, so one forward scan
+            // serves every match whose $e lies inside it (2026-11-10 note in the spec: stay linear).
+            if ($e < $scanFrom || $e > $scanEnd) {
+                $scanFrom = $e;
+                $scanEnd = self::valueEnd($text, $e);
             }
-            $value = substr($text, $e, $v - $e);
-            if (self::cpLen($value) >= 8) {
+            $v = $scanEnd;
+            $len = $v - $e;
+            // The instant refusals first (each one refuses, as the spec's later checks would): under 8 bytes is
+            // under 8 code points; a value whose first character is $ < { % * is a REFERENCE (that character
+            // is never trimmed as sentence punctuation, so V starts with it too). Answers do not change.
+            if ($len < 8 || strpos('$<{%*', $text[$e]) !== false) {
+                $pos = $s + 1;
+                continue;
+            }
+            // A call or an index (NAMEs before the first "(" or "[") is a REFERENCE too; neither character is
+            // trimmed, so the test on the value equals the test on V. Read in place, without copying the value.
+            $cut = strcspn($text, '([', $e, $len);
+            if ($cut < $len && self::namesOnly(substr($text, $e, $cut))) {
+                $pos = $s + 1;
+                continue;
+            }
+            $value = substr($text, $e, $len);
+            if ($len >= 32 || self::cpLen($value) >= 8) {
                 $core = rtrim($value, '.,;:!?');
                 if (!self::isPlaceholder($core) && !self::isReference($core) && self::looksLikeSecret($core)) {
                     $out[] = [$e, $v];
@@ -844,6 +860,30 @@ final class Screener
             $pos = $s + 1;
         }
         return $out;
+    }
+
+    /**
+     * Where detector 13's value starting at $from ends: the first of space, tab, LF, CR, FF, VT, ' " ; or a
+     * backslash followed by space, tab, LF, CR, FF, VT, ' or " (a backslash at the very end is taken), else the
+     * end of the text. Uses strcspn, so a scan costs its length once.
+     * In: text, byte offset. Out: byte offset of the end. Why: SCREEN-14 ("token=$" * 28571 must stay linear;
+     * spec note 2026-11-10). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+     */
+    private static function valueEnd(string $text, int $from): int
+    {
+        $n = strlen($text);
+        $v = $from;
+        while ($v < $n) {
+            $v += strcspn($text, " \t\n\r\f\v'\";\\", $v);
+            if ($v >= $n || $text[$v] !== '\\') {
+                return $v;
+            }
+            if ($v + 1 < $n && strpos(" \t\n\r\f\v'\"", $text[$v + 1]) !== false) {
+                return $v;
+            }
+            $v++;
+        }
+        return $n;
     }
 
     /**

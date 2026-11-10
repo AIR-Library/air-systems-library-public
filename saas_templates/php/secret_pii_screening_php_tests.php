@@ -500,6 +500,7 @@ TXT;
 /**
  * SCREEN-14: invalid_mode, invalid_categories and text_too_large before any scan; every hostile 200,000
  * character input screened (strip) in under 2 seconds. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+ * "token=$" * 28571 added 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP) with the spec note that detector 13 stays linear.
  * Touches: memory, the clock (timing only).
  */
 function test_screen14_limits_and_hostile_inputs(): void
@@ -525,6 +526,7 @@ function test_screen14_limits_and_hostile_inputs(): void
         str_repeat('xsk-', 50000),
         'password' . str_repeat(' ', 199990),
         str_repeat('token=[REDACTED:', 12500),
+        str_repeat('token=$', 28571),
         str_repeat('a://b:', 33000),
         str_repeat('ab:', 66000),
         str_repeat('1.1.', 50000),
