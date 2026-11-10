@@ -15,12 +15,42 @@
 //     eraseSubject() adds exactly one 'audit_subject_erased' entry.
 //   - Reads (query, replay, search) are for admins only (403 otherwise) and show personal_erased after erasure.
 //   - Time comes from an injectable clock; ties are broken by insertion order (rowid); '_' in a wildcard is literal.
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, one answer in every language): logMutation() refuses
+//   a 'user' actor without actor_id (actor_required) and a 'service' actor without actor_service
+//   (actor_service_required; it fell back to actor_id); replay() always says whether the entry's subject row is
+//   erased; AuditLogger implements Compliance\AuditEraser (data_export_compliance), so the deletion cascade takes the
+//   logger as it is, with no adapter. The interface is declared below in its own namespace block, so the rest of
+//   this file sits in the global namespace block.
 // Touches: the database only.
 declare(strict_types=1);
 
+namespace Compliance {
+    if (!\interface_exists(AuditEraser::class, false)) {
+        /**
+         * The audit system's erasure entry point as data_export_compliance_php.php declares it: erase_subject(user_id)
+         * -> {erased_rows: int}. Declared here too, identically, so AuditLogger can implement it whichever file loads
+         * first; keep the two declarations the same.
+         * Why: Phase B.2 bug "AuditLogger::eraseSubject returns an array while the AuditEraser interface returns void;
+         * make the two fit without an adapter". 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing by itself.
+         */
+        interface AuditEraser
+        {
+            /**
+             * Erase the personal audit data of $userId. Output: {erased_rows: int}. Throws on failure.
+             * Touches: the audit system's tables.
+             */
+            public function eraseSubject(int|string $userId): array;
+        }
+    }
+}
+
+namespace {
+
 /**
  * A refused audit call: HTTP-style status and error code (400 subject_required, subject_mismatch,
- * metadata_key_not_allowed, actor_user_required, invalid_actor_type; 403 admin_only; 404 log_not_found).
+ * metadata_key_not_allowed, actor_user_required, actor_required, actor_service_required, invalid_actor_type;
+ * 403 admin_only; 404 log_not_found). actor_required and actor_service_required are 2026-11-10,
+ * session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2).
  * Why: AUDIT-10. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
  */
 final class AuditException extends RuntimeException
@@ -31,7 +61,12 @@ final class AuditException extends RuntimeException
     }
 }
 
-class AuditLogger
+/**
+ * The audit log (audit_logging.md): append-only events, personal data beside them, erasure and retention, admin
+ * reads. Implements Compliance\AuditEraser, so data_export_compliance's deletion cascade calls eraseSubject() on it
+ * directly (since 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, Phase B.2). Touches: the database only.
+ */
+class AuditLogger implements \Compliance\AuditEraser
 {
     public const ACTOR_TYPES = ['user', 'service', 'api_key'];
     public const ALLOWED_METADATA_KEYS = ['feature_flag', 'erased_rows'];
@@ -160,12 +195,15 @@ SQL;
      * new_value, why_chain_id, metadata (only feature_flag / erased_rows), subject_user_id (required unless
      * resource_type is 'user': a user id or 'none'), ip, user_agent, request_id.
      * Output: {success: true, log_id}. Throws AuditException 400: invalid_actor_type, metadata_key_not_allowed,
-     * subject_required, subject_mismatch, actor_user_required.
+     * subject_required, subject_mismatch, actor_required ('user' without actor_id), actor_service_required
+     * ('service' without actor_service), actor_user_required ('api_key' without actor_user_id).
      * Writes in ONE transaction: the subject(s), the audit_log event (resource fields only when the subject is
      * 'none'), the 'subject' row {resource_id, old_value, new_value, why_chain_id} and the 'actor' row
      * {actor_id, ip, user_agent, request_id} (user / api_key actors).
      * Why: AUDIT-01/10 as amended 2026-11-10 (personal data beside the log so it can be erased).
-     * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database.
+     * session_012zDydZCZ4AChqhEZ4oVtaP. The same day (Phase B.2) a 'user' actor without actor_id became actor_required
+     * (it was actor_user_required) and a 'service' actor must name actor_service (it fell back to actor_id).
+     * Touches: the database.
      */
     public function logMutation(array $data): array
     {
@@ -202,7 +240,7 @@ SQL;
         $actorOwner = null;
         if ($actorType === 'user') {
             if ($actorId === null || (string)$actorId === '') {
-                throw new AuditException(400, 'actor_user_required', 'a user actor needs actor_id');
+                throw new AuditException(400, 'actor_required', 'a user actor needs actor_id');
             }
             $actorOwner = (string)$actorId;
         } elseif ($actorType === 'api_key') {
@@ -212,7 +250,13 @@ SQL;
             }
             $actorOwner = (string)$owner;
         }
-        $serviceName = $actorType === 'service' ? (string)($data['actor_service'] ?? $actorId ?? '') : null;
+        $serviceName = null;
+        if ($actorType === 'service') {
+            $serviceName = (string)($data['actor_service'] ?? '');
+            if ($serviceName === '') {
+                throw new AuditException(400, 'actor_service_required', "a service actor needs actor_service (the service's name)");
+            }
+        }
 
         $logId = $this->generateUuid();
         $now = self::iso(($this->clock)());
@@ -270,7 +314,9 @@ SQL;
      * 'service', resource_type 'user', no resource_id, personal_roles '', metadata {erased_rows}). No audit_log
      * row is updated or deleted. Input: user id. Output: {erased_rows}.
      * Why: AUDIT-08 (amended 2026-11-10); data_export_compliance calls it LAST in its cascade.
-     * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database.
+     * session_012zDydZCZ4AChqhEZ4oVtaP. It implements Compliance\AuditEraser::eraseSubject() since the same day
+     * (Phase B.2), so the cascade calls it with no adapter; erased_rows = the audit_personal rows deleted.
+     * Touches: the database.
      */
     public function eraseSubject(int|string $userId): array
     {
@@ -485,7 +531,8 @@ SQL;
         }
         $entry = $this->present([$row])[0];
         $hasSubject = in_array('subject', explode(',', (string)$row['personal_roles']), true);
-        if ($hasSubject && $entry['personal_erased']) {
+        if ($hasSubject) {
+            // erased reflects the entry's own subject row only (an erased actor row does not hide the snapshots).
             $subjectGone = $this->pdo->prepare("SELECT COUNT(*) FROM audit_personal WHERE log_id = ? AND role = 'subject'");
             $subjectGone->execute([$log_id]);
             if ((int)$subjectGone->fetchColumn() === 0) {
@@ -510,7 +557,7 @@ SQL;
             $latestNew = $last && $last['new_value'] !== null ? json_decode($last['new_value'], true) : null;
         }
         $hasDiverged = (bool)($last && $last['id'] !== $log_id && $latestNew !== $entry['new_value']);
-        return ['log_id' => $log_id, 'timestamp' => $row['timestamp'], 'resource_state_at_time' => $entry['old_value'], 'has_diverged' => $hasDiverged];
+        return ['log_id' => $log_id, 'timestamp' => $row['timestamp'], 'erased' => false, 'resource_state_at_time' => $entry['old_value'], 'has_diverged' => $hasDiverged];
     }
 
     /**
@@ -539,4 +586,5 @@ SQL;
         $stmt->execute();
         return ['results' => $this->present($stmt->fetchAll(PDO::FETCH_ASSOC))];
     }
+}
 }

@@ -267,6 +267,27 @@ $runner->assertSame([89, 'CHALLENGE'], $timing('2025-04-14 12:00:00', null), 'tr
 $runner->assertSame([90, 'CHALLENGE'], $timing('2025-04-15 12:00:00', '2025-01-10 12:00:00'), 'trial_payment_timing → 90 days with an earlier payment CHALLENGE');
 $runner->assertSame([-1, 'PASS'], $timing('2025-01-15 00:00:00', null), 'trial_payment_timing → half a day before the trial ends is -1 (floor toward negative infinity)');
 $runner->assertSame([60, 'CHALLENGE'], $timing('2025-04-15 12:00:00', null, 44), 'trial_payment_timing → trial_days is per configuration (44 days: 60 days after)');
+// TRIAL-10 / TRIAL-11 edge cases (Phase B.2, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): a user with no users
+// row is FAIL user_not_found (fail closed; it threw), also through the payment flow; a user with no ledger row
+// is judged from users.created_at with no earlier payment. Touches: in-memory SQLite.
+// TRIAL-10
+// TRIAL-11
+$db = makeDb();
+$svc = makeService($db, '2025-05-01 12:00:00');
+$r = $svc->checkTrialPaymentTiming('usr_missing');
+$runner->assertSame(['FAIL', 'user_not_found'], [$r->decision, $r->ruleOutputs['error'] ?? null], 'trial_payment_timing → no users row is FAIL user_not_found');
+$runner->assertSame(1, (int) $db->query("SELECT COUNT(*) FROM gate_decisions WHERE gate_name = 'trial_payment_timing' AND decision = 'FAIL' AND user_id = 'usr_missing'")->fetchColumn(), 'trial_payment_timing → the FAIL for an unknown user is logged');
+$response = $svc->subscriptionCreated('usr_missing', 'pm_missing');
+$runner->assertSame([403, 'user_not_found'], [$response['status'], $response['body']['error']], 'payment → 403 user_not_found for a user with no users row');
+$runner->assertSame(0, (int) $db->query('SELECT COUNT(*) FROM subscriptions')->fetchColumn(), 'payment → no subscription for an unknown user');
+$svc->createUser('usr_noledger', 'nl@x.com', 'pass', ['created_at' => '2025-01-01 12:00:00', 'trial_days' => 14]);
+$r = $svc->checkTrialPaymentTiming('usr_noledger');
+$runner->assertSame([106, false, 'FAIL'], [$r->ruleInputs['days_after_trial'], $r->ruleInputs['earlier_payment'], $r->decision], 'trial_payment_timing → no ledger row: judged from created_at, no earlier payment');
+$svc2 = makeService(makeDb(), '2025-01-17 12:00:00');
+$svc2->createUser('usr_noledger2', 'nl2@x.com', 'pass', ['created_at' => '2025-01-01 12:00:00', 'trial_days' => 14]);
+$r = $svc2->checkTrialPaymentTiming('usr_noledger2');
+$runner->assertSame([2, 'PASS'], [$r->ruleInputs['days_after_trial'], $r->decision], 'trial_payment_timing → no ledger row 2 days after the trial is PASS');
+
 $db = makeDb();
 $svc = new TrialAbusePrevention($db, '2025-01-01 12:00:00', 30);
 TrialAbusePrevention::migrate($db);

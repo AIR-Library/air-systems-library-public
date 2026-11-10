@@ -4,6 +4,10 @@
 // Why: the suite failed on CI (it was listed in ci/baseline.json). Reviewed by Claude; fixed by a free model from a continuity handoff, session c6ee9a72 (2026-11-03).
 // Touches: the database, mail() and the SMS API (not in test mode).
 // Changed 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): see NotificationService (NOTIF-02/05/11/12 amendments).
+// Changed again 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP, Phase B.2): retries are 3 AFTER the first attempt (4
+//   attempts, 1 s / 2 s / 4 s; it was 3 attempts in total); quiet hours are "HH:MM" UTC and may cross midnight;
+//   deliverDue re-queues a due message inside quiet hours with scheduled_at = quiet_hours_end; openMessage() is
+//   GET /notifications/open/:message_id (NOTIF-05/07/08).
 declare(strict_types=1);
 
 namespace NotificationSystem;
@@ -81,6 +85,9 @@ function renderTemplate(string $template, array $variables): string
  *  - quiet hours and future sends are stored 'queued' with scheduled_at (quiet hours: the next quiet_hours_end;
  *    the old code wrote the time into sent_at) and delivered by deliverDue(now) in the spec's four steps;
  *  - the clock, the retry sleep and the senders are injectable; tracking records opens and clicks.
+ * Changed the same day (Phase B.2): an e-mail or SMS failure is retried up to MAX_RETRIES = 3 times after the
+ * first attempt (4 attempts, waiting 1 s, 2 s, 4 s); deliverDue step 3 puts a due message inside the user's quiet
+ * hours back to 'queued' with scheduled_at = quiet_hours_end; openMessage() records an open once and answers 204.
  *
  * Touches: the database (notification_* tables), e-mail via mail() and the Twilio SMS API (not in test mode).
  */
@@ -94,7 +101,12 @@ class NotificationService
     private PDO $pdo;
     private array $emailConfig;
     private array $smsConfig;
-    private int $maxRetries = 3;
+    /**
+     * Retries after the first attempt of an e-mail or SMS: at most 1 + MAX_RETRIES = 4 attempts, waiting 1 s, 2 s
+     * and 4 s, the same counting as background jobs. Why: NOTIF-08 as amended (Phase B.2 bug: $maxRetries = 3
+     * meant 3 attempts in total). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     */
+    public const MAX_RETRIES = 3;
     protected array $lastEmailData = [];
     protected array $lastSmsData = [];
     protected bool $testMode = false;
@@ -235,10 +247,12 @@ class NotificationService
      *    with UPDATE ... SET status = 'sending', claimed_at = now WHERE id = ? AND status = 'queued' (a row
      *    another worker claimed first is skipped);
      * 3. preferences are checked NOW: do-not-disturb or the channel switched off (e.g. unsubscribed) ->
-     *    'skipped';
+     *    'skipped'; inside the user's quiet hours -> back to 'queued' with scheduled_at = quiet_hours_end;
      * 4. the final write is conditional on the same claim (status 'sending' and this claimed_at).
-     * Input: now (default the clock). Output: {requeued, sent, skipped, failed}. No in-process timers.
+     * Input: now (default the clock). Output: {requeued, sent, skipped, failed, deferred} (deferred = put back for
+     * quiet hours). No in-process timers.
      * Why: NOTIF-12 (amended 2026-11-10 after an independent security review). session_012zDydZCZ4AChqhEZ4oVtaP.
+     * The quiet-hours step and `deferred` are the same day (Phase B.2, NOTIF-05).
      * Touches: the database; e-mail / SMS through the senders.
      */
     public function deliverDue(?\DateTimeImmutable $now = null): array
@@ -247,12 +261,13 @@ class NotificationService
         $nowText = self::ts($now);
         $requeue = $this->pdo->prepare("UPDATE notification_logs SET status = 'queued', claimed_at = NULL WHERE status = 'sending' AND claimed_at IS NOT NULL AND claimed_at < :cutoff");
         $requeue->execute([':cutoff' => self::ts($now->modify('-' . self::CLAIM_TIMEOUT_SECONDS . ' seconds'))]);
-        $result = ['requeued' => $requeue->rowCount(), 'sent' => 0, 'skipped' => 0, 'failed' => 0];
+        $result = ['requeued' => $requeue->rowCount(), 'sent' => 0, 'skipped' => 0, 'failed' => 0, 'deferred' => 0];
 
         $due = $this->pdo->prepare("SELECT id FROM notification_logs WHERE status = 'queued' AND scheduled_at IS NOT NULL AND scheduled_at <= :now ORDER BY scheduled_at ASC, id ASC");
         $due->execute([':now' => $nowText]);
         $claim = $this->pdo->prepare("UPDATE notification_logs SET status = 'sending', claimed_at = :now WHERE id = :id AND status = 'queued'");
         $final = $this->pdo->prepare("UPDATE notification_logs SET status = :st, sent_at = :sa, error = :err, bounced = :bounced WHERE id = :id AND status = 'sending' AND claimed_at = :claimed");
+        $defer = $this->pdo->prepare("UPDATE notification_logs SET status = 'queued', scheduled_at = :at, claimed_at = NULL WHERE id = :id AND status = 'sending' AND claimed_at = :claimed");
         foreach ($due->fetchAll(PDO::FETCH_COLUMN) as $id) {
             $claim->execute([':now' => $nowText, ':id' => $id]);
             if ($claim->rowCount() !== 1) {
@@ -260,10 +275,17 @@ class NotificationService
             }
             $row = $this->pdo->query('SELECT * FROM notification_logs WHERE id = ' . (int)$id)->fetch(PDO::FETCH_ASSOC);
             $template = $this->loadTemplate((string)$row['template_key']);
-            $skip = $template ? $this->skipReason($this->getUserPreferences((int)$row['user_id']), (string)$row['channel']) : 'template_missing';
+            $pref = $this->getUserPreferences((int)$row['user_id']);
+            $skip = $template ? $this->skipReason($pref, (string)$row['channel']) : 'template_missing';
             if ($skip !== null) {
                 $final->execute([':st' => 'skipped', ':sa' => null, ':err' => $skip, ':bounced' => 0, ':id' => $id, ':claimed' => $nowText]);
                 $result['skipped'] += $final->rowCount();
+                continue;
+            }
+            $quietUntil = $this->quietHoursEnd($pref, $now);
+            if ($quietUntil !== null) {
+                $defer->execute([':at' => self::ts($quietUntil), ':id' => $id, ':claimed' => $nowText]);
+                $result['deferred'] += $defer->rowCount();
                 continue;
             }
             $vars = json_decode((string)$row['vars_used'], true) ?: [];
@@ -361,6 +383,21 @@ class NotificationService
     }
 
     /**
+     * GET /notifications/open/:message_id: record that a message was opened (the tracking pixel or link). The
+     * first call on a sent message sets opened_at = now and status 'opened'; any later call, or a call for an
+     * unknown or unsent message, changes nothing. Input: the message id. Output: {status: 204} either way, so
+     * the answer never tells whether an id exists.
+     * Why: NOTIF-07 as amended (Phase B.2: one open endpoint in every language). 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database (one conditional UPDATE).
+     */
+    public function openMessage(string $messageId): array
+    {
+        $this->pdo->prepare("UPDATE notification_logs SET opened_at = :now, status = 'opened' WHERE id = :id AND status = 'sent' AND opened_at IS NULL")
+            ->execute([':now' => self::ts($this->now()), ':id' => $messageId]);
+        return ['status' => 204];
+    }
+
+    /**
      * Get user preferences; a user who has set none gets the defaults (no quiet hours, do_not_disturb false,
      * channels {email true, sms false, in_app true}), stored on first read.
      * Why: NOTIF-02 as amended: SMS is opt-in (it was on by default). 2026-11-10,
@@ -394,12 +431,21 @@ class NotificationService
 
     /**
      * Update user preferences. channels_enabled is merged into the stored map (only known channels, booleans).
+     * quiet_hours_start / quiet_hours_end are "HH:MM" in UTC (00:00-23:59) or null; anything else is refused
+     * with {success: false, error: 'invalid_quiet_hours', status: 400} and nothing is changed.
      * Output: {success} or {success: false, error}.
      * Why: it updated nothing for a user without a stored row, and replaced the whole channel map.
-     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database.
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. The HH:MM check is the same day (Phase B.2: quiet hours are
+     * HH:MM in UTC). Touches: the database.
      */
     public function updateUserPreferences(int $userId, array $updates): array
     {
+        foreach (['quiet_hours_start', 'quiet_hours_end'] as $key) {
+            if (array_key_exists($key, $updates) && $updates[$key] !== null
+                && !(is_string($updates[$key]) && preg_match('/^([01]\d|2[0-3]):[0-5]\d$/', $updates[$key]))) {
+                return ['success' => false, 'error' => 'invalid_quiet_hours', 'status' => 400];
+            }
+        }
         $current = $this->getUserPreferences($userId); // makes sure the row exists
         $fields = [];
         $params = [':uid' => $userId];
@@ -515,8 +561,10 @@ class NotificationService
     }
 
     /**
-     * The next quiet_hours_end (UTC) when $now is inside the user's quiet hours, else null. Quiet hours may
-     * wrap midnight (22:00-07:00). Why: amended spec (queue with scheduled_at = quiet_hours_end).
+     * The next quiet_hours_end (UTC) when $now is inside the user's quiet hours, else null. Quiet hours are
+     * "HH:MM" in UTC and may wrap midnight (22:00-07:00); the window includes its start and excludes its end.
+     * Why: amended spec (queue with scheduled_at = quiet_hours_end); used by deliverDue step 3 too since the same
+     * day (Phase B.2).
      * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
      */
     private function quietHoursEnd(array $pref, \DateTimeImmutable $now): ?\DateTimeImmutable
@@ -541,10 +589,11 @@ class NotificationService
     }
 
     /**
-     * Render and send one message, up to $maxRetries attempts with exponential backoff (1 s, 2 s through the
-     * injected sleeper). Output: null on success, else the last error text. Emails carry the signed
-     * unsubscribe link. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (factored out of sendNotification so
-     * deliverDue uses it too). Touches: e-mail / SMS through sendEmail / sendSms.
+     * Render and send one message: the first attempt and up to MAX_RETRIES retries (4 attempts), waiting 1 s, 2 s
+     * and 4 s between them through the injected sleeper. Output: null on success, else the last error text.
+     * Emails carry the signed unsubscribe link. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (factored out of
+     * sendNotification so deliverDue uses it too; the same day, Phase B.2, the count became retries after the
+     * first attempt: it was 3 attempts in total). Touches: e-mail / SMS through sendEmail / sendSms.
      */
     private function dispatch(int $userId, array $template, string $channel, array $vars): ?string
     {
@@ -552,7 +601,8 @@ class NotificationService
         $bodyText = $template['body_text'] ? renderTemplate($template['body_text'], $vars) : '';
         $bodyHtml = $template['body_html'] ? renderTemplate($template['body_html'], $vars) : '';
         $errorMsg = null;
-        for ($attempt = 1; $attempt <= $this->maxRetries; $attempt++) {
+        $attempts = 1 + self::MAX_RETRIES;
+        for ($attempt = 1; $attempt <= $attempts; $attempt++) {
             try {
                 switch ($channel) {
                     case 'email':
@@ -569,7 +619,7 @@ class NotificationService
                 return null;
             } catch (Exception $e) {
                 $errorMsg = $e->getMessage();
-                if ($attempt < $this->maxRetries) {
+                if ($attempt < $attempts) {
                     ($this->sleeper)((int)pow(2, $attempt - 1) * 1000000);
                 }
             }
@@ -693,6 +743,16 @@ class NotificationService
     public function endpointTrack(string $messageId): array
     {
         return $this->trackMessage($messageId);
+    }
+
+    /**
+     * GET /notifications/open/:message_id (the router for openMessage()). Input: the path's message id. Output:
+     * {status: 204}. Why: NOTIF-07 as amended (Phase B.2). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches: the database.
+     */
+    public function endpointOpen(string $messageId): array
+    {
+        return $this->openMessage($messageId);
     }
 
     /**

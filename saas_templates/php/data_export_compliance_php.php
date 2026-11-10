@@ -29,6 +29,13 @@
  * user's rows, logs 'user_deleted_cascade', then calls the injected AuditEraser's eraseSubject() LAST, in
  * one transaction, and sets deletion_requests.user_id to NULL.
  *
+ * Amended 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, EXPORT-15): every ComplianceException carries
+ * its HTTP status; a wrong, reused or expired confirmation token gets the one answer 400
+ * invalid_confirmation_token; confirm or cancel of a cancelled request is 409 deletion_not_pending (before the
+ * token is looked at); another user's request, and a completed one (it has no owner any more), is 404 not_found. AuditEraser::eraseSubject() now has the
+ * signature of the audit system's AuditLogger::eraseSubject() (it returns {erased_rows}), so the audit logger
+ * is passed in as it is, with no adapter.
+ *
  * Touches: the database (users and related tables, export_requests, deletion_requests,
  * audit_log), object storage (export files), email and the audit system's eraser, each behind an
  * interface; the in-memory implementations here touch no network or files. No money.
@@ -47,22 +54,44 @@ use RuntimeException;
 use Throwable;
 
 /**
- * A compliance request that cannot be carried out; $errorCode is the API's error string.
+ * A compliance request that cannot be carried out; $errorCode is the API's error string and $httpStatus the
+ * HTTP status to answer with.
  *
  * Why: callers need a code to map to HTTP 400/403/404 without parsing messages. 2026-11-10,
- * session session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+ * session session_012zDydZCZ4AChqhEZ4oVtaP. The status travels with the code since the same day (Phase B.2:
+ * one answer in every language). Touches nothing.
  */
 class ComplianceException extends RuntimeException
 {
+    /** HTTP status of each error code; a code not listed here is 400. */
+    public const STATUS = [
+        'invalid_format' => 400,
+        'invalid_reason' => 400,
+        'invalid_confirmation_token' => 400,
+        'not_found' => 404,
+        'user_not_found' => 404,
+        'deletion_not_pending' => 409,
+        'grace_period_elapsed' => 409,
+        'audit_eraser_not_configured' => 500,
+        'audit_eraser_failed' => 500,
+    ];
+
+    /** The HTTP status to answer with (from STATUS unless given). */
+    public readonly int $httpStatus;
+
     /**
-     * @param string $errorCode e.g. invalid_format, not_found, invalid_token, grace_period_elapsed
-     * @param string $message   Human-readable text (no secrets).
+     * @param string   $errorCode  e.g. invalid_format, not_found, invalid_confirmation_token, deletion_not_pending
+     * @param string   $message    Human-readable text (no secrets).
+     * @param int|null $httpStatus The HTTP status; null takes it from STATUS (400 for an unlisted code).
      *
-     * Why: dependencies are injected instead of static singletons. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing (stores dependencies; the default signing key comes from random_bytes).
+     * Why: the error code is machine-readable; the status was added 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, EXPORT-15: 400 / 404 / 409 are part of the contract).
+     * Touches: nothing.
      */
-    public function __construct(public readonly string $errorCode, string $message)
+    public function __construct(public readonly string $errorCode, string $message, ?int $httpStatus = null)
     {
         parent::__construct($message);
+        $this->httpStatus = $httpStatus ?? (self::STATUS[$errorCode] ?? 400);
     }
 }
 
@@ -180,17 +209,29 @@ SQL);
     }
 }
 
-/**
- * The audit system's erasure entry point (audit_logging.md erase_subject): removes the user's personal
- * audit data. The deletion cascade calls it LAST, inside its transaction.
- *
- * Why: EXPORT-13 (an independent review found nothing erased the user's audit personal data).
- * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the audit system's tables in real implementations.
- */
-interface AuditEraser
-{
-    /** Erase the personal audit data of $userId. Throws on failure (the cascade then rolls back). */
-    public function eraseSubject(int $userId): void;
+if (!interface_exists(AuditEraser::class, false)) {
+    /**
+     * The audit system's erasure entry point (audit_logging.md erase_subject): removes the user's personal
+     * audit data and returns {erased_rows: int}, the number of audit_personal rows it deleted. The deletion
+     * cascade calls it LAST, inside its transaction.
+     *
+     * The audit system's AuditLogger (audit_logging_php.php) implements this interface as it is: that file
+     * declares the same interface when it loads first, and this one when it does, so the logger is passed to
+     * ComplianceService directly, with no adapter. Keep the two declarations identical.
+     *
+     * Why: EXPORT-13 (an independent review found nothing erased the user's audit personal data).
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Changed the same day (Phase B.2 bug: this returned void
+     * while AuditLogger::eraseSubject returns {erased_rows}, so the two did not fit).
+     * Touches: the audit system's tables in real implementations.
+     */
+    interface AuditEraser
+    {
+        /**
+         * Erase the personal audit data of $userId. Output: {erased_rows: int}. Throws on failure (the cascade
+         * then rolls back). Touches: the audit system's tables.
+         */
+        public function eraseSubject(int|string $userId): array;
+    }
 }
 
 /**
@@ -687,26 +728,30 @@ final class ComplianceService
      *               request becomes 'approved' and is deleted at requested_at + 30 days by
      *               processDueDeletions(); for a statutory reason the cascade runs before this returns
      *               (status 'completed', deleted_at = deletion_scheduled_for = now).
-     * @throws ComplianceException not_found | not_pending (already used) | invalid_token | token_expired |
-     *                             audit_eraser_not_configured
+     * @throws ComplianceException 404 not_found (none, another user's, or completed: it has no owner any more) |
+     *                             409 deletion_not_pending (cancelled; checked before the token) | 400 invalid_confirmation_token (wrong, reused or expired: one answer,
+     *                             so the reply never says which) | 500 audit_eraser_not_configured
      *
      * Why: the token is single-use, valid 24 hours, bound to this deletion id (its hash is on this row)
      * and compared in constant time; the caller check and the statutory path are amended
-     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-12, EXPORT-14). Touches: the database, the audit log, storage and
-     * the audit eraser (statutory path).
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-12, EXPORT-14). The error codes follow EXPORT-15 since the
+     * same day (they were not_pending, invalid_token and token_expired, so a reply told a wrong token from an
+     * expired one). Touches: the database, the audit log, storage and the audit eraser (statutory path).
      */
     public function confirmDeletion(int $userId, string $deletionId, string $token): array
     {
         $row = $this->getOwnDeletion($userId, $deletionId);
-        if ($row['status'] !== 'pending' || $row['confirmation_token_hash'] === null) {
-            throw new ComplianceException('not_pending', 'Deletion request is not awaiting confirmation');
+        if (!in_array($row['status'], ['pending', 'approved'], true)) {
+            throw new ComplianceException('deletion_not_pending', 'Deletion request is no longer pending');
         }
-        if (!hash_equals((string) $row['confirmation_token_hash'], hash('sha256', $token))) {
-            throw new ComplianceException('invalid_token', 'Invalid confirmation token');
-        }
+        // A token is refused with the same answer whether it is wrong, already used (the request is
+        // 'approved' and its hash cleared) or expired; the hash comparison runs in every case.
         $now = $this->now();
-        if ($row['confirmation_expires_at'] === null || self::format($now) >= $row['confirmation_expires_at']) {
-            throw new ComplianceException('token_expired', 'The confirmation link has expired');
+        $storedHash = (string) ($row['confirmation_token_hash'] ?? '');
+        $matches = hash_equals(str_pad($storedHash, 64, '0'), hash('sha256', $token)) && $storedHash !== '';
+        $expired = $row['confirmation_expires_at'] === null || self::format($now) >= $row['confirmation_expires_at'];
+        if ($row['status'] !== 'pending' || !$matches || $expired) {
+            throw new ComplianceException('invalid_confirmation_token', 'Invalid or expired confirmation token');
         }
         $statutory = in_array($row['reason'], self::STATUTORY_REASONS, true);
         $scheduledAt = $statutory ? self::format($now) : (string) $row['scheduled_at'];
@@ -717,7 +762,8 @@ final class ComplianceService
         );
         $stmt->execute([':scheduled_at' => $scheduledAt, ':id' => $deletionId, ':hash' => $row['confirmation_token_hash']]);
         if ($stmt->rowCount() !== 1) {
-            throw new ComplianceException('not_pending', 'Deletion request is not awaiting confirmation');
+            // A concurrent confirm spent the token first: to this caller it is a reused token.
+            throw new ComplianceException('invalid_confirmation_token', 'Invalid or expired confirmation token');
         }
         $this->audit->record($userId, 'deletion_confirmed', ['deletion_id' => $deletionId]);
 
@@ -734,16 +780,19 @@ final class ComplianceService
      * @param int    $userId     The authenticated user; another user's request is not_found (404).
      * @param string $deletionId
      * @return array {success: true, status: 'cancelled'}
-     * @throws ComplianceException not_found | not_cancellable | grace_period_elapsed
+     * @throws ComplianceException 404 not_found (none, another user's, or completed) | 409 deletion_not_pending (cancelled) |
+     *                             409 grace_period_elapsed (confirmed and its grace period is over)
      *
      * Why: cancelling must stop at the end of the grace period; the caller is required since
-     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-14; it was optional). Touches: the database and the audit log.
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-14; it was optional). The code for a request no longer
+     * pending is deletion_not_pending since the same day (EXPORT-15; it was not_cancellable).
+     * Touches: the database and the audit log.
      */
     public function cancelDeletion(int $userId, string $deletionId): array
     {
         $row = $this->getOwnDeletion($userId, $deletionId);
         if (!in_array($row['status'], ['pending', 'approved'], true)) {
-            throw new ComplianceException('not_cancellable', 'Deletion can no longer be cancelled');
+            throw new ComplianceException('deletion_not_pending', 'Deletion request is no longer pending');
         }
         $now = self::format($this->now());
         if ($row['status'] === 'approved' && $row['scheduled_at'] <= $now) {
@@ -755,7 +804,7 @@ final class ComplianceService
         );
         $stmt->execute([':id' => $deletionId]);
         if ($stmt->rowCount() !== 1) {
-            throw new ComplianceException('not_cancellable', 'Deletion can no longer be cancelled');
+            throw new ComplianceException('deletion_not_pending', 'Deletion request is no longer pending');
         }
         $this->audit->record($userId, 'deletion_cancelled', ['deletion_id' => $deletionId]);
         return ['success' => true, 'status' => 'cancelled'];
@@ -794,7 +843,8 @@ final class ComplianceService
      * (2) log 'user_deleted_cascade' with the user as subject;
      * (3) call the audit eraser's eraseSubject(user_id) LAST. Nothing logs this user afterwards.
      * Stored export files are removed after the commit. Throws (and rolls back) when no eraser is
-     * configured or the eraser fails.
+     * configured, the eraser fails, or it does not return {erased_rows: int} (audit_eraser_failed; checked
+     * since 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, when the eraser started returning it).
      *
      * Why: the old cascade deleted the deletion request it then marked completed, left export files behind,
      * and (found by an independent review) never erased the user's personal audit data; amended
@@ -824,7 +874,10 @@ final class ComplianceService
             $this->pdo->prepare('UPDATE deletion_requests SET user_id = NULL WHERE user_id = :uid')->execute([':uid' => $userId]);
 
             $this->audit->record($userId, 'user_deleted_cascade', ['deletion_id' => $deletionId, 'deleted_items' => $deleted]);
-            $this->auditEraser->eraseSubject($userId); // LAST: nothing logs this user after it
+            $erased = $this->auditEraser->eraseSubject($userId); // LAST: nothing logs this user after it
+            if (!is_int($erased['erased_rows'] ?? null)) {
+                throw new ComplianceException('audit_eraser_failed', 'The audit eraser did not report erased_rows');
+            }
             $this->pdo->commit();
         } catch (Throwable $e) {
             $this->pdo->rollBack();
@@ -932,10 +985,12 @@ final class ComplianceService
 
     /**
      * The caller's own deletion request.
-     * @throws ComplianceException not_found (also for another user's request, so ids cannot be probed)
+     * @throws ComplianceException 404 not_found (none, another user's, or a completed one, so ids cannot be probed)
      *
      * Why: shared lookup for confirm/cancel; the owner check is 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-14).
-     * Touches: the database (read).
+     * A completed request no longer names its user (EXPORT-13 sets user_id to NULL so the row cannot re-identify
+     * erased audit entries), so it has no owner and is 404 to every caller (EXPORT-15 as clarified the same day,
+     * spec commit 3abb340). Touches: the database (read).
      */
     private function getOwnDeletion(int $userId, string $deletionId): array
     {

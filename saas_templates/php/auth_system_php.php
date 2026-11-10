@@ -8,6 +8,11 @@
 //   that order (AUTH-03); verify_email reports code_expired and compares codes in constant time (AUTH-06) and sets
 //   status 'verified' (AUTH-05); the e-mail sender, OAuth profile fetcher, clock and database are injectable;
 //   oauth_callback takes the e-mail only from the provider and links the account in oauth_accounts (AUTH-10/11).
+// Changed again 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP, Phase B.2, AUTH-16 and "Secrets at rest"): every flow that
+//   creates a session (login, MFA, OAuth) returns its refresh_token, which token_refresh() takes; sessions store only
+//   refresh_token_hash (SHA-256), verification codes only code_hash, OAuth state only state_hash; OAuth state comes
+//   from oauth_start(), is single-use and expires in 10 minutes; the callback exchanges the code through the
+//   injected provider client and never uses the code as an identity. A database read hands out no usable credential.
 declare(strict_types=1);
 
 class Database {
@@ -31,6 +36,13 @@ class Database {
         }
         return self::$pdo;
     }
+    /**
+     * Create the tables if missing. sessions keeps refresh_token_hash, verification_codes keeps code_hash and
+     * oauth_states keeps state_hash: only SHA-256 hex of each secret (Phase B.2, "Secrets at rest", 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP; the plain columns refresh_token and code are gone). An older database that
+     * still has those columns needs a migration that drops them; CREATE TABLE IF NOT EXISTS leaves it as it is.
+     * Input: none. Output: none. Touches: the database (DDL).
+     */
     private static function migrate(): void {
         $sql = <<<SQL
 CREATE TABLE IF NOT EXISTS users (
@@ -46,7 +58,7 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     user_id INTEGER NOT NULL,
-    refresh_token TEXT NOT NULL,
+    refresh_token_hash TEXT NOT NULL UNIQUE,
     created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
     ip TEXT,
@@ -65,7 +77,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
 CREATE TABLE IF NOT EXISTS verification_codes (
     id TEXT PRIMARY KEY,
     user_id INTEGER NOT NULL,
-    code TEXT,
+    code_hash TEXT,
     created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
     type TEXT NOT NULL,
@@ -78,6 +90,12 @@ CREATE TABLE IF NOT EXISTS oauth_accounts (
     created_at TEXT NOT NULL,
     UNIQUE(provider, provider_user_id),
     FOREIGN KEY(user_id) REFERENCES users(id)
+);
+CREATE TABLE IF NOT EXISTS oauth_states (
+    state_hash TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS auth_attempts (
     bucket TEXT NOT NULL,
@@ -165,6 +183,31 @@ class AuthSystem {
     private const JWT_ALG = 'HS256';
     private const ACCESS_TOKEN_EXPIRES = 900; // 15 minutes
     private const REFRESH_TOKEN_EXPIRES = 2592000; // 30 days
+    /** OAuth state lifetime: 10 minutes (auth_system.md "Secrets at rest", Phase B.2, 2026-11-10). */
+    public const OAUTH_STATE_EXPIRES = 600;
+
+    /**
+     * SHA-256 hex of a secret: the only form in which refresh tokens, verification codes and OAuth state are stored.
+     * Input: the secret. Output: 64 lowercase hex characters. Why: auth_system.md "Secrets at rest" (Phase B.2,
+     * AUTH-16). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+     */
+    public static function secretHash(string $secret): string { return hash('sha256', $secret); }
+
+    /**
+     * Create a session row and return its id and refresh token. The refresh token is 32 random bytes as hex; only
+     * its SHA-256 is stored (refresh_token_hash), so a database read hands out no usable token.
+     * Inputs: user id, ip, device id. Output: {session_id, refresh_token}. Why: AUTH-16; login, MFA and OAuth each
+     * wrote the plain token into sessions.refresh_token and none returned it. 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database (sessions).
+     */
+    private static function createSession(int $userId, string $ip, string $deviceId): array {
+        $sessionId = self::randomString(32);
+        $refreshToken = self::randomString(32);
+        $expiresAt = gmdate('c', self::t() + self::REFRESH_TOKEN_EXPIRES);
+        Database::get()->prepare('INSERT INTO sessions (id,user_id,refresh_token_hash,created_at,expires_at,ip,device_id) VALUES (?,?,?,?,?,?,?)')
+            ->execute([$sessionId, $userId, self::secretHash($refreshToken), self::now(), $expiresAt, $ip, $deviceId]);
+        return ['session_id' => $sessionId, 'refresh_token' => $refreshToken];
+    }
 
     // Utility
     public static function now(): string { return gmdate('c', self::t()); }
@@ -287,8 +330,9 @@ class AuthSystem {
         // Verification code
         $code = self::randomString(16);
         $expires = gmdate('c', $now + 86400);
-        $stmt = $db->prepare('INSERT INTO verification_codes (id,user_id,code,created_at,expires_at,type) VALUES (?,?,?,?,?,?)');
-        $stmt->execute([self::randomString(32),$userId,$code,$now,$expires,'email']);
+        // Only the code's SHA-256 is stored (Phase B.2, AUTH-16, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
+        $stmt = $db->prepare('INSERT INTO verification_codes (id,user_id,code_hash,created_at,expires_at,type) VALUES (?,?,?,?,?,?)');
+        $stmt->execute([self::randomString(32),$userId,self::secretHash($code),$now,$expires,'email']);
         // Send email
         self::sendEmail($email,'Verify your account',"Your code: $code");
         // Logs
@@ -303,8 +347,10 @@ class AuthSystem {
      *
      * Inputs: email, code. Output: 200 {status: "verified", user_id, message}, or 400 with error
      * code_invalid (no such user or no matching code), code_expired (the matching code is past expires_at)
-     * or already_verified. Codes are compared in constant time (hash_equals), never in the SQL WHERE.
+     * or already_verified. The code's SHA-256 is compared with the stored code_hash in constant time
+     * (hash_equals), never in the SQL WHERE.
      * Why: AUTH-05/06; expiry was never checked and status stayed 'unverified'. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Codes are stored only as code_hash since the same day (Phase B.2, AUTH-16).
      * Touches: the database (users, verification_codes, audit_log).
      */
     public static function verify_email(string $email, string $code): array {
@@ -314,11 +360,12 @@ class AuthSystem {
         $user = $stmt->fetch(PDO::FETCH_ASSOC);
         if (!$user) return ['status_code'=>400,'body'=>['error'=>'code_invalid','message'=>'Invalid code']];
         if ($user['email_verified_at']) return ['status_code'=>400,'body'=>['error'=>'already_verified','message'=>'Email already verified']];
-        $stmt = $db->prepare('SELECT id,code,expires_at FROM verification_codes WHERE user_id=? AND type=\'email\' ORDER BY rowid');
+        $stmt = $db->prepare('SELECT id,code_hash,expires_at FROM verification_codes WHERE user_id=? AND type=\'email\' ORDER BY rowid');
         $stmt->execute([$user['id']]);
         $row = null;
+        $given = self::secretHash($code);
         foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $vc) {
-            if ($vc['code'] !== null && hash_equals((string)$vc['code'], $code)) { $row = $vc; }
+            if ($vc['code_hash'] !== null && hash_equals((string)$vc['code_hash'], $given)) { $row = $vc; }
         }
         if ($row === null) return ['status_code'=>400,'body'=>['error'=>'code_invalid','message'=>'Invalid code']];
         if (self::t() >= strtotime($row['expires_at'])) return ['status_code'=>400,'body'=>['error'=>'code_expired','message'=>'Code expired']];
@@ -334,9 +381,12 @@ class AuthSystem {
     }
 
     /**
-     * Log in: verified user and correct password -> session + access token, or 202 mfa_required with a
-     * challenge id; wrong password -> 401 invalid_credentials (429 after 5 failures in 15 min per ip/email).
-     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: times come from the injectable clock. Touches: the database.
+     * Log in: verified user and correct password -> 200 {status: "authenticated", session_id, token,
+     * refresh_token, expires_in, user}, or 202 mfa_required with a challenge id; wrong password -> 401
+     * invalid_credentials (429 after 5 failures in 15 min per ip/email).
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: times come from the injectable clock; the same day
+     * (Phase B.2, AUTH-16) the response carries refresh_token and the session stores only its hash.
+     * Touches: the database.
      */
     // 3. login
     public static function login(string $email, string $password, string $device_id, string $ip): array {
@@ -359,42 +409,80 @@ class AuthSystem {
         if ($user['mfa_enabled']) {
             $challenge_id = self::randomString(32);
             $expires = gmdate('c', self::t()+300);
-            $stmt = $db->prepare('INSERT INTO verification_codes (id,user_id,code,created_at,expires_at,type) VALUES (?,?,?,?,?,?)');
+            $stmt = $db->prepare('INSERT INTO verification_codes (id,user_id,code_hash,created_at,expires_at,type) VALUES (?,?,?,?,?,?)');
             $stmt->execute([$challenge_id,$user['id'],null,self::now(),$expires,'mfa']);
             self::logWhy('login',['user_exists','password_correct','mfa_gate']);
             self::auditLog((int)$user['id'],'mfa_challenge_created',null,(int)$user['id']);
             return ['status_code'=>202,'body'=>['success'=>true,'status'=>'mfa_required','challenge_id'=>$challenge_id]];
         }
-        // Create session
-        $session_id = self::randomString(32);
-        $refresh_token = self::randomString(64);
-        $expires_at = gmdate('c', self::t()+self::REFRESH_TOKEN_EXPIRES);
-        $stmt = $db->prepare('INSERT INTO sessions (id,user_id,refresh_token,created_at,expires_at,ip,device_id) VALUES (?,?,?,?,?,?,?)');
-        $stmt->execute([$session_id,$user['id'],$refresh_token,self::now(),$expires_at,$ip,$device_id]);
+        // Create session (only the refresh token's hash is stored; the token goes to the client)
+        $session = self::createSession((int)$user['id'], $ip, $device_id);
+        $session_id = $session['session_id'];
         $access_payload = ['user_id'=>$user['id'],'tier'=>$user['tier'],'exp'=>self::t()+self::ACCESS_TOKEN_EXPIRES];
         $token = self::jwtEncode($access_payload);
         self::logWhy('login',['user_exists','password_correct','mfa_gate']);
         self::auditLog((int)$user['id'],'session_created',null,(int)$user['id'],$ip,$device_id);
-        return ['status_code'=>200,'body'=>['success'=>true,'status'=>'authenticated','session_id'=>$session_id,'token'=>$token,'expires_in'=>self::ACCESS_TOKEN_EXPIRES,'user'=>['id'=>$user['id'],'email'=>$user['email'],'tier'=>$user['tier']]]];
+        return ['status_code'=>200,'body'=>['success'=>true,'status'=>'authenticated','session_id'=>$session_id,'token'=>$token,'refresh_token'=>$session['refresh_token'],'expires_in'=>self::ACCESS_TOKEN_EXPIRES,'user'=>['id'=>$user['id'],'email'=>$user['email'],'tier'=>$user['tier']]]];
+    }
+
+    /**
+     * Start an OAuth sign-in: make the state value the provider will send back.
+     *
+     * Input: the provider name. Output: 200 {success, state, expires_in: 600}. state is 32 random bytes as hex;
+     * only its SHA-256 is stored (oauth_states), with the provider and an expiry 10 minutes ahead. The app keeps
+     * state in the visitor's session (cookie) and sends it in the provider's authorize URL; oauth_callback()
+     * accepts it once. Why: auth_system.md "Secrets at rest" (Phase B.2): OAuth state is single-use, expires in
+     * 10 minutes and is stored only as its hash; the callback took any state. 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database (oauth_states).
+     */
+    public static function oauth_start(string $provider): array {
+        $state = self::randomString(32);
+        $now = self::t();
+        $db = Database::get();
+        $db->prepare('DELETE FROM oauth_states WHERE expires_at <= ?')->execute([$now]);
+        $db->prepare('INSERT INTO oauth_states (state_hash,provider,created_at,expires_at) VALUES (?,?,?,?)')
+            ->execute([self::secretHash($state), $provider, $now, $now + self::OAUTH_STATE_EXPIRES]);
+        return ['status_code'=>200,'body'=>['success'=>true,'state'=>$state,'expires_in'=>self::OAUTH_STATE_EXPIRES]];
+    }
+
+    /**
+     * Use up an OAuth state: true when its hash is stored for this provider and has not expired; the row is
+     * deleted in the same statement, so a second use (or a concurrent one) finds nothing. Inputs: provider, state.
+     * Output: bool. Why: single-use, 10-minute state (Phase B.2). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches: the database (oauth_states).
+     */
+    private static function consumeOauthState(string $provider, string $state): bool {
+        if ($state === '') return false;
+        $hash = self::secretHash($state);
+        $stmt = Database::get()->prepare('DELETE FROM oauth_states WHERE state_hash=? AND provider=? AND expires_at > ?');
+        $stmt->execute([$hash, $provider, self::t()]);
+        return $stmt->rowCount() === 1;
     }
 
     /**
      * Sign in (or sign up) with an OAuth provider.
      *
-     * Inputs: provider, the authorization code, state. The caller has already matched state to the visitor's
-     * session (state_valid); nothing in state or code is trusted as identity. The injected profile fetcher
-     * exchanges the code with the provider and returns {id, email, email_verified}.
-     * Output: 200 {status: "authenticated", session_id, token, user}; 400 email_not_verified when the provider
-     * does not vouch for the address; 401 oauth_failed when the exchange fails; 503 oauth_not_configured
-     * without a fetcher. A returning user is found by (provider, provider id) first, then by e-mail (Case B:
-     * link to the existing account); otherwise a verified user is created and linked (Case A).
+     * Inputs: provider, the authorization code, state. state must be one oauth_start() issued for this provider,
+     * unused and under 10 minutes old (else 400 invalid_state, before the provider is called); it is used up
+     * whatever happens next. The app has matched state to the visitor's session cookie. Nothing in state or code
+     * is trusted as identity: the injected provider client exchanges the code with the provider and returns
+     * {id, email, email_verified}.
+     * Output: 200 {status: "authenticated", session_id, token, refresh_token, expires_in, user}; 400
+     * invalid_state; 400 email_not_verified when the provider does not vouch for the address; 401 oauth_failed
+     * when the exchange fails; 503 oauth_not_configured without a provider client. A returning user is found by
+     * (provider, provider id) first, then by e-mail (Case B: link to the existing account); otherwise a verified
+     * user is created and linked (Case A).
      * Why: AUTH-10/11; the e-mail was read straight from the client's code, so anyone could log in as anyone,
-     * and no link was stored. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
-     * Touches: the database (users, oauth_accounts, sessions, audit_log); the provider via the fetcher.
+     * and no link was stored. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. The state check and refresh_token are
+     * the same day (Phase B.2, AUTH-16 and "Secrets at rest").
+     * Touches: the database (oauth_states, users, oauth_accounts, sessions, audit_log); the provider via the client.
      */
     public static function oauth_callback(string $provider, string $code, string $state): array {
         if (self::$oauthProfile === null) {
             return ['status_code'=>503,'body'=>['error'=>'oauth_not_configured','message'=>'OAuth is not configured']];
+        }
+        if (!self::consumeOauthState($provider, $state)) {
+            return ['status_code'=>400,'body'=>['error'=>'invalid_state','message'=>'Invalid or expired OAuth state']];
         }
         try {
             $profile = (self::$oauthProfile)($provider, $code);
@@ -429,11 +517,8 @@ class AuthSystem {
             }
             $db->prepare('INSERT OR IGNORE INTO oauth_accounts (user_id,provider,provider_user_id,created_at) VALUES (?,?,?,?)')
                 ->execute([(int)$user['id'],$provider,$providerUserId,self::now()]);
-            $session_id = self::randomString(32);
-            $refresh_token = self::randomString(64);
-            $expires_at = gmdate('c', self::t()+self::REFRESH_TOKEN_EXPIRES);
-            $stmt = $db->prepare('INSERT INTO sessions (id,user_id,refresh_token,created_at,expires_at,ip,device_id) VALUES (?,?,?,?,?,?,?)');
-            $stmt->execute([$session_id,(int)$user['id'],$refresh_token,self::now(),$expires_at,'0.0.0.0','']);
+            $session = self::createSession((int)$user['id'], '0.0.0.0', '');
+            $session_id = $session['session_id'];
             $db->commit();
         } catch (Throwable $e) {
             if ($db->inTransaction()) $db->rollBack();
@@ -442,13 +527,14 @@ class AuthSystem {
         $token = self::jwtEncode(['user_id'=>(int)$user['id'],'tier'=>$user['tier'],'exp'=>self::t()+self::ACCESS_TOKEN_EXPIRES]);
         self::logWhy('oauth_callback',['state_valid','email_verified']);
         self::auditLog((int)$user['id'],'oauth_login',$provider,(int)$user['id'],null,$newUser ? 'new_user' : 'linked');
-        return ['status_code'=>200,'body'=>['success'=>true,'status'=>'authenticated','session_id'=>$session_id,'token'=>$token,'user'=>['id'=>(int)$user['id'],'email'=>$user['email'],'tier'=>$user['tier']]]];
+        return ['status_code'=>200,'body'=>['success'=>true,'status'=>'authenticated','session_id'=>$session_id,'token'=>$token,'refresh_token'=>$session['refresh_token'],'expires_in'=>self::ACCESS_TOKEN_EXPIRES,'user'=>['id'=>(int)$user['id'],'email'=>$user['email'],'tier'=>$user['tier']]]];
     }
 
     /**
      * Complete an MFA challenge with a TOTP code (constant-time compare, one step of drift) -> session +
      * token; wrong code -> 401 invalid_code. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the injectable clock, and
-     * the response's user carries the stored email and tier (they were null and 'free').
+     * the response's user carries the stored email and tier (they were null and 'free'). The same day (Phase B.2,
+     * AUTH-16) the response carries refresh_token and expires_in, and the session stores only the token's hash.
      * Touches: the database.
      */
     // 5. mfa_challenge
@@ -472,31 +558,32 @@ class AuthSystem {
         // Delete challenge
         $stmt = $db->prepare('DELETE FROM verification_codes WHERE id=?');
         $stmt->execute([$challenge_id]);
-        // Create session
-        $session_id = self::randomString(32);
-        $refresh_token = self::randomString(64);
-        $expires_at = gmdate('c', self::t()+self::REFRESH_TOKEN_EXPIRES);
-        $stmt = $db->prepare('INSERT INTO sessions (id,user_id,refresh_token,created_at,expires_at,ip,device_id) VALUES (?,?,?,?,?,?,?)');
-        $stmt->execute([$session_id,(int)$row['user_id'],$refresh_token,self::now(),$expires_at,'0.0.0.0','']);
+        // Create session (only the refresh token's hash is stored)
+        $session = self::createSession((int)$row['user_id'], '0.0.0.0', '');
+        $session_id = $session['session_id'];
         $access_payload = ['user_id'=>(int)$row['user_id'],'tier'=>$row['tier'],'exp'=>self::t()+self::ACCESS_TOKEN_EXPIRES];
         $token = self::jwtEncode($access_payload);
         self::logWhy('mfa_challenge',['challenge_valid','code_correct']);
         self::auditLog((int)$row['user_id'],'mfa_verified',null,(int)$row['user_id']);
-        return ['status_code'=>200,'body'=>['success'=>true,'status'=>'authenticated','session_id'=>$session_id,'token'=>$token,'user'=>['id'=>(int)$row['user_id'],'email'=>$row['email'],'tier'=>$row['tier']]]];
+        return ['status_code'=>200,'body'=>['success'=>true,'status'=>'authenticated','session_id'=>$session_id,'token'=>$token,'refresh_token'=>$session['refresh_token'],'expires_in'=>self::ACCESS_TOKEN_EXPIRES,'user'=>['id'=>(int)$row['user_id'],'email'=>$row['email'],'tier'=>$row['tier']]]];
     }
 
     /**
      * Issue a new access token for a valid, unexpired refresh token; a banned or suspended user gets 403
-     * user_banned. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: times come from the injectable clock.
+     * user_banned. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: times come from the injectable clock. The same
+     * day (Phase B.2, AUTH-16) the session is found by the token's SHA-256 (refresh_token_hash) and the hashes are
+     * compared in constant time; the plain token is no longer stored. Input: the refresh_token login, MFA or OAuth
+     * returned. Output: 200 {status: "ok", token, expires_in}, 400 invalid_token | token_expired, 403 user_banned.
      * Touches: the database.
      */
     // 6. token_refresh
     public static function token_refresh(string $refresh_token): array {
         $db = Database::get();
-        $stmt = $db->prepare('SELECT * FROM sessions WHERE refresh_token=?');
-        $stmt->execute([$refresh_token]);
+        $given = self::secretHash($refresh_token);
+        $stmt = $db->prepare('SELECT * FROM sessions WHERE refresh_token_hash=?');
+        $stmt->execute([$given]);
         $session = $stmt->fetch(PDO::FETCH_ASSOC);
-        if (!$session) return ['status_code'=>400,'body'=>['error'=>'invalid_token','message'=>'Invalid refresh token']];
+        if (!$session || !hash_equals((string)$session['refresh_token_hash'], $given)) return ['status_code'=>400,'body'=>['error'=>'invalid_token','message'=>'Invalid refresh token']];
         if (self::t() > strtotime($session['expires_at'])) return ['status_code'=>400,'body'=>['error'=>'token_expired','message'=>'Refresh token expired']];
         $stmt = $db->prepare('SELECT * FROM users WHERE id=?');
         $stmt->execute([$session['user_id']]);

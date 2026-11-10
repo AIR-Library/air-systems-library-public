@@ -7,6 +7,11 @@
  * active user; invite and reset e-mails go through an injected sender and the reset token is stored only as a
  * SHA-256 hash (it was written into the audit log); create_deployment initialises a config row; publish checks
  * the SafetyFlags.can_publish gate (fail closed) and domain_verified; governance approve executes the action.
+ * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): every error carries its HTTP status
+ * ({error, status, message}; only the newest ones did); a suspended caller is refused before any gate with 403
+ * account_suspended (ADMIN-19); users.tier is the staff role (owner | admin | user) and a customer's or
+ * deployment's tier is the plan (solo | team | enterprise), never mixed: create_deployment checked the plan
+ * against the staff roles.
  * Touches: the database, e-mail through the injected sender, Stripe through the injected gateway (money).
  */
 declare(strict_types=1);
@@ -39,7 +44,50 @@ class AdminSystem
     private Closure $canPublish;
     private int $current_user_id = 0;
     private string $current_user_tier = '';
+    /** The caller's account status ('active' or 'suspended'); set by setCurrentUser (Phase B.2, ADMIN-19). */
+    private string $current_user_status = '';
+    /** users.tier: the STAFF ROLE (admin_system.md TIERS). */
     private const ALLOWED_TIERS = ['owner', 'admin', 'user'];
+    /** A customer's or deployment's tier: the PLAN (admin_system.md TIERS; 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). */
+    public const PLAN_TIERS = ['solo', 'team', 'enterprise'];
+    /**
+     * HTTP status of every error code this service returns; a code not listed (an unexpected exception) is 500.
+     * Why: Phase B.2 bug "admin errors are {error} arrays without an HTTP status". 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP.
+     */
+    public const ERROR_STATUS = [
+        'Invalid CSRF token' => 403,
+        'account_suspended' => 403,
+        'owner_only' => 403,
+        'admin_or_owner' => 403,
+        'publish_not_allowed' => 403,
+        'invalid_email' => 400,
+        'invalid_name' => 400,
+        'invalid_tier' => 400,
+        'cannot_reset_own_password' => 400,
+        'cannot_demote_last_owner' => 400,
+        'cannot_change_own_role' => 400,
+        'cannot_suspend_yourself' => 400,
+        'reason_required' => 400,
+        'invalid_decide' => 400,
+        'unsupported_action_type' => 400,
+        'user_not_found' => 404,
+        'customer_not_found' => 404,
+        'invoice_not_found' => 404,
+        'deployment_not_found' => 404,
+        'theme_not_found' => 404,
+        'action_not_found' => 404,
+        'email_exists' => 409,
+        'no_subscription' => 409,
+        'subscription_item_ambiguous' => 409,
+        'domain_already_registered' => 409,
+        'deployment_not_in_draft' => 409,
+        'domain_not_verified' => 409,
+        'theme_not_set' => 409,
+        'action_already_decided' => 409,
+        'stripe_error' => 502,
+        'stripe_not_configured' => 503,
+    ];
     /**
      * The token a page must send back with every write; compared in constant time. It was the constant
      * 'valid_csrf_token', which every attacker knows. It must outlive one request: the page that shows the
@@ -79,10 +127,12 @@ class AdminSystem
     /**
      * Set the caller. $user_id must be the id of the VERIFIED session user (from verify_access_token or the
      * framework's session), never a value from the request body, query or headers; the role is read from the
-     * users table, never taken from the client. A suspended (or otherwise non-active) user cannot act.
-     * Input: user id. Output: none; RuntimeException when the user is missing or not active.
+     * users table, never taken from the client. A suspended user is set, and every action then answers 403
+     * account_suspended before any gate (ADMIN-19); any other non-active status cannot act at all.
+     * Input: user id. Output: none; RuntimeException when the user is missing or neither active nor suspended.
      * Why: common rule "identity comes from the verified caller"; the status check is 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
-     * Touches: the database (read).
+     * The same day (Phase B.2, ADMIN-19) a suspended caller became an answer (403 account_suspended) instead of
+     * an exception here. Touches: the database (read).
      */
     public function setCurrentUser(int $user_id): void
     {
@@ -92,11 +142,35 @@ class AdminSystem
         if (!$row) {
             throw new RuntimeException("User not found");
         }
-        if ($row['status'] !== 'active') {
+        if (!in_array($row['status'], ['active', 'suspended'], true)) {
             throw new RuntimeException('user_not_active');
         }
         $this->current_user_id = $user_id;
         $this->current_user_tier = $row['tier'];
+        $this->current_user_status = $row['status'];
+    }
+
+    /**
+     * The first check of every action, before CSRF and every gate: a suspended caller (or no caller) is refused.
+     * Input: none (the caller from setCurrentUser). Output: none; RuntimeException('account_suspended'), answered
+     * 403. Why: ADMIN-19 (Phase B.2). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+     */
+    private function require_active(): void
+    {
+        if ($this->current_user_status !== 'active') {
+            throw new RuntimeException('account_suspended');
+        }
+    }
+
+    /**
+     * An error answer with its HTTP status: {error, status, message}. Inputs: the error code and a message (the
+     * code when empty). Output: the array. The status comes from ERROR_STATUS (500 for a code not listed).
+     * Why: Phase B.2 bug "admin errors are {error} arrays without an HTTP status except the newest ones".
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+     */
+    private function fail(string $code, string $message = ''): array
+    {
+        return ['error' => $code, 'status' => self::ERROR_STATUS[$code] ?? 500, 'message' => $message !== '' ? $message : $code];
     }
 
     /**
@@ -147,9 +221,20 @@ class AdminSystem
         return strlen(trim($name)) >= 1 && strlen(trim($name)) <= 255;
     }
 
+    /** True for a staff role (owner | admin | user); a plan value is not one. Touches: nothing. */
     private function validate_tier(string $tier): bool
     {
         return in_array($tier, self::ALLOWED_TIERS, true);
+    }
+
+    /**
+     * True for a plan tier (solo | team | enterprise); a staff role is not one. Input: the tier. Output: bool.
+     * Why: admin_system.md TIERS (Phase B.2 bug: create_deployment checked the plan against the staff roles).
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+     */
+    private function validate_plan_tier(string $tier): bool
+    {
+        return in_array($tier, self::PLAN_TIERS, true);
     }
 
     private function getCurrentTimestamp(): string
@@ -281,10 +366,13 @@ SQL;
      * (invalid_email, invalid_name, invalid_tier, email_exists, owner_only, Invalid CSRF token).
      * Why: ADMIN-01..03; the invite was a placeholder until 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
      * Touches: the database (users, audit_logs) and e-mail.
+     * Phase B.2 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): a suspended caller is refused first (403
+     * account_suspended, ADMIN-19), and every error carries its HTTP status ({error, status, message}).
      */
     public function createUser(array $data): array
     {
         try {
+            $this->require_active();
             $this->verify_csrf($data['csrf_token'] ?? '');
             $this->require_owner();
 
@@ -294,19 +382,19 @@ SQL;
             $notify = $data['notify'] ?? false;
 
             if (!$this->validate_email($email)) {
-                return ['error' => 'invalid_email', 'message' => 'Invalid email format'];
+                return $this->fail('invalid_email', 'Invalid email format');
             }
             if (!$this->validate_name($name)) {
-                return ['error' => 'invalid_name', 'message' => 'Name must be 1-255 characters'];
+                return $this->fail('invalid_name', 'Name must be 1-255 characters');
             }
             if (!$this->validate_tier($tier)) {
-                return ['error' => 'invalid_tier', 'message' => 'Invalid tier'];
+                return $this->fail('invalid_tier', 'Invalid tier');
             }
 
             $stmt = $this->pdo->prepare('SELECT id FROM users WHERE email = :email');
             $stmt->execute([':email' => $email]);
             if ($stmt->fetch(PDO::FETCH_ASSOC)) {
-                return ['error' => 'email_exists', 'message' => 'Email already exists'];
+                return $this->fail('email_exists', 'Email already exists');
             }
 
             $now = $this->getCurrentTimestamp();
@@ -330,7 +418,7 @@ SQL;
 
             return ['success' => true, 'user_id' => $user_id, 'email' => $email, 'tier' => $tier, 'created_at' => $now];
         } catch (RuntimeException $e) {
-            return ['error' => $e->getMessage(), 'message' => $e->getMessage()];
+            return $this->fail($e->getMessage());
         }
     }
 
@@ -340,27 +428,30 @@ SQL;
      * Output: {success, status: 'reset_email_sent'} or {error, message}.
      * Why: ADMIN-04/05; the token was written into the audit log in plain text and never sent (fixed
      * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). Touches: the database (password_resets, audit_logs) and e-mail.
+     * Phase B.2 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): a suspended caller is refused first (403
+     * account_suspended, ADMIN-19), and every error carries its HTTP status ({error, status, message}).
      */
     public function resetPassword(array $data): array
     {
         try {
+            $this->require_active();
             $this->verify_csrf($data['csrf_token'] ?? '');
             $this->require_owner();
 
             $user_id = (int)($data['user_id'] ?? 0);
             if ($user_id === $this->current_user_id) {
-                return ['error' => 'cannot_reset_own_password', 'message' => 'Cannot reset own password'];
+                return $this->fail('cannot_reset_own_password', 'Cannot reset own password');
             }
 
             $stmt = $this->pdo->prepare('SELECT id, email, tier, status FROM users WHERE id = :id');
             $stmt->execute([':id' => $user_id]);
             $user = $stmt->fetch(PDO::FETCH_ASSOC);
             if (!$user) {
-                return ['error' => 'user_not_found', 'message' => 'User not found'];
+                return $this->fail('user_not_found', 'User not found');
             }
 
             if ($user['tier'] === 'owner' && $this->countOwners() <= 1) {
-                return ['error' => 'cannot_demote_last_owner', 'message' => 'Cannot demote last active owner'];
+                return $this->fail('cannot_demote_last_owner', 'Cannot demote last active owner');
             }
 
             // Reset token: 32 random bytes, stored only as SHA-256 with a 1 h expiry, e-mailed to the user, never
@@ -380,17 +471,20 @@ SQL;
 
             return ['success' => true, 'status' => 'reset_email_sent'];
         } catch (RuntimeException $e) {
-            return ['error' => $e->getMessage(), 'message' => $e->getMessage()];
+            return $this->fail($e->getMessage());
         }
     }
 
     /**
      * Changes a user's tier after the CSRF check; refuses an invalid tier, demoting the last active owner and the
      * caller's own role. Output: success or an error array. Touches: users and audit_logs. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+     * Phase B.2 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): a suspended caller is refused first (403
+     * account_suspended, ADMIN-19), and every error carries its HTTP status ({error, status, message}).
      */
     public function changeRole(array $data): array
     {
         try {
+            $this->require_active();
             $this->verify_csrf($data['csrf_token'] ?? '');
             $this->require_owner();
 
@@ -398,23 +492,23 @@ SQL;
             $new_tier = trim($data['new_tier'] ?? '');
 
             if (!$this->validate_tier($new_tier)) {
-                return ['error' => 'invalid_tier', 'message' => 'Invalid tier'];
+                return $this->fail('invalid_tier', 'Invalid tier');
             }
 
             $stmt = $this->pdo->prepare('SELECT tier FROM users WHERE id = :id');
             $stmt->execute([':id' => $user_id]);
             $user = $stmt->fetch(PDO::FETCH_ASSOC);
             if (!$user) {
-                return ['error' => 'user_not_found', 'message' => 'User not found'];
+                return $this->fail('user_not_found', 'User not found');
             }
 
             // Check if trying to demote the last active owner (takes precedence over own-role check)
             if ($user['tier'] === 'owner' && $this->countOwners() <= 1 && $new_tier !== 'owner') {
-                return ['error' => 'cannot_demote_last_owner', 'message' => 'Cannot demote last active owner'];
+                return $this->fail('cannot_demote_last_owner', 'Cannot demote last active owner');
             }
 
             if ($user_id === $this->current_user_id) {
-                return ['error' => 'cannot_change_own_role', 'message' => 'Cannot change own role'];
+                return $this->fail('cannot_change_own_role', 'Cannot change own role');
             }
 
             $old_tier = $user['tier'];
@@ -429,13 +523,21 @@ SQL;
 
             return ['success' => true, 'user_id' => $user_id, 'old_tier' => $old_tier, 'new_tier' => $new_tier];
         } catch (RuntimeException $e) {
-            return ['error' => $e->getMessage(), 'message' => $e->getMessage()];
+            return $this->fail($e->getMessage());
         }
     }
 
+    /**
+     * Owner only: suspend another user ({csrf_token, user_id, reason}); never the caller, never the last active
+     * owner. Output: {success, user_id, suspended: true} or {error, status, message}. Why: ADMIN-08/09.
+     * Touches: the database (users, audit_logs).
+     * Phase B.2 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): a suspended caller is refused first (403
+     * account_suspended, ADMIN-19), and every error carries its HTTP status ({error, status, message}).
+     */
     public function suspendUser(array $data): array
     {
         try {
+            $this->require_active();
             $this->verify_csrf($data['csrf_token'] ?? '');
             $this->require_owner();
 
@@ -443,18 +545,18 @@ SQL;
             $reason = trim($data['reason'] ?? '');
 
             if ($user_id === $this->current_user_id) {
-                return ['error' => 'cannot_suspend_yourself', 'message' => 'Cannot suspend yourself'];
+                return $this->fail('cannot_suspend_yourself', 'Cannot suspend yourself');
             }
 
             $stmt = $this->pdo->prepare('SELECT tier FROM users WHERE id = :id');
             $stmt->execute([':id' => $user_id]);
             $user = $stmt->fetch(PDO::FETCH_ASSOC);
             if (!$user) {
-                return ['error' => 'user_not_found', 'message' => 'User not found'];
+                return $this->fail('user_not_found', 'User not found');
             }
 
             if ($user['tier'] === 'owner' && $this->countOwners() <= 1) {
-                return ['error' => 'cannot_demote_last_owner', 'message' => 'Cannot demote last active owner'];
+                return $this->fail('cannot_demote_last_owner', 'Cannot demote last active owner');
             }
 
             $stmt = $this->pdo->prepare('UPDATE users SET status = :status, updated_at = :updated_at WHERE id = :id');
@@ -468,7 +570,7 @@ SQL;
 
             return ['success' => true, 'user_id' => $user_id, 'suspended' => true];
         } catch (RuntimeException $e) {
-            return ['error' => $e->getMessage(), 'message' => $e->getMessage()];
+            return $this->fail($e->getMessage());
         }
     }
 
@@ -499,10 +601,13 @@ SQL;
      * Output: [{customer_id, email, name, tier, signup_date, invoice_count, status}] or {error, message}.
      * Why: ADMIN-10; the tie-break is 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (equal signup dates could repeat or skip
      * a customer across pages). Touches: the database (read).
+     * Phase B.2 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): a suspended caller is refused first (403
+     * account_suspended, ADMIN-19), and every error carries its HTTP status ({error, status, message}).
      */
     public function listCustomers(int $page = 1, int $per_page = 20): array
     {
         try {
+            $this->require_active();
             $this->require_admin_or_owner();
 
             $offset = ($page - 1) * $per_page;
@@ -514,24 +619,32 @@ SQL;
             $customers = $stmt->fetchAll(PDO::FETCH_ASSOC);
             return $customers;
         } catch (RuntimeException $e) {
-            return ['error' => $e->getMessage(), 'message' => $e->getMessage()];
+            return $this->fail($e->getMessage());
         }
     }
 
+    /**
+     * Admin or owner: one customer's detail. Input: customer id. Output: {customer_id, email, name, tier (the plan),
+     * subscription_status, payment_method, address, notes} or {error, status, message}. Why: ADMIN-11.
+     * Touches: the database (read).
+     * Phase B.2 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): a suspended caller is refused first (403
+     * account_suspended, ADMIN-19), and every error carries its HTTP status ({error, status, message}).
+     */
     public function getCustomer(int $customer_id): array
     {
         try {
+            $this->require_active();
             $this->require_admin_or_owner();
 
             $stmt = $this->pdo->prepare('SELECT id as customer_id, email, name, tier, subscription_status, payment_method, address, notes FROM customers WHERE id = :id');
             $stmt->execute([':id' => $customer_id]);
             $customer = $stmt->fetch(PDO::FETCH_ASSOC);
             if (!$customer) {
-                return ['error' => 'customer_not_found', 'message' => 'Customer not found'];
+                return $this->fail('customer_not_found', 'Customer not found');
             }
             return $customer;
         } catch (RuntimeException $e) {
-            return ['error' => $e->getMessage(), 'message' => $e->getMessage()];
+            return $this->fail($e->getMessage());
         }
     }
 
@@ -546,45 +659,48 @@ SQL;
      * which adds a second item and bills both plans). Then customers.tier and audit_log plan_changed.
      * Why: ADMIN-12 as amended; it validated new_tier against user roles and never called Stripe.
      * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: Stripe (what the customer pays), the database, the audit log.
+     * Phase B.2 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): a suspended caller is refused first (403
+     * account_suspended, ADMIN-19), and every error carries its HTTP status ({error, status, message}).
      */
     public function changePlan(array $data): array
     {
         try {
+            $this->require_active();
             $this->verify_csrf($data['csrf_token'] ?? '');
             $this->require_owner();
 
             $customer_id = (int)($data['customer_id'] ?? 0);
             $new_tier = trim((string)($data['new_tier'] ?? ''));
 
-            if (!isset(self::PRICE_IDS[$new_tier])) {
-                return ['error' => 'invalid_tier', 'status' => 400, 'message' => 'Invalid tier'];
+            if (!$this->validate_plan_tier($new_tier) || !isset(self::PRICE_IDS[$new_tier])) {
+                return $this->fail('invalid_tier', 'Invalid tier');
             }
 
             $stmt = $this->pdo->prepare('SELECT stripe_subscription_id, tier FROM customers WHERE id = :id');
             $stmt->execute([':id' => $customer_id]);
             $customer = $stmt->fetch(PDO::FETCH_ASSOC);
             if (!$customer) {
-                return ['error' => 'customer_not_found', 'message' => 'Customer not found'];
+                return $this->fail('customer_not_found', 'Customer not found');
             }
             $subscription_id = (string)($customer['stripe_subscription_id'] ?? '');
             if ($subscription_id === '') {
-                return ['error' => 'no_subscription', 'message' => 'Customer has no subscription'];
+                return $this->fail('no_subscription', 'Customer has no subscription');
             }
             if ($this->stripe === null) {
-                return ['error' => 'stripe_not_configured', 'message' => 'Stripe is not configured'];
+                return $this->fail('stripe_not_configured', 'Stripe is not configured');
             }
 
             try {
                 $remote = $this->stripe->retrieveSubscription($subscription_id);
             } catch (Throwable) {
-                return ['error' => 'stripe_error', 'message' => 'The payment provider rejected the request'];
+                return $this->fail('stripe_error', 'The payment provider rejected the request');
             }
             $itemIds = [];
             foreach (($remote->items->data ?? []) as $item) {
                 $itemIds[] = is_array($item) ? ($item['id'] ?? null) : ($item->id ?? null);
             }
             if (count($itemIds) !== 1 || !is_string($itemIds[0]) || $itemIds[0] === '') {
-                return ['error' => 'subscription_item_ambiguous', 'status' => 409, 'message' => 'The subscription does not have exactly one item'];
+                return $this->fail('subscription_item_ambiguous', 'The subscription does not have exactly one item');
             }
             try {
                 $updated = $this->stripe->updateSubscription($subscription_id, [
@@ -592,7 +708,7 @@ SQL;
                     'proration_behavior' => 'create_prorations',
                 ]);
             } catch (Throwable) {
-                return ['error' => 'stripe_error', 'message' => 'The payment provider rejected the request'];
+                return $this->fail('stripe_error', 'The payment provider rejected the request');
             }
 
             $old_tier = $customer['tier'];
@@ -613,13 +729,21 @@ SQL;
             if ($this->pdo->inTransaction()) {
                 $this->pdo->rollBack();
             }
-            return ['error' => $e->getMessage(), 'message' => $e->getMessage()];
+            return $this->fail($e->getMessage());
         }
     }
 
+    /**
+     * Owner only: queue a refund ({csrf_token, invoice_id, amount, reason}) as status 'queued'; nothing is paid
+     * here. Output: {success, refund_id, status: 'queued', amount} or {error, status, message}. Why: ADMIN-13.
+     * Touches: the database (refunds, audit_logs).
+     * Phase B.2 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): a suspended caller is refused first (403
+     * account_suspended, ADMIN-19), and every error carries its HTTP status ({error, status, message}).
+     */
     public function queueRefund(array $data): array
     {
         try {
+            $this->require_active();
             $this->verify_csrf($data['csrf_token'] ?? '');
             $this->require_owner();
 
@@ -630,7 +754,7 @@ SQL;
             // Simulate invoice check
             // In real implementation, query invoices table
             if ($invoice_id <= 0) {
-                return ['error' => 'invoice_not_found', 'message' => 'Invoice not found'];
+                return $this->fail('invoice_not_found', 'Invoice not found');
             }
 
             $now = $this->getCurrentTimestamp();
@@ -649,15 +773,23 @@ SQL;
 
             return ['success' => true, 'refund_id' => $refund_id, 'status' => 'queued', 'amount' => $amount];
         } catch (RuntimeException $e) {
-            return ['error' => $e->getMessage(), 'message' => $e->getMessage()];
+            return $this->fail($e->getMessage());
         }
     }
 
     /* DEPLOYMENTS DOMAIN */
 
+    /**
+     * Admin or owner: every deployment, newest published first. Output: [{deployment_id, customer_id, domain, tier
+     * (the plan), status, theme_id, published_at}] or {error, status, message}. Why: the DEPLOYMENTS list.
+     * Touches: the database (read).
+     * Phase B.2 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): a suspended caller is refused first (403
+     * account_suspended, ADMIN-19), and every error carries its HTTP status ({error, status, message}).
+     */
     public function listDeployments(): array
     {
         try {
+            $this->require_active();
             $this->require_admin_or_owner();
 
             $stmt = $this->pdo->prepare('SELECT id as deployment_id, customer_id, domain, tier, status, theme_id, published_at FROM deployments ORDER BY published_at DESC');
@@ -665,19 +797,24 @@ SQL;
             $deployments = $stmt->fetchAll(PDO::FETCH_ASSOC);
             return $deployments;
         } catch (RuntimeException $e) {
-            return ['error' => $e->getMessage(), 'message' => $e->getMessage()];
+            return $this->fail($e->getMessage());
         }
     }
 
     /**
      * Owner only: create a draft deployment ({csrf_token, customer_id, domain, tier, theme_id}) and initialise
-     * its config row. Output: {success, deployment_id, domain, tier} or {error, message}.
-     * Why: ADMIN-14; the config row replaced a placeholder 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * its config row; tier is the PLAN (solo | team | enterprise), a staff role is 400 invalid_tier. The deployment
+     * starts with domain_verified false. Output: {success, deployment_id, domain, tier} or {error, status, message}.
+     * Why: ADMIN-14; the config row replaced a placeholder 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. The tier check
+     * against plans (it checked staff roles) is the same day (Phase B.2).
      * Touches: the database (deployments, deployment_configs, audit_logs).
+     * Phase B.2 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): a suspended caller is refused first (403
+     * account_suspended, ADMIN-19), and every error carries its HTTP status ({error, status, message}).
      */
     public function createDeployment(array $data): array
     {
         try {
+            $this->require_active();
             $this->verify_csrf($data['csrf_token'] ?? '');
             $this->require_owner();
 
@@ -686,27 +823,27 @@ SQL;
             $tier = trim($data['tier'] ?? '');
             $theme_id = (int)($data['theme_id'] ?? 0);
 
-            if (!$this->validate_tier($tier)) {
-                return ['error' => 'invalid_tier', 'message' => 'Invalid tier'];
+            if (!$this->validate_plan_tier($tier)) {
+                return $this->fail('invalid_tier', 'Invalid tier');
             }
 
             // Check customer exists
             $stmt = $this->pdo->prepare('SELECT id FROM customers WHERE id = :id');
             $stmt->execute([':id' => $customer_id]);
             if (!$stmt->fetch(PDO::FETCH_ASSOC)) {
-                return ['error' => 'customer_not_found', 'message' => 'Customer not found'];
+                return $this->fail('customer_not_found', 'Customer not found');
             }
 
             // Check domain not registered
             $stmt = $this->pdo->prepare('SELECT id FROM deployments WHERE domain = :domain');
             $stmt->execute([':domain' => $domain]);
             if ($stmt->fetch(PDO::FETCH_ASSOC)) {
-                return ['error' => 'domain_already_registered', 'message' => 'Domain already registered'];
+                return $this->fail('domain_already_registered', 'Domain already registered');
             }
 
             // Check theme exists (simulate)
             if ($theme_id <= 0) {
-                return ['error' => 'theme_not_found', 'message' => 'Theme not found'];
+                return $this->fail('theme_not_found', 'Theme not found');
             }
 
             $now = $this->getCurrentTimestamp();
@@ -736,7 +873,7 @@ SQL;
 
             return ['success' => true, 'deployment_id' => $deployment_id, 'domain' => $domain, 'tier' => $tier];
         } catch (RuntimeException $e) {
-            return ['error' => $e->getMessage(), 'message' => $e->getMessage()];
+            return $this->fail($e->getMessage());
         }
     }
 
@@ -746,10 +883,13 @@ SQL;
      * public_url} or {error, message} (owner_only, publish_not_allowed, domain_not_verified, theme_not_set, ...).
      * Why: ADMIN-15; the flag and the domain check were placeholders until 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
      * Touches: the database (deployments, audit_logs).
+     * Phase B.2 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): a suspended caller is refused first (403
+     * account_suspended, ADMIN-19), and every error carries its HTTP status ({error, status, message}).
      */
     public function publishDeployment(array $data): array
     {
         try {
+            $this->require_active();
             $this->verify_csrf($data['csrf_token'] ?? '');
             $this->require_owner();
 
@@ -760,23 +900,23 @@ SQL;
             $stmt->execute([':id' => $deployment_id]);
             $deployment = $stmt->fetch(PDO::FETCH_ASSOC);
             if (!$deployment) {
-                return ['error' => 'deployment_not_found', 'message' => 'Deployment not found'];
+                return $this->fail('deployment_not_found', 'Deployment not found');
             }
 
             if ($deployment['status'] !== 'draft') {
-                return ['error' => 'deployment_not_in_draft', 'message' => 'Deployment not in draft status'];
+                return $this->fail('deployment_not_in_draft', 'Deployment not in draft status');
             }
 
             if (!(bool)($this->canPublish)($deployment_id)) {
-                return ['error' => 'publish_not_allowed', 'message' => 'SafetyFlags.can_publish is off'];
+                return $this->fail('publish_not_allowed', 'SafetyFlags.can_publish is off');
             }
 
             if ((int)$deployment['domain_verified'] !== 1) {
-                return ['error' => 'domain_not_verified', 'message' => 'Domain not verified'];
+                return $this->fail('domain_not_verified', 'Domain not verified');
             }
 
             if (empty($deployment['theme_id'])) {
-                return ['error' => 'theme_not_set', 'message' => 'Theme not set'];
+                return $this->fail('theme_not_set', 'Theme not set');
             }
 
             $now = $this->getCurrentTimestamp();
@@ -794,13 +934,21 @@ SQL;
 
             return ['success' => true, 'deployment_id' => $deployment_id, 'status' => 'live', 'public_url' => $public_url];
         } catch (RuntimeException $e) {
-            return ['error' => $e->getMessage(), 'message' => $e->getMessage()];
+            return $this->fail($e->getMessage());
         }
     }
 
+    /**
+     * Owner only: suspend a deployment ({csrf_token, deployment_id, reason}). Output: {success, deployment_id,
+     * status: 'suspended'} or {error, status, message}. Why: DEPLOYMENTS suspend. Touches: the database
+     * (deployments, audit_logs).
+     * Phase B.2 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): a suspended caller is refused first (403
+     * account_suspended, ADMIN-19), and every error carries its HTTP status ({error, status, message}).
+     */
     public function suspendDeployment(array $data): array
     {
         try {
+            $this->require_active();
             $this->verify_csrf($data['csrf_token'] ?? '');
             $this->require_owner();
 
@@ -811,7 +959,7 @@ SQL;
             $stmt->execute([':id' => $deployment_id]);
             $deployment = $stmt->fetch(PDO::FETCH_ASSOC);
             if (!$deployment) {
-                return ['error' => 'deployment_not_found', 'message' => 'Deployment not found'];
+                return $this->fail('deployment_not_found', 'Deployment not found');
             }
 
             $stmt = $this->pdo->prepare('UPDATE deployments SET status = :status, suspend_reason = :reason, updated_at = :updated_at WHERE id = :id');
@@ -826,13 +974,20 @@ SQL;
 
             return ['success' => true, 'deployment_id' => $deployment_id, 'status' => 'suspended'];
         } catch (RuntimeException $e) {
-            return ['error' => $e->getMessage(), 'message' => $e->getMessage()];
+            return $this->fail($e->getMessage());
         }
     }
 
+    /**
+     * Owner only: archive a deployment ({csrf_token, deployment_id}). Output: {success, deployment_id, status:
+     * 'archived'} or {error, status, message}. Why: DEPLOYMENTS retire. Touches: the database (deployments, audit_logs).
+     * Phase B.2 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): a suspended caller is refused first (403
+     * account_suspended, ADMIN-19), and every error carries its HTTP status ({error, status, message}).
+     */
     public function retireDeployment(array $data): array
     {
         try {
+            $this->require_active();
             $this->verify_csrf($data['csrf_token'] ?? '');
             $this->require_owner();
 
@@ -842,7 +997,7 @@ SQL;
             $stmt->execute([':id' => $deployment_id]);
             $deployment = $stmt->fetch(PDO::FETCH_ASSOC);
             if (!$deployment) {
-                return ['error' => 'deployment_not_found', 'message' => 'Deployment not found'];
+                return $this->fail('deployment_not_found', 'Deployment not found');
             }
 
             $now = $this->getCurrentTimestamp();
@@ -858,15 +1013,23 @@ SQL;
 
             return ['success' => true, 'deployment_id' => $deployment_id, 'status' => 'archived'];
         } catch (RuntimeException $e) {
-            return ['error' => $e->getMessage(), 'message' => $e->getMessage()];
+            return $this->fail($e->getMessage());
         }
     }
 
     /* GOVERNANCE DOMAIN */
 
+    /**
+     * Admin or owner: one page of governance actions, newest first. Inputs: page, per_page. Output: [{action_id,
+     * action_type, actor_id, target_resource_id, reason, submitted_at, status}] or {error, status, message}.
+     * Why: GOVERNANCE list. Touches: the database (read).
+     * Phase B.2 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): a suspended caller is refused first (403
+     * account_suspended, ADMIN-19), and every error carries its HTTP status ({error, status, message}).
+     */
     public function listGovernanceActions(int $page = 1, int $per_page = 20): array
     {
         try {
+            $this->require_active();
             $this->require_admin_or_owner();
 
             $offset = ($page - 1) * $per_page;
@@ -877,7 +1040,7 @@ SQL;
             $actions = $stmt->fetchAll(PDO::FETCH_ASSOC);
             return $actions;
         } catch (RuntimeException $e) {
-            return ['error' => $e->getMessage(), 'message' => $e->getMessage()];
+            return $this->fail($e->getMessage());
         }
     }
 
@@ -886,10 +1049,13 @@ SQL;
      * governance action. Output: {success, action_id, status} or {error, message}; an action that cannot be
      * executed stays pending. Why: ADMIN-16/17; approval only "simulated" the action until
      * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database (governance_actions, the target rows, audit_logs).
+     * Phase B.2 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): a suspended caller is refused first (403
+     * account_suspended, ADMIN-19), and every error carries its HTTP status ({error, status, message}).
      */
     public function decideGovernanceAction(int $action_id, string $decide, array $data = []): array
     {
         try {
+            $this->require_active();
             $this->verify_csrf($data['csrf_token'] ?? '');
             $this->require_owner();
 
@@ -897,11 +1063,11 @@ SQL;
             $stmt->execute([':id' => $action_id]);
             $action = $stmt->fetch(PDO::FETCH_ASSOC);
             if (!$action) {
-                return ['error' => 'action_not_found', 'message' => 'Action not found'];
+                return $this->fail('action_not_found', 'Action not found');
             }
 
             if ($action['status'] !== 'pending') {
-                return ['error' => 'action_already_decided', 'message' => 'Action already decided'];
+                return $this->fail('action_already_decided', 'Action already decided');
             }
 
             if ($decide === 'approve') {
@@ -925,7 +1091,7 @@ SQL;
             } elseif ($decide === 'reject') {
                 $reason = trim($data['reason'] ?? '');
                 if ($reason === '') {
-                    return ['error' => 'reason_required', 'message' => 'Reason required for rejection'];
+                    return $this->fail('reason_required', 'Reason required for rejection');
                 }
                 $stmt = $this->pdo->prepare('UPDATE governance_actions SET status = :status, rejection_reason = :reason, approved_at = :approved_at WHERE id = :id');
                 $stmt->execute([
@@ -939,10 +1105,10 @@ SQL;
 
                 return ['success' => true, 'action_id' => $action_id, 'status' => 'rejected'];
             } else {
-                return ['error' => 'invalid_decide', 'message' => 'Invalid decide value'];
+                return $this->fail('invalid_decide', 'Invalid decide value');
             }
         } catch (RuntimeException $e) {
-            return ['error' => $e->getMessage(), 'message' => $e->getMessage()];
+            return $this->fail($e->getMessage());
         }
     }
 
@@ -950,8 +1116,9 @@ SQL;
      * Run an approved governance action. Supported action types: suspend_user and delete_user (target a user;
      * never the approver, never the last active owner), suspend_deployment and retire_deployment (target a
      * deployment). Input: the governance_actions row. Output: {executed: action_type, target} or
-     * {error, message} (unsupported_action_type, user_not_found, deployment_not_found, cannot_suspend_yourself,
-     * cannot_demote_last_owner). Why: ADMIN-16 "action executed". 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * {error, status, message} (unsupported_action_type, user_not_found, deployment_not_found, cannot_suspend_yourself,
+     * cannot_demote_last_owner). Why: ADMIN-16 "action executed". 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP; the
+     * status on each error is the same day (Phase B.2).
      * Touches: the database (users or deployments) and the audit log.
      */
     private function executeGovernanceAction(array $action): array
@@ -960,16 +1127,16 @@ SQL;
         $type = (string)$action['action_type'];
         if ($type === 'suspend_user' || $type === 'delete_user') {
             if ($target === $this->current_user_id) {
-                return ['error' => 'cannot_suspend_yourself', 'message' => 'Cannot act on yourself'];
+                return $this->fail('cannot_suspend_yourself', 'Cannot act on yourself');
             }
             $stmt = $this->pdo->prepare('SELECT tier, status FROM users WHERE id = :id');
             $stmt->execute([':id' => $target]);
             $user = $stmt->fetch(PDO::FETCH_ASSOC);
             if (!$user) {
-                return ['error' => 'user_not_found', 'message' => 'User not found'];
+                return $this->fail('user_not_found', 'User not found');
             }
             if ($user['tier'] === 'owner' && $this->countOwners() <= 1) {
-                return ['error' => 'cannot_demote_last_owner', 'message' => 'Cannot remove the last active owner'];
+                return $this->fail('cannot_demote_last_owner', 'Cannot remove the last active owner');
             }
             $newStatus = $type === 'suspend_user' ? 'suspended' : 'deleted';
             $this->pdo->prepare('UPDATE users SET status = :status, updated_at = :now WHERE id = :id')
@@ -982,7 +1149,7 @@ SQL;
             $stmt->execute([':id' => $target]);
             $deployment = $stmt->fetch(PDO::FETCH_ASSOC);
             if (!$deployment) {
-                return ['error' => 'deployment_not_found', 'message' => 'Deployment not found'];
+                return $this->fail('deployment_not_found', 'Deployment not found');
             }
             $newStatus = $type === 'suspend_deployment' ? 'suspended' : 'archived';
             $this->pdo->prepare('UPDATE deployments SET status = :status, updated_at = :now WHERE id = :id')
@@ -990,7 +1157,7 @@ SQL;
             $this->auditLog($type === 'suspend_deployment' ? 'deployment_suspended' : 'deployment_archived', $this->current_user_id, 'deployments', $target, ['status' => $deployment['status']], ['status' => $newStatus], (string)$action['reason']);
             return ['executed' => $type, 'target' => $target];
         }
-        return ['error' => 'unsupported_action_type', 'message' => 'Unsupported action type'];
+        return $this->fail('unsupported_action_type', 'Unsupported action type');
     }
 
     /* AUDIT LOG SEARCH */
@@ -999,10 +1166,13 @@ SQL;
      * Admin or owner: filters the audit log by the given fields. Output: matching rows. Touches: reads audit_logs. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
      * Newest first; equal timestamps newest insertion first, so limit/offset pages never overlap (tie-break
      * added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, ADMIN-18).
+     * Phase B.2 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): a suspended caller is refused first (403
+     * account_suspended, ADMIN-19), and every error carries its HTTP status ({error, status, message}).
      */
     public function searchAuditLog(array $filters): array
     {
         try {
+            $this->require_active();
             $this->require_admin_or_owner();
 
             $action_type = $filters['action_type'] ?? null;
@@ -1043,7 +1213,7 @@ SQL;
             $logs = $stmt->fetchAll(PDO::FETCH_ASSOC);
             return $logs;
         } catch (RuntimeException $e) {
-            return ['error' => $e->getMessage(), 'message' => $e->getMessage()];
+            return $this->fail($e->getMessage());
         }
     }
 }

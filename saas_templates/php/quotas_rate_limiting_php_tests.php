@@ -325,6 +325,14 @@ class QuotaRateLimitingTest
         $this->assertEquals(403, $result['status']);
         $this->assertEquals('feature_not_available_in_tier', $result['body']['error']);
         $this->assertEquals('https://example.com/upgrade', $result['body']['upgrade_url']);
+        // Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): the refusal is exactly
+        // 403 {error, tier, minimum_tier, upgrade_url} in every language.
+        $this->assertEquals(
+            ['error' => 'feature_not_available_in_tier', 'tier' => 'solo', 'minimum_tier' => 'enterprise', 'upgrade_url' => 'https://example.com/upgrade'],
+            $result['body']
+        );
+        $teamOnly = $this->limiter->checkRequest(2, 'solo', '127.0.0.2', '/api/feature_a', 0, 'feature_a', 'https://example.com/upgrade');
+        $this->assertEquals([403, 'solo', 'team'], [$teamOnly['status'], $teamOnly['body']['tier'], $teamOnly['body']['minimum_tier']]);
     }
 
     // QUOTA-11
