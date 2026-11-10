@@ -668,4 +668,100 @@ class AdminSystemTests {
         postAs(owner, "/admin/deployments/action", "X-Action", "publish", Map.of("deployment_id", created.getId()))
                 .andExpect(status().isOk()).andExpect(jsonPath("$.status").value("live"));
     }
+
+    /**
+     * ADMIN-19 with the Phase B.3 ruling: a suspended caller is refused with 403 account_suspended before the CSRF
+     * check too, so a request with no CSRF token, or a wrong one, still answers account_suspended (not csrf_invalid),
+     * and nothing changes. An active caller without the token still gets csrf_invalid. Added 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3, d4f4ed7). Touches: the test database.
+     */
+    // ADMIN-19
+    @Test
+    void testSuspendedCallerIsRefusedBeforeCsrf() throws Exception {
+        User suspended = new User(); suspended.setEmail("suspended-csrf@example.com"); suspended.setName("Suspended");
+        suspended.setTier("owner"); suspended.setStatus("suspended");
+        userRepo.save(suspended);
+        Map<String, Object> body = Map.of("email", "by-suspended-csrf@example.com", "name", "X", "tier", "user", "notify", false);
+        mockMvc.perform(post("/admin/users/action")
+                        .header("X-Action", "create")
+                        .header("X-User-Id", suspended.getId().toString())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(mapper.writeValueAsString(body)))
+                .andExpect(status().isForbidden()).andExpect(jsonPath("$.error").value("account_suspended"));
+        mockMvc.perform(post("/admin/users/action")
+                        .header("X-Action", "create")
+                        .header("X-User-Id", suspended.getId().toString())
+                        .header(CSRF_HEADER, "wrong-token")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(mapper.writeValueAsString(body)))
+                .andExpect(status().isForbidden()).andExpect(jsonPath("$.error").value("account_suspended"));
+        Assertions.assertFalse(userRepo.existsByEmail("by-suspended-csrf@example.com"));
+        mockMvc.perform(post("/admin/users/action")
+                        .header("X-Action", "create")
+                        .header("X-User-Id", owner.getId().toString())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(mapper.writeValueAsString(body)))
+                .andExpect(status().isForbidden()).andExpect(jsonPath("$.error").value("csrf_invalid"));
+        Assertions.assertFalse(userRepo.existsByEmail("by-suspended-csrf@example.com"));
+    }
+
+    /**
+     * ADMIN-07 (Phase B.3 ruling): approving a governance change_role that would demote the last active owner fails
+     * with 400 cannot_demote_last_owner, the action stays pending and the owner keeps the role. Every other active
+     * owner is made an admin for the test and restored afterwards. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP
+     * (Phase B.3, d4f4ed7). Touches: the test database.
+     */
+    // ADMIN-07
+    @Test
+    void testGovernanceChangeRoleCannotDemoteLastOwner() throws Exception {
+        List<User> otherOwners = userRepo.findActiveOwners().stream()
+                .filter(u -> !u.getId().equals(owner.getId())).toList();
+        for (User u : otherOwners) { u.setTier("admin"); userRepo.save(u); }
+        try {
+            Assertions.assertEquals(1, userRepo.findActiveOwners().size());
+            GovernanceAction ga = new GovernanceAction();
+            ga.setActionType("change_role");
+            ga.setActorId(admin.getId());
+            ga.setTargetResourceId(owner.getId());
+            ga.setNewTier("admin");
+            ga.setReason("demote the owner");
+            gaRepo.save(ga);
+            mockMvc.perform(post("/admin/governance/actions/" + ga.getId() + "/decide")
+                            .header("X-Decide", "approve")
+                            .with(auth(owner)))
+                    .andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.error").value("cannot_demote_last_owner"));
+            Assertions.assertEquals("pending", gaRepo.findById(ga.getId()).orElseThrow().getStatus());
+            Assertions.assertEquals("owner", userRepo.findById(owner.getId()).orElseThrow().getTier());
+        } finally {
+            for (User u : otherOwners) { User x = userRepo.findById(u.getId()).orElseThrow(); x.setTier("owner"); userRepo.save(x); }
+        }
+    }
+
+    /**
+     * Governance approve executes a change_role on a user who is not the last owner: the role changes, the action is
+     * approved and role_changed is audited. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3: change_role
+     * became a governance action type for ADMIN-07). Touches: the test database.
+     */
+    // ADMIN-16
+    @Test
+    void testGovernanceChangeRoleApproved() throws Exception {
+        User target = new User(); target.setEmail("gov-role-target@example.com"); target.setName("Gov"); target.setTier("user");
+        userRepo.save(target);
+        GovernanceAction ga = new GovernanceAction();
+        ga.setActionType("change_role");
+        ga.setActorId(admin.getId());
+        ga.setTargetResourceId(target.getId());
+        ga.setNewTier("admin");
+        ga.setReason("promote");
+        gaRepo.save(ga);
+        mockMvc.perform(post("/admin/governance/actions/" + ga.getId() + "/decide")
+                        .header("X-Decide", "approve")
+                        .with(auth(owner)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("approved"));
+        Assertions.assertEquals("admin", userRepo.findById(target.getId()).orElseThrow().getTier());
+        Assertions.assertEquals("approved", gaRepo.findById(ga.getId()).orElseThrow().getStatus());
+        Assertions.assertEquals(1, auditRows("role_changed", target.getId()).size());
+    }
 }

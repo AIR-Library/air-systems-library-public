@@ -175,6 +175,31 @@ public class AuthSystemTests {
         assertEquals("code_expired", res.get("error"));
     }
 
+    /**
+     * Phase B.3 ruling (d4f4ed7): 5 wrong verification codes invalidate the user's current code, so the right code is
+     * then code_invalid too; after only 4 wrong codes the right code still verifies. Added 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory H2 (verification_codes, users).
+     */
+    // AUTH-05
+    @Test
+    public void testFiveWrongCodesInvalidateTheCode() {
+        AuthSystem.signup("guess5@example.com", "StrongPassword123456", "Guess", "1.2.9.1");
+        String code = extractCodeFromEmail("guess5@example.com");
+        String wrong = code.equals("000000") ? "111111" : "000000";
+        for (int i = 0; i < 5; i++) {
+            assertEquals("code_invalid", AuthSystem.verifyEmail("guess5@example.com", wrong).get("error"), "wrong try " + i);
+        }
+        Map<String, Object> res = AuthSystem.verifyEmail("guess5@example.com", code);
+        assertFalse((Boolean) res.get("success"));
+        assertEquals("code_invalid", res.get("error"), "the right code after 5 wrong ones");
+
+        AuthSystem.signup("guess4@example.com", "StrongPassword123456", "Guess", "1.2.9.2");
+        String code4 = extractCodeFromEmail("guess4@example.com");
+        String wrong4 = code4.equals("000000") ? "111111" : "000000";
+        for (int i = 0; i < 4; i++) AuthSystem.verifyEmail("guess4@example.com", wrong4);
+        assertEquals("verified", AuthSystem.verifyEmail("guess4@example.com", code4).get("status"), "4 wrong tries leave it valid");
+    }
+
     // AUTH-07
     @Test
     public void testLoginHappyPathNoMfa() {

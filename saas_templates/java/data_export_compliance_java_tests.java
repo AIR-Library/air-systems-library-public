@@ -516,12 +516,33 @@ public class DataExportComplianceTest {
         assertEquals(USER, auditOf("deletion_cancelled").userId());
     }
 
+    /**
+     * Cancelling once will_delete_at has passed is 409 grace_period_over and changes nothing. Changed 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3 ruling, d4f4ed7): the code was grace_period_expired; the spec now
+     * names grace_period_over with status 409, and the status is asserted too. Touches: in-memory H2.
+     */
+    // EXPORT-06
     @Test
     void cancellingAfterTheGracePeriodIsRefused() {
         UUID id = confirmedDeletion();
         clock.advance(Duration.ofDays(31));
 
-        assertRefused("grace_period_expired", () -> compliance.cancelDeletion(id, USER));
+        assertRefused(409, "grace_period_over", () -> compliance.cancelDeletion(id, USER));
+        assertEquals(DataExportCompliance.DeletionStatus.APPROVED, deletion(id).status());
+    }
+
+    /**
+     * One second after will_delete_at the deletion is due but not yet run: a cancel is 409 grace_period_over and the
+     * request stays approved (exactly at will_delete_at a cancel still wins: aCancellationAtTheDeadlineStopsTheEraser).
+     * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3 ruling, d4f4ed7). Touches: in-memory H2.
+     */
+    // EXPORT-06
+    @Test
+    void cancellingOneSecondAfterWillDeleteAtIsGracePeriodOver() {
+        UUID due = confirmedDeletion();
+        clock.advance(Duration.between(clock.instant(), deletion(due).willDeleteAt()).plusSeconds(1));
+        assertRefused(409, "grace_period_over", () -> compliance.cancelDeletion(due, USER));
+        assertEquals(DataExportCompliance.DeletionStatus.APPROVED, deletion(due).status());
     }
 
     /**

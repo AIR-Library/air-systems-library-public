@@ -74,7 +74,7 @@ public class AuthSystem {
                 "resource_id VARCHAR(255), old_value VARCHAR(255), new_value VARCHAR(255))";
         String verCodes = "CREATE TABLE IF NOT EXISTS verification_codes (" +
                 "id IDENTITY PRIMARY KEY, user_id BIGINT, code_hash CHAR(64), created_at TIMESTAMP, " +
-                "expires_at TIMESTAMP, type VARCHAR(10))";
+                "expires_at TIMESTAMP, type VARCHAR(10), attempts INT NOT NULL DEFAULT 0)";
         String oauthLinks = "CREATE TABLE IF NOT EXISTS oauth_links (" +
                 "id IDENTITY PRIMARY KEY, user_id BIGINT, provider VARCHAR(50), provider_user_id VARCHAR(255))";
         // OAuth state values, stored only as their HMAC-SHA256 under AUTH_SECRET_KEY (spec d270fa3) (AUTH spec "Secrets at rest", 2026-11-10,
@@ -337,6 +337,9 @@ public class AuthSystem {
             }
             VerificationCode vc = any;
             if (vc == null) {
+                // Phase B.3 (d4f4ed7): count the wrong try against the user's current code; the 5th wrong try
+                // invalidates it, so even the right code is code_invalid until a new code is sent.
+                recordWrongVerificationCode(userId);
                 decisions.add("code_invalid");
                 return error("code_invalid", "Invalid code");
             }
@@ -866,6 +869,30 @@ public class AuthSystem {
         byte[] bytes = new byte[16];
         random.nextBytes(bytes);
         return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+    }
+
+    /** Wrong verification codes that invalidate the user's current code (Phase B.3, 2026-11-10). */
+    static final int MAX_VERIFY_ATTEMPTS = 5;
+
+    /**
+     * Counts one wrong verification code against the user's current email code(s), in one UPDATE, and deletes a code
+     * once it has MAX_VERIFY_ATTEMPTS wrong tries, so it can never verify (a 6-digit code must not be guessable by
+     * retrying); a new code starts again at 0. In: the user id. Out: none.
+     * Why: auth spec verify_email "Attempts", Phase B.3 ruling (d4f4ed7). Added 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (verification_codes).
+     */
+    private static void recordWrongVerificationCode(long userId) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "UPDATE verification_codes SET attempts = attempts + 1 WHERE user_id = ? AND type = 'email'")) {
+            ps.setLong(1, userId);
+            ps.executeUpdate();
+        }
+        try (PreparedStatement ps = conn.prepareStatement(
+                "DELETE FROM verification_codes WHERE user_id = ? AND type = 'email' AND attempts >= ?")) {
+            ps.setLong(1, userId);
+            ps.setInt(2, MAX_VERIFY_ATTEMPTS);
+            ps.executeUpdate();
+        }
     }
 
     /**
