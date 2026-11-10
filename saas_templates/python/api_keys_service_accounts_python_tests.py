@@ -435,11 +435,16 @@ def test_management_routes_require_login_and_admin():
     created = client.post("/api-keys", json={"name": "Mine", "scopes": ["read:users"]}).json()
     try:
         del app.dependency_overrides[get_current_user]
-        assert client.get("/api-keys").status_code == 401
+        # Each call is made before its assert, so the requests still happen under `python -O` (code scanning, PR 19).
+        anonymous = client.get("/api-keys")
+        assert anonymous.status_code == 401
         app.dependency_overrides[get_current_user] = lambda: CurrentUser(id=2, is_admin=False)
-        assert client.get("/admin/api-keys").status_code == 403
-        assert client.delete(f"/api-keys/{created['api_key_id']}").status_code == 404
-        assert client.get("/api-keys").json()["keys"] == []
+        audit_list = client.get("/admin/api-keys")
+        assert audit_list.status_code == 403
+        delete_other = client.delete(f"/api-keys/{created['api_key_id']}")
+        assert delete_other.status_code == 404
+        own_keys = client.get("/api-keys").json()["keys"]
+        assert own_keys == []
     finally:
         app.dependency_overrides[get_current_user] = lambda: CurrentUser(id=1, is_admin=True)
     listed = client.get("/api-keys").json()["keys"]
@@ -456,9 +461,11 @@ def test_bearer_request_succeeds_and_is_logged():
         resp = client.get("/api/deployments", headers={"Authorization": f"Bearer {ok['key']}"})
         assert resp.status_code == 200
         assert resp.json()["api_key_id"] == ok["api_key_id"]
-        assert client.get("/api/deployments").status_code == 401
+        no_key = client.get("/api/deployments")
+        assert no_key.status_code == 401
         other = client.post("/api-keys", json={"name": "Users only", "scopes": ["read:users"]}).json()
-        assert client.get("/api/deployments", headers={"Authorization": f"Bearer {other['key']}"}).status_code == 403
+        wrong_scope = client.get("/api/deployments", headers={"Authorization": f"Bearer {other['key']}"})
+        assert wrong_scope.status_code == 403
         stats = client.get(f"/api-keys/{other['api_key_id']}/usage").json()
         assert stats["errors"] == {"403": 1}
     finally:
