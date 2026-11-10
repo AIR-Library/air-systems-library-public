@@ -69,6 +69,11 @@ namespace AuthSystem
                 entity.Property(e => e.CreatedAt).IsRequired();
                 entity.Property(e => e.ExpiresAt).IsRequired();
                 entity.Property(e => e.Type).IsRequired().HasMaxLength(20);
+                // Attempts is a concurrency token (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, review finding
+                // 4525101240): EF then writes "SET Attempts = k + 1 WHERE Id = ? AND Attempts = k", ONE conditional
+                // write that fails (DbUpdateConcurrencyException) when another request counted a try first, so
+                // concurrent wrong codes can no longer all write the same k + 1. Touches: the model only.
+                entity.Property(e => e.Attempts).IsConcurrencyToken();
                 entity.HasOne(e => e.User).WithMany().HasForeignKey(e => e.UserId);
             });
 
@@ -140,6 +145,14 @@ namespace AuthSystem
         public DateTime ExpiresAt { get; set; }
         public string Type { get; set; }
         public User User { get; set; }
+
+        /// <summary>
+        /// Wrong email codes tried against this user's current code (verify_email only). At
+        /// <see cref="AuthService.MaxEmailCodeAttempts"/> the code is deleted, so even the right code is code_invalid until
+        /// a new code is sent (a new row starts at 0). Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3,
+        /// auth spec flow 2 "Attempts"). Pure data.
+        /// </summary>
+        public int Attempts { get; set; }
     }
 
     public class AuditLog
@@ -207,6 +220,12 @@ namespace AuthSystem
         public const int MaxFailedLoginsPer15Min = 5;
         /// <summary>Wrong TOTP codes allowed on one MFA challenge before it is destroyed.</summary>
         public const int MaxMfaAttemptsPerChallenge = 5;
+        /// <summary>Wrong email verification codes for one user before the current code is invalidated (Phase B.3, 2026-11-10).</summary>
+        public const int MaxEmailCodeAttempts = 5;
+        /// <summary>resend_verification requests accepted per email per hour (AUTH-18, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).</summary>
+        public const int MaxResendsPerHour = 3;
+        /// <summary>Life of a resent verification code in minutes (AUTH-18, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).</summary>
+        public const int ResendCodeMinutes = 10;
         /// <summary>Access-token lifetime in seconds (15 minutes).</summary>
         public const int AccessTokenSeconds = 900;
         /// <summary>Bucket used when a caller does not pass the client IP to <see cref="SignupAsync"/>: all such signups share one limit (fail closed).</summary>
@@ -321,6 +340,16 @@ namespace AuthSystem
         /// code_expired}. Repaired 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): sets status so login accepts
         /// the user, constant-time comparison, wrong vs expired codes reported apart. Changed the same day (Phase B.2,
         /// AUTH-16): the stored value is the code's HMAC-SHA256, compared in constant time with the hash of the code given.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3, flow 2 "Attempts"): a wrong code adds one to
+        /// the attempts of the user's current code(s); the 5th wrong code deletes them, so further tries, even with the
+        /// right code, get code_invalid until a new code is sent (a 6-digit code must not be guessable by retrying).
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (review finding 4525101240, CWE-307): every try is
+        /// COUNTED FIRST, in one conditional database write per code (<see cref="TryCountEmailCodeAttemptAsync"/>),
+        /// and the code is compared only when that write succeeded, as Go, JavaScript and TypeScript do. Before, the
+        /// count was read, compared and written back as an absolute value, so N concurrent wrong guesses all wrote
+        /// Attempts + 1 and a batch cost one attempt. A code with 5 counted tries is spent: it is never compared again
+        /// and a wrong 5th try deletes it. The right code on a counted 5th try still verifies; an expired code on a
+        /// counted try is code_expired (the try counts, as in Go). Answers are unchanged (AUTH-17).
         /// Touches: users, verification_codes, audit_log.
         /// </summary>
         public async Task<object> VerifyEmailAsync(string email, string code)
@@ -334,7 +363,21 @@ namespace AuthSystem
                 .Where(v => v.UserId == user.Id && v.Type == "email")
                 .ToListAsync();
             var providedHash = code == null ? null : HashSecret(code);
-            var verification = candidates.FirstOrDefault(v => SecretEquals(v.CodeHash, providedHash));
+            // Review finding 4525101240 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): count the try in the database
+            // first; compare only a code whose conditional increment succeeded.
+            VerificationCode verification = null;
+            foreach (var current in candidates)
+            {
+                if (!await TryCountEmailCodeAttemptAsync(current))
+                    continue; // spent (5 counted tries), or deleted meanwhile: never compared
+                if (SecretEquals(current.CodeHash, providedHash))
+                {
+                    verification = current;
+                    break;
+                }
+                if (current.Attempts >= MaxEmailCodeAttempts)
+                    await RemoveSpentEmailCodeAsync(current);
+            }
             if (verification == null)
                 return new { error = "code_invalid" };
             if (verification.ExpiresAt <= DateTime.UtcNow)
@@ -343,12 +386,129 @@ namespace AuthSystem
             user.EmailVerifiedAt = DateTime.UtcNow;
             user.Status = "verified";
             _db.VerificationCodes.Remove(verification);
-            await _db.SaveChangesAsync();
+            for (var round = 0; ; round++)
+            {
+                try
+                {
+                    await _db.SaveChangesAsync();
+                    break;
+                }
+                catch (DbUpdateConcurrencyException) when (round < MaxEmailCodeAttempts)
+                {
+                    // A racing wrong guess counted a try on this row after ours. Our try was counted and matched, so
+                    // finish: reload the row (it may be gone) and delete it again; the user's update is still pending.
+                    var entry = _db.Entry(verification);
+                    await entry.ReloadAsync();
+                    if (entry.State != EntityState.Detached) _db.VerificationCodes.Remove(verification);
+                }
+            }
 
             await LogAuditAsync(user.Id, "email_verified", "user", user.Id.ToString(), null, null);
             await LogWhyChainAsync("verify_email", new[] { "code_valid", "user_unverified" });
 
             return new { status = "verified", user_id = user.Id, message = "ready to login" };
+        }
+
+        /// <summary>
+        /// Flow 2b, resend_verification. At most <see cref="MaxResendsPerHour"/> requests per email per hour are accepted
+        /// (the check and the count are one step under the counter lock, so concurrent requests cannot pass it); a 4th
+        /// within the hour is {error: "too_many_requests"} (the spec's 429) and sends nothing. For an unverified user it
+        /// deletes the user's email codes, stores a new 6-digit code (Attempts 0, its HMAC-SHA256, valid
+        /// <see cref="ResendCodeMinutes"/> minutes) and emails it. An unknown or already verified email gets the same
+        /// {status: "sent"} (the spec's 202) and nothing is sent, so the answer never says whether an account exists;
+        /// those requests count toward the limit too. In: the email (trimmed and lower-cased, as signup stores it).
+        /// Out: {status: "sent"} or {error: "too_many_requests"}. Why: AUTH-18 (auth spec flow 2b, commit 0eb5a4e):
+        /// after 5 wrong codes (AUTH-17) nothing could issue a new code, so anyone who knew an email could block its
+        /// verification. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        /// Touches: users (read), verification_codes, audit_log, the cache, the email sender (network in production).
+        /// </summary>
+        public async Task<object> ResendVerificationAsync(string email)
+        {
+            var normalizedEmail = (email ?? string.Empty).Trim().ToLowerInvariant();
+            if (!TryTakeCounter($"resend_email:{normalizedEmail}", MaxResendsPerHour, TimeSpan.FromHours(1)))
+            {
+                await LogWhyChainAsync("resend_verification", new[] { "rate_limit_email_1h:failed" });
+                return new { error = "too_many_requests" };
+            }
+            var sent = new { status = "sent" };
+            var user = await _db.Users.FirstOrDefaultAsync(u => u.Email == normalizedEmail);
+            if (user == null || user.EmailVerifiedAt.HasValue)
+            {
+                // Unknown or already verified: the same answer as a real resend, and no email (no account enumeration).
+                await LogWhyChainAsync("resend_verification", new[] { "rate_limit_email_1h", "user_unverified:failed" });
+                return sent;
+            }
+            var old = await _db.VerificationCodes.Where(v => v.UserId == user.Id && v.Type == "email").ToListAsync();
+            _db.VerificationCodes.RemoveRange(old);
+            var code = GenerateVerificationCode();
+            _db.VerificationCodes.Add(new VerificationCode
+            {
+                UserId = user.Id,
+                CodeHash = HashSecret(code),
+                Type = "email",
+                Attempts = 0,
+                CreatedAt = DateTime.UtcNow,
+                ExpiresAt = DateTime.UtcNow.AddMinutes(ResendCodeMinutes)
+            });
+            await _db.SaveChangesAsync();
+
+            await _emailSender.SendVerificationEmailAsync(normalizedEmail, code);
+            await LogAuditAsync(user.Id, "verification_resent", "user", user.Id.ToString(), null, null);
+            await LogWhyChainAsync("resend_verification", new[] { "rate_limit_email_1h", "user_unverified" });
+            return sent;
+        }
+
+        /// <summary>
+        /// Counts one try against an email code in ONE conditional database write: Attempts is a concurrency token, so
+        /// EF writes "SET Attempts = k + 1 WHERE Id = ? AND Attempts = k" with k read below 5. When another request
+        /// counted first the write changes no row (DbUpdateConcurrencyException): the row is re-read from the database
+        /// and the count is tried again from the new value. Attempts only grow, so this loop ends within 5 rounds.
+        /// In: the tracked code row. Out: true when this try was counted (the caller may compare the code); false when
+        /// the code is spent (5 counted tries) or was deleted.
+        /// Why: review finding 4525101240 (CWE-307: concurrent wrong guesses all wrote the same Attempts + 1); auth
+        /// spec flow 2 "Attempts", AUTH-17. EF InMemory, which the tests use, has no ExecuteUpdateAsync, so the
+        /// conditional write is EF's own concurrency check. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        /// Touches: verification_codes.
+        /// </summary>
+        private async Task<bool> TryCountEmailCodeAttemptAsync(VerificationCode row)
+        {
+            var entry = _db.Entry(row);
+            for (var round = 0; round <= MaxEmailCodeAttempts; round++)
+            {
+                if (row.Attempts >= MaxEmailCodeAttempts) return false;
+                row.Attempts++;
+                try
+                {
+                    await _db.SaveChangesAsync();
+                    return true;
+                }
+                catch (DbUpdateConcurrencyException)
+                {
+                    await entry.ReloadAsync();
+                    if (entry.State == EntityState.Detached) return false;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Deletes an email code that has 5 counted tries (it is spent). Another request may have deleted it first;
+        /// that is the same outcome, so a concurrency failure only detaches the row.
+        /// In: the tracked code row. Out: nothing. Why: review finding 4525101240; auth spec flow 2 "Attempts" (a spent
+        /// code is gone until a new code is sent). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        /// Touches: verification_codes.
+        /// </summary>
+        private async Task RemoveSpentEmailCodeAsync(VerificationCode row)
+        {
+            _db.VerificationCodes.Remove(row);
+            try
+            {
+                await _db.SaveChangesAsync();
+            }
+            catch (DbUpdateConcurrencyException)
+            {
+                _db.Entry(row).State = EntityState.Detached;
+            }
         }
 
         /// <summary>
@@ -665,6 +825,26 @@ namespace AuthSystem
                 entry.Count++;
                 _cache.Set(key, entry, entry.ExpiresAt);
                 return entry.Count;
+            }
+        }
+
+        /// <summary>
+        /// Adds one to a rate-limit counter only while it is below max, in one step under the counter lock, so
+        /// concurrent callers cannot pass the limit. The window starts at the first hit and does not slide.
+        /// In: the key, the max and the window. Out: true when the hit was counted (allowed); false when the window was
+        /// already at max (refused, not counted). Why: AUTH-18 (3 resends per email per hour). 2026-11-10,
+        /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the cache.
+        /// </summary>
+        private bool TryTakeCounter(string key, int max, TimeSpan window)
+        {
+            lock (CounterGate)
+            {
+                if (!_cache.TryGetValue(key, out CounterEntry entry) || entry.ExpiresAt <= DateTimeOffset.UtcNow)
+                    entry = new CounterEntry { ExpiresAt = DateTimeOffset.UtcNow.Add(window) };
+                if (entry.Count >= max) return false;
+                entry.Count++;
+                _cache.Set(key, entry, entry.ExpiresAt);
+                return true;
             }
         }
 

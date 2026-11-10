@@ -74,7 +74,7 @@ public class AuthSystem {
                 "resource_id VARCHAR(255), old_value VARCHAR(255), new_value VARCHAR(255))";
         String verCodes = "CREATE TABLE IF NOT EXISTS verification_codes (" +
                 "id IDENTITY PRIMARY KEY, user_id BIGINT, code_hash CHAR(64), created_at TIMESTAMP, " +
-                "expires_at TIMESTAMP, type VARCHAR(10))";
+                "expires_at TIMESTAMP, type VARCHAR(10), attempts INT NOT NULL DEFAULT 0)";
         String oauthLinks = "CREATE TABLE IF NOT EXISTS oauth_links (" +
                 "id IDENTITY PRIMARY KEY, user_id BIGINT, provider VARCHAR(50), provider_user_id VARCHAR(255))";
         // OAuth state values, stored only as their HMAC-SHA256 under AUTH_SECRET_KEY (spec d270fa3) (AUTH spec "Secrets at rest", 2026-11-10,
@@ -198,6 +198,35 @@ public class AuthSystem {
     /* ---------- Rate Limiter ---------- */
     private static final ConcurrentHashMap<String, List<Instant>> signupAttempts = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<String, List<Instant>> loginAttempts = new ConcurrentHashMap<>();
+    /** Accepted resendVerification requests per email (AUTH-18, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). */
+    private static final ConcurrentHashMap<String, List<Instant>> resendAttempts = new ConcurrentHashMap<>();
+    /** resendVerification: requests accepted per email per hour (AUTH-18). */
+    static final int MAX_RESENDS_PER_HOUR = 3;
+    /** Life of a resent verification code (AUTH-18: 10 minutes). */
+    static final Duration RESEND_CODE_TTL = Duration.ofMinutes(10);
+
+    /**
+     * Counts one resendVerification request for the email and says whether it is accepted: false when 3 were already
+     * accepted in the last hour (that request is then not counted). The prune, check and count run in one
+     * ConcurrentHashMap.compute, which is atomic per key, so concurrent requests cannot pass the limit.
+     * In: the email. Out: true when accepted. Why: AUTH-18 (3 resends per email per hour). 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+     */
+    private static boolean takeResend(String email) {
+        Instant now = now();
+        Instant cutoff = now.minus(Duration.ofHours(1));
+        boolean[] accepted = {false};
+        resendAttempts.compute(email, (k, list) -> {
+            if (list == null) list = new ArrayList<>();
+            list.removeIf(t -> !t.isAfter(cutoff));
+            if (list.size() < MAX_RESENDS_PER_HOUR) {
+                list.add(now);
+                accepted[0] = true;
+            }
+            return list;
+        });
+        return accepted[0];
+    }
 
     private static void recordAttempt(ConcurrentHashMap<String, List<Instant>> map, String key, Duration window) {
         Instant now = now();
@@ -337,6 +366,9 @@ public class AuthSystem {
             }
             VerificationCode vc = any;
             if (vc == null) {
+                // Phase B.3 (d4f4ed7): count the wrong try against the user's current code; the 5th wrong try
+                // invalidates it, so even the right code is code_invalid until a new code is sent.
+                recordWrongVerificationCode(userId);
                 decisions.add("code_invalid");
                 return error("code_invalid", "Invalid code");
             }
@@ -356,6 +388,54 @@ public class AuthSystem {
             ));
         } catch (Exception e) {
             return error("internal_error", e.getMessage());
+        }
+    }
+
+    /**
+     * Flow 2b, resend_verification: replaces an unverified user's email code and emails the new one.
+     * In: the email. Out: {success: true, status: "sent"} (the spec's 202), or {success: false, error:
+     * "too_many_requests"} (the spec's 429), or {error: "internal_error"}. At most 3 requests per email per hour are
+     * accepted (takeResend); the 4th within the hour sends nothing. For an unverified user it deletes the user's email
+     * codes, stores a new 6-digit code (attempts 0, its HMAC-SHA256 under AUTH_SECRET_KEY, 10-minute expiry) and sends it
+     * through the injected EmailSender. An unknown or already verified email gets the same {success: true, status:
+     * "sent"} and nothing is sent, so the answer never says whether an account exists; those requests count toward the
+     * limit too. Why: AUTH-18 (commit 0eb5a4e): after 5 wrong codes (AUTH-17) nothing could issue a new code, so anyone
+     * who knew an email could block its verification. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches: database (users read, verification_codes, audit_log), memory (the limiter), the EmailSender.
+     */
+    public static Map<String, Object> resendVerification(String email) {
+        String key = email == null ? "" : email;
+        if (!takeResend(key)) {
+            logWhy("resend_verification", List.of("rate_limit_email_1h:failed"));
+            return error("too_many_requests", "Too many verification emails requested");
+        }
+        try {
+            Long userId = getUserIdByEmail(key);
+            if (userId == null || isEmailVerified(userId)) {
+                // Unknown or already verified: the same answer as a real resend, and no email (no account enumeration).
+                logWhy("resend_verification", List.of("rate_limit_email_1h", "user_unverified:failed"));
+                return success(Map.of("status", "sent"));
+            }
+            String code = String.format("%06d", random.nextInt(1_000_000));
+            Instant now = now();
+            try (PreparedStatement del = conn.prepareStatement(
+                    "DELETE FROM verification_codes WHERE user_id = ? AND type = 'email'");
+                 PreparedStatement ins = conn.prepareStatement(
+                    "INSERT INTO verification_codes (user_id, code_hash, created_at, expires_at, type, attempts) VALUES (?, ?, ?, ?, 'email', 0)")) {
+                del.setLong(1, userId);
+                del.executeUpdate();
+                ins.setLong(1, userId);
+                ins.setString(2, secretHash(code));
+                ins.setTimestamp(3, java.sql.Timestamp.from(now));
+                ins.setTimestamp(4, java.sql.Timestamp.from(now.plus(RESEND_CODE_TTL)));
+                ins.executeUpdate();
+            }
+            sendEmail(key, code);
+            logWhy("resend_verification", List.of("rate_limit_email_1h", "user_unverified"));
+            auditLog(userId, "verification_resent", "users", String.valueOf(userId), null, null);
+            return success(Map.of("status", "sent"));
+        } catch (Exception e) {
+            return error("internal_error", "internal error");
         }
     }
 
@@ -866,6 +946,30 @@ public class AuthSystem {
         byte[] bytes = new byte[16];
         random.nextBytes(bytes);
         return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+    }
+
+    /** Wrong verification codes that invalidate the user's current code (Phase B.3, 2026-11-10). */
+    static final int MAX_VERIFY_ATTEMPTS = 5;
+
+    /**
+     * Counts one wrong verification code against the user's current email code(s), in one UPDATE, and deletes a code
+     * once it has MAX_VERIFY_ATTEMPTS wrong tries, so it can never verify (a 6-digit code must not be guessable by
+     * retrying); a new code starts again at 0. In: the user id. Out: none.
+     * Why: auth spec verify_email "Attempts", Phase B.3 ruling (d4f4ed7). Added 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (verification_codes).
+     */
+    private static void recordWrongVerificationCode(long userId) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "UPDATE verification_codes SET attempts = attempts + 1 WHERE user_id = ? AND type = 'email'")) {
+            ps.setLong(1, userId);
+            ps.executeUpdate();
+        }
+        try (PreparedStatement ps = conn.prepareStatement(
+                "DELETE FROM verification_codes WHERE user_id = ? AND type = 'email' AND attempts >= ?")) {
+            ps.setLong(1, userId);
+            ps.setInt(2, MAX_VERIFY_ATTEMPTS);
+            ps.executeUpdate();
+        }
     }
 
     /**

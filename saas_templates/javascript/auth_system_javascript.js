@@ -65,8 +65,13 @@ const dbPromise = open({
 
 const rateLimits = {
   signup: new Map(), // ip -> [{ts}]
-  loginFail: new Map() // key(ip+user) -> [{ts}]
+  loginFail: new Map(), // key(ip+user) -> [{ts}]
+  resend: new Map() // email -> [ts] of accepted resend_verification requests (AUTH-18, 2026-11-10)
 };
+
+/** resend_verification: requests accepted per email per hour, and the resent code's life (AUTH-18, flow 2b). */
+const MAX_RESENDS_PER_HOUR = 3;
+const RESEND_CODE_TTL_MS = 10 * 60 * 1000;
 
 /** E-mails "sent" by the default in-memory mailer, newest last ({ to, subject, text }). Tests read codes here. */
 const sentEmails = [];
@@ -95,6 +100,8 @@ function configure(options = {}) {
  * TOTP challenge, which sends no code), oauth_states keeps state_hash only (auth spec "Secrets at rest", Phase B.2).
  * In: nothing. Out: a promise. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16: the plain refresh_token
  * and code columns are gone; oauth_states and oauth_links are new). Touches: the database.
+ * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.3: verification_codes.attempts counts the tries made against
+ * a code (auth flow 2 "Attempts": 5 wrong codes invalidate it).
  */
 async function initDB() {
   const db = await dbPromise;
@@ -135,6 +142,7 @@ async function initDB() {
       created_at TEXT NOT NULL,
       expires_at TEXT NOT NULL,
       type TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
       FOREIGN KEY(user_id) REFERENCES users(id)
     );
     CREATE TABLE IF NOT EXISTS oauth_states (
@@ -211,6 +219,12 @@ async function hashPassword(pw) {
 async function verifyPassword(pw, hash) {
   return bcrypt.compare(pw, hash);
 }
+
+/**
+ * Wrong tries one e-mail verification code takes before it is spent (auth flow 2 "Attempts").
+ * Phase B.3, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+ */
+const MAX_EMAIL_CODE_ATTEMPTS = 5;
 
 function generateCode() {
   return crypto.randomBytes(3).toString('hex'); // 6 chars
@@ -362,18 +376,37 @@ async function signup(email, password, name, ip) {
  * Gates: code_valid (its HMAC-SHA256 matches a stored code_hash, compared in constant time; 400 invalid_code; past
  * expires_at 400 code_expired), user_unverified (409 already_verified). The used code is deleted.
  * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2: code_hash, statuses, the injectable clock).
+ * Phase B.3 (same day, same session): each try is counted on the user's codes before the compare (a conditional
+ * UPDATE ... WHERE attempts < 5); after 5 wrong codes the current code is spent and every further try, even with the
+ * right code, is 400 code_invalid until a new code is sent. Before, a 6-digit code could be guessed by retrying.
  * Touches: users, verification_codes, audit_log.
  * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
+ * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.4 (af92d76, AUTH-17): a wrong code (and an unknown e-mail,
+ * which must not read differently) is 400 {error: "code_invalid"}; it was 400 invalid_code. An expired right code
+ * stays 400 code_expired. In: email, code. Out: as above. Touches: users, verification_codes, audit_log.
  */
 async function verify_email(email, code) {
   const db = await dbPromise;
   const user = await db.get(`SELECT * FROM users WHERE email = ?`, email);
-  if (!user) return fail(400, 'invalid_code', 'Invalid code');
+  if (!user) return fail(400, 'code_invalid', 'Invalid code'); // Phase B.4 (af92d76): was invalid_code
   if (user.email_verified_at) return fail(409, 'already_verified', 'Already verified');
   const presented = hashSecret(code == null ? '' : code);
   const rows = await db.all(`SELECT * FROM verification_codes WHERE user_id = ? AND type = 'email'`, user.id);
-  const record = rows.find(r => safeEqualHex(presented, r.code_hash));
-  if (!record) return fail(400, 'invalid_code', 'Invalid code');
+  // Phase B.3 (auth flow 2 "Attempts"): COUNT THE TRY FIRST, one conditional write per code that still has tries
+  // left; only the codes whose write succeeded are compared. Once the user's codes have taken 5 wrong tries, every
+  // further try, the right code included, is 400 code_invalid until a new code is sent (a new row starts at 0).
+  const counted = [];
+  for (const row of rows) {
+    const res = await db.run(
+      `UPDATE verification_codes SET attempts = attempts + 1 WHERE id = ? AND attempts < ?`, row.id, MAX_EMAIL_CODE_ATTEMPTS);
+    if (res.changes === 1) counted.push(row);
+  }
+  if (rows.length > 0 && counted.length === 0) return fail(400, 'code_invalid', 'Too many wrong codes; ask for a new code');
+  let record = null;
+  for (const r of counted) {
+    if (safeEqualHex(presented, r.code_hash)) record = r; // every code is compared: the time says nothing about which
+  }
+  if (!record) return fail(400, 'code_invalid', 'Invalid code'); // Phase B.4 (af92d76, AUTH-17): was invalid_code
   if (Date.parse(record.expires_at) < nowMs()) {
     return fail(400, 'code_expired', 'Code expired');
   }
@@ -382,6 +415,64 @@ async function verify_email(email, code) {
   logWhyChain('verify_email', ['code_valid', 'user_unverified']);
   await logAudit({ actor_id: user.id, action: 'email_verified', resource_type: 'user', resource_id: user.id, old_value: null, new_value: null });
   return { success: true, status: 'verified', user_id: user.id, message: 'ready to login' };
+}
+
+/**
+ * Counts one resend_verification request for the email and says whether it is refused: true when 3 were already
+ * accepted in the last hour (the request is then not counted). The check and the count run with no await between
+ * them, so concurrent requests cannot pass the limit. In: the email. Out: boolean. Why: AUTH-18 (3 resends per email
+ * per hour). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: rateLimits.resend (memory).
+ */
+function isRateLimitedResend(email) {
+  const nowTs = nowMs();
+  const recent = (rateLimits.resend.get(email) || []).filter(ts => nowTs - ts < 60 * 60 * 1000);
+  if (recent.length >= MAX_RESENDS_PER_HOUR) {
+    rateLimits.resend.set(email, recent);
+    return true;
+  }
+  recent.push(nowTs);
+  rateLimits.resend.set(email, recent);
+  return false;
+}
+
+/**
+ * resend_verification(email) -> { success, status: 'sent' } (the spec's 202) | 429 { error: 'too_many_requests' }.
+ * For an unverified user it deletes the user's e-mail codes, stores a new 6-digit code (attempts 0, its HMAC-SHA256
+ * under AUTH_SECRET_KEY, 10-minute expiry) and e-mails it through the mailer. At most 3 requests per email per hour
+ * are accepted; the 4th within the hour is 429 and sends nothing. An unknown or already verified email gets the same
+ * { success, status: 'sent' } and nothing is sent, so the answer never says whether an account exists; those
+ * requests count toward the limit too. Why: AUTH-18 (auth spec flow 2b, commit 0eb5a4e): after 5 wrong codes
+ * (AUTH-17) nothing could issue a new code, so anyone who knew an email could block its verification.
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: users (read), verification_codes, audit_log, the mailer.
+ */
+async function resend_verification(email) {
+  const key = typeof email === 'string' ? email : '';
+  if (isRateLimitedResend(key)) {
+    logWhyChain('resend_verification', ['rate_limit_email_1h:failed']);
+    return fail(429, 'too_many_requests', 'Too many verification e-mails requested');
+  }
+  const sent = { success: true, status: 'sent' };
+  const db = await dbPromise;
+  const user = await db.get(`SELECT id, email_verified_at FROM users WHERE email = ?`, key);
+  if (!user || user.email_verified_at) {
+    // Unknown or already verified: the same answer as a real resend, and no e-mail (no account enumeration).
+    logWhyChain('resend_verification', ['rate_limit_email_1h', 'user_unverified:failed']);
+    return sent;
+  }
+  const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+  await db.run(`DELETE FROM verification_codes WHERE user_id = ? AND type = 'email'`, user.id);
+  await db.run(`
+    INSERT INTO verification_codes (id, user_id, code_hash, created_at, expires_at, type, attempts)
+    VALUES (?,?,?,?,?,?,0)`,
+    uuidv4(), user.id, hashSecret(code), now(), new Date(nowMs() + RESEND_CODE_TTL_MS).toISOString(), 'email');
+  await settings.mailer.send({
+    to: key,
+    subject: 'Verify your e-mail address',
+    text: `Your verification code is ${code}. It expires in 10 minutes.`,
+  });
+  logWhyChain('resend_verification', ['rate_limit_email_1h', 'user_unverified']);
+  await logAudit({ actor_id: user.id, action: 'verification_resent', resource_type: 'user', resource_id: user.id, old_value: null, new_value: null });
+  return sent;
 }
 
 /**
@@ -606,9 +697,14 @@ async function verify_access_token(token) {
   return { success: true, status: 'ok', user: { id: user.id, email: user.email, tier: user.tier } };
 }
 
+/**
+ * Forgets every rate-limit window (tests call it between cases). Changed 2026-11-10,
+ * session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-18: also the resend_verification window). Touches: memory.
+ */
 function resetRateLimits() {
   rateLimits.signup.clear();
   rateLimits.loginFail.clear();
+  rateLimits.resend.clear();
 }
 
 module.exports = {
@@ -616,6 +712,7 @@ module.exports = {
   configure,
   signup,
   verify_email,
+  resend_verification,
   login,
   oauth_start,
   oauth_callback,

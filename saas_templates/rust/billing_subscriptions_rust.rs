@@ -54,7 +54,9 @@ impl BillingError {
             BillingError::RefundExceedsInvoice => ("refund_exceeds_invoice", 400),
             BillingError::InvalidAmount => ("invalid_amount", 400),
             BillingError::InvoiceNotPaid => ("invoice_not_paid", 400),
-            BillingError::InvalidSignature => ("invalid_signature", 403),
+            // 400, Stripe's documented answer (spec Phase B.3 ruling, BILL-09; it was 403). 2026-11-10,
+            // session_012zDydZCZ4AChqhEZ4oVtaP.
+            BillingError::InvalidSignature => ("invalid_signature", 400),
             BillingError::InvalidEvent(_) => ("invalid_event", 400),
             BillingError::NotFound(_) => ("not_found", 404),
             BillingError::Provider(_) => ("payment_provider_error", 502),
@@ -502,7 +504,8 @@ impl BillingService {
     /// (lookup key, else configured price id, else the stored tier) and the status is always saved; an
     /// unknown subscription with an unknown price is acknowledged and audited but not recorded (changed
     /// for the CodeRabbit review on PR 19, 2026-11-10). Out: `{received: true}` or `InvalidSignature`
-    /// (403) / `InvalidEvent`. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database, clock.
+    /// (400 invalid_signature, BILL-09; the comment said 403 until the PR 22 review, 2026-11-10) / `InvalidEvent`.
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database, clock.
     pub async fn handle_stripe_webhook(&self, request: WebhookRequest) -> Result<Value, BillingError> {
         self.verify_signature(&request.payload, &request.signature)?;
         let event: Value = serde_json::from_str(&request.payload).map_err(|_| BillingError::InvalidEvent("body is not JSON".into()))?;

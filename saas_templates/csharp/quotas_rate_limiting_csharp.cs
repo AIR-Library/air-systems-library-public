@@ -115,6 +115,12 @@ CREATE TABLE IF NOT EXISTS api_calls (
         /// Why: before 2026-11-10 the counter was re-Set without an expiry after the first request, so it never reset
         /// and an IP was blocked for good after its 10th request ever. The window is now part of the key and expires
         /// at the window's end. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory cache.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (found while running the full C# suite for the Phase B.4
+        /// rulings): the entry's expiry was an absolute time taken from the injected clock, but MemoryCache judges
+        /// expiry by the real clock, so with a clock behind real time (the tests' fixed 2026-11-10 12:00 UTC, once the
+        /// wall clock passed 12:02) every counter expired as it was written and no limit ever fired. The expiry is now
+        /// relative (two window lengths from now, cleanup only); which window counts is still decided by the key, from
+        /// the injected clock. Behaviour with the real clock is unchanged.
         /// </summary>
         private bool TryCountInWindow(string name, DateTime windowStart, TimeSpan window, int limit)
         {
@@ -122,7 +128,7 @@ CREATE TABLE IF NOT EXISTS api_calls (
             var count = _cache.TryGetValue(key, out int existing) ? existing : 0;
             if (count >= limit)
                 return false;
-            _cache.Set(key, count + 1, new DateTimeOffset(windowStart + window + window, TimeSpan.Zero));
+            _cache.Set(key, count + 1, new MemoryCacheEntryOptions { AbsoluteExpirationRelativeToNow = window + window });
             return true;
         }
 

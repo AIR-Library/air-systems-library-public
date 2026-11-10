@@ -189,6 +189,176 @@ namespace AuthSystemTests
             Assert.Equal("code_expired", ((dynamic)result).error);
         }
 
+        /// <summary>
+        /// Auth spec flow 2 "Attempts" (Phase B.3 ruling): 4 wrong codes leave the code usable; the 5th wrong code
+        /// invalidates it, so the right code is then code_invalid and the user stays unverified; a new code
+        /// (as signup sends) works. A second user with 4 wrong tries then the right one is verified. In: nothing.
+        /// Out: asserts. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory database.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4 ruling af92d76): tagged AUTH-17, the id the
+        /// ruling gave this rule (a wrong code is code_invalid; the right code after 5 wrong is code_invalid; after 4
+        /// wrong the right one verifies; a newly sent code works). Its assertions already matched and are unchanged.
+        /// </summary>
+        // AUTH-17
+        [Fact]
+        public async Task VerifyEmail_FiveWrongCodes_InvalidateTheCode()
+        {
+            using var db = CreateDb();
+            var user = new User { Email = "guess@example.com", PasswordHash = BCrypt.Net.BCrypt.HashPassword("password"), Status = "unverified" };
+            var other = new User { Email = "four@example.com", PasswordHash = BCrypt.Net.BCrypt.HashPassword("password"), Status = "unverified" };
+            db.Users.AddRange(user, other);
+            await db.SaveChangesAsync();
+            foreach (var u in new[] { user, other })
+                db.VerificationCodes.Add(new VerificationCode
+                {
+                    UserId = u.Id, CodeHash = Hash("123456"), Type = "email",
+                    CreatedAt = DateTime.UtcNow, ExpiresAt = DateTime.UtcNow.AddMinutes(15)
+                });
+            await db.SaveChangesAsync();
+
+            for (var i = 0; i < 4; i++)
+                Assert.Equal("code_invalid", ((dynamic)await CreateService().VerifyEmailAsync("four@example.com", "00000" + i)).error);
+            Assert.Equal("verified", ((dynamic)await CreateService().VerifyEmailAsync("four@example.com", "123456")).status);
+
+            for (var i = 0; i < 5; i++)
+                Assert.Equal("code_invalid", ((dynamic)await CreateService().VerifyEmailAsync("guess@example.com", "00000" + i)).error);
+            Assert.Equal("code_invalid", ((dynamic)await CreateService().VerifyEmailAsync("guess@example.com", "123456")).error);
+            Assert.Equal("code_invalid", ((dynamic)await CreateService().VerifyEmailAsync("guess@example.com", "123456")).error);
+            using (var check = CreateDb())
+            {
+                Assert.Null((await check.Users.FindAsync(user.Id)).EmailVerifiedAt);
+                Assert.Empty(check.VerificationCodes.Where(v => v.UserId == user.Id));
+            }
+
+            // a new code is sent: it works
+            using (var resend = CreateDb())
+            {
+                resend.VerificationCodes.Add(new VerificationCode
+                {
+                    UserId = user.Id, CodeHash = Hash("654321"), Type = "email",
+                    CreatedAt = DateTime.UtcNow, ExpiresAt = DateTime.UtcNow.AddMinutes(15)
+                });
+                await resend.SaveChangesAsync();
+            }
+            Assert.Equal("verified", ((dynamic)await CreateService().VerifyEmailAsync("guess@example.com", "654321")).status);
+        }
+
+        /// <summary>
+        /// resend_verification (auth spec flow 2b): a code spent by 5 wrong tries is replaced by a new 6-digit code (the
+        /// only email code row, Attempts 0, stored as its HMAC, valid 10 minutes), which is emailed and verifies; a 4th
+        /// resend for one email within the hour is too_many_requests and sends nothing; an unknown and an already
+        /// verified email get the same {status: "sent"} as a real resend and no email.
+        /// In: nothing. Out: asserts. Why: AUTH-18 (commit 0eb5a4e). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        /// Touches: the in-memory database and cache; the mocked email sender.
+        /// </summary>
+        // AUTH-18
+        [Fact]
+        public async Task ResendVerification_ReplacesSpentCode_LimitsToThreePerHour_HidesAccounts()
+        {
+            var sent = new List<(string Email, string Code)>();
+            _emailSenderMock.Setup(es => es.SendVerificationEmailAsync(It.IsAny<string>(), It.IsAny<string>()))
+                .Callback<string, string>((e, c) => sent.Add((e, c)))
+                .Returns(Task.CompletedTask);
+            await CreateService().SignupAsync("resend@example.com", "ThisIsAVeryLongPassword123!", "Resend User", "203.0.113.18");
+            var old = sent.Last().Code;
+            var wrong = old == "000000" ? "111111" : "000000";
+            for (var i = 0; i < 5; i++)
+                Assert.Equal("code_invalid", ((dynamic)await CreateService().VerifyEmailAsync("resend@example.com", wrong)).error);
+            Assert.Equal("code_invalid", ((dynamic)await CreateService().VerifyEmailAsync("resend@example.com", old)).error);
+
+            var before = sent.Count;
+            var started = DateTime.UtcNow;
+            Assert.Equal("sent", ((dynamic)await CreateService().ResendVerificationAsync("resend@example.com")).status);
+            Assert.Equal(before + 1, sent.Count);
+            var fresh = sent.Last();
+            Assert.Equal("resend@example.com", fresh.Email);
+            Assert.Matches("^[0-9]{6}$", fresh.Code);
+            using (var check = CreateDb())
+            {
+                var user = await check.Users.SingleAsync(u => u.Email == "resend@example.com");
+                var row = Assert.Single(check.VerificationCodes.Where(v => v.UserId == user.Id && v.Type == "email"));
+                Assert.Equal(Hash(fresh.Code), row.CodeHash);
+                Assert.Equal(0, row.Attempts);
+                Assert.InRange(row.ExpiresAt, started.AddMinutes(10), DateTime.UtcNow.AddMinutes(10));
+            }
+            Assert.Equal("verified", ((dynamic)await CreateService().VerifyEmailAsync("resend@example.com", fresh.Code)).status);
+
+            await CreateService().SignupAsync("limit@example.com", "ThisIsAVeryLongPassword123!", "Limit User", "203.0.113.19");
+            for (var i = 0; i < 3; i++)
+                Assert.Equal("sent", ((dynamic)await CreateService().ResendVerificationAsync("limit@example.com")).status);
+            before = sent.Count;
+            Assert.Equal("too_many_requests", ((dynamic)await CreateService().ResendVerificationAsync("limit@example.com")).error);
+            Assert.Equal(before, sent.Count);
+
+            var unknown = await CreateService().ResendVerificationAsync("nobody@example.com");
+            var verified = await CreateService().ResendVerificationAsync("resend@example.com");
+            Assert.Equal("sent", ((dynamic)unknown).status);
+            Assert.Equal(System.Text.Json.JsonSerializer.Serialize(unknown), System.Text.Json.JsonSerializer.Serialize(verified));
+            Assert.Equal(before, sent.Count);
+        }
+
+        /// <summary>
+        /// AUTH-17 under a race (review finding 4525101240): the count is taken from the database, not from memory.
+        /// Service A's context reads the code row (Attempts 0) and keeps that stale copy, as a request does that read
+        /// before others wrote. Four wrong tries then go through other contexts (Attempts 4 in the database). A's wrong
+        /// try must count as the 5th: before the fix A wrote its in-memory 0 + 1 = 1 and the code stayed guessable.
+        /// So the code is spent and deleted, and the right code is then code_invalid. Then 20 wrong tries run at once on
+        /// their own contexts and the right code is still code_invalid afterwards, and no row ever passes 5.
+        /// In: nothing. Out: asserts. Why: review finding 4525101240 (CWE-307). 2026-11-10,
+        /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory database.
+        /// </summary>
+        // AUTH-17
+        [Fact]
+        public async Task VerifyEmail_AttemptsCountedInDatabase_EvenWhenTriesRace()
+        {
+            using (var db = CreateDb())
+            {
+                foreach (var email in new[] { "race@example.com", "burst@example.com" })
+                    db.Users.Add(new User { Email = email, PasswordHash = BCrypt.Net.BCrypt.HashPassword("password"), Status = "unverified" });
+                await db.SaveChangesAsync();
+                foreach (var u in db.Users.ToList())
+                    db.VerificationCodes.Add(new VerificationCode
+                    {
+                        UserId = u.Id, CodeHash = Hash("123456"), Type = "email",
+                        CreatedAt = DateTime.UtcNow, ExpiresAt = DateTime.UtcNow.AddMinutes(15)
+                    });
+                await db.SaveChangesAsync();
+            }
+
+            // A reads first and keeps a stale copy (Attempts 0) in its context.
+            var staleDb = CreateDb();
+            var raceId = (await staleDb.Users.SingleAsync(u => u.Email == "race@example.com")).Id;
+            Assert.Equal(0, (await staleDb.VerificationCodes.SingleAsync(v => v.UserId == raceId)).Attempts);
+            var serviceA = new AuthService(staleDb, _emailSenderMock.Object, _oauthProviderMock.Object, _cache, _jwtSecret, TestSecretKey);
+
+            for (var i = 0; i < 4; i++)
+                Assert.Equal("code_invalid", ((dynamic)await CreateService().VerifyEmailAsync("race@example.com", "00000" + i)).error);
+            using (var check = CreateDb())
+                Assert.Equal(4, (await check.VerificationCodes.SingleAsync(v => v.UserId == raceId)).Attempts);
+
+            Assert.Equal("code_invalid", ((dynamic)await serviceA.VerifyEmailAsync("race@example.com", "000009")).error);
+            using (var check = CreateDb())
+                Assert.Empty(check.VerificationCodes.Where(v => v.UserId == raceId));
+            Assert.Equal("code_invalid", ((dynamic)await CreateService().VerifyEmailAsync("race@example.com", "123456")).error);
+            using (var check = CreateDb())
+                Assert.Null((await check.Users.FindAsync(raceId)).EmailVerifiedAt);
+
+            // 20 wrong tries at once, each on its own context: at least 5 are counted, so the code is spent.
+            var burst = Enumerable.Range(0, 20).Select(i => Task.Run(async () =>
+                (string)((dynamic)await CreateService().VerifyEmailAsync("burst@example.com", (100000 + i).ToString())).error));
+            Assert.All(await Task.WhenAll(burst), e => Assert.Equal("code_invalid", e));
+            using (var check = CreateDb())
+            {
+                var burstId = (await check.Users.SingleAsync(u => u.Email == "burst@example.com")).Id;
+                Assert.All(check.VerificationCodes.Where(v => v.UserId == burstId).ToList(), v => Assert.True(v.Attempts <= MaxAttempts));
+            }
+            Assert.Equal("code_invalid", ((dynamic)await CreateService().VerifyEmailAsync("burst@example.com", "123456")).error);
+            staleDb.Dispose();
+        }
+
+        /// <summary>The cap the service counts tries against (AuthService.MaxEmailCodeAttempts). 2026-11-10,
+        /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.</summary>
+        private const int MaxAttempts = AuthService.MaxEmailCodeAttempts;
+
         // AUTH-07
         [Fact]
         public async Task Login_NoMFA_ReturnsToken()

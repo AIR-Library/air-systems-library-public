@@ -101,23 +101,27 @@ public class AdminSystemApplication {
     }
 
     /**
-     * CSRF check on every state-changing /admin request, first in the chain (spec: "Every POST: verify_csrf()
-     * first"). Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: token from configuration,
-     * constant-time comparison. Touches: nothing (reads the request).
+     * CSRF check on every state-changing /admin request (spec: "Every POST: verify_csrf()"). Repaired 2026-11-10,
+     * session session_012zDydZCZ4AChqhEZ4oVtaP: token from configuration, constant-time comparison.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3, ADMIN-19 "the CSRF check included"): it now
+     * runs second, after AuthFilter, so a suspended caller is refused with 403 account_suspended before the CSRF
+     * check. In: the configured token. Out: the filter registration. Touches: nothing (reads the request).
      */
     @Bean
     FilterRegistrationBean<CsrfFilter> csrfFilter(@Value("${admin.csrf.token:}") String token) {
         FilterRegistrationBean<CsrfFilter> registration = new FilterRegistrationBean<>();
         registration.setFilter(new CsrfFilter(token));
         registration.addUrlPatterns("/admin/*");
-        registration.setOrder(1);
+        registration.setOrder(2);
         return registration;
     }
 
     /**
      * Authentication: resolves the signed-in user from the trusted header, if one is configured.
      * Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (replaces MockAuthFilter, which trusted any
-     * client-sent X-User-Id). Touches: reads the database.
+     * client-sent X-User-Id). Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3, ADMIN-19): first in
+     * the chain, so a suspended caller is refused before any gate, the CSRF check included. In: the user repository
+     * and the trusted header name. Out: the filter registration. Touches: reads the database.
      */
     @Bean
     FilterRegistrationBean<AuthFilter> authFilter(UserRepository users,
@@ -125,7 +129,7 @@ public class AdminSystemApplication {
         FilterRegistrationBean<AuthFilter> registration = new FilterRegistrationBean<>();
         registration.setFilter(new AuthFilter(users, header));
         registration.addUrlPatterns("/admin/*");
-        registration.setOrder(2);
+        registration.setOrder(1);
         return registration;
     }
 
@@ -505,7 +509,7 @@ class SchemaInitializer {
             "CREATE TABLE IF NOT EXISTS deployments (id BIGINT PRIMARY KEY AUTO_INCREMENT, customer_id BIGINT NOT NULL, domain VARCHAR(255) NOT NULL UNIQUE, tier VARCHAR(50) NOT NULL, status VARCHAR(20) NOT NULL DEFAULT 'draft', theme_id BIGINT, domain_verified BOOLEAN NOT NULL DEFAULT FALSE, config VARCHAR(2000), published_at TIMESTAMP, archived_at TIMESTAMP, suspend_reason VARCHAR(255))",
             "CREATE TABLE IF NOT EXISTS refunds (id BIGINT PRIMARY KEY AUTO_INCREMENT, invoice_id BIGINT NOT NULL, amount DECIMAL(12,2) NOT NULL, reason VARCHAR(255) NOT NULL, status VARCHAR(20) NOT NULL, created_by BIGINT NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)",
             "CREATE TABLE IF NOT EXISTS audit_log (id BIGINT PRIMARY KEY AUTO_INCREMENT, action VARCHAR(100) NOT NULL, actor_id BIGINT NOT NULL, resource_type VARCHAR(50), resource_id BIGINT, old_value VARCHAR(2000), new_value VARCHAR(2000), reason VARCHAR(500), created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)",
-            "CREATE TABLE IF NOT EXISTS governance_actions (id BIGINT PRIMARY KEY AUTO_INCREMENT, action_type VARCHAR(100) NOT NULL, actor_id BIGINT NOT NULL, target_resource_id BIGINT, reason VARCHAR(255), submitted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, status VARCHAR(20) NOT NULL DEFAULT 'pending', approved_by BIGINT, approved_at TIMESTAMP, rejection_reason VARCHAR(255), execution_result VARCHAR(500))"
+            "CREATE TABLE IF NOT EXISTS governance_actions (id BIGINT PRIMARY KEY AUTO_INCREMENT, action_type VARCHAR(100) NOT NULL, actor_id BIGINT NOT NULL, target_resource_id BIGINT, reason VARCHAR(255), submitted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, status VARCHAR(20) NOT NULL DEFAULT 'pending', approved_by BIGINT, approved_at TIMESTAMP, rejection_reason VARCHAR(255), execution_result VARCHAR(500), new_tier VARCHAR(20))"
         };
         for (String sql : statements) {
             jdbc.execute(sql);
@@ -705,6 +709,7 @@ class GovernanceAction {
     private Instant approvedAt;
     private String rejectionReason;
     private String executionResult;
+    private String newTier;
 
     public Long getId() { return id; }
     void setId(Long id) { this.id = id; }
@@ -728,6 +733,13 @@ class GovernanceAction {
     public void setRejectionReason(String r) { this.rejectionReason = r; }
     public String getExecutionResult() { return executionResult; }
     public void setExecutionResult(String r) { this.executionResult = r; }
+    /**
+     * The role a change_role action sets (null for other action types). Added 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3, ADMIN-07: a governance-approved change_role). Touches: nothing.
+     */
+    public String getNewTier() { return newTier; }
+    /** Sets the role a change_role action sets. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing. */
+    public void setNewTier(String t) { this.newTier = t; }
 }
 
 /* ---------- REPOSITORIES (JdbcTemplate, parameterized SQL only) ---------- */
@@ -1047,6 +1059,7 @@ class GovernanceActionRepository extends JdbcRepository {
         g.setApprovedAt(instant(rs, "approved_at"));
         g.setRejectionReason(rs.getString("rejection_reason"));
         g.setExecutionResult(rs.getString("execution_result"));
+        g.setNewTier(rs.getString("new_tier"));
         return g;
     };
     private final Clock clock;
@@ -1059,9 +1072,10 @@ class GovernanceActionRepository extends JdbcRepository {
     GovernanceAction save(GovernanceAction g) {
         if (g.getId() == null) {
             if (g.getSubmittedAt() == null) g.setSubmittedAt(clock.instant());
-            g.setId(insert("INSERT INTO governance_actions (action_type, actor_id, target_resource_id, reason, submitted_at, status, approved_by, approved_at, rejection_reason, execution_result) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            g.setId(insert("INSERT INTO governance_actions (action_type, actor_id, target_resource_id, reason, submitted_at, status, approved_by, approved_at, rejection_reason, execution_result, new_tier) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     g.getActionType(), g.getActorId(), g.getTargetResourceId(), g.getReason(), ts(g.getSubmittedAt()),
-                    g.getStatus(), g.getApprovedBy(), ts(g.getApprovedAt()), g.getRejectionReason(), g.getExecutionResult()));
+                    g.getStatus(), g.getApprovedBy(), ts(g.getApprovedAt()), g.getRejectionReason(), g.getExecutionResult(),
+                    g.getNewTier()));
         } else {
             jdbc.update("UPDATE governance_actions SET status = ?, approved_by = ?, approved_at = ?, rejection_reason = ?, execution_result = ? WHERE id = ?",
                     g.getStatus(), g.getApprovedBy(), ts(g.getApprovedAt()), g.getRejectionReason(), g.getExecutionResult(), g.getId());
@@ -1222,11 +1236,20 @@ class UserService {
     }
 
     /**
-     * Changes a user's role; returns the old role. The last active owner cannot be demoted, and that rule is
-     * checked before "not your own role", because an owner can only demote the last owner by demoting
-     * themselves (with the other order the last-owner rule could never fire).
+     * Changes a user's role; returns the old role. The last active owner cannot be demoted.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4 ruling af92d76, change_role "Order"): the gate
+     * (owner_only, checked by the caller, and user_id != current_user_id) now runs before the checks, so an owner
+     * changing their own role always gets 400 cannot_change_own_role, even as the last owner. It ran the last-owner
+     * check first (answering cannot_demote_last_owner) and the tier check before both; the last-owner refusal is now
+     * reached through a governance change_role (ADMIN-07).
+     * In: the verified owner, the target id, the new tier. Out: the old tier, or ResponseStatusException 400
+     * cannot_change_own_role | invalid_tier | cannot_demote_last_owner, 404 user_not_found.
+     * Touches: the database (users, audit_logs).
      */
     String changeRole(User actor, Long userId, String newTier) {
+        if (userId != null && userId.equals(actor.getId())) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "cannot_change_own_role");
+        }
         if (newTier == null || !VALID_TIERS.contains(newTier)) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "invalid_tier");
         }
@@ -1235,9 +1258,6 @@ class UserService {
                     .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "user_not_found"));
             if (isLastActiveOwner(target) && !Tiers.OWNER.equals(newTier)) {
                 throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "cannot_demote_last_owner");
-            }
-            if (target.getId().equals(actor.getId())) {
-                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "cannot_change_own_role");
             }
             String oldTier = target.getTier();
             target.setTier(newTier);
@@ -1539,7 +1559,8 @@ class DeploymentService {
 
 /**
  * Governance: pending list, approve (executes the original action) and reject (reason required), audit search.
- * Supported action types: suspend_user, delete_user (soft delete: status 'deleted'), retire_deployment. The
+ * Supported action types: change_role (new_tier), suspend_user, delete_user (soft delete: status 'deleted'),
+ * retire_deployment (change_role added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, Phase B.3 ADMIN-07). The
  * submitter cannot approve their own action, and the last active owner cannot be suspended or deleted.
  * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: approve executed nothing, reject did not require
  * a reason, the audit search was a placeholder. Touches: the database.
@@ -1595,7 +1616,7 @@ class GovernanceService {
             if (actor.getId().equals(ga.getActorId())) {
                 throw new ResponseStatusException(HttpStatus.FORBIDDEN, "cannot_approve_own_action");
             }
-            String result = execute(ga);
+            String result = execute(actor, ga);
             ga.setStatus("approved");
             ga.setApprovedBy(actor.getId());
             ga.setApprovedAt(clock.instant());
@@ -1606,10 +1627,39 @@ class GovernanceService {
         });
     }
 
-    /** Runs the approved action inside the decision's transaction; returns a short result. */
-    private String execute(GovernanceAction ga) {
+    /**
+     * Runs the approved action inside the decision's transaction; returns a short result. Any refusal it throws
+     * rolls the whole decision back, so the action stays pending.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3, ADMIN-07): supports change_role (target user,
+     * new_tier): 400 invalid_tier for anything but a staff role, 400 cannot_demote_last_owner when it would demote the
+     * last active owner, otherwise the role changes and role_changed is audited. In: the approver and the action.
+     * Out: the execution result. Touches: the database.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (review finding 4525101248; spec LAST OWNER, approver rule):
+     * a change_role whose target is the approver ({@code actor}) is refused with 400 cannot_change_own_role, checked
+     * AFTER the last-owner check, so the decision rolls back and the action stays pending, as in PHP and JavaScript.
+     */
+    private String execute(User actor, GovernanceAction ga) {
         Long target = ga.getTargetResourceId();
         switch (ga.getActionType() == null ? "" : ga.getActionType()) {
+            case "change_role": {
+                String newTier = ga.getNewTier();
+                if (newTier == null || !UserService.VALID_TIERS.contains(newTier)) {
+                    throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "invalid_tier");
+                }
+                User u = userRepo.findById(target)
+                        .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "user_not_found"));
+                if (userService.isLastActiveOwner(u) && !Tiers.OWNER.equals(newTier)) {
+                    throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "cannot_demote_last_owner");
+                }
+                if (u.getId().equals(actor.getId())) {
+                    throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "cannot_change_own_role");
+                }
+                String oldTier = u.getTier();
+                u.setTier(newTier);
+                userRepo.save(u);
+                audit.log("role_changed", actor.getId(), "user", u.getId(), oldTier, newTier, null);
+                return "user " + u.getId() + " " + oldTier + " -> " + newTier;
+            }
             case "suspend_user":
             case "delete_user": {
                 User u = userRepo.findById(target)
@@ -1867,7 +1917,13 @@ class AdminGovernanceController {
         this.govService = govService;
     }
 
-    /** Admin-or-owner list of pending governance actions, oldest first. Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: reads the database. */
+    /**
+     * Admin-or-owner list of pending governance actions, oldest first. Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: reads the database.
+     * In: page (from 0) and size (1 to 100, default 20). Out: 200 [{action_id, action_type, actor, target_resource_id,
+     * reason, submitted_at, status, new_tier}]; new_tier is the tier a change_role will set (null for other types).
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (review on PR 22, Java admin_system): each entry now carries
+     * new_tier, so an approver can see what a change_role will set before approving it (it was left out).
+     */
     @GetMapping("/actions")
     public ResponseEntity<?> pending(@RequestParam(name = "page", defaultValue = "0") int page,
                                      @RequestParam(name = "size", defaultValue = "20") int size) {
@@ -1877,7 +1933,8 @@ class AdminGovernanceController {
         for (GovernanceAction a : govService.pendingActions(Math.max(0, page) * limit, limit)) {
             data.add(Payloads.map("action_id", a.getId(), "action_type", a.getActionType(), "actor", a.getActorId(),
                     "target_resource_id", a.getTargetResourceId(), "reason", a.getReason(),
-                    "submitted_at", Payloads.iso(a.getSubmittedAt()), "status", a.getStatus()));
+                    "submitted_at", Payloads.iso(a.getSubmittedAt()), "status", a.getStatus(),
+                    "new_tier", a.getNewTier()));
         }
         return ResponseEntity.ok(data);
     }

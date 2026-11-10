@@ -145,7 +145,11 @@ const AUTH_ERRORS: Readonly<Record<string, [number, string]>> = {
   email_already_exists: [409, 'An account with this email already exists.'],
   password_rejected: [400, 'Choose a different password.'],
   too_many_signups_from_ip: [429, 'Too many signups from this address; try again later.'],
-  code_expired: [400, 'The code is wrong or has expired.'],
+  // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4, af92d76): a wrong code is now code_invalid, so the two
+  // messages were reworded to match (code_expired said "wrong or has expired").
+  code_expired: [400, 'The code has expired; ask for a new code.'],
+  code_invalid: [400, 'The code is wrong, or too many wrong codes were tried; ask for a new code.'],
+  token_expired: [401, 'The token has expired.'],
   already_verified: [409, 'This email is already verified.'],
   invalid_credentials: [401, 'Email or password is wrong.'],
   too_many_login_attempts: [429, 'Too many sign-in attempts; try again later.'],
@@ -156,6 +160,8 @@ const AUTH_ERRORS: Readonly<Record<string, [number, string]>> = {
   oauth_exchange_failed: [401, 'The provider did not accept the sign-in.'],
   email_not_verified: [403, 'The provider has not verified this email.'],
   oauth_not_configured: [503, 'Sign-in with this provider is not available.'],
+  // AUTH-18 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): a 4th resend_verification for one email within the hour.
+  too_many_requests: [429, 'Too many verification emails requested; try again later.'],
   internal_error: [500, 'Something went wrong.'],
 };
 
@@ -208,8 +214,18 @@ function sameHash(a: unknown, b: unknown): boolean {
   return timingSafeEqual(Buffer.from(a, 'hex'), Buffer.from(b, 'hex'));
 }
 
+/**
+ * Wrong verification codes one user's current code survives (AUTH spec flow 2, Phase B.3 ruling): after 5 wrong
+ * codes that code is spent and every further try, the right code included, is 400 code_invalid until a new code is
+ * sent. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+ */
+const MAX_EMAIL_CODE_ATTEMPTS = 5;
+
 /** How long an OAuth state is valid (AUTH spec: 10 minutes). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
 const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
+
+/** resend_verification: requests accepted per email per hour (AUTH-18, flow 2b). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+const MAX_RESENDS_PER_HOUR = 3;
 
 class AuthSystem {
   private db: Db;
@@ -222,6 +238,8 @@ class AuthSystem {
   private refreshTokenExpiry: string;
   private signupIpLimiter: Map<string, number[]>;
   private loginLimiter: Map<string, number[]>;
+  /** Accepted resend_verification requests per email, as times in ms (AUTH-18, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). */
+  private resendLimiter: Map<string, number[]>;
   private signupWindowMs: number;
   private maxSignupsPerIP: number;
   private loginWindowMs: number;
@@ -271,6 +289,7 @@ class AuthSystem {
     this.maxLoginAttempts = options.maxLoginAttempts ?? 5;
     this.signupIpLimiter = new Map();
     this.loginLimiter = new Map();
+    this.resendLimiter = new Map();
     this.oauthClient = options.oauthClient ?? null;
     this.now = options.now ?? (() => new Date());
   }
@@ -462,21 +481,48 @@ class AuthSystem {
   }
 
   /**
+   * Whether the given code is one of the user's expired email codes (HMAC compared in constant time with each).
+   * In: user id, the code as given. Out: true when an expired code matches. Why: Phase B.4 ruling (af92d76): an
+   * expired code is 400 code_expired and a wrong one 400 code_invalid, so verify_email must tell them apart.
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database (verification_codes, read only).
+   */
+  private async expiredCodeMatches(userId: unknown, code_or_token: string): Promise<boolean> {
+    const expired = await this.db.query(
+      'SELECT id, code_hash FROM verification_codes WHERE user_id = $1 AND type = \'email\' AND expires_at <= NOW()',
+      [userId]
+    );
+    const given = this.hashSecret(code_or_token);
+    let found = false;
+    for (const row of expired) {
+      if (sameHash(row.code_hash, given)) found = true; // every row is compared
+    }
+    return found;
+  }
+
+  /**
    * Verifies an email with the emailed code. In: email and code. Out: {status: 'verified', user_id, message} or
-   * {error, message, http_status}: 400 code_expired (unknown email, wrong or expired code: one answer), 409
+   * {error, message, http_status}: 400 code_invalid (unknown email or wrong code), 400 code_expired (expired code), 409
    * already_verified. The user's live email codes are read and each stored code_hash is compared with the HMAC-SHA256 of
    * the given code in constant time; the matching row is deleted.
    * Why: AUTH-05/06; changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, AUTH-16 and the spec's "Secrets
    * at rest" line): the code was stored and matched in plain text in SQL; errors now carry their HTTP status.
    * Touches: the database (users, verification_codes), the audit log.
    * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
+   * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.3 ruling (auth flow 2 "Attempts"): each try is COUNTED
+   * FIRST on every live code that still has tries left, with one conditional write per row (UPDATE ... SET attempts =
+   * attempts + 1 WHERE id = ? AND attempts < 5), and only the rows whose write succeeded are compared. After 5 wrong
+   * codes the user's current code is spent: every further try, the right code too, is 400 code_invalid until a new
+   * code is sent (a new code row starts at 0 attempts). Before, a 6-digit code could be guessed by retrying.
+   * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.4 ruling (af92d76, AUTH-17): a wrong code (and an unknown
+   * email, which must not read differently) is now 400 code_invalid; it was 400 code_expired. Only a code that matches
+   * one of the user's expired codes is 400 code_expired (expiredCodeMatches). Touches: the same tables.
    */
   async verify_email(email: string, code_or_token: string): Promise<any> {
     try {
       const user = await this.db.query('SELECT id, email_verified_at FROM users WHERE email = $1', [email]);
       if (user.length === 0) {
         await this.logWhyChain('verify_email', ['code_valid', 'user_unverified']);
-        return fail('code_expired'); // Or invalid, but spec test expects expired for wrong code
+        return fail('code_invalid'); // Phase B.4 (af92d76): was code_expired; same answer as a wrong code
       }
       if (user[0].email_verified_at !== null) {
         await this.logWhyChain('verify_email', ['code_valid', 'user_unverified']);
@@ -484,17 +530,36 @@ class AuthSystem {
       }
 
       const live = await this.db.query(
-        'SELECT id, code_hash FROM verification_codes WHERE user_id = $1 AND type = \'email\' AND expires_at > NOW()',
+        'SELECT id, code_hash, attempts FROM verification_codes WHERE user_id = $1 AND type = \'email\' AND expires_at > NOW()',
         [user[0].id]
       );
+      if (live.length === 0) {
+        await this.logWhyChain('verify_email', ['code_valid', 'user_unverified']);
+        // Phase B.4 (af92d76): code_expired only for an expired code that matches; anything else is code_invalid.
+        return fail(await this.expiredCodeMatches(user[0].id, code_or_token) ? 'code_expired' : 'code_invalid');
+      }
+      // Count the try first, one conditional write per live code; a code with 5 wrong tries takes no more.
+      const counted: any[] = [];
+      for (const row of live) {
+        const res = await this.db.execute(
+          'UPDATE verification_codes SET attempts = attempts + 1 WHERE id = $1 AND attempts < $2',
+          [row.id, MAX_EMAIL_CODE_ATTEMPTS]
+        );
+        if (res.affectedRows === 1) counted.push(row);
+      }
+      if (counted.length === 0) {
+        await this.logWhyChain('verify_email', ['code_valid', 'user_unverified']);
+        return fail('code_invalid');
+      }
       const given = this.hashSecret(code_or_token);
       let match: any = null;
-      for (const row of live) {
+      for (const row of counted) {
         if (sameHash(row.code_hash, given)) match = row; // every row is compared, so the time does not say which
       }
       if (match === null) {
         await this.logWhyChain('verify_email', ['code_valid', 'user_unverified']);
-        return fail('code_expired');
+        // Phase B.4 (af92d76, AUTH-17): a wrong code is code_invalid (it was code_expired).
+        return fail(await this.expiredCodeMatches(user[0].id, code_or_token) ? 'code_expired' : 'code_invalid');
       }
 
       await this.db.execute(
@@ -510,6 +575,63 @@ class AuthSystem {
       return { status: 'verified', user_id: user[0].id, message: 'ready to login' };
     } catch (err) {
       this.logger.error('Verify email error', { err });
+      return fail('internal_error');
+    }
+  }
+
+  /**
+   * Counts one resend_verification request for the email on the injected clock and says whether it is accepted:
+   * false when 3 were already accepted in the last hour (that request is not counted). The check and the count run
+   * with no await between them, so concurrent requests cannot pass the limit. In: the email. Out: boolean.
+   * Why: AUTH-18 (3 resends per email per hour). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
+   */
+  private takeResend(email: string): boolean {
+    const now = this.now().getTime();
+    const valid = (this.resendLimiter.get(email) ?? []).filter(t => t > now - 60 * 60 * 1000);
+    const accepted = valid.length < MAX_RESENDS_PER_HOUR;
+    if (accepted) valid.push(now);
+    this.resendLimiter.set(email, valid);
+    return accepted;
+  }
+
+  /**
+   * Replaces an unverified user's email code and emails the new one (auth spec flow 2b).
+   * In: the email. Out: {status: 'sent', http_status: 202}, or {error, message, http_status}: 429 too_many_requests,
+   * 500 internal_error. At most 3 requests per email per hour are accepted; the 4th within the hour is 429 and sends
+   * nothing. For an unverified user it deletes the user's email codes, stores a new 6-digit code (attempts 0, its
+   * HMAC-SHA256 under the secret key, 10-minute expiry) and sends it through the email sender. An unknown or already
+   * verified email gets the same {status: 'sent', http_status: 202} and nothing is sent, so the answer never says
+   * whether an account exists; those requests count toward the limit too.
+   * Why: AUTH-18 (commit 0eb5a4e): after 5 wrong codes (AUTH-17) nothing could issue a new code, so anyone who knew an
+   * email could block its verification. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * Touches: the database (users read, verification_codes), the email sender, the audit log, memory (the limiter).
+   */
+  async resend_verification(email: string): Promise<any> {
+    const key = typeof email === 'string' ? email : '';
+    if (!this.takeResend(key)) {
+      await this.logWhyChain('resend_verification', ['rate_limit_email_1h:failed']);
+      return fail('too_many_requests');
+    }
+    const sent = { status: 'sent', http_status: 202 };
+    try {
+      const user = await this.db.query('SELECT id, email_verified_at FROM users WHERE email = $1', [key]);
+      if (user.length === 0 || user[0].email_verified_at !== null) {
+        // Unknown or already verified: the same answer as a real resend, and no email (no account enumeration).
+        await this.logWhyChain('resend_verification', ['rate_limit_email_1h', 'user_unverified:failed']);
+        return sent;
+      }
+      const code = randomInt(0, 1000000).toString().padStart(6, '0');
+      await this.db.execute('DELETE FROM verification_codes WHERE user_id = $1 AND type = \'email\'', [user[0].id]);
+      await this.db.execute(
+        'INSERT INTO verification_codes (user_id, code_hash, type, attempts, expires_at) VALUES ($1, $2, $3, 0, NOW() + INTERVAL \'10 minutes\')',
+        [user[0].id, this.hashSecret(code), 'email']
+      );
+      await this.emailSender.sendVerificationEmail(key, code);
+      await this.logWhyChain('resend_verification', ['rate_limit_email_1h', 'user_unverified']);
+      await this.logAudit('verification_resent', user[0].id);
+      return sent;
+    } catch (err) {
+      this.logger.error('Resend verification error', { err });
       return fail('internal_error');
     }
   }
@@ -791,6 +913,53 @@ class AuthSystem {
       return { status: 'ok', token: newToken, expires_in: 900 };
     } catch (err) {
       this.logger.error('Token refresh error', { err });
+      return fail('internal_error');
+    }
+  }
+
+  /**
+   * Verifies an access token (spec flow 7): the step every authenticated request calls, which produces the verified
+   * user that permissions_rbac's require_authenticated(current_user) assumes. Read-only.
+   * Gates, in order: signature_valid (HS256 ONLY: the algorithm is passed explicitly to jwt.verify, the token's own
+   * header alg is never trusted and "none" is refused), not_expired (against the injected clock), and
+   * user_exists_and_active (status not 'suspended' or 'banned').
+   * In: the token (the `token` a session-creating flow or token_refresh returned). Out: {status: 'ok', user: {id,
+   * email, tier}} or {error, message, http_status}: 401 invalid_token (bad signature, another algorithm, malformed,
+   * no user id, unknown user), 401 token_expired, 403 user_banned.
+   * Why: auth spec flow 7, missing from the TypeScript build (Phase D wave 1, owner request 2026-11-10).
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database (one parameterized read of users).
+   */
+  async verify_access_token(token: string): Promise<any> {
+    const decisions = ['signature_valid', 'not_expired', 'user_active'];
+    try {
+      let claims: any;
+      try {
+        claims = jwt.verify(String(token ?? ''), this.jwtSecret, {
+          algorithms: ['HS256'],
+          clockTimestamp: Math.floor(this.now().getTime() / 1000),
+        });
+      } catch (err: any) {
+        await this.logWhyChain('verify_access_token', decisions);
+        return fail(err?.name === 'TokenExpiredError' ? 'token_expired' : 'invalid_token');
+      }
+      const userId = claims && typeof claims === 'object' ? claims.userId : undefined;
+      if (typeof userId !== 'number' || !Number.isSafeInteger(userId)) {
+        await this.logWhyChain('verify_access_token', decisions);
+        return fail('invalid_token');
+      }
+      const rows = await this.db.query('SELECT id, email, tier, status FROM users WHERE id = $1', [userId]);
+      if (rows.length === 0) {
+        await this.logWhyChain('verify_access_token', decisions);
+        return fail('invalid_token');
+      }
+      if (rows[0].status === 'suspended' || rows[0].status === 'banned') {
+        await this.logWhyChain('verify_access_token', decisions);
+        return fail('user_banned');
+      }
+      await this.logWhyChain('verify_access_token', decisions);
+      return { status: 'ok', user: { id: rows[0].id, email: rows[0].email, tier: rows[0].tier } };
+    } catch (err) {
+      this.logger.error('Verify access token error', { err });
       return fail('internal_error');
     }
   }

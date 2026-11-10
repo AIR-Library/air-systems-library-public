@@ -105,7 +105,8 @@ public class DataExportCompliance {
     }
 
     /** A refused or failed request. {@code code()} is one of: invalid_format, invalid_reason, not_found,
-     *  invalid_confirmation_token, deletion_not_pending, cannot_cancel, grace_period_expired, forbidden, email_failed,
+     *  invalid_confirmation_token, deletion_not_pending, cannot_cancel, grace_period_expired (a late confirm),
+     *  grace_period_over (a cancel once the deletion is due; Phase B.3, 2026-11-10), forbidden, email_failed,
      *  deletion_failed, storage_error; {@code httpStatus()} is the status the endpoint answers with.
      *  Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-15, Phase B.2): invalid_token became
      *  invalid_confirmation_token (400) and not_pending became deletion_not_pending (409), and each code carries its
@@ -116,7 +117,7 @@ public class DataExportCompliance {
         /**
          * The HTTP status for this refusal. In: none. Out: 400 (invalid_format, invalid_reason,
          * invalid_confirmation_token), 403 forbidden, 404 not_found, 409 (deletion_not_pending, cannot_cancel,
-         * grace_period_expired), else 500 (email_failed, deletion_failed, storage_error). Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP
+         * grace_period_expired, grace_period_over: added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, Phase B.3), else 500 (email_failed, deletion_failed, storage_error). Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP
          * (EXPORT-15: the spec names a status with each answer). Touches: nothing.
          */
         public int httpStatus() {
@@ -124,7 +125,7 @@ public class DataExportCompliance {
                 case "invalid_format", "invalid_reason", "invalid_confirmation_token" -> 400;
                 case "forbidden" -> 403;
                 case "not_found" -> 404;
-                case "deletion_not_pending", "cannot_cancel", "grace_period_expired" -> 409;
+                case "deletion_not_pending", "cannot_cancel", "grace_period_expired", "grace_period_over" -> 409;
                 default -> 500;
             };
         }
@@ -509,8 +510,18 @@ public class DataExportCompliance {
      * 409 deletion_not_pending (it was cannot_cancel); a completed one has user_id NULL and is 404 not_found (spec
      * clarification 3abb340); cannot_cancel (409) is left only for an erase already started.
      *
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3 ruling, d4f4ed7): a confirmed request whose
+     * will_delete_at has passed (the deletion is due but not yet run) is 409 grace_period_over (it was
+     * grace_period_expired).
+     *
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4 ruling af92d76, EXPORT-16): a confirmed request is
+     * 409 grace_period_over from will_delete_at on, exactly at it included (a cancel at that very instant used to win);
+     * a pending (unconfirmed) request can always be cancelled, even after will_delete_at. The conditional update repeats
+     * the rule, so a confirm that lands between the read and the write cannot be cancelled past its date.
+     * Touches: deletion_requests, the audit log.
+     *
      * @throws ComplianceException not_found, also when the requester may not see it; deletion_not_pending;
-     *                             grace_period_expired; cannot_cancel
+     *                             grace_period_over; cannot_cancel
      */
     public DeletionStatus cancelDeletion(UUID deletionId, UUID requesterId) {
         DeletionView deletion = findDeletion(deletionId).orElseThrow(() -> new ComplianceException("not_found"));
@@ -518,15 +529,24 @@ public class DataExportCompliance {
             throw new ComplianceException("not_found");
         }
         refuseIfClosed(deletion);
-        if (deletion.status() == DeletionStatus.APPROVED && clock.instant().isAfter(deletion.willDeleteAt())) {
-            throw new ComplianceException("grace_period_expired");
+        // Phase B.3 (d4f4ed7), 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: once will_delete_at is reached, cancelling a
+        // confirmed request is 409 grace_period_over. Phase B.4 (af92d76), same day: exactly at will_delete_at included
+        // (it was isAfter, so a cancel at that instant won), and only a confirmed request: a pending one is not scheduled.
+        Instant now = clock.instant();
+        if (deletion.status() == DeletionStatus.APPROVED && !now.isBefore(deletion.willDeleteAt())) {
+            throw new ComplianceException("grace_period_over");
         }
-        // Only an erase that has not started can be cancelled, so a cancellation and the eraser never both win.
-        int changed = update("UPDATE deletion_requests SET status = ? WHERE id = ? AND status IN (?, ?)"
-                        + " AND erase_started_at IS NULL",
+        // Only an erase that has not started can be cancelled, so a cancellation and the eraser never both win; a
+        // confirmed request only before will_delete_at (Phase B.4).
+        int changed = update("UPDATE deletion_requests SET status = ? WHERE id = ? AND erase_started_at IS NULL"
+                        + " AND (status = ? OR (status = ? AND will_delete_at > ?))",
                 DeletionStatus.CANCELLED.value(), deletionId,
-                DeletionStatus.PENDING.value(), DeletionStatus.APPROVED.value());
+                DeletionStatus.PENDING.value(), DeletionStatus.APPROVED.value(), now);
         if (changed == 0) {
+            DeletionView current = findDeletion(deletionId).orElseThrow(() -> new ComplianceException("not_found"));
+            if (current.status() == DeletionStatus.APPROVED && !now.isBefore(current.willDeleteAt())) {
+                throw new ComplianceException("grace_period_over");
+            }
             throw new ComplianceException("cannot_cancel");
         }
         services.audit().record("deletion_cancelled", deletion.userId(), Map.of("deletion_id", deletionId.toString()));

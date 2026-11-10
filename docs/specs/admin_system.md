@@ -35,7 +35,7 @@ name or in a comment on the line above it (for example `# ADMIN-01`), so a missi
 
 ```text
 EVERY ACTION: the caller is the verified session user. A caller whose account status is 'suspended' is refused
-  before any gate: 403 {error: "account_suspended"} (ADMIN-19). Amended 2026-11-10 (Phase B.2: one answer in every language).
+  before any gate, the CSRF check included: 403 {error: "account_suspended"} (ADMIN-19). Amended 2026-11-10 (Phase B.2: one answer in every language).
 
 TIERS: two different things share the word.
   - users.tier is the STAFF ROLE: 'owner' | 'admin' | 'user' (create, change_role, last-owner rules).
@@ -43,6 +43,13 @@ TIERS: two different things share the word.
     create_deployment, prices). A plan value given where a role is expected, or the reverse, is 400
     {error: "invalid_tier"}. deployments carry domain_verified (BOOLEAN, default false); publish needs it.
   Amended 2026-11-10 (Phase B.2).
+
+LAST OWNER (ADMIN-07): an owner cannot change their own role, and ADMIN-19 refuses a suspended owner, so a
+  direct change_role never reaches the last active owner; only a governance-approved change_role can. ADMIN-07
+  is proven there: approving a change_role that would demote the last active owner fails with 400
+  {error: "cannot_demote_last_owner"} and leaves the action pending. A governance change_role whose target is
+  the approver is refused with 400 {error: "cannot_change_own_role"}, checked after the last-owner check, and
+  the action stays pending. Amended 2026-11-10 (Phase B.3; approver rule added after review on PR 22).
 
 DOMAINS:
 
@@ -63,6 +70,8 @@ DOMAINS:
         Return: {success: true, status: "reset_email_sent"}
 
       action=change_role → require(user_id, new_tier)
+        Order: the gate (owner_only, user_id != current_user_id) runs before the checks, so an owner changing
+        their own role gets cannot_change_own_role even when they are the last owner. Amended 2026-11-10 (Phase B.4: one answer in every language).
         Gate: owner_only, user_id != current_user_id
         Check: new_tier in valid_tiers, user != last_active_owner
         Action: update users.tier, audit_log
@@ -156,7 +165,7 @@ DOMAINS:
       Return: [{timestamp, actor_id, action, resource_type, resource_id, old_value, new_value, reason}, ...]
 
 IMPLEMENTATION REQUIREMENTS:
-  - Every POST: verify_csrf() first
+  - Every POST: refuse a suspended caller (ADMIN-19), then verify_csrf()
   - Every mutation: require_owner() gate (except reads: require_admin_or_owner())
   - Every mutation: audit_log write before commit
   - Validation: email format, name length, role in allowed_roles

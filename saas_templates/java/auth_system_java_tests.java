@@ -175,6 +175,109 @@ public class AuthSystemTests {
         assertEquals("code_expired", res.get("error"));
     }
 
+    /**
+     * Phase B.3 ruling (d4f4ed7): 5 wrong verification codes invalidate the user's current code, so the right code is
+     * then code_invalid too; after only 4 wrong codes the right code still verifies. Added 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory H2 (verification_codes, users).
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4 ruling af92d76): tagged AUTH-17, the id the ruling
+     * gave this rule (it was tagged AUTH-05, which testVerifyEmailHappyPath still names); it now also asserts each of
+     * the 4 wrong tries is code_invalid and that a newly sent code verifies. Nothing it asserted before changed.
+     */
+    // AUTH-17
+    @Test
+    public void testFiveWrongCodesInvalidateTheCode() {
+        AuthSystem.signup("guess5@example.com", "StrongPassword123456", "Guess", "1.2.9.1");
+        String code = extractCodeFromEmail("guess5@example.com");
+        String wrong = code.equals("000000") ? "111111" : "000000";
+        for (int i = 0; i < 5; i++) {
+            assertEquals("code_invalid", AuthSystem.verifyEmail("guess5@example.com", wrong).get("error"), "wrong try " + i);
+        }
+        Map<String, Object> res = AuthSystem.verifyEmail("guess5@example.com", code);
+        assertFalse((Boolean) res.get("success"));
+        assertEquals("code_invalid", res.get("error"), "the right code after 5 wrong ones");
+
+        // AUTH-17 (Phase B.4, af92d76, 2026-11-10): a newly sent code (a fresh row, stored as its HMAC) works again.
+        String guessId = queryString("SELECT id FROM users WHERE email = ?", "guess5@example.com");
+        try (java.sql.Connection conn = java.sql.DriverManager.getConnection("jdbc:h2:mem:authdb;DB_CLOSE_DELAY=-1");
+             java.sql.PreparedStatement ps = conn.prepareStatement(
+                     "INSERT INTO verification_codes (user_id, code_hash, created_at, expires_at, type) VALUES (?, ?, ?, ?, 'email')")) {
+            ps.setLong(1, Long.parseLong(guessId));
+            ps.setString(2, hmacHex("654321"));
+            ps.setTimestamp(3, java.sql.Timestamp.from(java.time.Instant.now()));
+            ps.setTimestamp(4, java.sql.Timestamp.from(java.time.Instant.now().plusSeconds(3600)));
+            assertEquals(1, ps.executeUpdate());
+        } catch (java.sql.SQLException e) {
+            throw new AssertionError(e);
+        }
+        assertEquals("verified", AuthSystem.verifyEmail("guess5@example.com", "654321").get("status"), "a newly sent code verifies");
+
+        AuthSystem.signup("guess4@example.com", "StrongPassword123456", "Guess", "1.2.9.2");
+        String code4 = extractCodeFromEmail("guess4@example.com");
+        String wrong4 = code4.equals("000000") ? "111111" : "000000";
+        for (int i = 0; i < 4; i++) {
+            // AUTH-17 (2026-11-10): each wrong try is now asserted too.
+            assertEquals("code_invalid", AuthSystem.verifyEmail("guess4@example.com", wrong4).get("error"), "wrong try " + i);
+        }
+        assertEquals("verified", AuthSystem.verifyEmail("guess4@example.com", code4).get("status"), "4 wrong tries leave it valid");
+    }
+
+    /**
+     * resend_verification (auth spec flow 2b): a code spent by 5 wrong tries is replaced by a new 6-digit code (the only
+     * email code row, 0 attempts, stored as its HMAC, expiring in 10 minutes), which is emailed and verifies; a 4th
+     * resend for one email within the hour is too_many_requests and sends nothing, and after the hour one is accepted
+     * again; an unknown and an already verified email get the same {success: true, status: "sent"} and no email.
+     * In: none. Out: assertions. Why: AUTH-18 (commit 0eb5a4e). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches: H2; the clock is fixed for the test (restoreClock puts it back).
+     */
+    // AUTH-18
+    @Test
+    public void testResendVerification() {
+        java.time.Instant base = java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS);
+        AuthSystem.setClock(java.time.Clock.fixed(base, java.time.ZoneOffset.UTC));
+        String email = "resend18@example.com";
+        AuthSystem.signup(email, "StrongPassword123456", "Resend", "1.2.18.1");
+        String old = extractCodeFromEmail(email);
+        String wrong = old.equals("000000") ? "111111" : "000000";
+        for (int i = 0; i < 5; i++) {
+            assertEquals("code_invalid", AuthSystem.verifyEmail(email, wrong).get("error"), "wrong try " + i);
+        }
+        assertEquals("code_invalid", AuthSystem.verifyEmail(email, old).get("error"), "the spent code");
+        int sent = SENT.size();
+        Map<String, Object> res = AuthSystem.resendVerification(email);
+        assertEquals(Map.of("success", true, "status", "sent"), res);
+        assertEquals(sent + 1, SENT.size(), "one email is sent");
+        String fresh = extractCodeFromEmail(email);
+        assertTrue(fresh.matches("[0-9]{6}"), "a 6-digit code: " + fresh);
+        String userId = queryString("SELECT id FROM users WHERE email = ?", email);
+        assertEquals("1", queryString("SELECT COUNT(*) FROM verification_codes WHERE type = 'email' AND user_id = ?", userId));
+        assertEquals(hmacHex(fresh), queryString("SELECT code_hash FROM verification_codes WHERE type = 'email' AND user_id = ?", userId));
+        assertEquals("0", queryString("SELECT attempts FROM verification_codes WHERE type = 'email' AND user_id = ?", userId));
+        assertEquals(base.plus(java.time.Duration.ofMinutes(10)), java.sql.Timestamp.valueOf(
+                queryString("SELECT expires_at FROM verification_codes WHERE type = 'email' AND user_id = ?", userId)).toInstant(),
+                "expires in 10 minutes");
+        assertEquals("verified", AuthSystem.verifyEmail(email, fresh).get("status"), "the new code verifies");
+
+        String limited = "resend18-limit@example.com";
+        AuthSystem.signup(limited, "StrongPassword123456", "Limit", "1.2.18.2");
+        for (int i = 0; i < 3; i++) {
+            assertEquals("sent", AuthSystem.resendVerification(limited).get("status"), "resend " + i);
+        }
+        sent = SENT.size();
+        AuthSystem.setClock(java.time.Clock.fixed(base.plus(java.time.Duration.ofMinutes(59)), java.time.ZoneOffset.UTC));
+        assertEquals("too_many_requests", AuthSystem.resendVerification(limited).get("error"), "a 4th within the hour");
+        assertEquals(sent, SENT.size(), "a refused resend sends nothing");
+        AuthSystem.setClock(java.time.Clock.fixed(base.plus(java.time.Duration.ofMinutes(61)), java.time.ZoneOffset.UTC));
+        assertEquals("sent", AuthSystem.resendVerification(limited).get("status"), "after the hour");
+        assertEquals(sent + 1, SENT.size());
+
+        sent = SENT.size();
+        Map<String, Object> unknown = AuthSystem.resendVerification("nobody18@example.com");
+        Map<String, Object> verified = AuthSystem.resendVerification(email);
+        assertEquals(Map.of("success", true, "status", "sent"), unknown);
+        assertEquals(unknown, verified, "the same answer for an unknown and a verified email");
+        assertEquals(sent, SENT.size(), "neither is sent an email");
+    }
+
     // AUTH-07
     @Test
     public void testLoginHappyPathNoMfa() {

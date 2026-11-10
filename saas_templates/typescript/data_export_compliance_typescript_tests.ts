@@ -58,6 +58,15 @@ class MockClock implements Clock {
   advanceHours(hours: number): void {
     this.currentTime = new Date(this.currentTime.getTime() + hours * 60 * 60 * 1000);
   }
+
+  /**
+   * Sets the clock to an exact instant. In: epoch milliseconds. Out: none. Why: EXPORT-16 (Phase B.4, af92d76)
+   * needs the clock at will_delete_at and one second either side of it. 2026-11-10,
+   * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+   */
+  setMs(ms: number): void {
+    this.currentTime = new Date(ms);
+  }
 }
 
 /**
@@ -665,5 +674,82 @@ async function rejection(fn: () => Promise<unknown>): Promise<ComplianceError> {
     assertEquals(cancelCompleted.status, 404, 'cancel of a completed request is 404');
     assertEquals(cancelCompleted.code, 'not_found', 'cancel of a completed request is not_found');
     assertEquals((await rejection(() => service.cancelDeletion('admin_999', gdpr.deletion_id))).status, 404, 'and 404 to anyone else');
+  });
+
+  /**
+   * EXPORT-06 (Phase B.3 ruling): a deletion can be cancelled until will_delete_at; once will_delete_at has passed
+   * (the deletion is due but the worker has not run it yet) cancel is 409 {error: "grace_period_over"} and the
+   * request is unchanged, confirmed or not. One second before will_delete_at the cancel still succeeds.
+   * In: the shared service and its mock clock. Out: throws on failure. Why: Phase D wave 1, owner request 2026-11-10
+   * (B.3 rulings). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+   * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4 ruling af92d76, EXPORT-16): an unconfirmed
+   * (pending) request past will_delete_at is now cancelled; this test asserted 409 grace_period_over for it, which
+   * af92d76 overturns (a pending request is not scheduled, so it can always be cancelled).
+   */
+  // EXPORT-06
+  test('Deletion: cancelling after will_delete_at is 409 grace_period_over', async () => {
+    seedUser();
+    const due = await service.requestDeletion('user_123', 'user_requested');
+    await service.confirmDeletion('user_123', due.deletion_id, tokenFromEmail(email, 'alice@example.com'));
+    clock.advanceDays(30);
+    assertEquals(clock.now().toISOString(), due.will_delete_at, 'the clock is exactly at will_delete_at');
+    const over = await rejection(() => service.cancelDeletion('user_123', due.deletion_id));
+    assertEquals(over.status, 409, 'cancel after will_delete_at is 409');
+    assertEquals(over.code, 'grace_period_over', 'cancel after will_delete_at is grace_period_over');
+    assertEquals(db.deletionRequests.find(r => r.id === due.deletion_id)!.status, 'approved', 'the refused cancel changes nothing');
+
+    seedUser();
+    const unconfirmed = await service.requestDeletion('user_123', 'user_requested');
+    clock.advanceDays(31);
+    // Phase B.4 (af92d76, 2026-11-10): was 409 grace_period_over; a pending request can always be cancelled.
+    const late = await service.cancelDeletion('user_123', unconfirmed.deletion_id);
+    assertEquals(late.status, 'cancelled', 'an unconfirmed request past will_delete_at is still cancelled');
+
+    seedUser();
+    const inTime = await service.requestDeletion('user_123', 'user_requested');
+    clock.advanceHours(30 * 24 - 1 / 3600);
+    const cancelled = await service.cancelDeletion('user_123', inTime.deletion_id);
+    assertEquals(cancelled.status, 'cancelled', 'one second before will_delete_at the cancel succeeds');
+  });
+
+  /**
+   * EXPORT-16 (Phase B.4 ruling af92d76): cancel follows the request's state. A pending (unconfirmed) request is
+   * cancelled a day after will_delete_at; a confirmed one is cancelled one second before will_delete_at, and gets
+   * 409 {error: "grace_period_over"} exactly at will_delete_at and one second after it, staying approved.
+   * In: the shared service and its mock clock. Out: throws on failure. Why: EXPORT-16 (af92d76).
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+   */
+  // EXPORT-16
+  test('Deletion: a pending request is always cancellable; a confirmed one is refused from will_delete_at on', async () => {
+    const statusOf = (id: string) => db.deletionRequests.find(r => r.id === id)!.status;
+    const start = clock.now().getTime();
+    const confirmedAt = async (offsetSeconds: number) => {
+      seedUser();
+      clock.setMs(start);
+      const d = await service.requestDeletion('user_123', 'user_requested');
+      await service.confirmDeletion('user_123', d.deletion_id, tokenFromEmail(email, 'alice@example.com'));
+      clock.setMs(Date.parse(d.will_delete_at) + offsetSeconds * 1000);
+      return d;
+    };
+
+    seedUser();
+    clock.setMs(start);
+    const pending = await service.requestDeletion('user_123', 'user_requested');
+    clock.setMs(Date.parse(pending.will_delete_at) + 24 * 3600 * 1000);
+    assertEquals((await service.cancelDeletion('user_123', pending.deletion_id)).status, 'cancelled',
+      'a pending request a day after will_delete_at is cancelled');
+    assertEquals(statusOf(pending.deletion_id), 'cancelled', 'and stored as cancelled');
+
+    const before = await confirmedAt(-1);
+    assertEquals((await service.cancelDeletion('user_123', before.deletion_id)).status, 'cancelled',
+      'a confirmed request one second before will_delete_at is cancelled');
+
+    for (const offset of [0, 1]) {
+      const d = await confirmedAt(offset);
+      const refused = await rejection(() => service.cancelDeletion('user_123', d.deletion_id));
+      assertEquals(refused.status, 409, `a confirmed request ${offset}s after will_delete_at is 409`);
+      assertEquals(refused.code, 'grace_period_over', `a confirmed request ${offset}s after will_delete_at is grace_period_over`);
+      assertEquals(statusOf(d.deletion_id), 'approved', 'the refused cancel leaves it confirmed');
+    }
   });
 }

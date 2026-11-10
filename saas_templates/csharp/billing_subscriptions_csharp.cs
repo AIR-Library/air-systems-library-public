@@ -308,7 +308,9 @@ namespace BillingSubscriptions
         /// <summary>
         /// The HTTP status the route returns: 200 on success; 400, 403, 404, 409 or 502 with an error.
         /// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (the spec names 400 invalid_tier, 409
-        /// subscription_item_ambiguous, 403 invalid_signature). Pure data.
+        /// subscription_item_ambiguous, 400 invalid_signature). Pure data.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3, BILL-09): invalid_signature is 400, Stripe's
+        /// documented answer and the same as stripe_webhook_entitlements (it was 403).
         /// </summary>
         public int Status { get; set; } = 200;
     }
@@ -577,11 +579,13 @@ namespace BillingSubscriptions
         /// invalid_payload. Rewritten 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): own constant-time
         /// verification and JSON parsing instead of Stripe.net's typed event objects. Touches: events, invoices,
         /// subscriptions, audit_logs.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3, BILL-09): a bad signature answers 400
+        /// invalid_signature (was 403), as Stripe documents and as stripe_webhook_entitlements answers.
         /// </summary>
         public async Task<ApiResponse> HandleStripeWebhookAsync(string jsonPayload, string stripeSignatureHeader)
         {
             if (!VerifySignature(jsonPayload, stripeSignatureHeader))
-                return Fail("invalid_signature", "Webhook signature verification failed", 403);
+                return Fail("invalid_signature", "Webhook signature verification failed", 400); // BILL-09, Phase B.3
 
             JsonElement root, obj;
             string eventId, eventType;

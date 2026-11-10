@@ -18,7 +18,9 @@ interfaces.
     tools/readme_status.py                               writes the status table below from ci/baseline.json
     ci/baseline.json                                     suites known to fail today (empty when all pass)
 
-18 systems x 8 languages = 144 suites.
+24 systems x 8 languages = 192 suites. Six of them (secret and PII screening, TOTP two-factor, a bring-your-own-key
+vault, Stripe webhook entitlements, safe archive ingest and passwordless email-code sign-in) were added on 2026-11-10,
+built from code already tested in the maintainers' own apps.
 
 ## Status
 
@@ -27,7 +29,7 @@ fails when it is out of date. CI fails any suite that does not pass unless it is
 missing file or a file that does not parse fails CI even for a suite on that list.
 
 <!-- status:start -->
-144 of 144 suites pass.
+192 of 192 suites pass.
 
 | system | csharp | go | java | javascript | php | python | rust | typescript |
 |---|---|---|---|---|---|---|---|---|
@@ -37,6 +39,7 @@ missing file or a file that does not parse fails CI even for a suite on that lis
 | auth_system | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | background_jobs_task_queue | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | billing_subscriptions | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| byok_key_vault | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | data_export_compliance | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | feature_flags | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | file_uploads | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -45,11 +48,16 @@ missing file or a file that does not parse fails CI even for a suite on that lis
 | idempotency_keys | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | notifications | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | organizations_teams | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| passwordless_email_code_signin | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | permissions_rbac | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | quotas_rate_limiting | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| safe_archive_ingest | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| secret_pii_screening | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| stripe_webhook_entitlements | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| totp_two_factor | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | trial_abuse_prevention | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | webhooks | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **passing** | **18/18** | **18/18** | **18/18** | **18/18** | **18/18** | **18/18** | **18/18** | **18/18** |
+| **passing** | **24/24** | **24/24** | **24/24** | **24/24** | **24/24** | **24/24** | **24/24** | **24/24** |
 <!-- status:end -->
 
 Each CI job's summary also shows its language's per-suite table with test counts. CI runs Python 3.12, Node 22,

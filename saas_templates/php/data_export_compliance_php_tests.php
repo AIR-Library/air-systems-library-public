@@ -296,7 +296,11 @@ final class DataExportComplianceTest extends TestCase
         $this->assertSame(0, $this->countFor('users', $userId));
     }
 
-    /** Spec: Deletion: User can cancel within grace period. Script test 5. */
+    /**
+     * Spec: Deletion: User can cancel within grace period. Script test 5.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3): a late cancel is 409 grace_period_over.
+     * Touches: the in-memory SQLite database.
+     */
     // EXPORT-06
     public function testUserCanCancelWithinGracePeriod(): void
     {
@@ -312,7 +316,9 @@ final class DataExportComplianceTest extends TestCase
         $this->assertSame(0, $this->service->processDueDeletions());
         $this->assertSame(1, $this->countFor('users', $userId2));
 
-        // After the grace period a confirmed deletion can no longer be cancelled
+        // After the grace period a confirmed deletion can no longer be cancelled.
+        // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3): the code is grace_period_over (it was
+        // grace_period_elapsed), and its 409 status is asserted too.
         $userId3 = $this->seedUser();
         [$delId3, $token3] = $this->requestDeletionAndToken($userId3, 'other');
         $this->service->confirmDeletion($userId3, $delId3, $token3);
@@ -321,8 +327,102 @@ final class DataExportComplianceTest extends TestCase
             $this->service->cancelDeletion($userId3, $delId3);
             $this->fail('cancel after the grace period accepted');
         } catch (ComplianceException $e) {
-            $this->assertSame('grace_period_elapsed', $e->errorCode);
+            $this->assertSame([409, 'grace_period_over'], [$e->httpStatus, $e->errorCode]);
         }
+    }
+
+    /**
+     * EXPORT-06 (Phase B.3, endpoint 5): the grace period ends at will_delete_at. One second before it a cancel
+     * works; from will_delete_at on (the deletion is due but the worker has not run) cancel is 409
+     * {error: "grace_period_over"} and the request is left as it was, confirmed or still pending.
+     * Input: the fixed clock. Output: assertions only. Why: data_export_compliance.md, amended 2026-11-10
+     * (Phase B.3). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory SQLite database.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4 ruling af92d76, EXPORT-16): the pending request
+     * at will_delete_at is now cancelled; this test asserted 409 grace_period_over and an unchanged pending row,
+     * which af92d76 overturns (a pending request is not scheduled, so it can always be cancelled).
+     */
+    // EXPORT-06
+    public function testCancelAfterWillDeleteAtIsGracePeriodOver(): void
+    {
+        $start = $this->now;
+        $answer = function (callable $call): array {
+            try {
+                return $call();
+            } catch (ComplianceException $e) {
+                return [$e->httpStatus, $e->errorCode];
+            }
+        };
+        $early = $this->seedUser();
+        [$earlyId, $earlyToken] = $this->requestDeletionAndToken($early, 'user_requested');
+        $this->service->confirmDeletion($early, $earlyId, $earlyToken);
+        $confirmed = $this->seedUser();
+        [$confirmedId, $confirmedToken] = $this->requestDeletionAndToken($confirmed, 'user_requested');
+        $this->service->confirmDeletion($confirmed, $confirmedId, $confirmedToken);
+        $pending = $this->seedUser();
+        [$pendingId] = $this->requestDeletionAndToken($pending, 'user_requested');
+        $willDeleteAt = $this->db->query("SELECT scheduled_at FROM deletion_requests WHERE id = '$confirmedId'")->fetchColumn();
+
+        $this->now = $start->modify('+30 days')->modify('-1 second');
+        $this->assertSame(['success' => true, 'status' => 'cancelled'], $answer(fn () => $this->service->cancelDeletion($early, $earlyId)), 'one second before');
+
+        $this->now = $start->modify('+30 days');
+        $this->assertSame(ComplianceService::format($this->now), $willDeleteAt, 'the clock is at will_delete_at');
+        $this->assertSame([409, 'grace_period_over'], $answer(fn () => $this->service->cancelDeletion($confirmed, $confirmedId)), 'confirmed, at will_delete_at');
+        // Phase B.4 (af92d76, 2026-11-10): was [409, 'grace_period_over']; a pending request can always be cancelled.
+        $this->assertSame(['success' => true, 'status' => 'cancelled'], $answer(fn () => $this->service->cancelDeletion($pending, $pendingId)), 'pending, at will_delete_at');
+        $statuses = $this->db->query("SELECT id, status FROM deletion_requests WHERE id IN ('$confirmedId', '$pendingId') ORDER BY status")->fetchAll(PDO::FETCH_KEY_PAIR);
+        // Phase B.4 (af92d76, 2026-11-10): the pending one is now cancelled (it was left pending).
+        $this->assertSame([$confirmedId => 'approved', $pendingId => 'cancelled'], $statuses, 'confirmed left as it was, pending cancelled');
+    }
+
+    /**
+     * EXPORT-16 (Phase B.4 ruling af92d76): cancel follows the request's state. A pending (unconfirmed) request is
+     * cancelled a day after will_delete_at; a confirmed one is cancelled one second before will_delete_at, and gets
+     * 409 {error: "grace_period_over"} exactly at will_delete_at and one second after it, staying approved.
+     * Input: the fixed clock. Output: assertions only. Why: EXPORT-16 (af92d76). 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory SQLite database.
+     */
+    // EXPORT-16
+    public function testPendingAlwaysCancellableConfirmedRefusedFromWillDeleteAt(): void
+    {
+        $start = $this->now;
+        $answer = function (callable $call): array {
+            try {
+                return $call();
+            } catch (ComplianceException $e) {
+                return [$e->httpStatus, $e->errorCode];
+            }
+        };
+        $statusOf = fn (string $id): string => (string) $this->db->query("SELECT status FROM deletion_requests WHERE id = '$id'")->fetchColumn();
+        $confirmedRequest = function (): array {
+            $user = $this->seedUser();
+            [$id, $token] = $this->requestDeletionAndToken($user, 'user_requested');
+            $this->service->confirmDeletion($user, $id, $token);
+            return [$user, $id];
+        };
+
+        $pendingUser = $this->seedUser();
+        [$pendingId] = $this->requestDeletionAndToken($pendingUser, 'user_requested');
+        [$beforeUser, $beforeId] = $confirmedRequest();
+        [$atUser, $atId] = $confirmedRequest();
+        [$afterUser, $afterId] = $confirmedRequest();
+        $willDeleteAt = $start->modify('+30 days');
+        $this->assertSame(ComplianceService::format($willDeleteAt),
+            $this->db->query("SELECT scheduled_at FROM deletion_requests WHERE id = '$atId'")->fetchColumn(), 'will_delete_at');
+
+        $this->now = $willDeleteAt->modify('+1 day');
+        $this->assertSame(['success' => true, 'status' => 'cancelled'], $answer(fn () => $this->service->cancelDeletion($pendingUser, $pendingId)), 'pending, a day after will_delete_at');
+        $this->assertSame('cancelled', $statusOf($pendingId));
+
+        $this->now = $willDeleteAt->modify('-1 second');
+        $this->assertSame(['success' => true, 'status' => 'cancelled'], $answer(fn () => $this->service->cancelDeletion($beforeUser, $beforeId)), 'confirmed, one second before');
+
+        $this->now = $willDeleteAt;
+        $this->assertSame([409, 'grace_period_over'], $answer(fn () => $this->service->cancelDeletion($atUser, $atId)), 'confirmed, exactly at will_delete_at');
+        $this->now = $willDeleteAt->modify('+1 second');
+        $this->assertSame([409, 'grace_period_over'], $answer(fn () => $this->service->cancelDeletion($afterUser, $afterId)), 'confirmed, one second after');
+        $this->assertSame('approved', $statusOf($atId), 'stays confirmed');
+        $this->assertSame('approved', $statusOf($afterId), 'stays confirmed');
     }
 
     /** Spec: Deletion: Cascade delete works (sessions, api_keys, etc deleted). Script test 4. */

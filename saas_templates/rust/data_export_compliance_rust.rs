@@ -777,7 +777,10 @@ impl ComplianceService {
 
     /// What: cancel the caller's own deletion within the grace period (spec endpoint 5). Anyone else's
     /// request, and a completed one, is `DeletionNotFound` (404 not_found); a cancelled one is
-    /// `DeletionNotPending` (409 deletion_not_pending); after will_delete_at it is `GracePeriodOver` (409). The token is spent.
+    /// `DeletionNotPending` (409 deletion_not_pending); a confirmed one from will_delete_at on is `GracePeriodOver`
+    /// (409) and stays confirmed, while a pending (unconfirmed) one can always be cancelled (changed 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP, spec Phase B.4, EXPORT-16: a pending one past will_delete_at was refused).
+    /// The token is spent.
     /// In: the authenticated user, deletion id. Out: cancelled. Changed 2026-11-10 for EXPORT-15 (Phase B.2:
     /// a closed request was a generic `NotAllowed`). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
     /// Touches: database.
@@ -785,7 +788,8 @@ impl ComplianceService {
         let conn = self.db();
         let (d, _, _) = Self::own_deletion(&conn, user_id, &deletion_id)?;
         Self::refuse_if_closed(&d)?;
-        if (self.clock)() >= d.scheduled_for {
+        // only a confirmed request is scheduled: a pending one can always be cancelled (spec Phase B.4, EXPORT-16)
+        if d.status == DeletionStatus::Approved && (self.clock)() >= d.scheduled_for {
             return Err(ComplianceError::GracePeriodOver);
         }
         conn.execute("UPDATE deletion_requests SET status = 'cancelled', token_hash = '' WHERE id = ?1", params![d.id])?;

@@ -58,6 +58,9 @@ pub enum AuthError {
     TooManySignups,
     TooManyAttempts,
     InvalidCode,
+    /// verify_email's refusal of a wrong, used-up or unknown code: 400 code_invalid (Phase B.3/B.4, 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP; it answered 401 invalid_code, and 429 after 5 wrong codes).
+    CodeInvalid,
     CodeExpired,
     InvalidCredentials,
     EmailNotVerified,
@@ -67,6 +70,9 @@ pub enum AuthError {
     InvalidToken,
     TokenExpired,
     UserBanned,
+    /// resend_verification's 4th request for one email within the hour: 429 too_many_requests (AUTH-18,
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
+    TooManyRequests,
     Internal(String),
 }
 
@@ -84,6 +90,7 @@ impl AuthError {
             AuthError::TooManySignups => ("too_many_signups_from_ip", 429, None),
             AuthError::TooManyAttempts => ("too_many_attempts", 429, None),
             AuthError::InvalidCode => ("invalid_code", 401, None),
+            AuthError::CodeInvalid => ("code_invalid", 400, None),
             AuthError::CodeExpired => ("code_expired", 400, None),
             AuthError::InvalidCredentials => ("invalid_credentials", 401, None),
             AuthError::EmailNotVerified => ("email_not_verified", 403, None),
@@ -93,6 +100,7 @@ impl AuthError {
             AuthError::InvalidToken => ("invalid_token", 401, None),
             AuthError::TokenExpired => ("token_expired", 401, None),
             AuthError::UserBanned => ("user_banned", 403, None),
+            AuthError::TooManyRequests => ("too_many_requests", 429, None),
             AuthError::Internal(_) => ("internal_error", 500, None),
         };
         let mut body = json!({ "error": code, "message": self.to_string(), "code": status });
@@ -196,6 +204,9 @@ pub enum AuthData {
     MfaRequired { challenge_id: String },
     Refreshed { token: String, expires_in: i64 },
     TokenValid { user: PublicUser },
+    /// resend_verification's 202 {status: "sent"}, the same for every email (AUTH-18, 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP).
+    Sent,
 }
 
 /// What: methods of `AuthData`, each documented below. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
@@ -208,6 +219,7 @@ impl AuthData {
             AuthData::Authenticated { .. } => "authenticated",
             AuthData::MfaRequired { .. } => "mfa_required",
             AuthData::Refreshed { .. } | AuthData::TokenValid { .. } => "ok",
+            AuthData::Sent => "sent",
         }
     }
 }
@@ -565,16 +577,69 @@ impl AuthSystem {
             .map_err(AuthError::Internal)
     }
 
+    /// What: flow 2b, resend_verification. At most 3 requests per email per hour are accepted: the count and this
+    /// request's row are one conditional INSERT into `attempts` (kind "resend_email"), and a 4th within the hour is
+    /// `TooManyRequests` (429 too_many_requests) and sends nothing. For an unverified user it deletes the user's email
+    /// codes, stores a new 6-digit code (attempts 0, its HMAC-SHA256 under the secret key, 10-minute expiry) and emails
+    /// it through the mailer. An unknown or already verified email gets the same `Sent` (202 {status: "sent"}) and
+    /// nothing is sent, so the answer never says whether an account exists; those requests count toward the limit too.
+    /// In: the email (trimmed and lower-cased, as signup stores it). Out: `Sent`, or `TooManyRequests` / `Internal`.
+    /// Why: AUTH-18 (auth spec flow 2b, commit 0eb5a4e): after 5 wrong codes (AUTH-17) nothing could issue a new code,
+    /// so anyone who knew an email could block its verification. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// Touches: database (attempts, users read, verification_codes, audit_log, why_chain), the mailer.
+    pub fn resend_verification(&mut self, email: &str) -> Result<AuthResponse, AuthError> {
+        let email = email.trim().to_lowercase();
+        let now = self.now();
+        let accepted = self.conn.execute(
+            "INSERT INTO attempts (kind, key, at) SELECT 'resend_email', ?1, ?2
+             WHERE (SELECT COUNT(*) FROM attempts WHERE kind = 'resend_email' AND key = ?1 AND at > ?3) < 3",
+            params![email, now, now - 3600],
+        )?;
+        if accepted != 1 {
+            self.why("resend_verification", &["rate_limit_email_1h"], "rate_limited");
+            return Err(AuthError::TooManyRequests);
+        }
+        let sent = AuthResponse { success: true, data: AuthData::Sent };
+        let user: Option<(i64, Option<i64>)> = self
+            .conn
+            .query_row("SELECT id, email_verified_at FROM users WHERE email = ?1", params![email], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let user_id = match user {
+            Some((id, None)) => id,
+            _ => {
+                // Unknown or already verified: the same answer as a real resend, and no email (no account enumeration).
+                self.why("resend_verification", &["rate_limit_email_1h", "user_unverified"], "not_sent");
+                return Ok(sent);
+            }
+        };
+        let n = u32::from_be_bytes(random_bytes(4).try_into().unwrap_or([0; 4])) % 1_000_000;
+        let code = format!("{:06}", n);
+        self.conn.execute("DELETE FROM verification_codes WHERE user_id = ?1 AND type = 'email'", params![user_id])?;
+        self.conn.execute(
+            "INSERT INTO verification_codes (id, user_id, code_hash, created_at, expires_at, type, attempts) VALUES (?1, ?2, ?3, ?4, ?5, 'email', 0)",
+            params![hex(&random_bytes(16)), user_id, self.hash_secret(&code), now, now + 10 * 60],
+        )?;
+        self.mailer
+            .send(Email { to: email.clone(), subject: "Your verification code".into(), body: format!("Your code is {}", code) })
+            .map_err(AuthError::Internal)?;
+        self.why("resend_verification", &["rate_limit_email_1h", "user_unverified"], "sent");
+        self.audit(Some(user_id), "verification_resent", Some(user_id.to_string()), json!({}))?;
+        Ok(sent)
+    }
+
     /// What: flow 2. Gates: an unexpired, unused code that matches (5 tries), user still unverified.
-    /// Unknown emails give `InvalidCode` (no account probing). Out: verified.
+    /// Unknown emails give `CodeInvalid` (no account probing). Out: verified.
+    /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec Phase B.3 and B.4, AUTH-17): a wrong code is
+    /// 400 code_invalid (was 401 invalid_code), and after 5 wrong codes the current code is dead: every further
+    /// try, the right code included, is 400 code_invalid (was 429 too_many_attempts) until a new code is sent.
     /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
     /// [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
     pub fn verify_email(&mut self, req: VerifyEmailRequest) -> Result<AuthResponse, AuthError> {
         let email = req.email.trim().to_lowercase();
         let user: Option<(i64, Option<i64>)> = self.conn.query_row("SELECT id, email_verified_at FROM users WHERE email = ?1", params![email], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-        let Some((user_id, verified_at)) = user else { return Err(AuthError::InvalidCode) };
+        let Some((user_id, verified_at)) = user else { return Err(AuthError::CodeInvalid) };
         if verified_at.is_some() {
-            return Err(AuthError::InvalidCode);
+            return Err(AuthError::CodeInvalid);
         }
         let code: Option<(String, String, i64, i64)> = self
             .conn
@@ -585,14 +650,14 @@ impl AuthSystem {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        let Some((code_id, code_hash, expires_at, attempts)) = code else { return Err(AuthError::InvalidCode) };
+        let Some((code_id, code_hash, expires_at, attempts)) = code else { return Err(AuthError::CodeInvalid) };
         if attempts >= 5 {
-            return Err(AuthError::TooManyAttempts);
+            return Err(AuthError::CodeInvalid);
         }
         if !ct_eq(self.hash_secret(req.code_or_token.trim()).as_bytes(), code_hash.as_bytes()) {
             self.conn.execute("UPDATE verification_codes SET attempts = attempts + 1 WHERE id = ?1", params![code_id])?;
             self.why("verify_email", &["code_valid"], "wrong_code");
-            return Err(AuthError::InvalidCode);
+            return Err(AuthError::CodeInvalid);
         }
         if self.now() >= expires_at {
             return Err(AuthError::CodeExpired);

@@ -451,9 +451,10 @@ SQL;
      * @param string $rawBody The request body exactly as received.
      * @param array  $headers Request headers (any letter case).
      * @return array {received: true, duplicate?: true} or
-     *               {error: missing_webhook_secret (500) | missing_signature (400) | invalid_signature (403) |
+     *               {error: missing_webhook_secret (500) | missing_signature (400) | invalid_signature (400) |
      *               invalid_event (400) | processing_failed (500), status, message} (status added 2026-11-10,
-     *               session_012zDydZCZ4AChqhEZ4oVtaP)
+     *               session_012zDydZCZ4AChqhEZ4oVtaP; invalid_signature is 400 since the same day, Phase B.3
+     *               BILL-09: Stripe's documented answer, the same as stripe_webhook_entitlements; it was 403)
      *
      * Why: see the file header (event recorded before processing; duplicate invoice rows).
      * 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches the database and the audit
@@ -477,7 +478,7 @@ SQL;
         try {
             $event = Webhook::constructEvent($rawBody, $sigHeader, self::$webhookSecret);
         } catch (SignatureVerificationException) {
-            return self::fail('invalid_signature', 403, 'Signature verification failed');
+            return self::fail('invalid_signature', 400, 'Signature verification failed');
         } catch (Throwable) {
             return self::fail('invalid_event', 400, 'Malformed event');
         }
@@ -614,7 +615,8 @@ SQL;
      *
      * Inputs: the error code, the HTTP status and a message (no secrets). Output: the array a caller turns
      * into the HTTP answer. Statuses: 400 invalid_tier, invalid_amount, invoice_not_succeeded,
-     * refund_exceeds_invoice, missing_signature, invalid_event; 403 invalid_signature; 404
+     * refund_exceeds_invoice, missing_signature, invalid_event, invalid_signature (400 since Phase B.3, BILL-09;
+     * it was 403); 404
      * subscription_not_found, invoice_not_found; 409 subscription_item_ambiguous; 500 missing_webhook_secret,
      * processing_failed; 502 stripe_error; 503 stripe_not_configured.
      * Why: Phase B.2 bug "billing errors are {error} arrays without an HTTP status except the newest ones".

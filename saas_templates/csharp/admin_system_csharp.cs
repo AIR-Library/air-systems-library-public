@@ -193,6 +193,12 @@ namespace AdminSystem
         public Guid? ApprovedBy { get; set; }
         public DateTime? ApprovedAt { get; set; }
         public string RejectionReason { get; set; }
+
+        /// <summary>
+        /// The action's parameter, when its type needs one: for "change_role", the new tier ("Admin" or "User").
+        /// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3, ADMIN-07 through governance). Pure data.
+        /// </summary>
+        public string NewValue { get; set; }
     }
 
     public class AuditLogEntry
@@ -414,7 +420,8 @@ namespace AdminSystem
 
     /// <summary>
     /// What approving a governance action runs: action_type -> executor(action) returning a short execution result.
-    /// ADMIN-16 "approve -> action executed". "suspend_user" is built in; an app registers the rest. Added 2026-11-10,
+    /// ADMIN-16 "approve -> action executed". "suspend_user" and "change_role" (Phase B.3, ADMIN-07; 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP) are built in; an app registers the rest. Added 2026-11-10,
     /// session_012zDydZCZ4AChqhEZ4oVtaP (approve only flipped the status). Touches: whatever an executor touches.
     /// </summary>
     public static class GovernanceExecutors
@@ -432,6 +439,38 @@ namespace AdminSystem
                 user.Status = "suspended";
                 return "user_suspended";
             };
+            ByType["change_role"] = ExecuteChangeRole;
+        }
+
+        /// <summary>
+        /// The built-in "change_role" executor: sets the target user's tier to the action's NewValue (Admin or User;
+        /// Owner is never assigned here). Refuses an unknown user (404 user_not_found), an invalid tier (400
+        /// invalid_tier) and a change that would demote the last active owner (400 cannot_demote_last_owner); a refusal
+        /// throws, so DecideGovernanceAction leaves the action pending and changes nothing. On success writes the audit
+        /// row role_changed (actor = the action's submitter) and returns "role_changed". In: the action. Out: the
+        /// execution result. Why: admin spec LAST OWNER (Phase B.3): ADMIN-07 is proven through a governance-approved
+        /// change_role. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory users and audit log.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (review finding 4525101209): a change_role whose target
+        /// is the approver (the caller, AuthContext.CurrentUser) is refused with 400 cannot_change_own_role, checked
+        /// AFTER the last-owner check, so the action stays pending, as the spec's LAST OWNER block and PHP and
+        /// JavaScript say.
+        /// </summary>
+        private static string ExecuteChangeRole(GovernanceAction ga)
+        {
+            var target = Database.Users.FirstOrDefault(u => u.UserId == ga.TargetResourceId)
+                ?? throw new ApiException("user_not_found", "User does not exist");
+            Validation.ValidateTier(ga.NewValue, allowOwner: false);
+            var newRole = (Role)Enum.Parse(typeof(Role), ga.NewValue, true);
+            var activeOwners = Database.Users.Count(u => u.Tier == Role.Owner && u.Status == "active");
+            if (target.Tier == Role.Owner && target.Status == "active" && activeOwners <= 1 && newRole != Role.Owner)
+                throw new ApiException("cannot_demote_last_owner", "Cannot demote last active owner");
+            if (AuthContext.CurrentUser != null && target.UserId == AuthContext.CurrentUser.UserId)
+                throw new ApiException("cannot_change_own_role", "Cannot change own role");
+            var oldTier = target.Tier.ToString();
+            AuditLogger.Log("role_changed", ga.ActorId, resourceType: "user", resourceId: target.UserId,
+                oldValue: oldTier, newValue: newRole.ToString());
+            target.Tier = newRole;
+            return "role_changed";
         }
 
         static GovernanceExecutors() => Reset();
@@ -615,6 +654,9 @@ namespace AdminSystem
         /// Owner-only: changes a user's tier after the CSRF check; the Owner tier cannot be assigned here.
         /// Refuses the caller's own role, then an unknown user, then demoting the last active owner (spec order; changed
         /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). Output: { success, old/new tier }.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4 ruling af92d76, change_role "Order"): the
+        /// own-role gate now also runs before the tier check, so an owner changing their own role always gets
+        /// cannot_change_own_role. In: CSRF token, target user id, new tier.
         /// Touches: the in-memory user and audit records. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
         /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a suspended caller is refused first, 403 account_suspended (ADMIN-19).
         /// </summary>
@@ -624,12 +666,14 @@ namespace AdminSystem
             CsrfValidator.Verify(csrfToken);
             RequireOwner();
 
-            Validation.ValidateTier(newTier, allowOwner: false); // Cannot promote to Owner via API
-            var newRole = (Role)Enum.Parse(typeof(Role), newTier, true);
-
             // Gate before check (spec order; changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): own account first.
+            // Phase B.4 (af92d76, same day): also before the tier check, so changing your own role is always
+            // cannot_change_own_role (an invalid tier for yourself was invalid_tier).
             if (userId == AuthContext.CurrentUser.UserId)
                 throw new ApiException("cannot_change_own_role", "Cannot change own role");
+
+            Validation.ValidateTier(newTier, allowOwner: false); // Cannot promote to Owner via API
+            var newRole = (Role)Enum.Parse(typeof(Role), newTier, true);
 
             var target = Database.Users.FirstOrDefault(u => u.UserId == userId)
                 ?? throw new ApiException("user_not_found", "User does not exist");

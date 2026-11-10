@@ -1387,6 +1387,9 @@ func decideAction(actorID, actionID int64, decide, reason string) (int, jsonResp
 // Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-16: "execute the original action"; approval
 // used to only mark it approved). Changed the same day (Phase B.2, admin spec "TIERS"): a change_role whose
 // new_tier is not a staff role is 400 invalid_tier (it was 422 invalid_action_params).
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec LAST OWNER, approver rule; the PR 22 review found
+// C#, Java and Rust missing it, and Go had the same gap): a change_role whose target is the approver (actorID) is
+// 400 cannot_change_own_role, checked after the last-owner check; the caller rolls back, so it stays pending.
 // Touches: SQLite users and audit_log (inside tx).
 func executeAction(tx *sql.Tx, actorID, actionID int64) (string, int, jsonResponse) {
 	var actionType string
@@ -1428,6 +1431,9 @@ func executeAction(tx *sql.Tx, actorID, actionID int64) (string, int, jsonRespon
 		}
 		if lastOwner && newTier != "owner" {
 			return "", http.StatusBadRequest, jsonResponse{"error": "cannot_demote_last_owner", "message": "Cannot demote last active owner"}
+		}
+		if target.Int64 == actorID {
+			return "", http.StatusBadRequest, jsonResponse{"error": "cannot_change_own_role", "message": "Cannot change own role"}
 		}
 		if _, err := tx.Exec(`UPDATE users SET role=? WHERE id=?`, newTier, target.Int64); err != nil {
 			return "", http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": "database error"}

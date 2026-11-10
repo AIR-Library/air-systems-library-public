@@ -307,8 +307,10 @@ public class AdminControllerTests
     /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: own-account gate first (spec order), so the sole owner
     /// demoting themselves gets cannot_change_own_role; demoting another owner who is the last ACTIVE owner (the actor
     /// is suspended) is cannot_demote_last_owner and the role is unchanged.
+    /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3): its ADMIN-07 tag moved to
+    /// Governance_ChangeRole_LastOwner_StaysPending, the path the spec now proves ADMIN-07 on; this test still proves
+    /// the own-role and suspended-caller refusals (no assertion removed).
     /// </summary>
-    // ADMIN-07
     [Fact]
     public void ChangeRole_LastOwner()
     {
@@ -740,6 +742,89 @@ public class AdminControllerTests
         Assert.Equal("pending", unknown.Status);
     }
 
+    /// <summary>
+    /// ADMIN-07 (admin spec LAST OWNER, Phase B.3): an admin's change_role demoting the only active owner is submitted
+    /// for governance; the owner approving it gets 400 cannot_demote_last_owner, the action stays pending, the owner's
+    /// tier is unchanged and nothing is audited. With a second active owner the same kind of action is approved and
+    /// the role changes (role_changed audited). In: nothing. Out: asserts. Added 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory admin state.
+    /// </summary>
+    // ADMIN-07
+    [Fact]
+    public void Governance_ChangeRole_LastOwner_StaysPending()
+    {
+        var owner = CreateOwner();
+        var admin = CreateAdmin();
+        SetupAuth(owner);
+        var csrf = GetCsrfToken(owner);
+
+        var demote = new GovernanceAction
+        {
+            ActionType = "change_role", ActorId = admin.UserId, TargetResourceId = owner.UserId,
+            NewValue = "Admin", Reason = "hand over"
+        };
+        Database.GovernanceActions.Add(demote);
+        var auditBefore = Database.AuditLog.Count;
+
+        var ex = Assert.Throws<ApiException>(() => _controller.DecideGovernanceAction(csrf, demote.ActionId, "approve"));
+        Assert.Equal("cannot_demote_last_owner", ex.Code);
+        Assert.Equal(400, ex.Status);
+        Assert.Equal("pending", demote.Status);
+        Assert.Null(demote.ApprovedBy);
+        Assert.Equal(Role.Owner, owner.Tier);
+        Assert.Equal(auditBefore, Database.AuditLog.Count);
+
+        // with a second active owner the governance change_role runs
+        var owner2 = CreateOwner("owner2@example.com");
+        var second = new GovernanceAction
+        {
+            ActionType = "change_role", ActorId = admin.UserId, TargetResourceId = owner2.UserId,
+            NewValue = "User", Reason = "role change"
+        };
+        Database.GovernanceActions.Add(second);
+        var result = _controller.DecideGovernanceAction(csrf, second.ActionId, "approve");
+        Assert.Equal("approved", ((dynamic)result).status);
+        Assert.Equal("role_changed", ((dynamic)result).execution_result);
+        Assert.Equal(Role.User, owner2.Tier);
+        Assert.Contains(Database.AuditLog, l => l.Action == "role_changed" && l.ResourceId == owner2.UserId && l.OldValue == "Owner" && l.NewValue == "User");
+    }
+
+    /// <summary>
+    /// ADMIN-07 (admin spec LAST OWNER, approver rule): an admin's governance change_role that targets the approving
+    /// owner, while a second active owner exists (so the last-owner check passes), is refused with 400
+    /// cannot_change_own_role; the action stays pending, the approver's tier is unchanged and nothing is audited.
+    /// With the only active owner as target the last-owner answer still comes first.
+    /// In: nothing. Out: asserts. Why: review finding 4525101209. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// Touches: the in-memory admin state.
+    /// </summary>
+    // ADMIN-07
+    [Fact]
+    public void Governance_ChangeRole_TargetIsApprover_Refused()
+    {
+        var owner = CreateOwner();
+        var admin = CreateAdmin();
+        SetupAuth(owner);
+        var csrf = GetCsrfToken(owner);
+        var self = new GovernanceAction
+        {
+            ActionType = "change_role", ActorId = admin.UserId, TargetResourceId = owner.UserId,
+            NewValue = "Admin", Reason = "hand over"
+        };
+        Database.GovernanceActions.Add(self);
+        // the only active owner: the last-owner check answers first
+        Assert.Equal("cannot_demote_last_owner", Assert.Throws<ApiException>(() => _controller.DecideGovernanceAction(csrf, self.ActionId, "approve")).Code);
+
+        CreateOwner("owner2@example.com");
+        var auditBefore = Database.AuditLog.Count;
+        var ex = Assert.Throws<ApiException>(() => _controller.DecideGovernanceAction(csrf, self.ActionId, "approve"));
+        Assert.Equal("cannot_change_own_role", ex.Code);
+        Assert.Equal(400, ex.Status);
+        Assert.Equal("pending", self.Status);
+        Assert.Null(self.ApprovedBy);
+        Assert.Equal(Role.Owner, owner.Tier);
+        Assert.Equal(auditBefore, Database.AuditLog.Count);
+    }
+
     // ADMIN-17
     [Fact]
     public void Governance_Reject_LogsReason()
@@ -900,6 +985,10 @@ public class AdminControllerTests
             () => _controller.ListGovernanceActions(csrf),
             () => _controller.DecideGovernanceAction(csrf, ga.ActionId, "approve"),
             () => _controller.SearchAuditLog(csrf),
+            // Phase B.3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): refused before the CSRF check too
+            () => _controller.ChangeUserRole("wrong-csrf", target.UserId, "Admin"),
+            () => _controller.DecideGovernanceAction("wrong-csrf", ga.ActionId, "approve"),
+            () => _controller.SearchAuditLog(null),
         };
         foreach (var action in actions)
         {

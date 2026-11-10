@@ -362,6 +362,73 @@ class TestNotificationService(unittest.TestCase):
             self.assertEqual(self.service.deliver_due()["sent"], 0)
             mock_email.assert_called_once()
 
+    # NOTIF-05
+    def test_quiet_hours_window_is_start_inclusive_end_exclusive(self):
+        """Quiet hours are [start, end): a message sent exactly at quiet_hours_end goes out at once, one sent exactly
+        at quiet_hours_start is queued until the end, also for a window that crosses midnight.
+        In: the test fixtures. Out: assertions. Why: NOTIF-05 as amended in Phase B.3 (notifications.md,
+        2026-11-10). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite, mocked SMTP."""
+        payload = {"user_id": self.user_id, "template_key": "welcome_email", "channel": "email",
+                   "vars": {"app_name": "Edge"}, "scheduled_at": None}
+        with patch('notifications_python._send_email') as mock_email:
+            self.service.update_user_preferences(self.user_id, {"quiet_hours_start": "11:00",
+                                                                "quiet_hours_end": "12:00"})
+            self.assertEqual(self.service.api_send(payload)["status"], "sent")  # T0 is 12:00, the end
+            self.assertEqual(mock_email.call_count, 1)
+            self.service.update_user_preferences(self.user_id, {"quiet_hours_start": "12:00",
+                                                                "quiet_hours_end": "13:00"})
+            self.assertEqual(self.service.api_send(payload)["status"], "queued")  # 12:00 is the start
+            self.assertEqual(self._last_log()["scheduled_at"], "2026-11-10T13:00:00.000000Z")
+            self.service.update_user_preferences(self.user_id, {"quiet_hours_start": "22:00",
+                                                                "quiet_hours_end": "08:00"})
+            self.now[0] = datetime(2026, 11, 11, 8, 0, tzinfo=timezone.utc)
+            self.assertEqual(self.service.api_send(payload)["status"], "sent")
+            self.now[0] = datetime(2026, 11, 11, 7, 59, 59, tzinfo=timezone.utc)
+            self.assertEqual(self.service.api_send(payload)["status"], "queued")
+            self.assertEqual(mock_email.call_count, 2)
+
+    # NOTIF-05
+    def test_quiet_hours_hold_email_and_sms_only(self):
+        """Inside quiet hours an in-app message is stored at once (status 'sent', channel in_app), whether it names
+        the channel or takes it from the template; email and SMS are still queued; and deliver_due sends a due
+        in-app message inside quiet hours instead of re-queueing it.
+        In: the test fixtures. Out: assertions. Why: NOTIF-05 as amended in Phase B.3 (notifications.md,
+        2026-11-10). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite, mocked senders."""
+        self.service.update_user_preferences(self.user_id, {"quiet_hours_start": "11:00", "quiet_hours_end": "13:00"})
+        with patch('notifications_python._send_email') as mock_email:
+            resp = self.service.api_send({"user_id": self.user_id, "template_key": "invoice_ready",
+                                          "channel": "in_app", "vars": {"month": "May"}, "scheduled_at": None})
+            self.assertEqual(resp["status"], "sent")
+            log = self.service.track_message(int(resp["message_id"]))
+            self.assertEqual((log["channel"], log["status"]), ("in_app", "sent"))
+            self.service.update_user_preferences(self.user_id, {"channels_enabled": {"email": False, "sms": False,
+                                                                                      "in_app": True}})
+            resp = self.service.api_send({"user_id": self.user_id, "template_key": "invoice_ready",
+                                          "vars": {"month": "May"}, "scheduled_at": None})
+            self.assertEqual(resp["status"], "sent")
+            self.assertEqual(self._last_log()["channel"], "in_app")
+            self.service.update_user_preferences(self.user_id, {"channels_enabled": {"email": True, "sms": True,
+                                                                                      "in_app": True}})
+            resp = self.service.api_send({"user_id": self.user_id, "template_key": "welcome_email",
+                                          "channel": "email", "vars": {"app_name": "Q"}, "scheduled_at": None})
+            self.assertEqual(resp["status"], "queued")
+            mock_email.assert_not_called()
+        with patch.object(self.service, "_sms_sender") as sms:
+            resp = self.service.api_send({"user_id": self.user_id, "template_key": "invoice_ready",
+                                          "channel": "sms", "vars": {"month": "May"}, "scheduled_at": None})
+            self.assertEqual(resp["status"], "queued")
+            sms.assert_not_called()
+        # deliver_due: an in-app message that falls due inside quiet hours is stored, not re-queued.
+        self.now[0] = datetime(2026, 11, 10, 10, 0, tzinfo=timezone.utc)
+        queued = self.service.api_send({"user_id": self.user_id, "template_key": "invoice_ready",
+                                        "channel": "in_app", "vars": {"month": "May"},
+                                        "scheduled_at": "2026-11-10T11:30:00Z"})
+        self.assertEqual(queued["status"], "queued")
+        self.now[0] = datetime(2026, 11, 10, 11, 30, tzinfo=timezone.utc)
+        counts = self.service.deliver_due()
+        self.assertEqual((counts["sent"], counts["requeued"]), (1, 0))
+        self.assertEqual(self.service.track_message(int(queued["message_id"]))["status"], "sent")
+
     # NOTIF-11
     def test_unsubscribe_link(self):
         """POST with a valid token turns the channel off; GET changes nothing; a missing, short, non-hex, altered or

@@ -231,6 +231,47 @@ final class NotificationServiceTest extends TestCase
         $this->assertTrue($this->service->updateUserPreferences(300, ['quiet_hours_start' => null, 'quiet_hours_end' => null])['success'], 'null clears');
     }
 
+    /**
+     * NOTIF-05 (Phase B.3): the quiet-hours window is [start, end): a message due exactly at quiet_hours_end is sent
+     * at once, one due exactly at quiet_hours_start is held. Quiet hours hold email and SMS only: an in-app message
+     * is stored at once, both from send and from deliverDue, while an SMS is queued until quiet_hours_end.
+     * Input: the fixed clock, quiet hours 11:00-14:00 UTC. Output: assertions only.
+     * Why: notifications.md IMPLEMENTATION, amended 2026-11-10 (Phase B.3). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches: the in-memory SQLite database; e-mail and SMS are captured (test mode).
+     */
+    // NOTIF-05
+    public function testQuietHoursAreHalfOpenAndHoldEmailAndSmsOnly(): void
+    {
+        $utc = new DateTimeZone('UTC');
+        $this->pdo->prepare('INSERT INTO user_notification_preferences (user_id, do_not_disturb, quiet_hours_start, quiet_hours_end, channels_enabled) VALUES (400, 0, :s, :e, :ch)')
+            ->execute([':s' => '11:00', ':e' => '14:00', ':ch' => json_encode(['email' => true, 'sms' => true, 'in_app' => true])]);
+        $send = fn(string $channel, ?string $at = null): array => $this->service->endpointSend(['user_id' => 400, 'template_key' => 'welcome_email', 'channel' => $channel, 'vars' => ['app_name' => 'Q'], 'scheduled_at' => $at]);
+
+        $this->now = new DateTimeImmutable('2026-11-10 14:00:00', $utc);
+        $this->assertSame('sent', $send('email')['status'], 'exactly at quiet_hours_end: sent');
+        $this->now = new DateTimeImmutable('2026-11-10 11:00:00', $utc);
+        $held = $send('email');
+        $this->assertSame(['queued', '2026-11-10 14:00:00'], [$held['status'], $this->logRow($held['message_id'])['scheduled_at']], 'exactly at quiet_hours_start: held');
+
+        $this->now = new DateTimeImmutable('2026-11-10 12:00:00', $utc);
+        $inApp = $send('in_app');
+        $this->assertSame('sent', $inApp['status'], 'in-app stored at once inside quiet hours');
+        $this->assertNull($this->logRow($inApp['message_id'])['scheduled_at']);
+        $sms = $send('sms');
+        $this->assertSame(['queued', '2026-11-10 14:00:00'], [$sms['status'], $this->logRow($sms['message_id'])['scheduled_at']], 'SMS held');
+
+        // deliverDue: an in-app message that falls due inside quiet hours is delivered, an email is deferred.
+        $this->now = new DateTimeImmutable('2026-11-10 10:00:00', $utc);
+        $dueInApp = $send('in_app', '2026-11-10T12:30:00Z');
+        $dueEmail = $send('email', '2026-11-10T12:30:00Z');
+        $this->assertSame(['queued', 'queued'], [$dueInApp['status'], $dueEmail['status']]);
+        $this->assertSame(['requeued' => 0, 'sent' => 1, 'skipped' => 0, 'failed' => 0, 'deferred' => 1], $this->service->deliverDue(new DateTimeImmutable('2026-11-10 12:30:00', $utc)));
+        $this->assertSame('sent', $this->logRow($dueInApp['message_id'])['status']);
+        $this->assertSame(['queued', '2026-11-10 14:00:00'], [$this->logRow($dueEmail['message_id'])['status'], $this->logRow($dueEmail['message_id'])['scheduled_at']]);
+        // At quiet_hours_end every held message is sent.
+        $this->assertSame(['requeued' => 0, 'sent' => 3, 'skipped' => 0, 'failed' => 0, 'deferred' => 0], $this->service->deliverDue(new DateTimeImmutable('2026-11-10 14:00:00', $utc)));
+    }
+
     // NOTIF-06
     public function testDoNotDisturbSkips(): void
     {

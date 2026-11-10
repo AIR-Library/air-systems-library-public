@@ -259,6 +259,8 @@ class AdminSystem
 
     /**
      * Creates the users, customers, deployments, governance and audit tables if missing. Touches: the database. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+     * Phase B.3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): governance_actions has a new_value column (a
+     * change_role action's new tier, ADMIN-07); an older database gets it through ALTER TABLE.
      */
     private function initializeSchema(): void
     {
@@ -341,7 +343,8 @@ CREATE TABLE IF NOT EXISTS governance_actions (
     status TEXT NOT NULL DEFAULT 'pending',
     approved_by INTEGER,
     approved_at TEXT,
-    rejection_reason TEXT
+    rejection_reason TEXT,
+    new_value TEXT
 );
 CREATE TABLE IF NOT EXISTS audit_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -356,6 +359,13 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 );
 SQL;
         $this->pdo->exec($sql);
+        // [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.3, ADMIN-07: governance_actions.new_value holds a
+        // change_role action's new tier. A database made before it gets the column added here.
+        try {
+            $this->pdo->query('SELECT new_value FROM governance_actions LIMIT 0');
+        } catch (PDOException $e) {
+            $this->pdo->exec('ALTER TABLE governance_actions ADD COLUMN new_value TEXT');
+        }
     }
 
     /* USERS DOMAIN */
@@ -480,6 +490,11 @@ SQL;
      * caller's own role. Output: success or an error array. Touches: users and audit_logs. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
      * Phase B.2 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): a suspended caller is refused first (403
      * account_suspended, ADMIN-19), and every error carries its HTTP status ({error, status, message}).
+     * Phase B.4 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, spec af92d76, change_role "Order"): the gate
+     * (owner_only, user_id != current_user_id) runs before the checks, so changing your own role is always 400
+     * cannot_change_own_role, even for the last active owner (the last-owner check used to run first and answer
+     * cannot_demote_last_owner). Input: {csrf_token, user_id, new_tier}. Output: {success, user_id, old_tier,
+     * new_tier} or an error array. Touches: users and audit_logs.
      */
     public function changeRole(array $data): array
     {
@@ -490,6 +505,11 @@ SQL;
 
             $user_id = (int)($data['user_id'] ?? 0);
             $new_tier = trim($data['new_tier'] ?? '');
+
+            // Gate before the checks (Phase B.4, af92d76): your own role is cannot_change_own_role, last owner or not.
+            if ($user_id === $this->current_user_id) {
+                return $this->fail('cannot_change_own_role', 'Cannot change own role');
+            }
 
             if (!$this->validate_tier($new_tier)) {
                 return $this->fail('invalid_tier', 'Invalid tier');
@@ -502,13 +522,8 @@ SQL;
                 return $this->fail('user_not_found', 'User not found');
             }
 
-            // Check if trying to demote the last active owner (takes precedence over own-role check)
             if ($user['tier'] === 'owner' && $this->countOwners() <= 1 && $new_tier !== 'owner') {
                 return $this->fail('cannot_demote_last_owner', 'Cannot demote last active owner');
-            }
-
-            if ($user_id === $this->current_user_id) {
-                return $this->fail('cannot_change_own_role', 'Cannot change own role');
             }
 
             $old_tier = $user['tier'];
@@ -1114,17 +1129,23 @@ SQL;
 
     /**
      * Run an approved governance action. Supported action types: suspend_user and delete_user (target a user;
-     * never the approver, never the last active owner), suspend_deployment and retire_deployment (target a
+     * never the approver, never the last active owner), change_role (target a user; new_value is the new staff
+     * role; never demotes the last active owner), suspend_deployment and retire_deployment (target a
      * deployment). Input: the governance_actions row. Output: {executed: action_type, target} or
      * {error, status, message} (unsupported_action_type, user_not_found, deployment_not_found, cannot_suspend_yourself,
-     * cannot_demote_last_owner). Why: ADMIN-16 "action executed". 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP; the
-     * status on each error is the same day (Phase B.2).
+     * cannot_demote_last_owner, invalid_tier, cannot_change_own_role). Why: ADMIN-16 "action executed". 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP; the status on each error is the same day (Phase B.2).
+     * Phase B.3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): change_role added, because ADMIN-07 (the last
+     * active owner) is proven through a governance-approved change_role; its refusal leaves the action pending.
      * Touches: the database (users or deployments) and the audit log.
      */
     private function executeGovernanceAction(array $action): array
     {
         $target = (int)$action['target_resource_id'];
         $type = (string)$action['action_type'];
+        if ($type === 'change_role') {
+            return $this->executeGovernanceChangeRole($target, (string)($action['new_value'] ?? ''));
+        }
         if ($type === 'suspend_user' || $type === 'delete_user') {
             if ($target === $this->current_user_id) {
                 return $this->fail('cannot_suspend_yourself', 'Cannot act on yourself');
@@ -1158,6 +1179,38 @@ SQL;
             return ['executed' => $type, 'target' => $target];
         }
         return $this->fail('unsupported_action_type', 'Unsupported action type');
+    }
+
+    /**
+     * The change_role a governance approval runs: the same checks, in the same order, as a direct change_role
+     * after its gates (valid staff role, user exists, the last active owner is never demoted, then not the
+     * approver's own role), then the update and the role_changed audit row.
+     * Input: the target user id and the new tier (governance_actions.new_value). Output: {executed: "change_role",
+     * target} or {error, status, message}; on a refusal nothing changes and decideGovernanceAction leaves the
+     * action pending. Why: admin_system.md LAST OWNER (Phase B.3): ADMIN-07 is proven through a governance-approved
+     * change_role. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database (users, audit_logs).
+     */
+    private function executeGovernanceChangeRole(int $target, string $newTier): array
+    {
+        if (!$this->validate_tier($newTier)) {
+            return $this->fail('invalid_tier', 'Invalid tier');
+        }
+        $stmt = $this->pdo->prepare('SELECT tier FROM users WHERE id = :id');
+        $stmt->execute([':id' => $target]);
+        $user = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$user) {
+            return $this->fail('user_not_found', 'User not found');
+        }
+        if ($user['tier'] === 'owner' && $this->countOwners() <= 1 && $newTier !== 'owner') {
+            return $this->fail('cannot_demote_last_owner', 'Cannot demote last active owner');
+        }
+        if ($target === $this->current_user_id) {
+            return $this->fail('cannot_change_own_role', 'Cannot change own role');
+        }
+        $this->pdo->prepare('UPDATE users SET tier = :tier, updated_at = :now WHERE id = :id')
+            ->execute([':tier' => $newTier, ':now' => $this->getCurrentTimestamp(), ':id' => $target]);
+        $this->auditLog('role_changed', $this->current_user_id, 'users', $target, ['tier' => $user['tier']], ['tier' => $newTier]);
+        return ['executed' => 'change_role', 'target' => $target];
     }
 
     /* AUDIT LOG SEARCH */

@@ -471,7 +471,9 @@ describe('Billing System', function() {
       const result = await billingSystem.handle_stripe_webhook(payload, signature);
       
       assert.strictEqual(result.error, 'invalid_signature');
-      assert.strictEqual(result.status, 403);  // Phase B.2 bug fix, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: errors carry the spec's HTTP status
+      // Phase B.2 bug fix, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: errors carry the spec's HTTP status.
+      // Phase B.3, same day: BILL-09 answers 400 (Stripe's documented answer), was 403.
+      assert.strictEqual(result.status, 400);
       assert.ok(result.message.includes('Webhook Error'));
       
       stripeStub.restore();

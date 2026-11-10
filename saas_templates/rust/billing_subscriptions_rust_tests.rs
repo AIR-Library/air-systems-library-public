@@ -262,7 +262,9 @@ async fn test_webhook_signature_invalid() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(matches!(err, BillingError::InvalidSignature));
-    assert_eq!(err.to_response().1, 403);
+    // BILL-09 answers 400 invalid_signature (spec Phase B.3 ruling, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP; was 403)
+    let (body, status) = err.to_response();
+    assert_eq!((body["error"].as_str(), status), (Some("invalid_signature"), 400));
     // nothing was processed or recorded
     assert_eq!(count(&service, "events", "1 = 1"), 0);
     assert_eq!(count(&service, "invoices", "1 = 1"), 0);

@@ -21,7 +21,8 @@ import {
  * - Four assertions checked mockPool.query, but the module runs its SQL in a transaction on the client from
  *   pool.connect() (BEGIN ... COMMIT), and the same tests give that client the replies; the pool-level mock is never
  *   called. They now check that client's query mock, with the same SQL and parameters.
- * - Added: the spec's "webhook signature invalid -> 403 invalid_signature" test, which this file did not have.
+ * - Added: the spec's "webhook signature invalid -> 403 invalid_signature" test, which this file did not have
+ *   (400 since the Phase B.3 ruling, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
  */
 
 // Mock Stripe
@@ -597,7 +598,8 @@ describe('Billing Subscriptions System', () => {
     });
 
     // BILL-09
-    it('should reject a webhook whose signature is invalid (403 invalid_signature)', async () => {
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3 ruling): the spec's answer is now 400, not 403.
+    it('should reject a webhook whose signature is invalid (400 invalid_signature)', async () => {
       const mockPool = { query: jest.fn(), connect: jest.fn() };
       set_clients({ pool: mockPool as any });
       mockStripe.webhooks.constructEvent.mockImplementation(() => {
@@ -605,7 +607,7 @@ describe('Billing Subscriptions System', () => {
       });
 
       const result = await verify_and_handle_stripe_webhook('{"id":"evt_forged"}', 't=1,v1=bad', 'whsec_test');
-      expect(result).toEqual({ error: 'invalid_signature', message: 'Webhook signature verification failed', code: 403 });
+      expect(result).toEqual({ error: 'invalid_signature', message: 'Webhook signature verification failed', code: 400 });
       expect(mockStripe.webhooks.constructEvent).toHaveBeenCalledWith('{"id":"evt_forged"}', 't=1,v1=bad', 'whsec_test');
       // Nothing is written for an unverified event.
       expect(mockPool.connect).not.toHaveBeenCalled();

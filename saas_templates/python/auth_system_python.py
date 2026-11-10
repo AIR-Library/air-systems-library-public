@@ -78,6 +78,8 @@ class AuthSystem:
         OAuth provider client that exchanges the one-time code for the verified profile {id, email,
         email_verified}; the default now refuses (it invented a user for any code). clock() returns the aware UTC
         now (default the wall clock), so state expiry can be tested.
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.3: email_code_max_attempts = 5 wrong verify_email
+        codes invalidate the current code (auth_system.md flow 2, "Attempts").
         Touches: SQLite (creates tables); network only through the injected sender/oauth_profile."""
         self._secret_key = _load_secret_key(secret_key)
         self.email_sender = email_sender or (lambda email, code: None)
@@ -86,6 +88,10 @@ class AuthSystem:
         # Exchanges a provider's one-time code for the user's verified profile: pass a real provider client.
         self.oauth_profile = oauth_profile or _unconfigured_oauth_client
         self.mfa_max_attempts = 5
+        self.email_code_max_attempts = 5
+        # AUTH-18 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): resend_verification limits and the resent code's life.
+        self.resend_max_per_hour = 3
+        self.resend_code_expires_minutes = 10
         self.jwt_secret = jwt_secret or secrets.token_urlsafe(32)
         self.bcrypt_rounds = bcrypt_rounds
         self.access_token_expires_minutes = access_token_expires_minutes
@@ -201,6 +207,14 @@ class AuthSystem:
             flow TEXT NOT NULL,
             decision_points TEXT NOT NULL
         );
+        -- AUTH-18 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): one row per accepted resend_verification request,
+        -- for every email asked about (known or not), so the 3-per-hour limit answers the same for any address.
+        CREATE TABLE IF NOT EXISTS verification_resends (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL,
+            requested_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_verification_resends_email ON verification_resends(email, requested_at);
         CREATE TABLE IF NOT EXISTS rate_limit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ip TEXT NOT NULL,
@@ -409,7 +423,24 @@ class AuthSystem:
         compared in constant time in Python (docs/specs/README.md); it was matched with "code = ?" in SQL.
         [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2 (AUTH-16): the supplied code's HMAC-SHA256 is
         compared with the stored code_hash. Touches: SQLite (users, verification_codes, audit_log).
-        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: each stored or compared secret is now HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256)."""
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: each stored or compared secret is now HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.3 (auth_system.md flow 2, "Attempts"): each wrong code
+        adds one to the attempts of the user's current (unexpired) email codes; a code with 5 wrong attempts is
+        invalidated, and every further try, the right code included, answers {error: "code_invalid"} until a new
+        code is stored (a 6-digit code must not be guessable by retrying).
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.4 (af92d76, AUTH-17): a wrong code now answers
+        {error: "code_invalid"} (it answered code_expired); only a code that matches a stored code whose expires_at
+        has passed answers {error: "code_expired"}, and that try does not count as wrong. Both are the spec's 400
+        answers. Touches: SQLite (users, verification_codes, audit_log).
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Review finding 4525101305 (CWE-367): the attempts were read,
+        the code compared, and the wrong try written after, so concurrent requests that all read attempts = 4 could
+        each compare a guess. Now every try against a current code is counted FIRST, in one conditional write
+        (UPDATE ... SET attempts = attempts + 1 WHERE id = ? AND attempts < 5 AND expires_at > now), committed, and the
+        code is compared only when that write changed one row, as Go, JavaScript and TypeScript do. The right code
+        on a counted 5th try still verifies; after 5 counted tries every try is code_invalid. A code matching only
+        an EXPIRED row is still code_expired and is not counted (an expired code cannot verify, so it is compared
+        before counting). _log_why_chain and _log_audit_log commit, so they are called only when no transaction of
+        this flow is open: they cannot commit any of it early."""
         decision_points = []
         cursor = self.db.cursor()
         cursor.execute("SELECT id, email_verified_at FROM users WHERE email = ?", (email,))
@@ -422,30 +453,110 @@ class AuthSystem:
             self._log_why_chain("verify_email", decision_points + ["user_unverified:failed"])
             return {"error": "email_already_verified"}
         decision_points.append("user_unverified")
-        cursor.execute(
-            """SELECT id, code_hash FROM verification_codes
-               WHERE user_id = ? AND type = 'email' AND expires_at > ? ORDER BY id""",
-            (user_id, self._now_iso())
-        )
-        supplied = self._hash_secret(code_or_token if isinstance(code_or_token, str) else "").encode("utf-8")
-        code_record = None
-        for candidate in cursor.fetchall():
-            if hmac.compare_digest(str(candidate[1]).encode("utf-8"), supplied):
-                code_record = candidate
-        if not code_record:
-            self._log_why_chain("verify_email", decision_points + ["code_valid:failed"])
-            return {"error": "code_expired"}
-        decision_points.append("code_valid")
         now_iso = self._now_iso()
+        cursor.execute(
+            """SELECT id, code_hash, attempts FROM verification_codes
+               WHERE user_id = ? AND type = 'email' AND expires_at > ? ORDER BY id""",
+            (user_id, now_iso)
+        )
+        current = cursor.fetchall()
+        live = [row for row in current if (row[2] or 0) < self.email_code_max_attempts]
+        supplied = self._hash_secret(code_or_token if isinstance(code_or_token, str) else "").encode("utf-8")
+        if current and not live:
+            # Every current code is spent (5 counted tries): code_invalid until a new code is sent; nothing compared.
+            self._log_why_chain("verify_email", [*decision_points, "code_valid:failed"])
+            return {"error": "code_invalid"}
+        # Phase B.4 (af92d76): the right code past its expiry is code_expired, and that try is not counted. Only
+        # EXPIRED rows are compared here; an expired code can never verify, so this compare gives a guesser nothing.
+        cursor.execute(
+            """SELECT code_hash FROM verification_codes
+               WHERE user_id = ? AND type = 'email' AND expires_at <= ?""",
+            (user_id, now_iso)
+        )
+        if any(hmac.compare_digest(str(row[0]).encode("utf-8"), supplied) for row in cursor.fetchall()):
+            self._log_why_chain("verify_email", [*decision_points, "code_valid:failed"])
+            return {"error": "code_expired"}
+        # Review finding 4525101305 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): COUNT FIRST, in one conditional
+        # write per code, and compare only a code whose count succeeded (one row changed). The count is committed
+        # before the compare, so concurrent requests on other connections can never compare more than 5 tries
+        # between them; the read above is only a pre-filter, the write decides.
+        code_record = None
+        for candidate in live:
+            cursor.execute(
+                """UPDATE verification_codes SET attempts = attempts + 1
+                   WHERE id = ? AND attempts < ? AND expires_at > ?""",
+                (candidate[0], self.email_code_max_attempts, now_iso)
+            )
+            counted = cursor.rowcount == 1
+            self.db.commit()
+            if counted and hmac.compare_digest(str(candidate[1]).encode("utf-8"), supplied):
+                code_record = candidate
+                break
+        if not code_record:
+            self._log_why_chain("verify_email", [*decision_points, "code_valid:failed"])
+            return {"error": "code_invalid"}
+        decision_points.append("code_valid")
         cursor.execute("UPDATE users SET email_verified_at = ?, status = 'verified', updated_at = ? WHERE id = ?",
                        (now_iso, now_iso, user_id))
         cursor.execute("DELETE FROM verification_codes WHERE id = ?", (code_record[0],))
         self.db.commit()
+        # The why chain and the audit row are written only now, with no transaction open: their own commit can
+        # never commit part of this flow early (review finding 4525101305).
         self._log_why_chain("verify_email", decision_points)
         self._log_audit_log("email_verified", actor_id=user_id, resource_type="user", resource_id=user_id,
                            old_value={"email_verified_at": None, "status": "unverified"}, 
                            new_value={"email_verified_at": now_iso, "status": "verified"})
         return {"status": "verified", "user_id": user_id, "message": "ready to login"}
+
+    def resend_verification(self, email: str) -> Dict[str, Any]:
+        """Flow 2b: replace an unverified user's email code and email the new one.
+
+        In: the email. Out: {status: "sent"} (the spec's 202) or {error: "too_many_requests"} (the spec's 429).
+        For an unverified user it deletes the user's email codes, stores a new 6-digit code (attempts 0, its
+        HMAC-SHA256 under AUTH_SECRET_KEY, 10-minute expiry) and sends it through the injected email_sender. At most 3
+        requests per email per hour are accepted: the 4th within the hour is too_many_requests and sends nothing. An
+        unknown or already verified email gets the same {status: "sent"} and nothing is sent, so the answer never says
+        whether an account exists; those requests count toward the limit too, so the 429 says nothing either. The
+        count and the new request's row are one conditional INSERT, so concurrent requests cannot pass the limit.
+        Why: AUTH-18 (auth_system.md flow 2b, commit 0eb5a4e): after 5 wrong codes (AUTH-17) nothing could issue a new
+        code, so anyone who knew an email could block its verification. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        Touches: SQLite (verification_resends, users read, verification_codes, audit_log, why_chain_log), the email
+        sender (network in production)."""
+        if not isinstance(email, str):
+            email = ""
+        now = self._now()
+        cursor = self.db.cursor()
+        cursor.execute(
+            """INSERT INTO verification_resends (email, requested_at)
+               SELECT ?, ? WHERE (SELECT COUNT(*) FROM verification_resends
+                                  WHERE email = ? AND requested_at > ?) < ?""",
+            (email, now.isoformat(), email, (now - timedelta(hours=1)).isoformat(), self.resend_max_per_hour)
+        )
+        accepted = cursor.rowcount == 1
+        self.db.commit()
+        if not accepted:
+            self._log_why_chain("resend_verification", ["rate_limit_email_1h:failed"])
+            return {"error": "too_many_requests"}
+        cursor.execute("SELECT id, email_verified_at FROM users WHERE email = ?", (email,))
+        user = cursor.fetchone()
+        if not user or user[1] is not None:
+            # Unknown or already verified: the same answer as a real resend, and no email (no account enumeration).
+            self._log_why_chain("resend_verification", ["rate_limit_email_1h", "user_unverified:failed"])
+            return {"status": "sent"}
+        user_id = user[0]
+        code = self._generate_verification_code()
+        cursor.execute("DELETE FROM verification_codes WHERE user_id = ? AND type = 'email'", (user_id,))
+        cursor.execute(
+            """INSERT INTO verification_codes (user_id, code_hash, created_at, expires_at, type, attempts)
+               VALUES (?, ?, ?, ?, 'email', 0)""",
+            (user_id, self._hash_secret(code), now.isoformat(),
+             (now + timedelta(minutes=self.resend_code_expires_minutes)).isoformat())
+        )
+        self.db.commit()
+        self.email_sender(email, code)
+        self._log_why_chain("resend_verification", ["rate_limit_email_1h", "user_unverified"])
+        self._log_audit_log("verification_resent", actor_id=user_id, resource_type="user", resource_id=user_id)
+        return {"status": "sent"}
 
     def login(self, email: str, password: str, device_id: str, ip: str) -> Dict[str, Any]:
         """Flow 3: sign in with email and password; an MFA user gets a challenge instead of a session.

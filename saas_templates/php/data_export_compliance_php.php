@@ -71,7 +71,7 @@ class ComplianceException extends RuntimeException
         'not_found' => 404,
         'user_not_found' => 404,
         'deletion_not_pending' => 409,
-        'grace_period_elapsed' => 409,
+        'grace_period_over' => 409,
         'audit_eraser_not_configured' => 500,
         'audit_eraser_failed' => 500,
     ];
@@ -781,11 +781,19 @@ final class ComplianceService
      * @param string $deletionId
      * @return array {success: true, status: 'cancelled'}
      * @throws ComplianceException 404 not_found (none, another user's, or completed) | 409 deletion_not_pending (cancelled) |
-     *                             409 grace_period_elapsed (confirmed and its grace period is over)
+     *                             409 grace_period_over (will_delete_at has passed: the deletion is due, not yet run)
      *
      * Why: cancelling must stop at the end of the grace period; the caller is required since
      * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-14; it was optional). The code for a request no longer
      * pending is deletion_not_pending since the same day (EXPORT-15; it was not_cancellable).
+     * Phase B.3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, data_export_compliance.md endpoint 5): once
+     * will_delete_at (scheduled_at) is reached the answer is 409 grace_period_over (the code was
+     * grace_period_elapsed), for a pending request as for a confirmed one, and the row is left as it was.
+     * Phase B.4 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, af92d76, EXPORT-16): only a confirmed (approved)
+     * request is scheduled, so only it gets 409 grace_period_over from will_delete_at on (exactly at it included)
+     * and stays approved; a pending (unconfirmed) request can always be cancelled, even after will_delete_at (it was
+     * refused like a confirmed one). The UPDATE repeats the rule, so a confirm that lands between the read and the
+     * write cannot be cancelled past its date.
      * Touches: the database and the audit log.
      */
     public function cancelDeletion(int $userId, string $deletionId): array
@@ -795,15 +803,20 @@ final class ComplianceService
             throw new ComplianceException('deletion_not_pending', 'Deletion request is no longer pending');
         }
         $now = self::format($this->now());
+        // Phase B.4 (af92d76): the grace period binds only a confirmed request; a pending one is not scheduled.
         if ($row['status'] === 'approved' && $row['scheduled_at'] <= $now) {
-            throw new ComplianceException('grace_period_elapsed', 'The grace period has ended');
+            throw new ComplianceException('grace_period_over', 'The grace period has ended');
         }
         $stmt = $this->pdo->prepare(
             "UPDATE deletion_requests SET status = 'cancelled', confirmation_token_hash = NULL, confirmation_expires_at = NULL
-             WHERE id = :id AND status IN ('pending', 'approved')"
+             WHERE id = :id AND (status = 'pending' OR (status = 'approved' AND scheduled_at > :now))"
         );
-        $stmt->execute([':id' => $deletionId]);
+        $stmt->execute([':id' => $deletionId, ':now' => $now]);
         if ($stmt->rowCount() !== 1) {
+            $status = $this->getOwnDeletion($userId, $deletionId)['status'];
+            if ($status === 'approved') {
+                throw new ComplianceException('grace_period_over', 'The grace period has ended');
+            }
             throw new ComplianceException('deletion_not_pending', 'Deletion request is no longer pending');
         }
         $this->audit->record($userId, 'deletion_cancelled', ['deletion_id' => $deletionId]);

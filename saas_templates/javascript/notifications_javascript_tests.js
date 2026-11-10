@@ -514,6 +514,69 @@ async function run() {
     assert.deepStrictEqual(sent, [77]);
   });
 
+  // NOTIF-05
+  /**
+   * Phase B.3: the quiet-hours window is [start, end). With quiet hours 22:00-08:00 UTC, an e-mail sent at 07:59 is
+   * queued for 08:00, and one sent exactly at 08:00 (quiet_hours_end) goes out at once.
+   * In: a service with a settable UTC clock. Out: assertions. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * Touches: memory.
+   */
+  await test('Quiet hours are [start, end): a message due exactly at quiet_hours_end is sent', async () => {
+    let clock = Date.UTC(2024, 0, 2, 7, 59);
+    const sent = [];
+    const svc = makeService({ nowFn: () => new Date(clock), emailSender: async (m) => { sent.push(m.to); } });
+    svc.updatePreferences(81, { quiet_hours_start: '22:00', quiet_hours_end: '08:00' });
+    const held = await svc.send({ user_id: 81, template_key: 'welcome_email', channel: 'email', vars: { app_name: 'Acme' } });
+    assert.strictEqual(held.status, 'queued');
+    assert.strictEqual(svc.logs.get(held.message_id).scheduled_at, '2024-01-02T08:00:00.000Z');
+    assert.deepStrictEqual(sent, []);
+    clock = Date.UTC(2024, 0, 2, 8, 0);
+    const atEnd = await svc.send({ user_id: 81, template_key: 'welcome_email', channel: 'email', vars: { app_name: 'Acme' } });
+    assert.strictEqual(atEnd.status, 'sent');
+    assert.deepStrictEqual(sent, [81]);
+    clock = Date.UTC(2024, 0, 2, 22, 0);
+    const atStart = await svc.send({ user_id: 81, template_key: 'welcome_email', channel: 'email', vars: { app_name: 'Acme' } });
+    assert.strictEqual(atStart.status, 'queued');
+    assert.strictEqual(svc.logs.get(atStart.message_id).scheduled_at, '2024-01-03T08:00:00.000Z');
+  });
+
+  // NOTIF-05
+  /**
+   * Phase B.3: quiet hours hold e-mail and SMS only. Inside the window an in-app message is stored at once (status
+   * 'sent', listed for the user), while an e-mail and an SMS sent at the same moment are queued until quiet_hours_end;
+   * deliverDue also delivers a due in-app message inside quiet hours instead of re-queueing it.
+   * In: a service with a fixed UTC clock at 12:00 and quiet hours 00:00-23:59. Out: assertions. Added 2026-11-10,
+   * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
+   */
+  await test('Quiet hours hold email and SMS only; an in-app message is stored at once', async () => {
+    let clock = Date.UTC(2024, 0, 1, 12, 0);
+    const inApp = [];
+    const sms = [];
+    const svc = makeService({
+      nowFn: () => new Date(clock),
+      inAppSender: async (m) => { inApp.push(m.userId); },
+      smsSender: async (m) => { sms.push(m.to); },
+    });
+    const due = new Date(Date.UTC(2024, 0, 1, 12, 30)).toISOString();
+    const scheduled = await svc.send({ user_id: 82, template_key: 'admin_alert', channel: 'in_app', vars: { actor: 'a', action: 'b', resource: 'c' }, scheduled_at: due });
+    assert.strictEqual(scheduled.status, 'queued');
+    svc.updatePreferences(82, { quiet_hours_start: '00:00', quiet_hours_end: '23:59', channels_enabled: { email: true, sms: true, in_app: true } });
+    const app = await svc.send({ user_id: 82, template_key: 'admin_alert', channel: 'in_app', vars: { actor: 'a', action: 'b', resource: 'c' } });
+    assert.strictEqual(app.status, 'sent');
+    assert.strictEqual(svc.logs.get(app.message_id).scheduled_at || null, null);
+    assert.deepStrictEqual(svc.getInAppNotifications(82).map((n) => n.message_id), [app.message_id]);
+    const mail = await svc.send({ user_id: 82, template_key: 'welcome_email', channel: 'email', vars: { app_name: 'Acme' } });
+    const text = await svc.send({ user_id: 82, template_key: 'welcome_email', channel: 'sms', vars: { app_name: 'Acme' } });
+    assert.strictEqual(mail.status, 'queued');
+    assert.strictEqual(text.status, 'queued');
+    assert.strictEqual(svc.logs.get(text.message_id).scheduled_at, '2024-01-01T23:59:00.000Z');
+    assert.deepStrictEqual(sms, []);
+    clock = Date.UTC(2024, 0, 1, 12, 30);
+    const out = await svc.deliverDue(new Date(clock));
+    assert.deepStrictEqual(out.map((r) => [r.message_id, r.status]), [[scheduled.message_id, 'sent']]);
+    assert.deepStrictEqual(inApp, [82, 82]);
+  });
+
   console.log(`\nResults: ${passed} passed, ${failed} failed`);
   if (failed > 0) {
     process.exitCode = 1;

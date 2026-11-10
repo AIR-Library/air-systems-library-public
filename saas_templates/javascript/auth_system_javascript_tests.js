@@ -3,8 +3,8 @@
 const TEST_SECRET_KEY = 'test-secret-key-0123456789abcdef-auth';
 process.env.AUTH_SECRET_KEY = TEST_SECRET_KEY;
 const crypto = require('crypto');
-const { initDB, configure, signup, verify_email, login, oauth_start, oauth_callback, mfa_challenge, token_refresh, dbPromise,
-  resetRateLimits, sentEmails } = require('./auth_system_javascript');
+const { initDB, configure, signup, verify_email, resend_verification, login, oauth_start, oauth_callback, mfa_challenge, token_refresh, dbPromise,
+  resetRateLimits, sentEmails, hashSecret } = require('./auth_system_javascript');
 const { expect } = require('@jest/globals');
 const speakeasy = require('speakeasy');
 
@@ -133,6 +133,103 @@ describe('Auth System Tests', () => {
     const res = await verify_email(email, emailedCode(email));
     expect(res.error).toBe('code_expired');
     expect(res.status).toBe(400);
+  });
+
+  /**
+   * Phase B.3 (auth flow 2 "Attempts"): 5 wrong codes invalidate the user's current code. Every further try, the
+   * right code included, is 400 code_invalid and the user stays unverified; a new code (stored as a resend would store
+   * it, 0 tries) then verifies the user. Separately, after 4 wrong codes the right one (the 5th try) is accepted.
+   * In: the test database and mailer. Out: assertions. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4, af92d76): tagged AUTH-17, the id the ruling gave
+   * this rule (it was tagged AUTH-05, which the happy-path test above still names), and each wrong code now asserts
+   * 400 code_invalid (it asserted invalid_code, which af92d76 rules out).
+   * Touches: the test database.
+   */
+  // AUTH-17
+  test('verify_email: 5 wrong codes invalidate the code until a new code is sent', async () => {
+    const db = await dbPromise;
+    const email = 'guess@example.com';
+    await signup(email, 'StrongPassword123456', 'Gus', ip);
+    const right = emailedCode(email);
+    const wrong = right === '000000' ? '111111' : '000000';
+    for (let i = 0; i < 5; i++) {
+      const res = await verify_email(email, wrong);
+      expect(res.error).toBe('code_invalid'); // Phase B.4 (af92d76, 2026-11-10): was invalid_code
+      expect(res.status).toBe(400);
+    }
+    for (let i = 0; i < 2; i++) {
+      const res = await verify_email(email, right);
+      expect(res.error).toBe('code_invalid');
+      expect(res.status).toBe(400);
+    }
+    const user = await db.get('SELECT id, email_verified_at FROM users WHERE email = ?', email);
+    expect(user.email_verified_at).toBeNull();
+    // A new code is sent: a fresh row with 0 tries, which verifies the user.
+    await db.run(`DELETE FROM verification_codes WHERE user_id = ? AND type = 'email'`, user.id);
+    const fresh = 'a1b2c3';
+    await db.run(`INSERT INTO verification_codes (id, user_id, code_hash, created_at, expires_at, type)
+      VALUES (?,?,?,?,?,?)`, `fresh-${user.id}`, user.id, hashSecret(fresh), new Date().toISOString(),
+    new Date(Date.now() + 60 * 60 * 1000).toISOString(), 'email');
+    const ok = await verify_email(email, fresh);
+    expect(ok.status).toBe('verified');
+
+    const email4 = 'four-tries@example.com';
+    await signup(email4, 'StrongPassword123456', 'Fay', ip);
+    const right4 = emailedCode(email4);
+    const wrong4 = right4 === '000000' ? '111111' : '000000';
+    // Phase B.4 (af92d76, 2026-11-10): a wrong code is code_invalid (this asserted invalid_code).
+    for (let i = 0; i < 4; i++) expect((await verify_email(email4, wrong4)).error).toBe('code_invalid');
+    const fifth = await verify_email(email4, right4);
+    expect(fifth.status).toBe('verified');
+    expect((await db.get('SELECT email_verified_at FROM users WHERE email = ?', email4)).email_verified_at).not.toBeNull();
+  });
+
+  /**
+   * resend_verification (auth spec flow 2b): a code spent by 5 wrong tries is replaced by a new 6-digit code (the only
+   * e-mail code row, 0 attempts, stored as its HMAC, expiring in 10 minutes), which is e-mailed and verifies; a 4th
+   * resend for one email within the hour is 429 too_many_requests and sends nothing, and after the hour one is
+   * accepted again; an unknown and an already verified email get the same { success, status: 'sent' } and no e-mail.
+   * In: none. Out: expectations. Why: AUTH-18 (commit 0eb5a4e). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * Touches: the test database; the in-memory outbox.
+   */
+  // AUTH-18
+  test('resend_verification replaces a spent code, is limited to 3 per hour, and hides accounts', async () => {
+    const db = await dbPromise;
+    clock = Date.parse('2026-11-10T12:00:00Z');
+    const email = 'resend@example.com';
+    await signup(email, 'StrongPassword123456', 'Ren', ip);
+    const old = emailedCode(email);
+    const wrong = old === '000000' ? '111111' : '000000';
+    for (let i = 0; i < 5; i++) expect((await verify_email(email, wrong)).error).toBe('code_invalid');
+    expect((await verify_email(email, old)).error).toBe('code_invalid');
+    let mails = sentEmails.length;
+    expect(await resend_verification(email)).toEqual({ success: true, status: 'sent' });
+    expect(sentEmails.length).toBe(mails + 1);
+    expect(sentEmails[sentEmails.length - 1].to).toBe(email);
+    const fresh = /code is ([0-9]{6})\b/.exec(sentEmails[sentEmails.length - 1].text)[1];
+    const user = await db.get('SELECT id FROM users WHERE email = ?', email);
+    const rows = await db.all(`SELECT code_hash, attempts, expires_at FROM verification_codes WHERE user_id = ? AND type = 'email'`, user.id);
+    expect(rows).toEqual([{ code_hash: sha256(fresh), attempts: 0, expires_at: '2026-11-10T12:10:00.000Z' }]);
+    expect((await verify_email(email, fresh)).status).toBe('verified');
+
+    const other = 'resend-limit@example.com';
+    await signup(other, 'StrongPassword123456', 'Lim', ip);
+    for (let i = 0; i < 3; i++) expect((await resend_verification(other)).status).toBe('sent');
+    mails = sentEmails.length;
+    clock += 59 * 60 * 1000;
+    const refused = await resend_verification(other);
+    expect([refused.status, refused.error]).toEqual([429, 'too_many_requests']);
+    expect(sentEmails.length).toBe(mails);
+    clock += 2 * 60 * 1000;
+    expect((await resend_verification(other)).status).toBe('sent');
+    expect(sentEmails.length).toBe(mails + 1);
+
+    mails = sentEmails.length;
+    const unknown = await resend_verification('nobody-resend@example.com');
+    const verified = await resend_verification(email);
+    expect(unknown).toEqual({ success: true, status: 'sent' });
+    expect(verified).toEqual(unknown);
+    expect(sentEmails.length).toBe(mails);
   });
 
   // AUTH-07

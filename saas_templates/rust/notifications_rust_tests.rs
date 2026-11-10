@@ -129,6 +129,49 @@ fn test_quiet_hours_skip() {
     assert_eq!(service.track_message_status(&resp.message_id).unwrap().status, "sent");
 }
 
+/// What: NOTIF-05 and the Phase B.3 ruling: the quiet window is [start, end), so an email due exactly at
+/// quiet_hours_end is sent and one a minute earlier is queued; quiet hours hold email and SMS only, so an
+/// in-app message inside the window is stored at once (sent, not queued), also when deliver_due meets it.
+/// In: none. Out: panics on a wrong answer. Why: Phase B.3 ruling (spec commit d4f4ed7).
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+// NOTIF-05
+#[test]
+fn test_quiet_hours_window_end_and_in_app() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let at = Rc::new(Cell::new(fixed_time(2026, 1, 15, 7, 59)));
+    let a = at.clone();
+    let service = setup_service().with_clock(Box::new(move || a.get()));
+    service
+        .update_user_preferences(
+            1,
+            &UserNotificationPreferencesUpdate {
+                do_not_disturb: Some(false),
+                quiet_hours_start: Some("22:00".to_string()),
+                quiet_hours_end: Some("08:00".to_string()),
+                channels_enabled: None,
+            },
+        )
+        .unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("app_name".to_string(), "TestApp".to_string());
+    let early = service.send_single_notification(1, "welcome_email", Some("email"), &vars, None).unwrap();
+    assert_eq!(early.status, "queued");
+    let in_app = service.send_single_notification(1, "welcome_email", Some("in_app"), &vars, None).unwrap();
+    assert_eq!(in_app.status, "sent");
+    assert_eq!(service.track_message_status(&in_app.message_id).unwrap().channel, "in_app");
+    at.set(fixed_time(2026, 1, 15, 8, 0));
+    let on_end = service.send_single_notification(1, "welcome_email", Some("email"), &vars, None).unwrap();
+    assert_eq!(on_end.status, "sent");
+    assert_eq!(service.deliver_due(fixed_time(2026, 1, 15, 8, 0)).unwrap().sent, 1, "the queued email is due at 08:00");
+    // a scheduled in-app message that comes due inside quiet hours is delivered, not held
+    at.set(fixed_time(2026, 1, 15, 21, 0));
+    let later = service.send_single_notification(1, "welcome_email", Some("in_app"), &vars, Some(fixed_time(2026, 1, 15, 23, 0))).unwrap();
+    assert_eq!(later.status, "queued");
+    assert_eq!(service.deliver_due(fixed_time(2026, 1, 15, 23, 0)).unwrap().sent, 1);
+    assert_eq!(service.track_message_status(&later.message_id).unwrap().status, "sent");
+}
+
 // NOTIF-06
 #[test]
 fn test_do_not_disturb_skip() {

@@ -19,7 +19,11 @@
 //! `Response::status` gives each answer's HTTP status.
 //! Touches: the SQLite database it owns; money through `StripeClient` (plan changes; refunds are
 //! only queued); email through `Mailer`; domain checks through `DomainVerifier`; OS randomness.
-//! CSRF tokens are checked by the HTTP layer before these methods are called.
+//! CSRF: the HTTP layer calls `verify_request` before every POST; it refuses a suspended caller with 403
+//! account_suspended BEFORE it looks at the CSRF token (403 csrf_invalid) (Phase B.3 ruling, 2026-11-10,
+//! session_012zDydZCZ4AChqhEZ4oVtaP). Governance can approve a change_role action, whose new role is in the
+//! action's `params` JSON ({"new_tier": ...}); approving one that would demote the last active owner is 400
+//! cannot_demote_last_owner and the action stays pending (ADMIN-07, Phase B.3).
 
 use chrono::Utc;
 use rand::RngCore;
@@ -221,13 +225,13 @@ impl Response {
 }
 
 /// What: the HTTP status of an error code: 403 for the gates (owner_only, admin_only, account_suspended,
-/// publishing_disabled), 404 not_found, 409 for conflicts (email_exists, domain_taken,
+/// publishing_disabled, csrf_invalid (Phase B.3, 2026-11-10)), 404 not_found, 409 for conflicts (email_exists, domain_taken,
 /// subscription_item_ambiguous, already_decided), 500 internal_error, 400 for every validation code.
 /// In: the code. Out: the status. Why: Phase B.2 (2026-11-10). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
 /// Touches: nothing.
 pub fn status_for(code: &str) -> u16 {
     match code {
-        "owner_only" | "admin_only" | "account_suspended" | "publishing_disabled" => 403,
+        "owner_only" | "admin_only" | "account_suspended" | "publishing_disabled" | "csrf_invalid" => 403,
         "not_found" => 404,
         "email_exists" | "domain_taken" | "subscription_item_ambiguous" | "already_decided" => 409,
         "internal_error" => 500,
@@ -313,6 +317,7 @@ pub struct AdminSystem {
     pub safety: SafetyFlags,
     outbox: RefCell<Vec<Email>>,
     base_url: String,
+    csrf_token: String,
 }
 
 /// What: `n` random bytes as hex. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: OS randomness.
@@ -353,7 +358,31 @@ impl AdminSystem {
             safety: SafetyFlags { can_publish: true },
             outbox: RefCell::new(Vec::new()),
             base_url: "https://app.example.com".into(),
+            csrf_token: random_hex(32),
         }
+    }
+
+    /// What: set the CSRF token the HTTP layer issued for this session (the default is random per instance,
+    /// so no token is hard-coded). In: the token. Out: self. Why: Phase B.3 ruling (CSRF after the suspended
+    /// check). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+    pub fn with_csrf_token(mut self, token: &str) -> Self {
+        self.csrf_token = token.to_string();
+        self
+    }
+
+    /// What: the check every POST runs first: the verified caller is re-read and a suspended one is refused
+    /// with 403 account_suspended BEFORE the CSRF token is looked at; then a token that is not the session's
+    /// (constant-time compare) is 403 csrf_invalid. In: the session user, the request's CSRF token. Out: the
+    /// stored caller. Why: spec EVERY ACTION ("before any gate, the CSRF check included"), Phase B.3 ruling.
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (read).
+    pub fn verify_request(&self, current: &User, csrf_token: &str) -> AdminResult<User> {
+        let me = self.caller(current, "owner_only")?;
+        let (a, b) = (csrf_token.as_bytes(), self.csrf_token.as_bytes());
+        let same = a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0;
+        if !same {
+            return Err(AdminError::Forbidden("csrf_invalid".into()));
+        }
+        Ok(me)
     }
 
     /// What: set the domain verifier. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
@@ -386,7 +415,7 @@ impl AdminSystem {
                 published_at TEXT NULL, suspend_reason TEXT NULL, archived_at TEXT NULL);
              CREATE TABLE IF NOT EXISTS governance_actions (id INTEGER PRIMARY KEY AUTOINCREMENT, action_type TEXT NOT NULL, actor_id INTEGER NOT NULL,
                 target_resource_id INTEGER NOT NULL, reason TEXT, submitted_at TEXT NOT NULL, status TEXT NOT NULL, approved_by INTEGER,
-                approved_at TEXT, rejection_reason TEXT, execution_result TEXT);
+                approved_at TEXT, rejection_reason TEXT, execution_result TEXT, params TEXT NULL);
              CREATE TABLE IF NOT EXISTS audit_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, actor_id INTEGER NOT NULL,
                 resource_type TEXT NOT NULL, resource_id INTEGER NOT NULL, old_value TEXT, new_value TEXT, reason TEXT, timestamp TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS refunds (id INTEGER PRIMARY KEY AUTOINCREMENT, invoice_id INTEGER NOT NULL, amount INTEGER NOT NULL,
@@ -532,17 +561,20 @@ impl AdminSystem {
     /// What: users action=change_role (tier). Gates: owner, valid role (owner / admin / user; a plan
     /// name is invalid_tier, Phase B.2), the last active owner cannot be demoted, nobody changes their own
     /// role. Out: `{user_id, old_tier, new_tier}`. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec change_role "Order", Phase B.4 line): the gate
+    /// (owner, not yourself) runs before the checks, so changing your own role is cannot_change_own_role even
+    /// for the last owner; the last-owner refusal is reached through governance (ADMIN-07).
     /// Touches: database.
     pub fn change_role(&self, current: &User, user_id: i64, new_tier: &str) -> Response {
         let run = || -> AdminResult<Value> {
             let me = self.require_owner(current)?;
+            if user_id == me.id {
+                return Err(AdminError::Validation("cannot_change_own_role".into()));
+            }
             let new_tier = Role::parse(new_tier)?;
             let target = self.get_user_by_id(user_id)?;
             if self.is_last_active_owner(&target)? && new_tier != Role::Owner {
                 return Err(AdminError::Validation("cannot_demote_last_owner".into()));
-            }
-            if user_id == me.id {
-                return Err(AdminError::Validation("cannot_change_own_role".into()));
             }
             let tx = self.conn.unchecked_transaction()?;
             tx.execute("UPDATE users SET tier = ?1, updated_at = ?2 WHERE id = ?3", params![new_tier.as_str(), now(), user_id])?;
@@ -853,16 +885,19 @@ impl AdminSystem {
     }
 
     /// What: governance decide. Gate: owner. "approve" executes the action (supported:
-    /// `suspend_user`, `delete_user` (soft delete), `retire_deployment`), under the same safety rules,
+    /// `suspend_user`, `delete_user` (soft delete), `retire_deployment`, and `change_role` with its new role in
+    /// `params` {"new_tier": ...}: added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, ADMIN-07 / Phase B.3:
+    /// a change that would demote the last active owner is 400 cannot_demote_last_owner and the action stays
+    /// pending, as nothing commits), under the same safety rules,
     /// and marks it approved with its result; "reject" needs a reason. Only pending actions can be
     /// decided. Out: `{action_id, status}`. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
     /// Touches: database.
     pub fn decide_governance_action(&self, current: &User, action_id: i64, decision: &str, reason: Option<&str>) -> Response {
         let run = || -> AdminResult<Value> {
             let me = self.require_owner(current)?;
-            let (action_type, target, status): (String, i64, String) = self
+            let (action_type, target, status, action_params): (String, i64, String, Option<String>) = self
                 .conn
-                .query_row("SELECT action_type, target_resource_id, status FROM governance_actions WHERE id = ?1", params![action_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .query_row("SELECT action_type, target_resource_id, status, params FROM governance_actions WHERE id = ?1", params![action_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, Option<String>>(3)?)))
                 .optional()?
                 .ok_or_else(|| AdminError::NotFound("governance action".into()))?;
             if status != "pending" {
@@ -884,6 +919,28 @@ impl AdminSystem {
                             let new_status = if action_type == "delete_user" { "deleted" } else { "suspended" };
                             tx.execute("UPDATE users SET status = ?1, updated_at = ?2 WHERE id = ?3", params![new_status, now(), target])?;
                             json!({ "user_id": target, "status": new_status })
+                        }
+                        "change_role" => {
+                            let wanted = action_params
+                                .as_deref()
+                                .and_then(|p| serde_json::from_str::<Value>(p).ok())
+                                .and_then(|v| v["new_tier"].as_str().map(|s| s.to_string()))
+                                .ok_or_else(|| AdminError::Validation("invalid_tier".into()))?;
+                            let new_tier = Role::parse(&wanted)?;
+                            let user = self.get_user_by_id(target)?;
+                            if self.is_last_active_owner(&user)? && new_tier != Role::Owner {
+                                return Err(AdminError::Validation("cannot_demote_last_owner".into()));
+                            }
+                            // Spec LAST OWNER, approver rule (review findings 4525101339 and 4525101321; 2026-11-10,
+                            // session_012zDydZCZ4AChqhEZ4oVtaP): a change_role whose target is the approver is 400
+                            // cannot_change_own_role, after the last-owner check; tx is dropped, so the action stays
+                            // pending and nothing changes.
+                            if target == me.id {
+                                return Err(AdminError::Validation("cannot_change_own_role".into()));
+                            }
+                            tx.execute("UPDATE users SET tier = ?1, updated_at = ?2 WHERE id = ?3", params![new_tier.as_str(), now(), target])?;
+                            Self::audit(&tx, "role_changed", me.id, "user", target, Some(json!({ "tier": user.tier.as_str() })), Some(json!({ "tier": new_tier.as_str() })), None)?;
+                            json!({ "user_id": target, "old_tier": user.tier.as_str(), "new_tier": new_tier.as_str() })
                         }
                         "retire_deployment" => {
                             let n = tx.execute("UPDATE deployments SET status = 'archived', archived_at = ?1 WHERE id = ?2", params![now(), target])?;

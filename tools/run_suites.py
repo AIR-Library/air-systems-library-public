@@ -126,17 +126,27 @@ def from_exit(rc: int, out: str, n: int, scrub: list[Path]) -> dict:
 
 # ------------------------------------------------------------------------------------ python
 PY_REQ = ["pytest", "bcrypt", "PyJWT", "pyotp", "SQLAlchemy>=2.0,<2.1", "fastapi", "httpx", "redis",
-          "fakeredis", "boto3", "moto>=4,<5", "stripe", "pydantic"]
+          "fakeredis", "boto3", "moto>=4,<5", "stripe", "pydantic",
+          "cryptography"]   # [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] AES-256-GCM for byok_key_vault
 
 
 def setup_python() -> Path:
+    """The Python interpreter of the runner's venv, created on first use with PY_REQ installed. Out: its path.
+
+    [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] A stamp file (.deps/python/req.txt) records the PY_REQ the venv
+    was built with; when PY_REQ changes (a new system needs a package) the packages are installed again, so a cached
+    venv cannot silently lack one. Why: Phase D adds `cryptography`. Touches: .deps/python, the network (pip)."""
     venv = DEPS / "python" / "venv"
     # [2026-11-03, session c6ee9a72] a Windows venv keeps its interpreter in Scripts\, not bin/
     py = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    stamp, wanted = DEPS / "python" / "req.txt", "\n".join(PY_REQ)
     if not py.exists():
         (DEPS / "python").mkdir(parents=True, exist_ok=True)
         subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
+        stamp.unlink(missing_ok=True)   # a new venv is empty, whatever the stamp says (CodeRabbit, PR 22)
+    if not stamp.is_file() or stamp.read_text() != wanted:
         subprocess.run([str(py), "-m", "pip", "install", "-q", *PY_REQ], check=True)
+        stamp.write_text(wanted)
     return py
 
 
@@ -420,6 +430,9 @@ CRATES = {
     "sha2": 'sha2 = "0.10"', "thiserror": 'thiserror = "1"', "regex": 'regex = "1"',
     "async_trait": 'async-trait = "0.1"', "stripe": 'stripe = { package = "async-stripe", version = "0.41", features = ["runtime-tokio-hyper"] }',
     "aws_config": 'aws-config = "1"', "aws_sdk_s3": 'aws-sdk-s3 = "1"', "lettre": 'lettre = "0.11"',
+    # [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase D: AES-256-GCM (byok_key_vault), SHA-1 for RFC 6238
+    # TOTP (totp_two_factor), raw deflate for reading zip entries (safe_archive_ingest).
+    "aes_gcm": 'aes-gcm = "0.10"', "sha1": 'sha1 = "0.10"', "flate2": 'flate2 = "1"',
 }
 
 

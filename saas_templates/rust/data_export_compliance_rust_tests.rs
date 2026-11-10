@@ -228,7 +228,8 @@ async fn test_signed_link_works_and_expires_after_7_days() {
 /// the EXPORT-05/12 amendment: the reason is user_requested (a statutory reason now has no grace
 /// period), will_delete_at is requested_at + 30 days, and confirm takes the caller. Corrected 2026-11-10
 /// (Phase B.2 bug): the kept audit rows are counted without user_id, which the cascade now clears, and a
-/// cancel after the grace period is the 409 `GracePeriodOver`.
+/// cancel after the grace period is the 409 `GracePeriodOver`. Changed 2026-11-10 (Phase B.3 ruling): its
+/// status and code are asserted too.
 // EXPORT-05
 #[tokio::test]
 async fn test_deletion_runs_only_after_grace_period() {
@@ -242,7 +243,11 @@ async fn test_deletion_runs_only_after_grace_period() {
     now.fetch_add(29 * 86_400, Ordering::SeqCst);
     assert_eq!(svc.process_due_deletions().await.unwrap(), 0);
     now.fetch_add(86_400, Ordering::SeqCst);
-    assert_eq!(svc.cancel_deletion(1, d.deletion_id.clone()).await.unwrap_err(), ComplianceError::GracePeriodOver);
+    let late = svc.cancel_deletion(1, d.deletion_id.clone()).await.unwrap_err();
+    assert_eq!(late, ComplianceError::GracePeriodOver);
+    // Phase B.3 ruling (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): the exact answer is 409 grace_period_over,
+    // and the refused cancel leaves the due deletion to run
+    assert_eq!((late.status(), late.code()), (409, "grace_period_over"));
     assert_eq!(svc.process_due_deletions().await.unwrap(), 1);
     let users: i64 = svc.db().query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0)).unwrap();
     assert_eq!(users, 0);
@@ -250,6 +255,38 @@ async fn test_deletion_runs_only_after_grace_period() {
     assert!(audit >= 3);
     let named: i64 = svc.db().query_row("SELECT COUNT(*) FROM audit_log WHERE user_id = 1", [], |r| r.get(0)).unwrap();
     assert_eq!(named, 0);
+}
+
+/// What: EXPORT-16: a pending (unconfirmed) request is cancelled even after will_delete_at; a confirmed one is
+/// cancelled one second before will_delete_at, and gets 409 grace_period_over exactly at it and after it, staying
+/// confirmed. In: none. Out: panics on a wrong answer. Why: spec Phase B.3 / B.4 rulings.
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+// EXPORT-16
+#[tokio::test]
+async fn test_cancel_pending_always_confirmed_until_will_delete_at() {
+    let day = 86_400;
+    // pending, past will_delete_at: cancelled
+    let (svc, _mailer, now) = build_service();
+    let d = svc.request_account_deletion(1, DeletionReason::UserRequested).await.unwrap();
+    now.fetch_add(31 * day, Ordering::SeqCst);
+    assert_eq!(svc.cancel_deletion(1, d.deletion_id.clone()).await.unwrap().status, DeletionStatus::Cancelled);
+    // confirmed, one second before will_delete_at: cancelled
+    let (svc, mailer, now) = build_service();
+    let d = svc.request_account_deletion(1, DeletionReason::UserRequested).await.unwrap();
+    svc.confirm_deletion(1, d.deletion_id.clone(), &last_token(&mailer)).await.unwrap();
+    now.fetch_add(30 * day - 1, Ordering::SeqCst);
+    assert_eq!(svc.cancel_deletion(1, d.deletion_id.clone()).await.unwrap().status, DeletionStatus::Cancelled);
+    // confirmed, exactly at and after will_delete_at: 409, still confirmed
+    for extra in [0, 1, day] {
+        let (svc, mailer, now) = build_service();
+        let d = svc.request_account_deletion(1, DeletionReason::UserRequested).await.unwrap();
+        svc.confirm_deletion(1, d.deletion_id.clone(), &last_token(&mailer)).await.unwrap();
+        now.fetch_add(30 * day + extra, Ordering::SeqCst);
+        let err = svc.cancel_deletion(1, d.deletion_id.clone()).await.unwrap_err();
+        assert_eq!((err.status(), err.code()), (409, "grace_period_over"));
+        let status: String = svc.db().query_row("SELECT status FROM deletion_requests WHERE id = ?1", rusqlite::params![d.deletion_id], |r| r.get(0)).unwrap();
+        assert_eq!(status, "approved");
+    }
 }
 
 /// Added 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP), CodeRabbit review on PR 19: an export made

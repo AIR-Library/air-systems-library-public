@@ -413,4 +413,38 @@ public class NotificationServiceTest {
         assertEquals(1, crashy.deliverDue(later.plusSeconds(301)));
         assertEquals("sent", crashy.track(stuck.messageId).status);
     }
+
+    /**
+     * Phase B.3 ruling (d4f4ed7): quiet hours are [start, end) and hold email and SMS only. Inside 11:00-13:00 an
+     * in-app message is stored at once ('sent') while an email and an SMS are queued; with the clock exactly at
+     * quiet_hours_end (13:00) an email is sent at once. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches: in-memory H2.
+     */
+    // NOTIF-05
+    @Test
+    public void testQuietHoursHoldEmailAndSmsOnlyAndEndIsOpen() throws Exception {
+        service.updateUserPreferences(1L, new NotificationService.UserNotificationPreferences(
+                1L, false, "11:00", "13:00", new HashMap<>(Map.of("email", true, "sms", true, "in_app", true))));
+        NotificationService.SendResponse inApp = service.sendSingle(new NotificationService.NotificationRequest(
+                1L, "invoice_ready", "in_app", new HashMap<>(Map.of("month", "January")), null));
+        assertEquals("sent", inApp.status, "an in-app message is stored at once inside quiet hours");
+        assertEquals("sent", service.track(inApp.messageId).status);
+        NotificationService.SendResponse email = service.sendSingle(new NotificationService.NotificationRequest(
+                1L, "trial_ending_soon", "email", new HashMap<>(Map.of("days_left", 2)), null));
+        assertEquals("queued", email.status, "an email is held");
+        NotificationService.SendResponse sms = service.sendSingle(new NotificationService.NotificationRequest(
+                1L, "trial_ending_soon", "sms", new HashMap<>(Map.of("days_left", 2)), null));
+        assertEquals("queued", sms.status, "an SMS is held");
+
+        List<String> sent = new ArrayList<>();
+        NotificationService atEnd = new NotificationService((to, subject, body) -> sent.add(to),
+                new NotificationService.SimpleSmsSender(), new NotificationService.SimpleInAppSender(),
+                SECRET, Clock.fixed(Instant.parse("2026-01-15T13:00:00Z"), ZoneOffset.UTC), "https://app.example.test", sleeps::add);
+        atEnd.updateUserPreferences(9L, new NotificationService.UserNotificationPreferences(
+                9L, false, "11:00", "13:00", new HashMap<>(Map.of("email", true, "sms", false, "in_app", true))));
+        NotificationService.SendResponse due = atEnd.sendSingle(new NotificationService.NotificationRequest(
+                9L, "trial_ending_soon", "email", new HashMap<>(Map.of("days_left", 2)), null));
+        assertEquals("sent", due.status, "a message due exactly at quiet_hours_end is sent");
+        assertEquals(1, sent.size());
+    }
 }

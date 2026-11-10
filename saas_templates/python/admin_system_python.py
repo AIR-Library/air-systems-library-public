@@ -743,7 +743,11 @@ class AdminSystem:
         status}; HTTPError 403 account_suspended (before any gate, ADMIN-19), 403 csrf_invalid, 403 owner_only,
         404 governance_action_not_found, 400 action_already_decided, 400 invalid_tier (a change_role to a plan
         value, Phase B.2 "TIERS"), 400 cannot_demote_last_owner (Phase B.2: the change_role Check now applies to
-        an approved change too), 400 invalid_decision. Why: ADMIN-16/17/19. Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite."""
+        an approved change too), 400 invalid_decision. Why: ADMIN-16/17/19. Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite.
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Spec LAST OWNER, approver rule (the PR 22 review found C#, Java
+        and Rust missing it; Python had the same gap): a change_role whose target is the approver is 400
+        cannot_change_own_role, checked after the last-owner check and before any write, so the action stays
+        pending."""
         actor = self._caller(current_user_id)  # ADMIN-19: before any gate (Phase B.2, 2026-11-10)
         verify_csrf(csrf_token)
         self._require_owner(actor)
@@ -771,6 +775,9 @@ class AdminSystem:
                 # other owner was suspended).
                 if target_user["tier"] == "owner" and new_tier != "owner" and self._count_active_owners() == 1:
                     raise HTTPError(400, "cannot_demote_last_owner", "Cannot demote last active owner")
+                # Spec LAST OWNER, approver rule (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
+                if target_user_id == actor["id"]:
+                    raise HTTPError(400, "cannot_change_own_role", "Cannot change own role")
                 old_tier = target_user["tier"]
                 cur.execute("UPDATE users SET tier = ?, last_active_at = ? WHERE id = ?",
                             (new_tier, now(), target_user_id))

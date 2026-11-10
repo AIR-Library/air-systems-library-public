@@ -192,6 +192,189 @@ def test_verify_email_expired_code(auth_system):
     result = auth_system.verify_email('test@example.com', 'expired')
     assert result['error'] == 'code_expired'
 
+# AUTH-17
+def test_verify_email_five_wrong_codes_invalidate_the_code(auth_system):
+    """5 wrong verification codes invalidate the user's current code: every further try, the right code included,
+    is {error: "code_invalid"} and the user stays unverified, until a new code is stored; that new code verifies.
+    Another user's code is not affected. In: the fixture. Out: assertions. Why: the Phase B.3 ruling in
+    auth_system.md flow 2 ("Attempts"). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    Touches: in-memory SQLite only.
+    Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4, af92d76): tagged AUTH-17, the id the ruling
+    gave this rule, and each wrong code now asserts {error: "code_invalid"} (it asserted code_expired, the
+    answer af92d76 rules out for a wrong code)."""
+    auth_system.signup('test@example.com', 'a' * 16, 'Test User', '127.0.0.1')
+    auth_system.signup('other@example.com', 'a' * 16, 'Other User', '127.0.0.1')
+    code = _sent_code(auth_system, 'test@example.com')
+    wrong = '%06d' % ((int(code) + 1) % 1000000) if code.isdigit() else 'wrong-code'
+    # Phase B.4 (af92d76, 2026-11-10): a wrong code is code_invalid (this asserted code_expired before).
+    for _ in range(5):
+        assert auth_system.verify_email('test@example.com', wrong) == {'error': 'code_invalid'}
+    assert auth_system.verify_email('test@example.com', code) == {'error': 'code_invalid'}
+    assert auth_system.verify_email('test@example.com', wrong) == {'error': 'code_invalid'}
+    cursor = auth_system.db.cursor()
+    cursor.execute("SELECT id, email_verified_at FROM users WHERE email = 'test@example.com'")
+    user = cursor.fetchone()
+    assert user['email_verified_at'] is None
+    # A new code is sent (stored as its HMAC, as signup stores one): it works.
+    expires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    cursor.execute("INSERT INTO verification_codes (user_id, code_hash, created_at, expires_at, type) "
+                   "VALUES (?, ?, ?, ?, 'email')", (user['id'], _sha('654321'), expires, expires))
+    auth_system.db.commit()
+    assert auth_system.verify_email('test@example.com', '654321')['status'] == 'verified'
+    # 4 wrong codes do not invalidate: the 5th try with the right code verifies.
+    other = _sent_code(auth_system, 'other@example.com')
+    other_wrong = '%06d' % ((int(other) + 1) % 1000000) if other.isdigit() else 'wrong-code'
+    # Phase B.4 (af92d76, 2026-11-10): a wrong code is code_invalid (this asserted code_expired before).
+    for _ in range(4):
+        assert auth_system.verify_email('other@example.com', other_wrong) == {'error': 'code_invalid'}
+    assert auth_system.verify_email('other@example.com', other)['status'] == 'verified'
+
+
+# AUTH-18
+def test_resend_verification_replaces_spent_code_limits_and_hides_accounts(auth_system):
+    """resend_verification (auth spec flow 2b): a code spent by 5 wrong tries is replaced by a new one (the only email
+    code row, attempts 0, stored as its HMAC, expiring in 10 minutes), which is emailed and verifies; a 4th resend for
+    one email within the hour is {error: "too_many_requests"} and sends nothing, and after the hour a resend works
+    again; an unknown and an already verified email get the same {status: "sent"} as a real resend and no email.
+    In: the fixture, with an injected clock. Out: assertions. Why: AUTH-18 (commit 0eb5a4e). 2026-11-10,
+    session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite only; the fake email sender."""
+    now = [datetime(2026, 11, 10, 12, 0, tzinfo=timezone.utc)]
+    auth_system.clock = lambda: now[0]
+    auth_system.signup('test@example.com', 'a' * 16, 'Test User', '127.0.0.1')
+    old = _sent_code(auth_system, 'test@example.com')
+    wrong = '%06d' % ((int(old) + 1) % 1000000)
+    for _ in range(5):
+        assert auth_system.verify_email('test@example.com', wrong) == {'error': 'code_invalid'}
+    assert auth_system.verify_email('test@example.com', old) == {'error': 'code_invalid'}
+    sent_before = len(auth_system.sent_codes)
+    assert auth_system.resend_verification('test@example.com') == {'status': 'sent'}
+    assert len(auth_system.sent_codes) == sent_before + 1
+    to, new = auth_system.sent_codes[-1]
+    assert to == 'test@example.com' and len(new) == 6 and new.isdigit()
+    rows = auth_system.db.execute(
+        "SELECT code_hash, attempts, expires_at FROM verification_codes vc JOIN users u ON u.id = vc.user_id "
+        "WHERE u.email = 'test@example.com' AND vc.type = 'email'").fetchall()
+    assert len(rows) == 1
+    assert rows[0]['code_hash'] == _sha(new) and rows[0]['attempts'] == 0
+    assert datetime.fromisoformat(rows[0]['expires_at']) == now[0] + timedelta(minutes=10)
+    assert auth_system.verify_email('test@example.com', new)['status'] == 'verified'
+
+    # 3 resends per email per hour; the 4th is refused and sends nothing; an hour later one is accepted again.
+    auth_system.signup('other@example.com', 'a' * 16, 'Other User', '127.0.0.1')
+    for _ in range(3):
+        assert auth_system.resend_verification('other@example.com') == {'status': 'sent'}
+    sent_before = len(auth_system.sent_codes)
+    now[0] += timedelta(minutes=59)
+    assert auth_system.resend_verification('other@example.com') == {'error': 'too_many_requests'}
+    assert len(auth_system.sent_codes) == sent_before
+    now[0] += timedelta(minutes=2)
+    assert auth_system.resend_verification('other@example.com') == {'status': 'sent'}
+    assert len(auth_system.sent_codes) == sent_before + 1
+
+    # Unknown and verified emails: the same answer as a real resend, and no email.
+    sent_before = len(auth_system.sent_codes)
+    unknown = auth_system.resend_verification('nobody@example.com')
+    verified = auth_system.resend_verification('test@example.com')
+    assert unknown == verified == {'status': 'sent'}
+    assert len(auth_system.sent_codes) == sent_before
+    assert auth_system.db.execute(
+        "SELECT COUNT(*) FROM verification_codes vc JOIN users u ON u.id = vc.user_id "
+        "WHERE u.email = 'test@example.com'").fetchone()[0] == 0
+
+
+def _file_auth(path):
+    """An AuthSystem on its own connection to the SQLite file at path, with a recording email sender, as one
+    request's worker would have. In: the file path. Out: the AuthSystem. Why: review finding 4525101305 (a race
+    needs two connections). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: that SQLite file."""
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    auth = AuthSystem(conn, jwt_secret='test_secret', bcrypt_rounds=4, secret_key=TEST_SECRET_KEY)
+    auth.sent_codes = []
+    auth.email_sender = lambda email, code: auth.sent_codes.append((email, code))
+    return auth
+
+
+# AUTH-17
+def test_verify_email_attempts_counted_in_database_when_tries_race(tmp_path):
+    """The race of review finding 4525101305, made deterministic with two connections to one database file. Four
+    wrong codes are tried. Request A (the right code) reads the user's codes; before A goes on, request B (another
+    connection) tries a 5th wrong code, which spends the code. A must then answer code_invalid and the user must
+    stay unverified: the count is taken in the database when A writes, not from what A read. Before the fix A
+    compared using its stale read (attempts = 4) and verified on what was really the 6th try.
+    In: pytest's tmp_path. Out: assertions. Why: review finding 4525101305 (CWE-367), auth spec flow 2 "Attempts".
+    2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: a SQLite file under tmp_path."""
+    db_file = tmp_path / 'auth.db'
+    a = _file_auth(db_file)
+    b = _file_auth(db_file)
+    try:
+        a.signup('race@example.com', 'a' * 16, 'Race User', '127.0.0.1')
+        code = _sent_code(a, 'race@example.com')
+        wrong = '%06d' % ((int(code) + 1) % 1000000)
+        for _ in range(4):
+            assert b.verify_email('race@example.com', wrong) == {'error': 'code_invalid'}
+        real_hash = a._hash_secret
+        raced = []
+
+        def hash_then_let_b_in(value):
+            """A's first hash runs after A read the codes: let B try a 5th wrong code then. 2026-11-10,
+            session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the SQLite file (through B)."""
+            if not raced:
+                raced.append(b.verify_email('race@example.com', wrong))
+            return real_hash(value)
+
+        a._hash_secret = hash_then_let_b_in
+        assert a.verify_email('race@example.com', code) == {'error': 'code_invalid'}
+        assert raced == [{'error': 'code_invalid'}]
+        a._hash_secret = real_hash
+        row = b.db.execute("SELECT email_verified_at FROM users WHERE email = 'race@example.com'").fetchone()
+        assert row['email_verified_at'] is None
+        attempts = b.db.execute("SELECT attempts FROM verification_codes").fetchone()['attempts']
+        assert attempts == 5
+        assert b.verify_email('race@example.com', code) == {'error': 'code_invalid'}
+    finally:
+        a.db.close()
+        b.db.close()
+
+
+# AUTH-17
+def test_verify_email_why_chain_never_commits_the_flow_early(auth_system):
+    """_log_why_chain commits; during verify_email it is only ever called with no transaction open, for a wrong, an
+    expired, a spent and the right code, so it can never commit part of the flow early. The answers are the spec's.
+    In: the fixture. Out: assertions. Why: review finding 4525101305. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    Touches: in-memory SQLite only."""
+    open_at_call = []
+    real_log = auth_system._log_why_chain
+
+    def watching_log(flow, points):
+        """Records whether a transaction is open, then logs. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP."""
+        open_at_call.append(auth_system.db.in_transaction)
+        return real_log(flow, points)
+
+    auth_system._log_why_chain = watching_log
+    auth_system.signup('t@example.com', 'a' * 16, 'T', '127.0.0.1')
+    auth_system.signup('x@example.com', 'a' * 16, 'X', '127.0.0.1')
+    code = _sent_code(auth_system, 't@example.com')
+    wrong = '%06d' % ((int(code) + 1) % 1000000)
+    assert auth_system.verify_email('t@example.com', wrong) == {'error': 'code_invalid'}
+    old = _sent_code(auth_system, 'x@example.com')
+    past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    auth_system.db.execute("UPDATE verification_codes SET expires_at = ? WHERE code_hash = ?", (past, _sha(old)))
+    auth_system.db.commit()
+    assert auth_system.verify_email('x@example.com', old) == {'error': 'code_expired'}
+    attempts = auth_system.db.execute("SELECT attempts FROM verification_codes WHERE code_hash = ?",
+                                      (_sha(old),)).fetchone()[0]
+    assert attempts == 0
+    for _ in range(4):
+        assert auth_system.verify_email('t@example.com', wrong) == {'error': 'code_invalid'}
+    assert auth_system.verify_email('t@example.com', code) == {'error': 'code_invalid'}
+    expires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    user_id = auth_system.db.execute("SELECT id FROM users WHERE email = 't@example.com'").fetchone()[0]
+    auth_system.db.execute("INSERT INTO verification_codes (user_id, code_hash, created_at, expires_at, type) "
+                           "VALUES (?, ?, ?, ?, 'email')", (user_id, _sha('654321'), expires, expires))
+    auth_system.db.commit()
+    assert auth_system.verify_email('t@example.com', '654321')['status'] == 'verified'
+    assert len(open_at_call) >= 8 and not any(open_at_call)
+
 # AUTH-07
 def test_login_happy_path_no_mfa(auth_system):
     # Create verified user

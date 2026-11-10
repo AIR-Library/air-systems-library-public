@@ -269,16 +269,17 @@ function createBillingSystem({ stripeSecretKey, webhookSecret, db, priceIds }) {
   }
 
   /**
-   * handle_stripe_webhook(payload, signature) -> { received: true } | { error: 'invalid_signature', status: 403,
+   * handle_stripe_webhook(payload, signature) -> { received: true } | { error: 'invalid_signature', status: 400,
    * message } (BILL-09). Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 bug fix: the error carried
-   * no HTTP status). Touches: Stripe signature check, the db adapter.
+   * no HTTP status; Phase B.3, same day: 400, Stripe's documented answer and the same as stripe_webhook_entitlements,
+   * was 403). Touches: Stripe signature check, the db adapter.
    */
   async function handle_stripe_webhook(payload, signature) {
     let event;
     try {
       event = stripeInstance.webhooks.constructEvent(payload, signature, webhookSecret);
     } catch (err) {
-      return { error: "invalid_signature", status: 403, message: `Webhook Error: ${err.message}` };
+      return { error: "invalid_signature", status: 400, message: `Webhook Error: ${err.message}` };
     }
 
     // Idempotency check

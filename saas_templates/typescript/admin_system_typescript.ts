@@ -1238,6 +1238,10 @@ export class AdminSystem {
    * action_id, status }. ADMIN-16/17. Touches: governance_actions, customers, users, deployments, Stripe, audit_log.
    * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a suspended caller is refused first with 403
    * account_suspended (ADMIN-19), and roles and plans are separate lists (admin TIERS).
+   * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec LAST OWNER, approver rule; the PR 22 review found C#,
+   * Java and Rust missing it, and TypeScript had the same gap): a change_role whose target is the approver
+   * (ctx.userId) is 400 cannot_change_own_role, checked after the last-owner check and before anything changes, so
+   * the action stays pending.
    */
   async decideGovernanceAction(
     ctx: AdminContext,
@@ -1280,6 +1284,9 @@ export class AdminSystem {
       }
       if (action.reason !== 'owner' && (await this.isLastActiveOwner(targetRows[0]))) {
         throw new AdminError('cannot_demote_last_owner', 'Cannot demote the last active owner.', 400);
+      }
+      if (Number(action.target_resource_id) === ctx.userId) {
+        throw new AdminError('cannot_change_own_role', 'You cannot change your own role.', 400);
       }
     }
 

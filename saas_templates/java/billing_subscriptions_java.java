@@ -394,8 +394,9 @@ public class BillingService {
      * in one transaction, so a failure leaves nothing half-applied and Stripe's retry processes it cleanly.
      * Input: raw request body, Stripe-Signature header. Output: {received: true} (plus duplicate: true for a
      * replay) or {error: config_error|invalid_signature|invalid_payload|db_error, message}, in a BillingResponse with
-     * its HTTP status (200; 403 invalid_signature, 400 invalid_payload, 500 config_error/db_error; added 2026-11-10,
-     * session_012zDydZCZ4AChqhEZ4oVtaP).
+     * its HTTP status (200; 400 invalid_signature, 400 invalid_payload, 500 config_error/db_error; added 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP). Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3 ruling,
+     * d4f4ed7): a bad signature is 400, Stripe's documented answer and the same as stripe_webhook_entitlements (was 403).
      * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: Webhook.constructEvent returns an Event,
      * not a JsonObject (compile error); the secret now also comes from a system property; one transaction.
      * Touches: the database.
@@ -659,15 +660,16 @@ public class BillingService {
 
     /**
      * HTTP status of each error code, as the spec and the other languages answer: 400 for bad input (invalid_tier,
-     * invalid_customer, invalid_amount, invalid_invoice_status, refund_exceeds_invoice, invalid_payload), 403
-     * invalid_signature, 404 not_found, 409 subscription_item_ambiguous, 502 stripe_error, 500 config_error and
+     * invalid_customer, invalid_amount, invalid_invoice_status, refund_exceeds_invoice, invalid_payload,
+     * invalid_signature: 400 since the Phase B.3 ruling of 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, was 403),
+     * 404 not_found, 409 subscription_item_ambiguous, 502 stripe_error, 500 config_error and
      * db_error. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (java bug list: billing returned a JSON body with no
      * HTTP status). Touches nothing.
      */
     static final Map<String, Integer> ERROR_STATUS = Map.ofEntries(
             Map.entry("invalid_tier", 400), Map.entry("invalid_customer", 400), Map.entry("invalid_amount", 400),
             Map.entry("invalid_invoice_status", 400), Map.entry("refund_exceeds_invoice", 400),
-            Map.entry("invalid_payload", 400), Map.entry("invalid_signature", 403), Map.entry("not_found", 404),
+            Map.entry("invalid_payload", 400), Map.entry("invalid_signature", 400), Map.entry("not_found", 404),
             Map.entry("subscription_item_ambiguous", 409), Map.entry("stripe_error", 502),
             Map.entry("config_error", 500), Map.entry("db_error", 500));
 

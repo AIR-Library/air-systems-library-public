@@ -44,6 +44,11 @@ class FakeDb {
     }
     // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16): codes, challenges and refresh tokens are looked up by
     // their SHA-256; OAuth links by the provider's user id.
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4, af92d76): the user's expired email codes, which
+    // verify_email reads to tell an expired code (code_expired) from a wrong one (code_invalid).
+    if (sql.includes("FROM verification_codes WHERE user_id = $1 AND type = 'email' AND expires_at <= NOW()")) {
+      return this.codes.filter((c) => c.user_id === params[0] && c.type === 'email' && !live(c));
+    }
     if (sql.includes("FROM verification_codes WHERE user_id = $1 AND type = 'email'")) {
       return this.codes.filter((c) => c.user_id === params[0] && c.type === 'email' && live(c));
     }
@@ -99,9 +104,22 @@ class FakeDb {
       user.status = 'verified';
       return { insertId: 0 };
     }
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-18): resend_verification deletes the user's email codes.
+    if (sql.startsWith("DELETE FROM verification_codes WHERE user_id = $1 AND type = 'email'")) {
+      const before = this.codes.length;
+      this.codes = this.codes.filter((c) => !(c.user_id === params[0] && c.type === 'email'));
+      return { insertId: 0, affectedRows: before - this.codes.length };
+    }
     if (sql.startsWith('DELETE FROM verification_codes WHERE id = $1')) {
       this.codes = this.codes.filter((c) => c.id !== params[0]);
       return { insertId: 0 };
+    }
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3 ruling): verify_email counts each try first on each
+    // live code, one conditional write per row, and reports whether the row took it.
+    if (sql.startsWith('UPDATE verification_codes SET attempts = attempts + 1 WHERE id = $1 AND attempts < $2')) {
+      const hit = this.codes.filter((c) => c.id === params[0] && c.attempts < params[1]);
+      hit.forEach((c) => { c.attempts += 1; });
+      return { insertId: 0, affectedRows: hit.length };
     }
     if (sql.startsWith('UPDATE verification_codes SET attempts = attempts + 1 WHERE code_hash = $1')) {
       this.codes.filter((c) => c.code_hash === params[0]).forEach((c) => { c.attempts += 1; });
@@ -552,7 +570,8 @@ describe('AuthSystem', () => {
       expect(db.codes[0].code_hash).toBe(sha256(code));
       expect(db.codes[0].code_hash).not.toBe(plainSha256(code)); // spec d270fa3 (2026-11-10): keyed, not plain SHA-256
       expect(db.codes[0]).not.toHaveProperty('code');
-      expect(await auth.verify_email('hash@example.com', '000000' === code ? '111111' : '000000')).toEqual(refused('code_expired', 400));
+      // Phase B.4 (af92d76, 2026-11-10): a wrong code is code_invalid (this asserted code_expired).
+      expect(await auth.verify_email('hash@example.com', '000000' === code ? '111111' : '000000')).toEqual(refused('code_invalid', 400));
       expect((await auth.verify_email('hash@example.com', code)).status).toBe('verified');
 
       const session = await auth.login('hash@example.com', STRONG, 'device-h', '1.2.3.9');
@@ -594,6 +613,140 @@ describe('AuthSystem', () => {
       } finally {
         if (saved === undefined) delete process.env.AUTH_SECRET_KEY; else process.env.AUTH_SECRET_KEY = saved;
       }
+    });
+  });
+
+  /**
+   * verify_email attempts (auth flow 2, Phase B.3 ruling): 5 wrong codes invalidate the user's current code, so the
+   * 6th try is 400 code_invalid even with the right code and the user stays unverified; with 4 wrong codes the right
+   * one (the 5th try) still verifies; a newly sent code (a new code row, 0 attempts) works again.
+   * In: the in-memory stand-in. Out: assertions only. Why: Phase D wave 1, owner request 2026-11-10 (B.3 rulings).
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+   * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4 ruling af92d76): tagged AUTH-17, the id the ruling
+   * gave this rule, and each wrong code now asserts 400 code_invalid (it asserted code_expired, which af92d76 rules
+   * out for a wrong code).
+   */
+  describe('verify_email attempts', () => {
+    // AUTH-17
+    it('5 wrong codes invalidate the code: the right code is then 400 code_invalid until a new code is sent', async () => {
+      await auth.signup('guess@example.com', STRONG, 'Guess User');
+      const { code } = mail[mail.length - 1];
+      const wrong = code === '000000' ? '111111' : '000000';
+      for (let i = 0; i < 5; i++) {
+        // Phase B.4 (af92d76, 2026-11-10): was code_expired.
+        expect(await auth.verify_email('guess@example.com', wrong)).toEqual(refused('code_invalid', 400));
+      }
+      expect(await auth.verify_email('guess@example.com', code)).toEqual(refused('code_invalid', 400));
+      expect(await auth.verify_email('guess@example.com', wrong)).toEqual(refused('code_invalid', 400));
+      const user = db.users.find((u) => u.email === 'guess@example.com') as Row;
+      expect(user.email_verified_at).toBeNull();
+      expect(db.codes.filter((c) => c.user_id === user.id)[0].attempts).toBe(5);
+
+      // A new code is sent: a fresh row with 0 attempts, which verifies.
+      await db.execute('INSERT INTO verification_codes (user_id, code_hash, type, expires_at) VALUES ($1, $2, $3, NOW())',
+        [user.id, sha256('424242'), 'email']);
+      expect((await auth.verify_email('guess@example.com', '424242')).status).toBe('verified');
+    });
+
+    // AUTH-17
+    it('4 wrong codes, then the right code on the 5th try is accepted', async () => {
+      await auth.signup('four@example.com', STRONG, 'Four User');
+      const { code } = mail[mail.length - 1];
+      const wrong = code === '000000' ? '111111' : '000000';
+      for (let i = 0; i < 4; i++) {
+        // Phase B.4 (af92d76, 2026-11-10): was code_expired.
+        expect(await auth.verify_email('four@example.com', wrong)).toEqual(refused('code_invalid', 400));
+      }
+      expect(await auth.verify_email('four@example.com', code)).toMatchObject({ status: 'verified' });
+    });
+  });
+
+  /**
+   * resend_verification (auth spec flow 2b): a code spent by 5 wrong tries is replaced by a new 6-digit code (the only
+   * email code row, 0 attempts, stored as its HMAC), which is emailed and verifies; a 4th resend for one email within
+   * the hour is 429 too_many_requests and sends nothing, and after the hour one is accepted again; an unknown and an
+   * already verified email get the same {status: 'sent', http_status: 202} and no email.
+   * In: the in-memory stand-in and the injected clock. Out: assertions. Why: AUTH-18 (commit 0eb5a4e). 2026-11-10,
+   * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+   */
+  describe('resend_verification', () => {
+    // AUTH-18
+    it('replaces a spent code, allows 3 resends per hour, and answers unknown and verified emails the same', async () => {
+      await auth.signup('resend@example.com', STRONG, 'Resend User');
+      const old = mail[mail.length - 1].code;
+      const wrong = old === '000000' ? '111111' : '000000';
+      for (let i = 0; i < 5; i++) {
+        expect(await auth.verify_email('resend@example.com', wrong)).toEqual(refused('code_invalid', 400));
+      }
+      expect(await auth.verify_email('resend@example.com', old)).toEqual(refused('code_invalid', 400));
+      let sentBefore = mail.length;
+      expect(await auth.resend_verification('resend@example.com')).toEqual({ status: 'sent', http_status: 202 });
+      expect(mail.length).toBe(sentBefore + 1);
+      const fresh = mail[mail.length - 1];
+      expect(fresh.to).toBe('resend@example.com');
+      expect(fresh.code).toMatch(/^[0-9]{6}$/);
+      const user = db.users.find((u) => u.email === 'resend@example.com') as Row;
+      const rows = db.codes.filter((c) => c.user_id === user.id && c.type === 'email');
+      expect(rows.map((c) => [c.code_hash, c.attempts])).toEqual([[sha256(fresh.code), 0]]);
+      expect(await auth.verify_email('resend@example.com', fresh.code)).toMatchObject({ status: 'verified' });
+
+      await auth.signup('limit@example.com', STRONG, 'Limit User');
+      for (let i = 0; i < 3; i++) {
+        expect(await auth.resend_verification('limit@example.com')).toEqual({ status: 'sent', http_status: 202 });
+      }
+      sentBefore = mail.length;
+      clock = new Date(clock.getTime() + 59 * 60 * 1000);
+      expect(await auth.resend_verification('limit@example.com')).toEqual(refused('too_many_requests', 429));
+      expect(mail.length).toBe(sentBefore);
+      clock = new Date(clock.getTime() + 2 * 60 * 1000);
+      expect(await auth.resend_verification('limit@example.com')).toEqual({ status: 'sent', http_status: 202 });
+      expect(mail.length).toBe(sentBefore + 1);
+
+      sentBefore = mail.length;
+      const unknown = await auth.resend_verification('nobody@example.com');
+      const verified = await auth.resend_verification('resend@example.com');
+      expect(unknown).toEqual({ status: 'sent', http_status: 202 });
+      expect(verified).toEqual(unknown);
+      expect(mail.length).toBe(sentBefore);
+    });
+  });
+
+  /**
+   * verify_access_token (auth flow 7): a token from login verifies to {status: 'ok', user: {id, email, tier}}; a
+   * token signed with another key, with another HMAC algorithm (HS512, same key), with alg "none", a malformed one and
+   * one naming no user are 401 invalid_token; one past its expiry on the injected clock is 401 token_expired; a
+   * suspended or banned user is 403 user_banned; a token for a user that no longer exists is 401 invalid_token.
+   * In: the in-memory stand-in and the injected clock. Out: assertions only. Why: auth spec flow 7 was missing from
+   * the TypeScript build (Phase D wave 1, owner request 2026-11-10). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * Touches: memory only.
+   */
+  describe('verify_access_token', () => {
+    it('accepts a valid HS256 token and refuses every other one with the spec error', async () => {
+      const user = await verifiedUser('tok@example.com');
+      const session = await auth.login('tok@example.com', STRONG, 'device-t', '1.2.3.10');
+      expect(await auth.verify_access_token(session.token)).toEqual({
+        status: 'ok', user: { id: user.id, email: 'tok@example.com', tier: 'free' },
+      });
+
+      const payload = { userId: user.id, tier: 'free' };
+      expect(await auth.verify_access_token(jwt.sign(payload, 'another-secret'))).toEqual(refused('invalid_token', 401));
+      expect(await auth.verify_access_token(jwt.sign(payload, SECRET, { algorithm: 'HS512' }))).toEqual(refused('invalid_token', 401));
+      const b64 = (o: object) => Buffer.from(JSON.stringify(o)).toString('base64url');
+      const unsigned = `${b64({ alg: 'none', typ: 'JWT' })}.${b64(payload)}.`;
+      expect(await auth.verify_access_token(unsigned)).toEqual(refused('invalid_token', 401));
+      expect(await auth.verify_access_token('not-a-token')).toEqual(refused('invalid_token', 401));
+      expect(await auth.verify_access_token('')).toEqual(refused('invalid_token', 401));
+      expect(await auth.verify_access_token(jwt.sign({ tier: 'free' }, SECRET))).toEqual(refused('invalid_token', 401));
+      expect(await auth.verify_access_token(jwt.sign({ userId: 999999, tier: 'free' }, SECRET))).toEqual(refused('invalid_token', 401));
+
+      clock = new Date(clock.getTime() + 16 * 60 * 1000);
+      expect(await auth.verify_access_token(session.token)).toEqual(refused('token_expired', 401));
+      clock = new Date(clock.getTime() - 16 * 60 * 1000);
+
+      user.status = 'suspended';
+      expect(await auth.verify_access_token(session.token)).toEqual(refused('user_banned', 403));
+      user.status = 'banned';
+      expect(await auth.verify_access_token(session.token)).toEqual(refused('user_banned', 403));
     });
   });
 });

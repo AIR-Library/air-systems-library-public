@@ -596,16 +596,23 @@ export class ComplianceService {
    * Cancels the caller's own pending or approved deletion before it runs.
    * In: the verified caller id and the deletion id. Out: { success, status: 'cancelled' }. Errors: 404 not_found
    * (unknown, another user's, or completed: no owner any more), 409 deletion_not_pending (already cancelled),
-   * 409 not_cancellable
-   * (approved and past its scheduled time, waiting for the worker). Why: EXPORT-06/14. 2026-11-10,
-   * session_012zDydZCZ4AChqhEZ4oVtaP: the caller check is new; Phase B.2 / EXPORT-15 the same day: a cancelled
-   * request was 409 not_cancellable (a completed one stays 404, EXPORT-13/15). Touches: deletion_requests, audit_logs.
+   * 409 grace_period_over
+   * (will_delete_at has passed: now >= will_delete_at, the deletion is due but not yet run). Why: EXPORT-06/14.
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the caller check is new; Phase B.2 / EXPORT-15 the same day: a
+   * cancelled request was 409 not_cancellable (a completed one stays 404, EXPORT-13/15). Phase B.3 ruling the same
+   * day: a cancel after will_delete_at is 409 grace_period_over whatever the request's status (it was
+   * not_cancellable, and only for an approved request). Touches: deletion_requests, audit_logs.
+   * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.4 ruling (af92d76, EXPORT-16): only a confirmed (approved)
+   * request is scheduled, so only it gets 409 grace_period_over from will_delete_at on (exactly at it included) and
+   * stays approved; a pending (unconfirmed) request can always be cancelled, even after will_delete_at (it was
+   * refused like a confirmed one).
    */
   public async cancelDeletion(callerUserId: string, deletionId: string): Promise<{ success: boolean; status: 'cancelled' }> {
     const req = this.ownDeletion(callerUserId, deletionId);
     this.refuseIfClosed(req);
-    if (req.status === 'approved' && req.scheduled_for.getTime() <= this.clock.now().getTime()) {
-      throw new ComplianceError('not_cancellable', 'The grace period is over', 409);
+    // Phase B.4 (af92d76): the grace period binds only a confirmed request; a pending one is not scheduled.
+    if (req.status === 'approved' && this.clock.now().getTime() >= req.scheduled_for.getTime()) {
+      throw new ComplianceError('grace_period_over', 'The grace period is over', 409);
     }
 
     req.status = 'cancelled';

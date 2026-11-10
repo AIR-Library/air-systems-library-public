@@ -349,6 +349,11 @@ namespace BillingSubscriptionsTests
             Assert.Equal("active", sub.Status);
         }
 
+        /// <summary>
+        /// BILL-09: a webhook with a bad Stripe-Signature is refused with 400 invalid_signature. In: nothing. Out:
+        /// asserts. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3 ruling: 400, Stripe's documented
+        /// answer and the same as stripe_webhook_entitlements; this asserted 403). Touches: the in-memory database.
+        /// </summary>
         // BILL-09
         [Fact]
         public async Task HandleWebhook_InvalidSignature()
@@ -362,7 +367,7 @@ namespace BillingSubscriptionsTests
             var response = await service.HandleStripeWebhookAsync("{}", "invalid_signature");
             Assert.False(response.Success);
             Assert.Equal("invalid_signature", response.Error.Code);
-            Assert.Equal(403, response.Status);
+            Assert.Equal(400, response.Status); // Phase B.3 (2026-11-10): was 403
         }
 
         // BILL-10
@@ -400,11 +405,13 @@ namespace BillingSubscriptionsTests
 
             var forged = await service.HandleStripeWebhookAsync(json, Sign(json, "whsec_someone_else"));
             Assert.Equal("invalid_signature", forged.Error.Code);
+            Assert.Equal(400, forged.Status); // BILL-09, Phase B.3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
 
             var later = new BillingService(ctx, GetMockStripeService().Object, GetLogger(), WebhookSecret,
                 () => DateTimeOffset.UtcNow.AddMinutes(10));
             var stale = await later.HandleStripeWebhookAsync(json, Sign(json));
             Assert.Equal("invalid_signature", stale.Error.Code);
+            Assert.Equal(400, stale.Status); // BILL-09, Phase B.3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
 
             Assert.Empty(await ctx.Events.ToListAsync());
             Assert.Empty(await ctx.Invoices.ToListAsync());

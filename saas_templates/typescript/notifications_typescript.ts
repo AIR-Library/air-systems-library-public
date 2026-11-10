@@ -98,6 +98,13 @@ export interface PreferencesCaller {
 /** The channels a link or preference may name. */
 const CHANNELS: readonly NotificationChannel[] = ['email', 'sms', 'in_app'];
 
+/**
+ * The channels quiet hours hold: email and SMS. An in-app message interrupts no one, so it is stored at once even
+ * inside the window. In: nothing. Out: the list. Why: notifications spec, Phase B.3 ruling ("Quiet hours hold email
+ * and SMS only; an in-app message is stored at once"). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+ */
+const QUIET_HOURS_CHANNELS: readonly NotificationChannel[] = ['email', 'sms'];
+
 /** A 'sending' row claimed longer ago than this is taken to belong to a crashed worker (spec deliver_due step 1). */
 const STALE_CLAIM_MS = 300 * 1000;
 
@@ -670,6 +677,9 @@ export class NotificationService {
    * Changed again 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-05 amendment): inside the quiet window the
    * message is no longer skipped; it is stored 'queued' with scheduled_at = the end of the window and deliverDue
    * sends it then. Do-not-disturb still skips.
+   * Changed again 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3 ruling): quiet hours hold email and SMS
+   * only, so the channel is chosen first and an in-app message inside the window is stored at once; the window is
+   * [start, end), so a send exactly at quiet_hours_end goes out.
    */
   async sendSingle(params: SendParams): Promise<{ success: boolean; message_id: string; status: NotificationStatus }> {
     const { user_id, template_key, channel, vars, scheduled_at } = params;
@@ -683,8 +693,6 @@ export class NotificationService {
     const isFuture = dueAt !== null && dueAt.getTime() > this.now().getTime();
     const prefs = await this.getUserPreferences(user_id);
     const enabled = (ch: NotificationChannel) => prefs.channels_enabled[ch] !== false;
-    const inQuietHours = !prefs.do_not_disturb && !(await this.shouldSendNow(prefs));
-    const quietEnd = !isFuture && inQuietHours ? this.quietHoursEndAt(prefs) : null;
     let chosenChannel: NotificationChannel | null;
     if (channel) {
       chosenChannel = channel;
@@ -692,6 +700,10 @@ export class NotificationService {
       const order: NotificationChannel[] = [...template.channels_default, 'email', 'sms', 'in_app'];
       chosenChannel = order.find(enabled) ?? null;
     }
+    // Quiet hours hold email and SMS only; an in-app message is stored at once (Phase B.3, 2026-11-10).
+    const inQuietHours = chosenChannel !== null && QUIET_HOURS_CHANNELS.includes(chosenChannel) &&
+      !prefs.do_not_disturb && !(await this.shouldSendNow(prefs));
+    const quietEnd = !isFuture && inQuietHours ? this.quietHoursEndAt(prefs) : null;
     const message_id = await this.logMessage({
       user_id,
       template_key,
@@ -747,6 +759,8 @@ export class NotificationService {
    * preference re-check and the conditional final write were missing). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
    * Changed again the same day (Phase B.2 NOTIF-05 amendment): step 3 re-queues a due message inside quiet hours
    * (it was sent). Touches: notification_logs, preferences, SMTP / Twilio.
+   * Changed again 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3 ruling): step 3's quiet-hours hand-back
+   * applies to email and SMS rows only; an in-app row is stored as sent at once.
    */
   async deliverDue(now: Date = this.now(), limit: number = 100): Promise<{ delivered: number; failed: number; skipped: number; message_ids: string[] }> {
     const nowIso = now.toISOString();
@@ -800,7 +814,9 @@ export class NotificationService {
         if (await finish(row.id, { status: 'skipped', error: reason })) skipped++;
         continue;
       }
-      const quietEnd = this.isInQuietHours(prefs, now) ? this.quietHoursEndAt(prefs, now) : null;
+      // Quiet hours hold email and SMS only; an in-app message is never handed back (Phase B.3, 2026-11-10).
+      const quietEnd = QUIET_HOURS_CHANNELS.includes(row.channel) && this.isInQuietHours(prefs, now)
+        ? this.quietHoursEndAt(prefs, now) : null;
       if (quietEnd !== null) {
         // Inside quiet hours: hand it back, due again when the window ends (only while this claim still holds).
         await this.db.run(

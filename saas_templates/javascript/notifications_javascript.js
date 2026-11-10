@@ -193,6 +193,15 @@ function inQuietHours(start, end, date) {
 }
 
 /**
+ * True for the channels quiet hours hold: e-mail and SMS. An in-app message is stored at once (it interrupts no one).
+ * In: channel. Out: boolean. Why: notifications spec, Phase B.3 ruling (quiet hours hold email and SMS only).
+ * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+ */
+function holdsForQuietHours(channel) {
+  return channel === 'email' || channel === 'sms';
+}
+
+/**
  * The first moment after `now` whose UTC time is quiet_hours_end: when a message held by quiet hours is released.
  * In: end ("HH:MM", UTC), now (Date). Out: a Date.
  * Why: NOTIF-05 (queued with scheduled_at = quiet_hours_end) and deliver_due step 3 (Phase B.2); it used local
@@ -539,8 +548,10 @@ class NotificationService extends EventEmitter {
       }
     }
 
-    // Quiet hours (UTC, may cross midnight): stored 'queued' with scheduled_at = quiet_hours_end (the next one after now).
-    if (inQuietHours(prefs.quiet_hours_start, prefs.quiet_hours_end, now)) {
+    // Quiet hours (UTC, may cross midnight, the window [start, end)): an e-mail or SMS is stored 'queued' with
+    // scheduled_at = quiet_hours_end (the next one after now). An in-app message interrupts no one, so it is stored at
+    // once (Phase B.3, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
+    if (holdsForQuietHours(channel) && inQuietHours(prefs.quiet_hours_start, prefs.quiet_hours_end, now)) {
       log.status = 'queued';
       log.scheduled_at = nextQuietHoursEnd(prefs.quiet_hours_end, now).toISOString();
       return { success: true, message_id: messageId, status: 'queued' };
@@ -753,8 +764,9 @@ class NotificationService extends EventEmitter {
    *   1. 'sending' rows whose claimed_at + 300 s < now go back to 'queued' (a crashed worker);
    *   2. 'queued' rows with scheduled_at <= now, by scheduled_at then insertion order, are claimed one by one with a
    *      conditional write (status 'queued' -> 'sending', claimed_at = now); a row claimed first elsewhere is skipped;
-   *   3. preferences are checked NOW: do-not-disturb, unsubscribed or channel off -> 'skipped'; inside the user's
-   *      quiet hours (UTC) -> back to 'queued' with scheduled_at = quiet_hours_end (Phase B.2, 2026-11-10);
+   *   3. preferences are checked NOW: do-not-disturb, unsubscribed or channel off -> 'skipped'; an e-mail or SMS inside
+   *      the user's quiet hours (UTC, [start, end)) -> back to 'queued' with scheduled_at = quiet_hours_end (Phase B.2,
+   *      2026-11-10); an in-app message is never held by quiet hours (Phase B.3, same day);
    *   4. the final write is conditional on status 'sending' and the same claimed_at.
    * Each message is sent once when no worker crashes, at least once after a crash. In: now (Date, ms or ISO; default
    * the clock). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (replaces processQueue's in-memory queue).
@@ -793,7 +805,7 @@ class NotificationService extends EventEmitter {
         results.push({ success: true, message_id: id, status: 'skipped' });
         continue;
       }
-      if (inQuietHours(prefs.quiet_hours_start, prefs.quiet_hours_end, at)) {
+      if (holdsForQuietHours(log.channel) && inQuietHours(prefs.quiet_hours_start, prefs.quiet_hours_end, at)) {
         if (log.status === 'sending' && log.claimed_at === claim) {
           log.status = 'queued';
           log.claimed_at = null;

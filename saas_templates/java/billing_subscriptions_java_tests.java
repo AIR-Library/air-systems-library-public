@@ -396,8 +396,9 @@ public class BillingServiceTest {
         String payload = "{}";
         BillingService.BillingResponse response = billingService.handleStripeWebhook(payload, "invalid_signature");
         assertEquals("invalid_signature", response.get("error").getAsString());
-        // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (java bug list): the spec's 403 comes back with the error.
-        assertEquals(403, response.status);
+        // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (java bug list): the spec's status comes back with the error.
+        // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3 ruling, d4f4ed7): BILL-09 is now 400 (was 403).
+        assertEquals(400, response.status);
     }
 
     // BILL-10

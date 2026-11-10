@@ -228,8 +228,9 @@ public class NotificationService {
 
     /**
      * Sends one notification. Order: do-not-disturb -> 'skipped'; no enabled channel -> 'skipped'; scheduled_at in the
-     * future -> 'queued' with that scheduled_at; inside quiet hours -> 'queued' with scheduled_at = the end of the quiet
-     * window; otherwise sent now, retrying a failing send up to 3 times after the first attempt (4 attempts, waits 1 s,
+     * future -> 'queued' with that scheduled_at; an email or SMS inside quiet hours ([start, end)) -> 'queued' with
+     * scheduled_at = the end of the quiet window (in-app is never held: Phase B.3, 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP); otherwise sent now, retrying a failing send up to 3 times after the first attempt (4 attempts, waits 1 s,
      * 2 s, 4 s) through the injected sleeper; a bounce is not retried. Queued rows are sent by deliverDue, never by a timer.
      * In: NotificationRequest. Out: SendResponse(success, messageId, status sent|queued|skipped|failed).
      * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-02/05/12): defaults (SMS off, no quiet hours), queued
@@ -259,7 +260,7 @@ public class NotificationService {
             logQueued(messageId, request, channel, request.scheduledAt);
             return new SendResponse(true, messageId, "queued");
         }
-        if (isInQuietHours(prefs, now.toLocalTime())) {
+        if (heldByQuietHours(prefs, channel, now.toLocalTime())) {
             logQueued(messageId, request, channel, quietHoursEnd(prefs, now));
             return new SendResponse(true, messageId, "queued");
         }
@@ -417,7 +418,7 @@ public class NotificationService {
             NotificationTemplate template = getTemplate(templateKey);
             if (prefs.doNotDisturb || channel == null || !isChannelEnabled(prefs, channel)) {
                 finalStatus = "skipped";
-            } else if (isInQuietHours(prefs, now.toLocalTime())) {
+            } else if (heldByQuietHours(prefs, channel, now.toLocalTime())) {
                 // Step 3: still inside the user's quiet hours -> back to 'queued' until the window ends.
                 try (PreparedStatement ps = conn.prepareStatement(
                         "UPDATE notification_logs SET status = 'queued', claimed_at = NULL, scheduled_at = ? WHERE id = ? AND status = 'sending' AND claimed_at = ?")) {
@@ -720,6 +721,17 @@ public class NotificationService {
         } catch (SQLException e) {
             logger.severe("Log error: " + e.getMessage());
         }
+    }
+
+    /**
+     * True when quiet hours hold this message: an email or SMS inside [start, end) of the window. An in-app message is
+     * never held (it interrupts no one) and is stored at once; a message due exactly at quiet_hours_end is sent.
+     * In: preferences, channel, the UTC time of day. Out: hold it or not.
+     * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3 ruling, d4f4ed7: quiet hours hold email and SMS
+     * only). Touches: nothing.
+     */
+    private boolean heldByQuietHours(UserNotificationPreferences prefs, String channel, LocalTime now) {
+        return ("email".equals(channel) || "sms".equals(channel)) && isInQuietHours(prefs, now);
     }
 
     /** True inside [start, end) of the quiet window (it may wrap midnight); no window when either end is unset. */

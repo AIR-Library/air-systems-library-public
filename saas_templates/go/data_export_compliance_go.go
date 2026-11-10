@@ -43,7 +43,10 @@ var (
 	ErrInvalidReason     = errors.New("invalid_reason")
 	ErrUnsupportedFormat = errors.New("unsupported_format")
 	ErrNotPending        = errors.New("deletion_not_pending")
-	ErrGraceElapsed      = errors.New("grace_period_elapsed")
+	// ErrGraceElapsed is 409 grace_period_over: cancel after will_delete_at has passed. Changed 2026-11-10,
+	// session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3, commit d4f4ed7: the spec's code is "grace_period_over"; its
+	// text was grace_period_elapsed). Touches nothing.
+	ErrGraceElapsed = errors.New("grace_period_over")
 	ErrLinkExpired       = errors.New("link_expired")
 	ErrInvalidLink       = errors.New("invalid_link")
 	ErrNotConfigured     = errors.New("not_configured")
@@ -411,7 +414,7 @@ func (s *ComplianceService) RequestDeletion(userID int, reason string) (*Deletio
 
 // HTTPStatus maps an error from this service to its HTTP status: 404 not_found; 400
 // invalid_confirmation_token, invalid_reason, unsupported_format, invalid_link; 409 deletion_not_pending,
-// grace_period_elapsed; 410 link_expired; 503 not_configured; 500 anything else; 200 for nil.
+// grace_period_over; 410 link_expired; 503 not_configured; 500 anything else; 200 for nil.
 // In: the error. Out: the status code. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2,
 // EXPORT-15: one answer per case in every language; the comment above said "400/403"). Touches nothing.
 func HTTPStatus(err error) int {
@@ -484,9 +487,14 @@ func (s *ComplianceService) ConfirmDeletion(callerUserID int, deletionID, token 
 
 // CancelDeletion cancels the caller's own pending or approved request before WillDeleteAt.
 // In: the verified caller's user id and the deletion id. Out: the request, or ErrNotFound (404, another
-// user's too), ErrNotPending (409, already cancelled or completed) or ErrGraceElapsed (409).
+// user's too), ErrNotPending (409, already cancelled or completed) or ErrGraceElapsed (409 grace_period_over,
+// once will_delete_at has passed, including the very second it is reached; Phase B.3, commit d4f4ed7,
+// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
 // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-06, 14): anyone could cancel any request.
 // Reviewed the same day for Phase B.2 (EXPORT-15): unchanged, it already answered 409 deletion_not_pending.
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4 ruling af92d76, EXPORT-16): only a confirmed
+// (approved) request is scheduled, so only it gets ErrGraceElapsed from will_delete_at on and stays approved; a
+// pending (unconfirmed) request can always be cancelled, even after will_delete_at (it was refused too).
 // Touches: memory.
 func (s *ComplianceService) CancelDeletion(callerUserID int, deletionID string) (*DeletionRequest, error) {
 	s.mu.Lock()
@@ -498,7 +506,8 @@ func (s *ComplianceService) CancelDeletion(callerUserID int, deletionID string) 
 	if req.Status != "pending" && req.Status != "approved" {
 		return nil, ErrNotPending
 	}
-	if !s.now().Before(req.WillDeleteAt) {
+	// Phase B.4 (af92d76): the grace period binds only a confirmed request; a pending one is not scheduled.
+	if req.Status == "approved" && !s.now().Before(req.WillDeleteAt) {
 		return nil, ErrGraceElapsed
 	}
 	req.Status = "cancelled"
