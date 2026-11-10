@@ -1,7 +1,23 @@
+const crypto = require('crypto');
 const request = require('supertest');
-const { app, knex, runMigrations, CSRF_SECRET } = require('./admin_system_javascript');
-const stripe = require('stripe');
-jest.mock('stripe');
+const jwt = require('jsonwebtoken');
+const { createAdminSystem, InMemoryMailer } = require('./admin_system_javascript');
+
+// Identity: an access token as the auth system issues it ({ user_id, tier }, HS256), signed with a secret made for
+// this run. The admin system reads the caller's tier from the database, never from the token or a header.
+// Stripe and e-mail are in-memory fakes, so nothing leaves the machine.
+// (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: replaces X-User-Id/X-User-Role headers, which any client can set,
+// and jest.mock('stripe'), whose automock has no `subscriptions` property, so the change_plan test could not run.)
+const JWT_SECRET = crypto.randomBytes(32).toString('hex');
+const stripe = { subscriptions: { update: jest.fn() } };
+const mailer = new InMemoryMailer();
+const { app, knex, runMigrations, csrfTokenFor } = createAdminSystem({
+  jwtSecret: JWT_SECRET,
+  csrfSecret: crypto.randomBytes(32).toString('hex'),
+  stripe,
+  mailer,
+  priceIds: { owner: 'price_owner', admin: 'price_admin', user: 'price_user' },
+});
 
 describe('Admin System Tests', () => {
   beforeAll(async () => {
@@ -28,6 +44,7 @@ describe('Admin System Tests', () => {
         stripe_subscription_id: 'sub_123',
       },
     ]);
+    await knex('invoices').insert([{ id: 10, customer_id: 1, amount: 100.0, status: 'succeeded' }]);
     await knex('deployments').insert([
       {
         id: 1,
@@ -57,9 +74,8 @@ describe('Admin System Tests', () => {
   const agent = request.agent(app);
 
   const authHeaders = (userId, role) => ({
-    'X-User-Id': userId,
-    'X-User-Role': role,
-    'X-CSRF-Token': CSRF_SECRET,
+    Authorization: `Bearer ${jwt.sign({ user_id: userId, tier: role }, JWT_SECRET, { algorithm: 'HS256', expiresIn: '15m' })}`,
+    'X-CSRF-Token': csrfTokenFor(userId),
   });
 
   test('create user happy path → user created + invite sent', async () => {
@@ -72,6 +88,9 @@ describe('Admin System Tests', () => {
     const user = await knex('users').where({ email: 'new@example.com' }).first();
     expect(user).toBeDefined();
     expect(user.tier).toBe('user');
+    const invite = mailer.outbox.find((m) => m.to === 'new@example.com');
+    expect(invite).toBeDefined();
+    expect(invite.text).toMatch(/token=[a-f0-9]{64}/);
   });
 
   test('create user duplicate email → 409 {error: "email_exists"}', async () => {
@@ -100,6 +119,11 @@ describe('Admin System Tests', () => {
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
     expect(res.body.status).toBe('reset_email_sent');
+    const mail = mailer.outbox.find((m) => m.to === 'user@example.com');
+    expect(mail).toBeDefined();
+    const token = mail.text.match(/token=([a-f0-9]{64})/)[1];
+    const stored = await knex('password_resets').where({ user_id: 3, purpose: 'reset' }).first();
+    expect(stored.token_hash).toBe(crypto.createHash('sha256').update(token).digest('hex'));
   });
 
   test('reset_password own account → 400 {error: "cannot_reset_own_password"}', async () => {
@@ -195,6 +219,9 @@ describe('Admin System Tests', () => {
     const customer = await knex('customers').where({ id: 1 }).first();
     expect(customer.tier).toBe('admin');
     expect(stripe.subscriptions.update).toHaveBeenCalled();
+    expect(stripe.subscriptions.update).toHaveBeenCalledWith('sub_123', { items: [{ price: 'price_admin' }] });
+    const audit = await knex('audit_logs').where({ action: 'plan_changed', resource_id: 1 }).first();
+    expect(audit).toBeDefined();
   });
 
   test('queue_refund → refund record created with status=\'queued\'', async () => {
@@ -241,6 +268,9 @@ describe('Admin System Tests', () => {
     expect(res.body.success).toBe(true);
     const action = await knex('governance_actions').where({ id: 1 }).first();
     expect(action.status).toBe('approved');
+    const target = await knex('users').where({ id: 3 }).first();
+    expect(target.status).toBe('suspended');
+    expect(JSON.parse(action.execution_result)).toEqual({ user_id: 3, suspended: true });
   });
 
   test('governance reject → action rejected + reason logged', async () => {
@@ -272,5 +302,31 @@ describe('Admin System Tests', () => {
     expect(res.status).toBe(200);
     expect(Array.isArray(res.body)).toBe(true);
     expect(res.body.length).toBeLessThanOrEqual(10);
+  });
+
+  // Added 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): the gate must not be opened by anything the client controls.
+  test('owner gate reads the tier from the database, not from the token or headers', async () => {
+    const res = await agent
+      .post('/admin/users/action')
+      .set(authHeaders(2, 'owner'))
+      .set('X-User-Role', 'owner')
+      .send({ action: 'create', email: 'forged@example.com', name: 'Forged', tier: 'owner' });
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe('owner_only');
+    expect(await knex('users').where({ email: 'forged@example.com' }).first()).toBeUndefined();
+  });
+
+  test('missing or forged access token → 401, wrong CSRF token → 403', async () => {
+    const noToken = await agent.get('/admin/customers').set('X-User-Id', '1').set('X-User-Role', 'owner');
+    expect(noToken.status).toBe(401);
+    const forged = jwt.sign({ user_id: 1, tier: 'owner' }, 'not-the-server-secret', { algorithm: 'HS256' });
+    const badSig = await agent.get('/admin/customers').set('Authorization', `Bearer ${forged}`);
+    expect(badSig.status).toBe(401);
+    const badCsrf = await agent
+      .post('/admin/users/action')
+      .set({ ...authHeaders(1, 'owner'), 'X-CSRF-Token': csrfTokenFor(2) })
+      .send({ action: 'create', email: 'csrf@example.com', name: 'Csrf User', tier: 'user' });
+    expect(badCsrf.status).toBe(403);
+    expect(badCsrf.body.error).toBe('csrf_token_invalid');
   });
 });
