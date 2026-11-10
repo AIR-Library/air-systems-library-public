@@ -604,12 +604,25 @@ def parse_failures(lang: str, files: list[Path], ctx: Path) -> dict[str, str]:
 
 
 # ----------------------------------------------------------------------------------- reporting
+def declared_systems() -> set[str]:
+    """The systems the library declares: one row per system in docs/specs/README.md's table. Out: names ({} when
+    there is no spec index). [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Touches: reads one file."""
+    index = TEMPLATES.parent / "docs" / "specs" / "README.md"
+    if not index.is_file():
+        return set()
+    return set(re.findall(r"^\|\s*([a-z0-9_]+)\s*\|\s*\[[a-z0-9_]+\.md\]", index.read_text(encoding="utf-8"), re.M))
+
+
 def systems_for(lang: str) -> list[str]:
-    """Every system with an implementation or a tests file. In: a language. Out: sorted names.
-    Both kinds count, so a tests file whose implementation is gone shows as MISSING too (2026-11-05, session f3daac6e)."""
+    """Every system with an implementation or a tests file, plus every declared system. In: a language. Out: sorted names.
+    Both kinds count, so a tests file whose implementation is gone shows as MISSING too (2026-11-05, session f3daac6e).
+    [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Declared systems (docs/specs/README.md) count too, so a system whose
+    files are all gone from a language is reported MISSING (never excused) instead of silently not run (CodeRabbit,
+    PR 19)."""
     ext = EXT[lang]
     names = {p.name[: -len(f"_{lang}.{ext}")] for p in (TEMPLATES / lang).glob(f"*_{lang}.{ext}")}
     names |= {p.name[: -len(f"_{lang}_tests.{ext}")] for p in (TEMPLATES / lang).glob(f"*_{lang}_tests.{ext}")}
+    names |= declared_systems()
     return sorted(names)
 
 

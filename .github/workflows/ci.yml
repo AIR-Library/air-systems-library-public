@@ -33,6 +33,10 @@ jobs:
         with: {python-version: "3.12"}
       - name: README status table matches ci/baseline.json
         run: python tools/readme_status.py
+      # The tools' own regression tests: a declared system with no files is still a suite (MISSING), and the README
+      # table keeps it as failing (CodeRabbit, PR 19).
+      - name: Tool tests
+        run: python -m unittest tools/test_tools.py -v
 
   suites:
     name: ${{ matrix.lang }}
