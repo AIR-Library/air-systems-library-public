@@ -310,6 +310,9 @@ namespace AOI.StripeWebhookEntitlements
         /// store the result as one transaction (step 9: any error undoes it all, 500 processing_failed). In: the RAW body
         /// bytes and the Stripe-Signature header. Out: 200 {received, result} or the refusal. Why: STRIPEWH-01..14.
         /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the store, the Stripe client.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec db20a03, Phase B.4): a body holding a non-finite
+        /// number anywhere (HoldsNonFinite: 1e400 outside created too) is 400 invalid_payload; before, only a non-finite
+        /// created was.
         /// </summary>
         public WebhookResult HandleWebhook(byte[] payload, string header)
         {
@@ -331,7 +334,8 @@ namespace AOI.StripeWebhookEntitlements
             using (doc)
             {
                 var root = doc.RootElement;
-                if (root.ValueKind != JsonValueKind.Object) return WebhookResult.Fail(400, "invalid_payload");
+                // Phase B.4 (spec db20a03, 2026-11-10): a non-finite number anywhere makes the whole body invalid.
+                if (root.ValueKind != JsonValueKind.Object || HoldsNonFinite(root)) return WebhookResult.Fail(400, "invalid_payload");
                 var id = Str(root, "id");
                 var type = Str(root, "type");
                 var created = Time(Prop(root, "created"));
@@ -491,6 +495,32 @@ namespace AOI.StripeWebhookEntitlements
         {
             var v = Prop(obj, name);
             return v?.ValueKind == JsonValueKind.String ? v.Value.GetString() : null;
+        }
+
+        /// <summary>
+        /// Whether a JSON value holds, anywhere inside it, a number that is not finite as a double (1e400 reads as
+        /// infinity, or does not read at all). In: a parsed element (JsonDocument caps the depth at 64). Out: true when
+        /// one is found. Why: spec db20a03 (Phase B.4): a body holding any non-finite number, not only in a TIME field,
+        /// is 400 invalid_payload as a whole, because some parsers refuse it while parsing.
+        /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Pure.
+        /// </summary>
+        private static bool HoldsNonFinite(JsonElement e)
+        {
+            switch (e.ValueKind)
+            {
+                case JsonValueKind.Number:
+                    return !e.TryGetDouble(out var d) || !double.IsFinite(d);
+                case JsonValueKind.Object:
+                    foreach (var p in e.EnumerateObject())
+                        if (HoldsNonFinite(p.Value)) return true;
+                    return false;
+                case JsonValueKind.Array:
+                    foreach (var item in e.EnumerateArray())
+                        if (HoldsNonFinite(item)) return true;
+                    return false;
+                default:
+                    return false;
+            }
         }
 
         /// <summary>

@@ -5,6 +5,7 @@ package stripeentitlements
 // Touches: memory only (in-memory store, fake Stripe client, fixed clock); no network.
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -250,6 +251,33 @@ func TestStripeWH06InvalidPayloads(t *testing.T) {
 	}
 	if r.store.events["evt_1"].Created != 1700000000 {
 		t.Fatal("created not read as 1700000000")
+	}
+}
+
+// TestStripeWH06NonFiniteNumberAnywhere proves the db20a03 amendment of STRIPEWH-06 (Phase B.4): a correctly
+// signed, otherwise valid body holding "x": 1e400 (a non-finite number outside any TIME field), at the top level or
+// inside data.object, is 400 invalid_payload and no event is recorded; the same body without it is applied.
+// In: none. Out: test failures. Why: STRIPEWH-06 as amended by db20a03. 2026-11-10,
+// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+// STRIPEWH-06
+func TestStripeWH06NonFiniteNumberAnywhere(t *testing.T) {
+	good := event("evt_inf", "customer.subscription.created", 1700000000, subObj("sub_inf", "user_1", "active", "price_pro_monthly", 1702592000))
+	top := append([]byte(`{"x":1e400,`), good[1:]...)
+	nested := bytes.Replace(good, []byte(`"object":{`), []byte(`"object":{"x":1e400,`), 1)
+	if bytes.Equal(nested, good) {
+		t.Fatal("the nested body is unchanged")
+	}
+	for name, b := range map[string][]byte{"top level": top, "in data.object": nested} {
+		r := newSRig(0)
+		if got := r.send(b); got != (Result{Status: 400, Error: "invalid_payload"}) {
+			t.Fatalf("1e400 %s = %+v", name, got)
+		}
+		if len(r.store.events) != 0 {
+			t.Fatalf("1e400 %s was recorded", name)
+		}
+	}
+	if got := newSRig(0).send(good); got.Status != 200 || got.Result != "applied" {
+		t.Fatalf("the same body without it = %+v", got)
 	}
 }
 

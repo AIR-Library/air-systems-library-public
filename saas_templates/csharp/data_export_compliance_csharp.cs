@@ -676,6 +676,10 @@ namespace ComplianceModule
         /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3 ruling, endpoint 5): once will_delete_at
         /// (ScheduledFor) has been reached by the injected clock, the deletion is due (the worker runs rows with
         /// scheduled_for &lt;= now) and cancelling is 409 grace_period_over; the row is left as it was.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4 ruling af92d76, EXPORT-16): only a confirmed
+        /// (approved) request is scheduled, so only it gets 409 grace_period_over from will_delete_at on (exactly at it
+        /// included) and stays approved; a pending (unconfirmed) request can always be cancelled, even after
+        /// will_delete_at (it was refused like a confirmed one).
         /// Touches: deletion_requests, audit_logs.
         /// </summary>
         public async Task<ServiceResult<object>> CancelDeletionAsync(Guid userId, Guid deletionId, CancellationToken ct)
@@ -683,7 +687,8 @@ namespace ComplianceModule
             var d = await _db.DeletionRequests.FirstOrDefaultAsync(x => x.Id == deletionId, ct);
             if (d == null || d.UserId != userId || d.Status == "completed") return new(null, "not_found", 404);
             if (!StillPending(d)) return new(null, "deletion_not_pending", 409);
-            if (_clock.Now() >= d.ScheduledFor) return new(null, "grace_period_over", 409); // Phase B.3, 2026-11-10
+            // Phase B.3, 2026-11-10; Phase B.4 (af92d76): the grace period binds only a confirmed request.
+            if (d.Status == "approved" && _clock.Now() >= d.ScheduledFor) return new(null, "grace_period_over", 409);
             d.Status = "cancelled";
             d.ConfirmationTokenHash = null;
             d.TokenExpiresAt = null;

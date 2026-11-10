@@ -193,10 +193,17 @@ func TestDeletionCancelWithinGrace(t *testing.T) {
 // deletion is due but not yet run) is 409 grace_period_over, and the request stays as it was.
 // In: none. Out: test failures. Why: data_export_compliance spec endpoint 5, amended by commit d4f4ed7.
 // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4 ruling af92d76, EXPORT-16): the request is now
+// confirmed before the late cancel; it was left pending, and af92d76 rules that a pending request can always be
+// cancelled (TestDeletionCancelPendingAlwaysConfirmedUntilWillDeleteAt).
 // EXPORT-06
 func TestDeletionCancelAfterGrace(t *testing.T) {
-	svc, _, _ := newFixedService(t0)
+	svc, mailer, _ := newFixedService(t0)
 	del, _ := svc.RequestDeletion(4, "user_requested")
+	// Phase B.4 (af92d76, 2026-11-10): confirmed first; only a confirmed request is refused after will_delete_at.
+	if _, err := svc.ConfirmDeletion(4, del.ID, mailer.tokens[del.ID]); err != nil {
+		t.Fatal(err)
+	}
 	before := del.Status
 	svc.nowFunc = func() time.Time { return del.WillDeleteAt.Add(time.Second) }
 	_, err := svc.CancelDeletion(4, del.ID)
@@ -205,6 +212,52 @@ func TestDeletionCancelAfterGrace(t *testing.T) {
 	}
 	if del.Status != before {
 		t.Fatalf("a refused cancel changed the status to %s", del.Status)
+	}
+}
+
+// TestDeletionCancelPendingAlwaysConfirmedUntilWillDeleteAt proves EXPORT-16 (Phase B.4 ruling af92d76): a
+// pending (unconfirmed) request is cancelled a day after will_delete_at; a confirmed one is cancelled one second
+// before will_delete_at, and gets 409 grace_period_over exactly at will_delete_at and one second after it,
+// staying approved. In: none. Out: test failures. Why: EXPORT-16. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+// Touches: memory only.
+// EXPORT-16
+func TestDeletionCancelPendingAlwaysConfirmedUntilWillDeleteAt(t *testing.T) {
+	svc, mailer, _ := newFixedService(t0)
+	pending, _ := svc.RequestDeletion(40, "user_requested")
+	confirmed := func(userID int) *DeletionRequest {
+		svc.nowFunc = func() time.Time { return t0 }
+		d, err := svc.RequestDeletion(userID, "user_requested")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := svc.ConfirmDeletion(userID, d.ID, mailer.tokens[d.ID]); err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	before, at, after := confirmed(41), confirmed(42), confirmed(43)
+
+	svc.nowFunc = func() time.Time { return pending.WillDeleteAt.Add(24 * time.Hour) }
+	if _, err := svc.CancelDeletion(40, pending.ID); err != nil || pending.Status != "cancelled" {
+		t.Fatalf("pending a day after will_delete_at: expected cancelled, got %v (%s)", err, pending.Status)
+	}
+	svc.nowFunc = func() time.Time { return before.WillDeleteAt.Add(-time.Second) }
+	if _, err := svc.CancelDeletion(41, before.ID); err != nil || before.Status != "cancelled" {
+		t.Fatalf("confirmed one second before: expected cancelled, got %v (%s)", err, before.Status)
+	}
+	for _, c := range []struct {
+		user   int
+		req    *DeletionRequest
+		offset time.Duration
+	}{{42, at, 0}, {43, after, time.Second}} {
+		svc.nowFunc = func() time.Time { return c.req.WillDeleteAt.Add(c.offset) }
+		_, err := svc.CancelDeletion(c.user, c.req.ID)
+		if !errors.Is(err, ErrGraceElapsed) || err.Error() != "grace_period_over" || HTTPStatus(err) != 409 {
+			t.Fatalf("confirmed %v after will_delete_at: expected 409 grace_period_over, got %v", c.offset, err)
+		}
+		if c.req.Status != "approved" {
+			t.Fatalf("confirmed %v after will_delete_at: a refused cancel changed the status to %s", c.offset, c.req.Status)
+		}
 	}
 }
 

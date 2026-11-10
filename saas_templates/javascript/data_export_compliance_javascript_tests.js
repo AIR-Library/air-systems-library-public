@@ -495,4 +495,53 @@ describe('Deletion rules amended 2026-11-10', () => {
             clock = start;
         }
     });
+
+    /**
+     * EXPORT-16 (Phase B.4, af92d76): cancel follows the request's state. A pending (unconfirmed) request is
+     * cancelled even a day after will_delete_at; a confirmed one is cancelled one second before will_delete_at, and
+     * gets 409 {error: "grace_period_over"} exactly at will_delete_at and one second after it, staying approved.
+     * In: the test app and clock. Out: assertions. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches the test database.
+     */
+    // EXPORT-16
+    test('Cancel: pending is always cancellable; confirmed is refused from will_delete_at on', async () => {
+        const start = clock;
+        const cancel = (deletionId, userId) => request(app).delete(`/compliance/delete/${deletionId}`).set(authFor(userId));
+        const confirmed = async (userId) => {
+            await seedUser(userId, `${userId}@example.com`);
+            const d = await requestDeletion(userId, 'user_requested');
+            const ok = await request(app).post(`/compliance/delete/${d.deletion_id}/confirm`).set(authFor(userId))
+                .send({ confirmation_token: d.token });
+            expect(ok.body.status).toBe('approved');
+            return d;
+        };
+        try {
+            await seedUser('b4-pending', 'b4-pending@example.com');
+            const pending = await requestDeletion('b4-pending', 'user_requested');
+            clock = Date.parse(pending.will_delete_at) + DAY_MS;
+            const p = await cancel(pending.deletion_id, 'b4-pending');
+            expect(p.status).toBe(200);
+            expect(p.body).toEqual({ success: true, status: 'cancelled' });
+            expect((await get('SELECT status FROM deletion_requests WHERE id = ?', [pending.deletion_id])).status).toBe('cancelled');
+
+            clock = start;
+            const before = await confirmed('b4-before');
+            clock = Date.parse(before.will_delete_at) - 1000;
+            const b = await cancel(before.deletion_id, 'b4-before');
+            expect(b.status).toBe(200);
+            expect(b.body).toEqual({ success: true, status: 'cancelled' });
+
+            for (const [userId, offset] of [['b4-at', 0], ['b4-after', 1000]]) {
+                clock = start;
+                const d = await confirmed(userId);
+                clock = Date.parse(d.will_delete_at) + offset;
+                const res = await cancel(d.deletion_id, userId);
+                expect(res.status).toBe(409);
+                expect(res.body).toEqual({ error: 'grace_period_over' });
+                expect((await get('SELECT status FROM deletion_requests WHERE id = ?', [d.deletion_id])).status).toBe('approved');
+            }
+        } finally {
+            clock = start;
+        }
+    });
 });

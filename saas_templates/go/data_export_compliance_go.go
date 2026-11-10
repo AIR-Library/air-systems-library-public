@@ -492,6 +492,9 @@ func (s *ComplianceService) ConfirmDeletion(callerUserID int, deletionID, token 
 // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
 // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-06, 14): anyone could cancel any request.
 // Reviewed the same day for Phase B.2 (EXPORT-15): unchanged, it already answered 409 deletion_not_pending.
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4 ruling af92d76, EXPORT-16): only a confirmed
+// (approved) request is scheduled, so only it gets ErrGraceElapsed from will_delete_at on and stays approved; a
+// pending (unconfirmed) request can always be cancelled, even after will_delete_at (it was refused too).
 // Touches: memory.
 func (s *ComplianceService) CancelDeletion(callerUserID int, deletionID string) (*DeletionRequest, error) {
 	s.mu.Lock()
@@ -503,7 +506,8 @@ func (s *ComplianceService) CancelDeletion(callerUserID int, deletionID string) 
 	if req.Status != "pending" && req.Status != "approved" {
 		return nil, ErrNotPending
 	}
-	if !s.now().Before(req.WillDeleteAt) {
+	// Phase B.4 (af92d76): the grace period binds only a confirmed request; a pending one is not scheduled.
+	if req.Status == "approved" && !s.now().Before(req.WillDeleteAt) {
 		return nil, ErrGraceElapsed
 	}
 	req.Status = "cancelled"

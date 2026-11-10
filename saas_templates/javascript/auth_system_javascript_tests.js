@@ -140,9 +140,12 @@ describe('Auth System Tests', () => {
    * right code included, is 400 code_invalid and the user stays unverified; a new code (stored as a resend would store
    * it, 0 tries) then verifies the user. Separately, after 4 wrong codes the right one (the 5th try) is accepted.
    * In: the test database and mailer. Out: assertions. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4, af92d76): tagged AUTH-17, the id the ruling gave
+   * this rule (it was tagged AUTH-05, which the happy-path test above still names), and each wrong code now asserts
+   * 400 code_invalid (it asserted invalid_code, which af92d76 rules out).
    * Touches: the test database.
    */
-  // AUTH-05
+  // AUTH-17
   test('verify_email: 5 wrong codes invalidate the code until a new code is sent', async () => {
     const db = await dbPromise;
     const email = 'guess@example.com';
@@ -151,7 +154,7 @@ describe('Auth System Tests', () => {
     const wrong = right === '000000' ? '111111' : '000000';
     for (let i = 0; i < 5; i++) {
       const res = await verify_email(email, wrong);
-      expect(res.error).toBe('invalid_code');
+      expect(res.error).toBe('code_invalid'); // Phase B.4 (af92d76, 2026-11-10): was invalid_code
       expect(res.status).toBe(400);
     }
     for (let i = 0; i < 2; i++) {
@@ -174,7 +177,8 @@ describe('Auth System Tests', () => {
     await signup(email4, 'StrongPassword123456', 'Fay', ip);
     const right4 = emailedCode(email4);
     const wrong4 = right4 === '000000' ? '111111' : '000000';
-    for (let i = 0; i < 4; i++) expect((await verify_email(email4, wrong4)).error).toBe('invalid_code');
+    // Phase B.4 (af92d76, 2026-11-10): a wrong code is code_invalid (this asserted invalid_code).
+    for (let i = 0; i < 4; i++) expect((await verify_email(email4, wrong4)).error).toBe('code_invalid');
     const fifth = await verify_email(email4, right4);
     expect(fifth.status).toBe('verified');
     expect((await db.get('SELECT email_verified_at FROM users WHERE email = ?', email4)).email_verified_at).not.toBeNull();

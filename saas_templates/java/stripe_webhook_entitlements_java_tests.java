@@ -32,6 +32,7 @@ public class stripe_webhook_entitlements_java_tests {
             testTolerance();
             testTwoV1Values();
             testInvalidPayloads();
+            testNonFiniteNumberAnywhere();
             testCreatedGrants();
             testDuplicate();
             testOutOfOrder();
@@ -235,6 +236,26 @@ public class stripe_webhook_entitlements_java_tests {
         check(fx.store.eventCount() == 0, "no id recorded");
         check(result(fx.deliver(event("evt_ok", "customer.subscription.updated", "1700000000.0", obj)), "applied"), "created 1700000000.0 accepted");
         check(fx.store.getEvent("evt_ok").created() == 1700000000L, "created stored as a whole number");
+    }
+
+    // STRIPEWH-06
+    /**
+     * STRIPEWH-06 (spec db20a03, Phase B.4): a correctly signed, otherwise valid body holding "x": 1e400 (a non-finite
+     * number outside any TIME field), at the top level or inside data.object, is 400 invalid_payload and no event is
+     * recorded; the same body without it is applied. In: none. Out: check failures. Why: STRIPEWH-06 as amended by
+     * db20a03. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory store.
+     */
+    static void testNonFiniteNumberAnywhere() {
+        Fx fx = new Fx();
+        String good = event("evt_inf", "customer.subscription.created", "1700000000",
+                sub("sub_inf", "cus_inf", "active", 1702592000L, false, "user_1", "price_pro_monthly"));
+        String top = "{\"x\":1e400," + good.substring(1);
+        String nested = good.replace("\"object\":{", "\"object\":{\"x\":1e400,");
+        check(!nested.equals(good), "the nested body differs");
+        check(refusal(fx.deliver(top), 400, "invalid_payload"), "1e400 at the top level");
+        check(refusal(fx.deliver(nested), 400, "invalid_payload"), "1e400 in data.object");
+        check(fx.store.eventCount() == 0, "no event recorded");
+        check(result(fx.deliver(good), "applied"), "the same body without it is applied");
     }
 
     // STRIPEWH-07

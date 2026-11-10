@@ -227,9 +227,11 @@ func TestVerifyEmailHappyPath(t *testing.T) {
 // TestVerifyEmailFiveWrongCodesInvalidate proves the Phase B.3 ruling on verify_email: after 5 wrong codes the
 // user's current code is invalid, so even the right code gets 400 code_invalid and the user stays unverified,
 // until a new code is sent (a new code row verifies); and with 4 wrong codes the right one, the 5th try, works.
-// In: none. Out: test failures. Why: auth spec flow 2 "Attempts", amended by commit d4f4ed7. It carries no
-// AUTH id: no row of the Required tests table names this rule. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
-// Touches: the in-memory SQLite database.
+// In: none. Out: test failures. Why: auth spec flow 2 "Attempts", amended by commit d4f4ed7.
+// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory SQLite database.
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4 ruling af92d76): tagged AUTH-17, the id the
+// ruling gave this rule (it said no AUTH id named it); every wrong code is asserted as code_invalid, as before.
+// AUTH-17
 func TestVerifyEmailFiveWrongCodesInvalidate(t *testing.T) {
 	as, err := newTestAuth(t)
 	if err != nil {

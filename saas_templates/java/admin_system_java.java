@@ -1236,11 +1236,20 @@ class UserService {
     }
 
     /**
-     * Changes a user's role; returns the old role. The last active owner cannot be demoted, and that rule is
-     * checked before "not your own role", because an owner can only demote the last owner by demoting
-     * themselves (with the other order the last-owner rule could never fire).
+     * Changes a user's role; returns the old role. The last active owner cannot be demoted.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4 ruling af92d76, change_role "Order"): the gate
+     * (owner_only, checked by the caller, and user_id != current_user_id) now runs before the checks, so an owner
+     * changing their own role always gets 400 cannot_change_own_role, even as the last owner. It ran the last-owner
+     * check first (answering cannot_demote_last_owner) and the tier check before both; the last-owner refusal is now
+     * reached through a governance change_role (ADMIN-07).
+     * In: the verified owner, the target id, the new tier. Out: the old tier, or ResponseStatusException 400
+     * cannot_change_own_role | invalid_tier | cannot_demote_last_owner, 404 user_not_found.
+     * Touches: the database (users, audit_logs).
      */
     String changeRole(User actor, Long userId, String newTier) {
+        if (userId != null && userId.equals(actor.getId())) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "cannot_change_own_role");
+        }
         if (newTier == null || !VALID_TIERS.contains(newTier)) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "invalid_tier");
         }
@@ -1249,9 +1258,6 @@ class UserService {
                     .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "user_not_found"));
             if (isLastActiveOwner(target) && !Tiers.OWNER.equals(newTier)) {
                 throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "cannot_demote_last_owner");
-            }
-            if (target.getId().equals(actor.getId())) {
-                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "cannot_change_own_role");
             }
             String oldTier = target.getTier();
             target.setTier(newTier);

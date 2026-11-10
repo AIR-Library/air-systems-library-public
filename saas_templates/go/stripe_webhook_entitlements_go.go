@@ -377,9 +377,39 @@ func text(v any) (string, bool) {
 	return s, ok
 }
 
+// holdsNonFinite reports whether a decoded JSON value (UseNumber: numbers are json.Number) holds, anywhere inside
+// it, a number that is not finite as a float64 (1e400: strconv answers ±Inf with ErrRange).
+// In: the decoded value. Out: true when one is found. Why: spec db20a03 (Phase B.4): a body holding any
+// non-finite number, not only in a TIME field, is 400 invalid_payload as a whole. 2026-11-10,
+// session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+func holdsNonFinite(v any) bool {
+	switch x := v.(type) {
+	case json.Number:
+		f, err := strconv.ParseFloat(string(x), 64)
+		return err != nil || math.IsInf(f, 0) || math.IsNaN(f)
+	case float64:
+		return math.IsInf(x, 0) || math.IsNaN(x)
+	case map[string]any:
+		for _, item := range x {
+			if holdsNonFinite(item) {
+				return true
+			}
+		}
+	case []any:
+		for _, item := range x {
+			if holdsNonFinite(item) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // parseEvent is step 6: strict UTF-8 without a BOM, one JSON value, and the id, type, created and data.object
 // rules.
 // In: raw body. Out: event object, ok. Why: STRIPEWH-06. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec db20a03, Phase B.4): a body holding a non-finite
+// number anywhere (holdsNonFinite: 1e400 outside created too) is refused; before, only a non-finite created was.
 func parseEvent(payload []byte) (map[string]any, bool) {
 	if !utf8.Valid(payload) || bytes.HasPrefix(payload, []byte{0xEF, 0xBB, 0xBF}) {
 		return nil, false
@@ -394,7 +424,7 @@ func parseEvent(payload []byte) (map[string]any, bool) {
 		return nil, false
 	}
 	ev, ok := v.(map[string]any)
-	if !ok {
+	if !ok || holdsNonFinite(ev) {
 		return nil, false
 	}
 	id, ok := text(ev["id"])

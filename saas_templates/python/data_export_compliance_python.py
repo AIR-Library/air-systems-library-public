@@ -460,6 +460,10 @@ class ComplianceManager:
         grace_period_over (now >= will_delete_at). The token is spent. Why: EXPORT-06/14 (amended 2026-11-10:
         only the caller's own request) and EXPORT-15 (Phase B.2, 2026-11-10: a closed request was 409
         cannot_cancel; now deletion_not_pending, as for confirm). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.4 (af92d76, EXPORT-16): only a confirmed (approved)
+        request is scheduled, so only it gets 409 grace_period_over from will_delete_at on (exactly at it included)
+        and stays approved; a pending (unconfirmed) request can always be cancelled, even after will_delete_at (it
+        was refused like a confirmed one).
         Touches: database, audit logger."""
         deletion_request = self._own_deletion(user_id, deletion_id)
         self._refuse_if_closed(deletion_request)
@@ -468,7 +472,8 @@ class ComplianceManager:
         now_utc = self.clock()
         will_delete_at = _ensure_utc_aware(deletion_request.will_delete_at)
         
-        if now_utc >= will_delete_at:
+        # Phase B.4 (af92d76): a pending request is not scheduled, so the grace period binds only a confirmed one.
+        if deletion_request.status == DeletionRequestStatus.APPROVED and now_utc >= will_delete_at:
             raise ComplianceError(409, 'grace_period_over', "Grace period has expired")
         
         deletion_request.status = DeletionRequestStatus.CANCELLED

@@ -190,6 +190,12 @@ class AdminSystemTests {
         Assertions.assertEquals(1, auditRows("role_changed", target.getId()).size());
     }
 
+    /**
+     * The last active owner changing their own role. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4
+     * ruling af92d76, change_role "Order"): the own-role gate runs before the last-owner check, so the answer is 400
+     * cannot_change_own_role (it asserted cannot_demote_last_owner); the owner keeps the role. ADMIN-07's
+     * cannot_demote_last_owner is proven through a governance change_role (testGovernanceChangeRoleCannotDemoteLastOwner). In: the seeded users. Out: assertions. Touches: the in-memory database.
+     */
     // ADMIN-07
     @Test
     void testChangeRoleLastOwner() throws Exception {
@@ -207,7 +213,9 @@ class AdminSystemTests {
                     .content(mapper.writeValueAsString(payload))
                     .with(auth(owner)))
                     .andExpect(status().isBadRequest())
-                    .andExpect(jsonPath("$.error").value("cannot_demote_last_owner"));
+                    // Phase B.4 (af92d76, 2026-11-10): was cannot_demote_last_owner; the own-role gate runs first.
+                    .andExpect(jsonPath("$.error").value("cannot_change_own_role"));
+            Assertions.assertEquals("owner", userRepo.findById(owner.getId()).orElseThrow().getTier());
         } finally {
             // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: put the admin back, so tests that act as the admin do
             // not depend on running before this one (the setup above demotes every non-owner).

@@ -44,6 +44,11 @@ class FakeDb {
     }
     // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16): codes, challenges and refresh tokens are looked up by
     // their SHA-256; OAuth links by the provider's user id.
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4, af92d76): the user's expired email codes, which
+    // verify_email reads to tell an expired code (code_expired) from a wrong one (code_invalid).
+    if (sql.includes("FROM verification_codes WHERE user_id = $1 AND type = 'email' AND expires_at <= NOW()")) {
+      return this.codes.filter((c) => c.user_id === params[0] && c.type === 'email' && !live(c));
+    }
     if (sql.includes("FROM verification_codes WHERE user_id = $1 AND type = 'email'")) {
       return this.codes.filter((c) => c.user_id === params[0] && c.type === 'email' && live(c));
     }
@@ -559,7 +564,8 @@ describe('AuthSystem', () => {
       expect(db.codes[0].code_hash).toBe(sha256(code));
       expect(db.codes[0].code_hash).not.toBe(plainSha256(code)); // spec d270fa3 (2026-11-10): keyed, not plain SHA-256
       expect(db.codes[0]).not.toHaveProperty('code');
-      expect(await auth.verify_email('hash@example.com', '000000' === code ? '111111' : '000000')).toEqual(refused('code_expired', 400));
+      // Phase B.4 (af92d76, 2026-11-10): a wrong code is code_invalid (this asserted code_expired).
+      expect(await auth.verify_email('hash@example.com', '000000' === code ? '111111' : '000000')).toEqual(refused('code_invalid', 400));
       expect((await auth.verify_email('hash@example.com', code)).status).toBe('verified');
 
       const session = await auth.login('hash@example.com', STRONG, 'device-h', '1.2.3.9');
@@ -610,14 +616,19 @@ describe('AuthSystem', () => {
    * one (the 5th try) still verifies; a newly sent code (a new code row, 0 attempts) works again.
    * In: the in-memory stand-in. Out: assertions only. Why: Phase D wave 1, owner request 2026-11-10 (B.3 rulings).
    * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+   * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4 ruling af92d76): tagged AUTH-17, the id the ruling
+   * gave this rule, and each wrong code now asserts 400 code_invalid (it asserted code_expired, which af92d76 rules
+   * out for a wrong code).
    */
   describe('verify_email attempts', () => {
+    // AUTH-17
     it('5 wrong codes invalidate the code: the right code is then 400 code_invalid until a new code is sent', async () => {
       await auth.signup('guess@example.com', STRONG, 'Guess User');
       const { code } = mail[mail.length - 1];
       const wrong = code === '000000' ? '111111' : '000000';
       for (let i = 0; i < 5; i++) {
-        expect(await auth.verify_email('guess@example.com', wrong)).toEqual(refused('code_expired', 400));
+        // Phase B.4 (af92d76, 2026-11-10): was code_expired.
+        expect(await auth.verify_email('guess@example.com', wrong)).toEqual(refused('code_invalid', 400));
       }
       expect(await auth.verify_email('guess@example.com', code)).toEqual(refused('code_invalid', 400));
       expect(await auth.verify_email('guess@example.com', wrong)).toEqual(refused('code_invalid', 400));
@@ -631,12 +642,14 @@ describe('AuthSystem', () => {
       expect((await auth.verify_email('guess@example.com', '424242')).status).toBe('verified');
     });
 
+    // AUTH-17
     it('4 wrong codes, then the right code on the 5th try is accepted', async () => {
       await auth.signup('four@example.com', STRONG, 'Four User');
       const { code } = mail[mail.length - 1];
       const wrong = code === '000000' ? '111111' : '000000';
       for (let i = 0; i < 4; i++) {
-        expect(await auth.verify_email('four@example.com', wrong)).toEqual(refused('code_expired', 400));
+        // Phase B.4 (af92d76, 2026-11-10): was code_expired.
+        expect(await auth.verify_email('four@example.com', wrong)).toEqual(refused('code_invalid', 400));
       }
       expect(await auth.verify_email('four@example.com', code)).toMatchObject({ status: 'verified' });
     });

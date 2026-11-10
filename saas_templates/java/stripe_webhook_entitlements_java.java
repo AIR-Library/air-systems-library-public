@@ -330,6 +330,28 @@ public final class StripeWebhookEntitlements {
         return c;
     }
 
+    /**
+     * Whether a parsed JSON value holds, anywhere inside it, a number that is not finite as a double (Jackson reads
+     * 1e400 as Infinity; a huge integer literal becomes a BigInteger whose double value is Infinity). Walks with an
+     * explicit stack, so a deep body cannot overflow the call stack.
+     * In: the parsed node. Out: true when one is found. Why: spec db20a03 (Phase B.4): a body holding any non-finite
+     * number, not only in a TIME field, is 400 invalid_payload as a whole. 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+     */
+    static boolean holdsNonFinite(JsonNode root) {
+        java.util.ArrayDeque<JsonNode> todo = new java.util.ArrayDeque<>();
+        if (root != null) todo.push(root);
+        while (!todo.isEmpty()) {
+            JsonNode n = todo.pop();
+            if (n.isNumber()) {
+                if (!Double.isFinite(n.doubleValue())) return true;
+            } else if (n.isContainerNode()) {
+                n.elements().forEachRemaining(todo::push);
+            }
+        }
+        return false;
+    }
+
     /** Parses the body: strict UTF-8, no BOM, one JSON value. Out: the node, or null for anything the parser raises. */
     private static JsonNode parse(byte[] payload) {
         if (payload == null) return null;
@@ -366,13 +388,15 @@ public final class StripeWebhookEntitlements {
      * Verifies first, then parses (400 invalid_payload), then CLAIM + APPLY + result in one transaction; any error
      * while applying undoes it all and answers 500 processing_failed (Stripe retries). STRIPEWH-01..14.
      * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the store, the Stripe client.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec db20a03, Phase B.4): a body holding a non-finite number
+     * anywhere (holdsNonFinite: 1e400 outside created too) is 400 invalid_payload; before, only a non-finite created was.
      */
     public Map<String, Object> handleWebhook(byte[] payload, String header) {
         long now = clock.getAsLong();
         Map<String, Object> v = verifySignature(payload, header, webhookSecret, now);
         if (!Integer.valueOf(200).equals(v.get("status"))) return v;
         JsonNode ev = parse(payload);
-        if (ev == null || !ev.isObject()) return refuse(400, "invalid_payload");
+        if (ev == null || !ev.isObject() || holdsNonFinite(ev)) return refuse(400, "invalid_payload");
         String id = text(ev.get("id"));
         String type = text(ev.get("type"));
         Long created = time(ev.get("created"));

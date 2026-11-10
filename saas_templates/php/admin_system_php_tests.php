@@ -187,6 +187,9 @@ final class AdminSystemTest extends TestCase
     /**
      * ADMIN-07 (direct path): changing the last active owner's role is refused with cannot_demote_last_owner.
      * Kept from PR 18; the governance path the Phase B.3 spec names is testChangeRoleLastOwnerThroughGovernance.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4 ruling af92d76, change_role "Order"): the last
+     * owner here is the caller, and the own-role gate now runs before the last-owner check, so the answer is
+     * cannot_change_own_role (it asserted cannot_demote_last_owner); it also asserts the owner keeps the role.
      * Touches: the in-memory SQLite database.
      */
     public function testChangeRoleLastOwner(): void
@@ -204,7 +207,10 @@ final class AdminSystemTest extends TestCase
             'user_id' => $owner_id,
             'new_tier' => 'admin',
         ]);
-        $this->assertEquals('cannot_demote_last_owner', $response['error']);
+        // Phase B.4 (af92d76, 2026-11-10): was cannot_demote_last_owner; the own-role gate runs first.
+        $this->assertSame($current_owner_id, $owner_id, 'the last owner is the caller');
+        $this->assertEquals('cannot_change_own_role', $response['error']);
+        $this->assertSame('owner', $this->pdo->query("SELECT tier FROM users WHERE id = $owner_id")->fetchColumn());
     }
 
     /**
@@ -594,6 +600,8 @@ final class AdminSystemTest extends TestCase
      * 400 cannot_* and invalid_tier, 404 not found, 409 conflicts, 403 publish_not_allowed and CSRF).
      * Input: the seeded database. Output: assertions only. Why: the amended spec (TIERS) and the bug "admin errors
      * are {error} arrays without an HTTP status". 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4 ruling af92d76): the owner changing their own
+     * role is now 400 cannot_change_own_role (it asserted cannot_demote_last_owner); the own-role gate runs first.
      * Touches: the in-memory SQLite database; fake Stripe and mail.
      */
     // ADMIN-02
@@ -621,7 +629,8 @@ final class AdminSystemTest extends TestCase
         $this->assertSame(['email_exists', 409], $pair($this->admin->createUser(['csrf_token' => $t, 'email' => 'user@example.com', 'name' => 'D', 'tier' => 'user'])));
         $this->assertSame(['Invalid CSRF token', 403], $pair($this->admin->createUser(['csrf_token' => 'nope', 'email' => 'q@example.com', 'name' => 'Q', 'tier' => 'user'])));
         $this->assertSame(['cannot_reset_own_password', 400], $pair($this->admin->resetPassword(['csrf_token' => $t, 'user_id' => $owner])));
-        $this->assertSame(['cannot_demote_last_owner', 400], $pair($this->admin->changeRole(['csrf_token' => $t, 'user_id' => $owner, 'new_tier' => 'admin'])));
+        // Phase B.4 (af92d76, 2026-11-10): was cannot_demote_last_owner; changing your own role meets the gate first.
+        $this->assertSame(['cannot_change_own_role', 400], $pair($this->admin->changeRole(['csrf_token' => $t, 'user_id' => $owner, 'new_tier' => 'admin'])));
         $this->assertSame(['cannot_suspend_yourself', 400], $pair($this->admin->suspendUser(['csrf_token' => $t, 'user_id' => $owner, 'reason' => 'x'])));
         $this->assertSame(['user_not_found', 404], $pair($this->admin->resetPassword(['csrf_token' => $t, 'user_id' => 999])));
         $this->assertSame(['customer_not_found', 404], $pair($this->admin->getCustomer(999)));

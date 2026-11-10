@@ -514,6 +514,12 @@ public class DataExportCompliance {
      * will_delete_at has passed (the deletion is due but not yet run) is 409 grace_period_over (it was
      * grace_period_expired).
      *
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4 ruling af92d76, EXPORT-16): a confirmed request is
+     * 409 grace_period_over from will_delete_at on, exactly at it included (a cancel at that very instant used to win);
+     * a pending (unconfirmed) request can always be cancelled, even after will_delete_at. The conditional update repeats
+     * the rule, so a confirm that lands between the read and the write cannot be cancelled past its date.
+     * Touches: deletion_requests, the audit log.
+     *
      * @throws ComplianceException not_found, also when the requester may not see it; deletion_not_pending;
      *                             grace_period_over; cannot_cancel
      */
@@ -523,18 +529,24 @@ public class DataExportCompliance {
             throw new ComplianceException("not_found");
         }
         refuseIfClosed(deletion);
-        // Phase B.3 (d4f4ed7), 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: after will_delete_at has passed, cancelling
-        // is 409 grace_period_over. Exactly at will_delete_at a cancel still wins over the eraser (the conditional
-        // update below decides), as before.
-        if (deletion.status() == DeletionStatus.APPROVED && clock.instant().isAfter(deletion.willDeleteAt())) {
+        // Phase B.3 (d4f4ed7), 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: once will_delete_at is reached, cancelling a
+        // confirmed request is 409 grace_period_over. Phase B.4 (af92d76), same day: exactly at will_delete_at included
+        // (it was isAfter, so a cancel at that instant won), and only a confirmed request: a pending one is not scheduled.
+        Instant now = clock.instant();
+        if (deletion.status() == DeletionStatus.APPROVED && !now.isBefore(deletion.willDeleteAt())) {
             throw new ComplianceException("grace_period_over");
         }
-        // Only an erase that has not started can be cancelled, so a cancellation and the eraser never both win.
-        int changed = update("UPDATE deletion_requests SET status = ? WHERE id = ? AND status IN (?, ?)"
-                        + " AND erase_started_at IS NULL",
+        // Only an erase that has not started can be cancelled, so a cancellation and the eraser never both win; a
+        // confirmed request only before will_delete_at (Phase B.4).
+        int changed = update("UPDATE deletion_requests SET status = ? WHERE id = ? AND erase_started_at IS NULL"
+                        + " AND (status = ? OR (status = ? AND will_delete_at > ?))",
                 DeletionStatus.CANCELLED.value(), deletionId,
-                DeletionStatus.PENDING.value(), DeletionStatus.APPROVED.value());
+                DeletionStatus.PENDING.value(), DeletionStatus.APPROVED.value(), now);
         if (changed == 0) {
+            DeletionView current = findDeletion(deletionId).orElseThrow(() -> new ComplianceException("not_found"));
+            if (current.status() == DeletionStatus.APPROVED && !now.isBefore(current.willDeleteAt())) {
+                throw new ComplianceException("grace_period_over");
+            }
             throw new ComplianceException("cannot_cancel");
         }
         services.audit().record("deletion_cancelled", deletion.userId(), Map.of("deletion_id", deletionId.toString()));

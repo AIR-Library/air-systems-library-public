@@ -203,6 +203,28 @@ test('STRIPEWH-06 a signed body that is not a valid event is 400 invalid_payload
 });
 
 /**
+ * STRIPEWH-06 (spec db20a03, Phase B.4): a correctly signed, otherwise valid body holding "x": 1e400 (a non-finite
+ * number outside any TIME field), at the top level or inside data.object, is 400 invalid_payload and no event is
+ * recorded; the same body without it is applied.
+ * In: fakes. Out: assertions only. Why: STRIPEWH-06 as amended by db20a03. 2026-11-10,
+ * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+ */
+// STRIPEWH-06
+test('STRIPEWH-06 a non-finite number anywhere in a signed body is 400 invalid_payload', async () => {
+  const good = body('evt_inf', 'customer.subscription.created', 1700000000, sub());
+  const top = '{"x":1e400,' + good.slice(1);
+  const nested = good.replace('"object":{', '"object":{"x":1e400,');
+  assert.notEqual(nested, good);
+  for (const payload of [top, nested]) {
+    const s = setup();
+    assert.deepEqual(await deliver(s, payload), { status: 400, error: 'invalid_payload' }, payload.slice(0, 60));
+    assert.equal(s.store.events.size, 0);
+  }
+  const s = setup();
+  assert.deepEqual(await deliver(s, good), { status: 200, received: true, result: 'applied' });
+});
+
+/**
  * STRIPEWH-07: subscription.created grants the plan; before it the none answer; another user unchanged.
  * In: the spec's vectors and fakes. Out: assertions only. Why: STRIPEWH-07 (Phase D wave 1, owner request
  * 2026-11-10). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.

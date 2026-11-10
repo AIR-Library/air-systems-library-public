@@ -115,15 +115,46 @@ def _reject_constant(_name):
     raise ValueError("not JSON")
 
 
+def _finite_float(text: str) -> float:
+    """json parse_float hook: a JSON number with a fraction or exponent, refused when it is not finite.
+
+    In: the number's text, as written in the body (e.g. "1e400"). Out: the float; ValueError for inf (Python's
+    json reads 1e400 as inf), which parse_event turns into invalid_payload for the whole body. Why: spec
+    db20a03 (Phase B.4): a body holding any non-finite number, not only in a TIME field, is 400 invalid_payload,
+    because some parsers refuse it while parsing. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing."""
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError("number is not finite")
+    return value
+
+
+def _double_sized_int(text: str) -> int:
+    """json parse_int hook: a JSON integer, refused when it does not fit a finite double.
+
+    In: the integer's text. Out: the int; ValueError when float(int) overflows (e.g. 1 followed by 400 zeros, the
+    same non-finite value as 1e400 in a double). Why: spec db20a03 (Phase B.4: any number not finite in the
+    language's double is invalid_payload). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing."""
+    value = int(text)
+    try:
+        float(value)
+    except OverflowError:
+        raise ValueError("number is not finite as a double") from None
+    return value
+
+
 def parse_event(payload: bytes) -> Optional[dict]:
     """Step 6: UTF-8 with no BOM, valid JSON, an object with id evt_..., type (1-100 printable ASCII), created
     (TIME) and data.object (an object). Out: the event dict or None. Anything the parser raises is None.
 
-    Why: STRIPEWH-06. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing."""
+    Why: STRIPEWH-06. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+    [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec db20a03 (Phase B.4): a number anywhere in the body that is
+    not finite as a double (1e400, which json read as inf) makes the whole body None (invalid_payload); before,
+    only a non-finite TIME field was refused."""
     try:
         if payload.startswith(b"\xef\xbb\xbf"):
             return None
-        event = json.loads(payload.decode("utf-8"), parse_constant=_reject_constant)
+        event = json.loads(payload.decode("utf-8"), parse_constant=_reject_constant,
+                           parse_float=_finite_float, parse_int=_double_sized_int)
     except Exception:  # noqa: BLE001 - a depth limit or any parser error is invalid_payload
         return None
     if not isinstance(event, dict):

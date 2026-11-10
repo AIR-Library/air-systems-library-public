@@ -240,6 +240,30 @@ function test_stripewh06_invalid_payloads(): void
     eq('1700000000', (string)$s->getEvent('evt_float')['created'], 'created stored as a whole number');
 }
 
+// STRIPEWH-06
+/**
+ * STRIPEWH-06 (spec db20a03, Phase B.4): a correctly signed, otherwise valid body holding "x": 1e400 (a non-finite
+ * number outside any TIME field), at the top level or inside data.object, is 400 invalid_payload and no event is
+ * recorded; the same body without it is applied. In: none. Out: assertions. Why: STRIPEWH-06 as amended by
+ * db20a03. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite.
+ */
+function test_stripewh06_non_finite_number_anywhere(): void
+{
+    $good = ev('evt_inf', 'customer.subscription.created', NOW, sub());
+    $bodies = [
+        'top level' => '{"x":1e400,' . substr($good, 1),
+        'in data.object' => str_replace('"object":{', '"object":{"x":1e400,', $good),
+    ];
+    eq(true, $bodies['in data.object'] !== $good, 'the nested body differs');
+    foreach ($bodies as $name => $body) {
+        [$h, $s] = world();
+        eq(['error' => 'invalid_payload', 'status' => 400], send($h, new Clock(), $body), "1e400 $name");
+        eq([0, 0], counts($s), "1e400 $name not recorded");
+    }
+    [$h] = world();
+    eq(APPLIED, send($h, new Clock(), $good), 'the same body without it is applied');
+}
+
 // STRIPEWH-07
 /** STRIPEWH-07: a created event grants; none before; other users unchanged. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
 function test_stripewh07_created_grants(): void

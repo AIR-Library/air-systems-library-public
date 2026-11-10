@@ -179,8 +179,11 @@ public class AuthSystemTests {
      * Phase B.3 ruling (d4f4ed7): 5 wrong verification codes invalidate the user's current code, so the right code is
      * then code_invalid too; after only 4 wrong codes the right code still verifies. Added 2026-11-10,
      * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory H2 (verification_codes, users).
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4 ruling af92d76): tagged AUTH-17, the id the ruling
+     * gave this rule (it was tagged AUTH-05, which testVerifyEmailHappyPath still names); it now also asserts each of
+     * the 4 wrong tries is code_invalid and that a newly sent code verifies. Nothing it asserted before changed.
      */
-    // AUTH-05
+    // AUTH-17
     @Test
     public void testFiveWrongCodesInvalidateTheCode() {
         AuthSystem.signup("guess5@example.com", "StrongPassword123456", "Guess", "1.2.9.1");
@@ -193,10 +196,28 @@ public class AuthSystemTests {
         assertFalse((Boolean) res.get("success"));
         assertEquals("code_invalid", res.get("error"), "the right code after 5 wrong ones");
 
+        // AUTH-17 (Phase B.4, af92d76, 2026-11-10): a newly sent code (a fresh row, stored as its HMAC) works again.
+        String guessId = queryString("SELECT id FROM users WHERE email = ?", "guess5@example.com");
+        try (java.sql.Connection conn = java.sql.DriverManager.getConnection("jdbc:h2:mem:authdb;DB_CLOSE_DELAY=-1");
+             java.sql.PreparedStatement ps = conn.prepareStatement(
+                     "INSERT INTO verification_codes (user_id, code_hash, created_at, expires_at, type) VALUES (?, ?, ?, ?, 'email')")) {
+            ps.setLong(1, Long.parseLong(guessId));
+            ps.setString(2, hmacHex("654321"));
+            ps.setTimestamp(3, java.sql.Timestamp.from(java.time.Instant.now()));
+            ps.setTimestamp(4, java.sql.Timestamp.from(java.time.Instant.now().plusSeconds(3600)));
+            assertEquals(1, ps.executeUpdate());
+        } catch (java.sql.SQLException e) {
+            throw new AssertionError(e);
+        }
+        assertEquals("verified", AuthSystem.verifyEmail("guess5@example.com", "654321").get("status"), "a newly sent code verifies");
+
         AuthSystem.signup("guess4@example.com", "StrongPassword123456", "Guess", "1.2.9.2");
         String code4 = extractCodeFromEmail("guess4@example.com");
         String wrong4 = code4.equals("000000") ? "111111" : "000000";
-        for (int i = 0; i < 4; i++) AuthSystem.verifyEmail("guess4@example.com", wrong4);
+        for (int i = 0; i < 4; i++) {
+            // AUTH-17 (2026-11-10): each wrong try is now asserted too.
+            assertEquals("code_invalid", AuthSystem.verifyEmail("guess4@example.com", wrong4).get("error"), "wrong try " + i);
+        }
         assertEquals("verified", AuthSystem.verifyEmail("guess4@example.com", code4).get("status"), "4 wrong tries leave it valid");
     }
 

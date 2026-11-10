@@ -194,7 +194,11 @@ namespace AuthSystemTests
         /// invalidates it, so the right code is then code_invalid and the user stays unverified; a new code
         /// (as signup sends) works. A second user with 4 wrong tries then the right one is verified. In: nothing.
         /// Out: asserts. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory database.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4 ruling af92d76): tagged AUTH-17, the id the
+        /// ruling gave this rule (a wrong code is code_invalid; the right code after 5 wrong is code_invalid; after 4
+        /// wrong the right one verifies; a newly sent code works). Its assertions already matched and are unchanged.
         /// </summary>
+        // AUTH-17
         [Fact]
         public async Task VerifyEmail_FiveWrongCodes_InvalidateTheCode()
         {

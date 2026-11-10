@@ -485,8 +485,13 @@ class TestComplianceManager(unittest.TestCase):
         also asserts the 409 status, that a confirmed (approved) deletion that is due but not yet run is refused
         the same way, at will_delete_at exactly too, that the refusal changes nothing, and that one second before
         will_delete_at the cancel still works.
+        Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4, af92d76, EXPORT-16): the first request past
+        will_delete_at is now confirmed (approved); it was pending, and af92d76 rules that a pending request can
+        always be cancelled (asserted in test_cancel_rules_for_pending_and_confirmed_requests).
         Touches: in-memory SQLite only."""
-        deletion_id = self._make_deletion(token='token', will_delete_at=T0 - timedelta(days=1))
+        # Phase B.4 (af92d76, 2026-11-10): status APPROVED added; a pending request past will_delete_at is cancellable.
+        deletion_id = self._make_deletion(token='token', status=DeletionRequestStatus.APPROVED,
+                                          will_delete_at=T0 - timedelta(days=1))
 
         with self.assertRaises(ComplianceError) as cm:
             self.compliance.cancel_deletion(self.test_user_id, deletion_id)
@@ -495,13 +500,39 @@ class TestComplianceManager(unittest.TestCase):
         with self.assertRaises(ComplianceError) as cm:
             self.compliance.cancel_deletion(self.test_user_id, due)
         self.assertEqual((cm.exception.status, cm.exception.code), (409, 'grace_period_over'))
-        for refused_id, status in ((deletion_id, DeletionRequestStatus.PENDING), (due, DeletionRequestStatus.APPROVED)):
+        for refused_id, status in ((deletion_id, DeletionRequestStatus.APPROVED), (due, DeletionRequestStatus.APPROVED)):
             self.assertEqual(self.db_session.query(DeletionRequest).filter_by(id=refused_id).first().status, status)
         self.cascade_delete_func.assert_not_called()
         almost = self._make_deletion(token='token3', status=DeletionRequestStatus.APPROVED,
                                      will_delete_at=T0 + timedelta(seconds=1))
         self.assertEqual(self.compliance.cancel_deletion(self.test_user_id, almost)['status'], 'cancelled')
     
+    # EXPORT-16
+    def test_cancel_rules_for_pending_and_confirmed_requests(self):
+        """Cancel follows the request's state: a pending (unconfirmed) request is cancelled even a day after
+        will_delete_at; a confirmed one is cancelled 1 second before will_delete_at, and gets 409
+        grace_period_over exactly at will_delete_at and 1 second after it, staying confirmed; nothing is deleted.
+        In: the test fixtures. Out: assertions. Why: EXPORT-16, Phase B.4 ruling af92d76.
+        2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite only."""
+        pending = self._make_deletion(token='p', will_delete_at=T0 - timedelta(days=1))
+        self.assertEqual(self.compliance.cancel_deletion(self.test_user_id, pending),
+                         {'success': True, 'status': 'cancelled'})
+        self.assertEqual(self.db_session.query(DeletionRequest).filter_by(id=pending).first().status,
+                         DeletionRequestStatus.CANCELLED)
+        before = self._make_deletion(token='b', status=DeletionRequestStatus.APPROVED,
+                                     will_delete_at=T0 + timedelta(seconds=1))
+        self.assertEqual(self.compliance.cancel_deletion(self.test_user_id, before)['status'], 'cancelled')
+        at = self._make_deletion(token='a', status=DeletionRequestStatus.APPROVED, will_delete_at=T0)
+        after = self._make_deletion(token='f', status=DeletionRequestStatus.APPROVED,
+                                    will_delete_at=T0 - timedelta(seconds=1))
+        for refused in (at, after):
+            with self.assertRaises(ComplianceError) as cm:
+                self.compliance.cancel_deletion(self.test_user_id, refused)
+            self.assertEqual((cm.exception.status, cm.exception.code), (409, 'grace_period_over'))
+            self.assertEqual(self.db_session.query(DeletionRequest).filter_by(id=refused).first().status,
+                             DeletionRequestStatus.APPROVED)
+        self.cascade_delete_func.assert_not_called()
+
     def test_cancel_deletion_wrong_status(self):
         """Cancelling a completed request is 404 not_found.
         In: the test fixtures. Out: assertions. Why: EXPORT-06. Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: caller user_id, error code.

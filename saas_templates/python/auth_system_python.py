@@ -416,8 +416,11 @@ class AuthSystem:
         [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.3 (auth_system.md flow 2, "Attempts"): each wrong code
         adds one to the attempts of the user's current (unexpired) email codes; a code with 5 wrong attempts is
         invalidated, and every further try, the right code included, answers {error: "code_invalid"} until a new
-        code is stored (a 6-digit code must not be guessable by retrying). A wrong code before that still answers
-        code_expired, as before."""
+        code is stored (a 6-digit code must not be guessable by retrying).
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.4 (af92d76, AUTH-17): a wrong code now answers
+        {error: "code_invalid"} (it answered code_expired); only a code that matches a stored code whose expires_at
+        has passed answers {error: "code_expired"}, and that try does not count as wrong. Both are the spec's 400
+        answers. Touches: SQLite (users, verification_codes, audit_log)."""
         decision_points = []
         cursor = self.db.cursor()
         cursor.execute("SELECT id, email_verified_at FROM users WHERE email = ?", (email,))
@@ -446,10 +449,18 @@ class AuthSystem:
             self._log_why_chain("verify_email", decision_points + ["code_valid:failed"])
             if current and not live:
                 return {"error": "code_invalid"}
+            # Phase B.4 (af92d76): the right code past its expiry is code_expired; any other code is code_invalid.
+            cursor.execute(
+                """SELECT code_hash FROM verification_codes
+                   WHERE user_id = ? AND type = 'email' AND expires_at <= ?""",
+                (user_id, self._now_iso())
+            )
+            if any(hmac.compare_digest(str(row[0]).encode("utf-8"), supplied) for row in cursor.fetchall()):
+                return {"error": "code_expired"}
             for row in live:
                 cursor.execute("UPDATE verification_codes SET attempts = attempts + 1 WHERE id = ?", (row[0],))
             self.db.commit()
-            return {"error": "code_expired"}
+            return {"error": "code_invalid"}
         decision_points.append("code_valid")
         now_iso = self._now_iso()
         cursor.execute("UPDATE users SET email_verified_at = ?, status = 'verified', updated_at = ? WHERE id = ?",

@@ -474,15 +474,28 @@ interface ParsedEvent {
 }
 
 /**
+ * JSON.parse reviver: refuses any number that is not finite (JSON.parse reads 1e400 as Infinity), wherever it is.
+ * In: the key and the parsed value. Out: the value unchanged; throws for Infinity / -Infinity, which parseEvent turns
+ * into invalid_payload for the whole body. Why: spec db20a03 (Phase B.4): a body holding any non-finite number, not
+ * only in a TIME field, is 400 invalid_payload. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+ */
+function refuseNonFinite(_key: string, value: unknown): unknown {
+  if (typeof value === 'number' && !Number.isFinite(value)) throw new SyntaxError('number is not finite');
+  return value;
+}
+
+/**
  * Step 6: the body as strict UTF-8 with no byte-order mark, parsed as JSON, an object with id evt_[A-Za-z0-9_]{1,200},
  * type 1-100 characters U+0020-U+007E, created a TIME and data.object an object. In: the raw bytes. Out: the event,
  * or null (400 invalid_payload). Never throws. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+ * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec db20a03 (Phase B.4): parsed with refuseNonFinite, so a
+ * non-finite number anywhere in the body (1e400 outside created too) is null; before, only a non-finite created was.
  */
 function parseEvent(bytes: Buffer): ParsedEvent | null {
   try {
     if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) return null;
     const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
-    const doc = JSON.parse(text);
+    const doc = JSON.parse(text, refuseNonFinite);
     if (!isObject(doc)) return null;
     const id = own(doc, 'id');
     const type = own(doc, 'type');

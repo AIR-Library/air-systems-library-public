@@ -192,18 +192,23 @@ def test_verify_email_expired_code(auth_system):
     result = auth_system.verify_email('test@example.com', 'expired')
     assert result['error'] == 'code_expired'
 
+# AUTH-17
 def test_verify_email_five_wrong_codes_invalidate_the_code(auth_system):
     """5 wrong verification codes invalidate the user's current code: every further try, the right code included,
     is {error: "code_invalid"} and the user stays unverified, until a new code is stored; that new code verifies.
     Another user's code is not affected. In: the fixture. Out: assertions. Why: the Phase B.3 ruling in
-    auth_system.md flow 2 ("Attempts"); no required-test id covers it. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
-    Touches: in-memory SQLite only."""
+    auth_system.md flow 2 ("Attempts"). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    Touches: in-memory SQLite only.
+    Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4, af92d76): tagged AUTH-17, the id the ruling
+    gave this rule, and each wrong code now asserts {error: "code_invalid"} (it asserted code_expired, the
+    answer af92d76 rules out for a wrong code)."""
     auth_system.signup('test@example.com', 'a' * 16, 'Test User', '127.0.0.1')
     auth_system.signup('other@example.com', 'a' * 16, 'Other User', '127.0.0.1')
     code = _sent_code(auth_system, 'test@example.com')
     wrong = '%06d' % ((int(code) + 1) % 1000000) if code.isdigit() else 'wrong-code'
+    # Phase B.4 (af92d76, 2026-11-10): a wrong code is code_invalid (this asserted code_expired before).
     for _ in range(5):
-        assert auth_system.verify_email('test@example.com', wrong) == {'error': 'code_expired'}
+        assert auth_system.verify_email('test@example.com', wrong) == {'error': 'code_invalid'}
     assert auth_system.verify_email('test@example.com', code) == {'error': 'code_invalid'}
     assert auth_system.verify_email('test@example.com', wrong) == {'error': 'code_invalid'}
     cursor = auth_system.db.cursor()
@@ -219,8 +224,9 @@ def test_verify_email_five_wrong_codes_invalidate_the_code(auth_system):
     # 4 wrong codes do not invalidate: the 5th try with the right code verifies.
     other = _sent_code(auth_system, 'other@example.com')
     other_wrong = '%06d' % ((int(other) + 1) % 1000000) if other.isdigit() else 'wrong-code'
+    # Phase B.4 (af92d76, 2026-11-10): a wrong code is code_invalid (this asserted code_expired before).
     for _ in range(4):
-        assert auth_system.verify_email('other@example.com', other_wrong) == {'error': 'code_expired'}
+        assert auth_system.verify_email('other@example.com', other_wrong) == {'error': 'code_invalid'}
     assert auth_system.verify_email('other@example.com', other)['status'] == 'verified'
 
 

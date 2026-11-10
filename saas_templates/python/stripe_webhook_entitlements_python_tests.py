@@ -221,6 +221,23 @@ def test_stripewh_06_invalid_payloads():
     assert deliver_raw(svc, clock, variant(id="evt_y", created=1.7e9 + 1)) == ok("applied")
 
 
+# STRIPEWH-06
+def test_stripewh_06_non_finite_number_anywhere_is_invalid_payload():
+    """A correctly signed, otherwise valid body holding "x": 1e400 (a number outside a TIME field that is not
+    finite as a double) is 400 invalid_payload and no event is recorded; inside data.object too; the same body
+    without it is applied. In: none. Out: assertions. Why: STRIPEWH-06 as amended by spec db20a03 (Phase B.4).
+    2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite."""
+    svc, clock, _, store = make()
+    good = body("evt_inf", "customer.subscription.created", NOW, sub())
+    top = b'{"x":1e400,' + good[1:]
+    nested = good.replace(b'"object":{', b'"object":{"x":1e400,', 1)
+    assert nested != good
+    for raw in (top, nested):
+        assert deliver_raw(svc, clock, raw) == {"error": "invalid_payload", "status": 400}, raw[:60]
+    assert counts(store) == (0, 0)
+    assert deliver_raw(svc, clock, good) == ok("applied")
+
+
 # STRIPEWH-07
 def test_stripewh_07_created_grants_access():
     """customer.subscription.created (active, known price, metadata.user_id) gives the entitled answer; before it

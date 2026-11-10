@@ -116,6 +116,28 @@ function as_time($v): ?int
 }
 
 /**
+ * Whether a decoded JSON value holds, anywhere inside it, a number that is not finite. json_decode reads 1e400 (and an
+ * integer literal too large for a double) as the float INF, so the body must be walked.
+ * In: a decoded JSON value (scalar, array or stdClass; json_decode already capped the depth at 512). Out: true when a
+ * float INF, -INF or NAN is found. Why: spec db20a03 (Phase B.4): a body holding any non-finite number, not only in a
+ * TIME field, is 400 invalid_payload as a whole. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+ */
+function holds_non_finite($v): bool
+{
+    if (is_float($v)) {
+        return !is_finite($v);
+    }
+    if ($v instanceof stdClass || is_array($v)) {
+        foreach ($v as $item) {
+            if (holds_non_finite($item)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
  * A property of a decoded JSON object, or null. In: value, key. Out: the property or null.
  * Why: reading untrusted event objects safely. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
  */
@@ -334,6 +356,8 @@ final class EntitlementWebhook
      * Step 6: parse the verified payload; null for anything that is not a valid event (invalid UTF-8, a BOM,
      * a parser error, a missing or malformed id, type, created or data.object). Out: ?stdClass.
      * Why: STRIPEWH-06. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+     * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec db20a03 (Phase B.4): a body holding a non-finite number
+     * anywhere (holds_non_finite: 1e400 outside created too) is null; before, only a non-finite created was.
      */
     private function parse(string $payload): ?stdClass
     {
@@ -345,7 +369,7 @@ final class EntitlementWebhook
         } catch (Throwable $ex) {
             return null;
         }
-        if (!$e instanceof stdClass) {
+        if (!$e instanceof stdClass || holds_non_finite($e)) {
             return null;
         }
         $id = prop($e, 'id');

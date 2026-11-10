@@ -376,11 +376,14 @@ async function signup(email, password, name, ip) {
  * right code, is 400 code_invalid until a new code is sent. Before, a 6-digit code could be guessed by retrying.
  * Touches: users, verification_codes, audit_log.
  * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
+ * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.4 (af92d76, AUTH-17): a wrong code (and an unknown e-mail,
+ * which must not read differently) is 400 {error: "code_invalid"}; it was 400 invalid_code. An expired right code
+ * stays 400 code_expired. In: email, code. Out: as above. Touches: users, verification_codes, audit_log.
  */
 async function verify_email(email, code) {
   const db = await dbPromise;
   const user = await db.get(`SELECT * FROM users WHERE email = ?`, email);
-  if (!user) return fail(400, 'invalid_code', 'Invalid code');
+  if (!user) return fail(400, 'code_invalid', 'Invalid code'); // Phase B.4 (af92d76): was invalid_code
   if (user.email_verified_at) return fail(409, 'already_verified', 'Already verified');
   const presented = hashSecret(code == null ? '' : code);
   const rows = await db.all(`SELECT * FROM verification_codes WHERE user_id = ? AND type = 'email'`, user.id);
@@ -398,7 +401,7 @@ async function verify_email(email, code) {
   for (const r of counted) {
     if (safeEqualHex(presented, r.code_hash)) record = r; // every code is compared: the time says nothing about which
   }
-  if (!record) return fail(400, 'invalid_code', 'Invalid code');
+  if (!record) return fail(400, 'code_invalid', 'Invalid code'); // Phase B.4 (af92d76, AUTH-17): was invalid_code
   if (Date.parse(record.expires_at) < nowMs()) {
     return fail(400, 'code_expired', 'Code expired');
   }

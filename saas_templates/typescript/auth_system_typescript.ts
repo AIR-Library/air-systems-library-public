@@ -145,8 +145,10 @@ const AUTH_ERRORS: Readonly<Record<string, [number, string]>> = {
   email_already_exists: [409, 'An account with this email already exists.'],
   password_rejected: [400, 'Choose a different password.'],
   too_many_signups_from_ip: [429, 'Too many signups from this address; try again later.'],
-  code_expired: [400, 'The code is wrong or has expired.'],
-  code_invalid: [400, 'Too many wrong codes; ask for a new code.'],
+  // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4, af92d76): a wrong code is now code_invalid, so the two
+  // messages were reworded to match (code_expired said "wrong or has expired").
+  code_expired: [400, 'The code has expired; ask for a new code.'],
+  code_invalid: [400, 'The code is wrong, or too many wrong codes were tried; ask for a new code.'],
   token_expired: [401, 'The token has expired.'],
   already_verified: [409, 'This email is already verified.'],
   invalid_credentials: [401, 'Email or password is wrong.'],
@@ -471,8 +473,27 @@ class AuthSystem {
   }
 
   /**
+   * Whether the given code is one of the user's expired email codes (HMAC compared in constant time with each).
+   * In: user id, the code as given. Out: true when an expired code matches. Why: Phase B.4 ruling (af92d76): an
+   * expired code is 400 code_expired and a wrong one 400 code_invalid, so verify_email must tell them apart.
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database (verification_codes, read only).
+   */
+  private async expiredCodeMatches(userId: unknown, code_or_token: string): Promise<boolean> {
+    const expired = await this.db.query(
+      'SELECT id, code_hash FROM verification_codes WHERE user_id = $1 AND type = \'email\' AND expires_at <= NOW()',
+      [userId]
+    );
+    const given = this.hashSecret(code_or_token);
+    let found = false;
+    for (const row of expired) {
+      if (sameHash(row.code_hash, given)) found = true; // every row is compared
+    }
+    return found;
+  }
+
+  /**
    * Verifies an email with the emailed code. In: email and code. Out: {status: 'verified', user_id, message} or
-   * {error, message, http_status}: 400 code_expired (unknown email, wrong or expired code: one answer), 409
+   * {error, message, http_status}: 400 code_invalid (unknown email or wrong code), 400 code_expired (expired code), 409
    * already_verified. The user's live email codes are read and each stored code_hash is compared with the HMAC-SHA256 of
    * the given code in constant time; the matching row is deleted.
    * Why: AUTH-05/06; changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, AUTH-16 and the spec's "Secrets
@@ -484,13 +505,16 @@ class AuthSystem {
    * attempts + 1 WHERE id = ? AND attempts < 5), and only the rows whose write succeeded are compared. After 5 wrong
    * codes the user's current code is spent: every further try, the right code too, is 400 code_invalid until a new
    * code is sent (a new code row starts at 0 attempts). Before, a 6-digit code could be guessed by retrying.
+   * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.4 ruling (af92d76, AUTH-17): a wrong code (and an unknown
+   * email, which must not read differently) is now 400 code_invalid; it was 400 code_expired. Only a code that matches
+   * one of the user's expired codes is 400 code_expired (expiredCodeMatches). Touches: the same tables.
    */
   async verify_email(email: string, code_or_token: string): Promise<any> {
     try {
       const user = await this.db.query('SELECT id, email_verified_at FROM users WHERE email = $1', [email]);
       if (user.length === 0) {
         await this.logWhyChain('verify_email', ['code_valid', 'user_unverified']);
-        return fail('code_expired'); // Or invalid, but spec test expects expired for wrong code
+        return fail('code_invalid'); // Phase B.4 (af92d76): was code_expired; same answer as a wrong code
       }
       if (user[0].email_verified_at !== null) {
         await this.logWhyChain('verify_email', ['code_valid', 'user_unverified']);
@@ -503,7 +527,8 @@ class AuthSystem {
       );
       if (live.length === 0) {
         await this.logWhyChain('verify_email', ['code_valid', 'user_unverified']);
-        return fail('code_expired');
+        // Phase B.4 (af92d76): code_expired only for an expired code that matches; anything else is code_invalid.
+        return fail(await this.expiredCodeMatches(user[0].id, code_or_token) ? 'code_expired' : 'code_invalid');
       }
       // Count the try first, one conditional write per live code; a code with 5 wrong tries takes no more.
       const counted: any[] = [];
@@ -525,7 +550,8 @@ class AuthSystem {
       }
       if (match === null) {
         await this.logWhyChain('verify_email', ['code_valid', 'user_unverified']);
-        return fail('code_expired');
+        // Phase B.4 (af92d76, AUTH-17): a wrong code is code_invalid (it was code_expired).
+        return fail(await this.expiredCodeMatches(user[0].id, code_or_token) ? 'code_expired' : 'code_invalid');
       }
 
       await this.db.execute(

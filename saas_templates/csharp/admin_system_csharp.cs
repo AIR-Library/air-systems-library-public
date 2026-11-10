@@ -648,6 +648,9 @@ namespace AdminSystem
         /// Owner-only: changes a user's tier after the CSRF check; the Owner tier cannot be assigned here.
         /// Refuses the caller's own role, then an unknown user, then demoting the last active owner (spec order; changed
         /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). Output: { success, old/new tier }.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4 ruling af92d76, change_role "Order"): the
+        /// own-role gate now also runs before the tier check, so an owner changing their own role always gets
+        /// cannot_change_own_role. In: CSRF token, target user id, new tier.
         /// Touches: the in-memory user and audit records. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
         /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a suspended caller is refused first, 403 account_suspended (ADMIN-19).
         /// </summary>
@@ -657,12 +660,14 @@ namespace AdminSystem
             CsrfValidator.Verify(csrfToken);
             RequireOwner();
 
-            Validation.ValidateTier(newTier, allowOwner: false); // Cannot promote to Owner via API
-            var newRole = (Role)Enum.Parse(typeof(Role), newTier, true);
-
             // Gate before check (spec order; changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): own account first.
+            // Phase B.4 (af92d76, same day): also before the tier check, so changing your own role is always
+            // cannot_change_own_role (an invalid tier for yourself was invalid_tier).
             if (userId == AuthContext.CurrentUser.UserId)
                 throw new ApiException("cannot_change_own_role", "Cannot change own role");
+
+            Validation.ValidateTier(newTier, allowOwner: false); // Cannot promote to Owner via API
+            var newRole = (Role)Enum.Parse(typeof(Role), newTier, true);
 
             var target = Database.Users.FirstOrDefault(u => u.UserId == userId)
                 ?? throw new ApiException("user_not_found", "User does not exist");

@@ -25,6 +25,7 @@ public static class StripeWebhookEntitlementsTests
         TestTolerance();
         TestTwoV1Values();
         TestInvalidPayloads();
+        TestNonFiniteNumberAnywhere();
         TestCreatedGrantsEntitlement();
         TestDuplicate();
         TestOutOfOrder();
@@ -274,6 +275,29 @@ public static class StripeWebhookEntitlementsTests
         var invalidUtf8 = Encoding.UTF8.GetBytes(Evt("evt_u8", "x", 1700000000, obj)).Concat(new byte[] { 0xFF }).ToArray();
         var u = rig.Sys.HandleWebhook(invalidUtf8, StripeWebhookEntitlements.SignPayload(invalidUtf8, Secret, rig.Now));
         Eq((400, "invalid_payload"), (u.Status, u.Error), "invalid UTF-8");
+    }
+
+    /// <summary>
+    /// STRIPEWH-06 (spec db20a03, Phase B.4): a correctly signed, otherwise valid body holding "x": 1e400 (a non-finite
+    /// number outside any TIME field), at the top level or inside data.object, is 400 invalid_payload and no event is
+    /// recorded; the same body without it is applied. In: none. Out: throws on a wrong answer. Why: STRIPEWH-06 as
+    /// amended by db20a03. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
+    /// </summary>
+    // STRIPEWH-06
+    public static void TestNonFiniteNumberAnywhere()
+    {
+        var rig = new Rig();
+        var good = Evt("evt_inf", "customer.subscription.created", 1700000000, Sub("sub_inf"));
+        var nested = good.Replace("\"object\":{", "\"object\":{\"x\":1e400,");
+        Eq(true, nested != good, "the nested body differs");
+        foreach (var (name, body) in new[] { ("top level", "{\"x\":1e400," + good.Substring(1)), ("in data.object", nested) })
+        {
+            var r = rig.Send(body);
+            Eq((400, "invalid_payload"), (r.Status, r.Error), "1e400 " + name);
+        }
+        Eq(0, rig.Store.EventCount, "no event recorded");
+        var ok = rig.Send(good);
+        Eq((200, "applied"), (ok.Status, ok.Result), "the same body without it is applied");
     }
 
     /// <summary>

@@ -490,6 +490,11 @@ SQL;
      * caller's own role. Output: success or an error array. Touches: users and audit_logs. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
      * Phase B.2 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): a suspended caller is refused first (403
      * account_suspended, ADMIN-19), and every error carries its HTTP status ({error, status, message}).
+     * Phase B.4 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, spec af92d76, change_role "Order"): the gate
+     * (owner_only, user_id != current_user_id) runs before the checks, so changing your own role is always 400
+     * cannot_change_own_role, even for the last active owner (the last-owner check used to run first and answer
+     * cannot_demote_last_owner). Input: {csrf_token, user_id, new_tier}. Output: {success, user_id, old_tier,
+     * new_tier} or an error array. Touches: users and audit_logs.
      */
     public function changeRole(array $data): array
     {
@@ -500,6 +505,11 @@ SQL;
 
             $user_id = (int)($data['user_id'] ?? 0);
             $new_tier = trim($data['new_tier'] ?? '');
+
+            // Gate before the checks (Phase B.4, af92d76): your own role is cannot_change_own_role, last owner or not.
+            if ($user_id === $this->current_user_id) {
+                return $this->fail('cannot_change_own_role', 'Cannot change own role');
+            }
 
             if (!$this->validate_tier($new_tier)) {
                 return $this->fail('invalid_tier', 'Invalid tier');
@@ -512,13 +522,8 @@ SQL;
                 return $this->fail('user_not_found', 'User not found');
             }
 
-            // Check if trying to demote the last active owner (takes precedence over own-role check)
             if ($user['tier'] === 'owner' && $this->countOwners() <= 1 && $new_tier !== 'owner') {
                 return $this->fail('cannot_demote_last_owner', 'Cannot demote last active owner');
-            }
-
-            if ($user_id === $this->current_user_id) {
-                return $this->fail('cannot_change_own_role', 'Cannot change own role');
             }
 
             $old_tier = $user['tier'];

@@ -548,7 +548,11 @@ class TestRunner {
      * the right one, the 5th try, still verifies; another user's wrong codes never count against this one.
      * Input: none. Output: assertions. Why: the Phase B.3 ruling (a 6-digit code must not be guessable by
      * retrying). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory database.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4 ruling af92d76): tagged AUTH-17, the id the
+     * ruling gave this rule, and it now also shows that a newly sent code (a fresh row, stored as its HMAC as signup
+     * stores one) verifies the user after the old code was invalidated. Nothing it asserted before changed.
      */
+    // AUTH-17
     private function testFiveWrongVerificationCodesInvalidateTheCode(): void {
         $this->resetDB();
         $db = Database::get();
@@ -562,6 +566,12 @@ class TestRunner {
         $this->assertEqual([$res['status_code'], $res['body']['error'] ?? null], [400, 'code_invalid'], 'the right code after 5 wrong ones is refused');
         $this->assertEqual($db->query("SELECT email_verified_at FROM users WHERE email='guess@example.com'")->fetchColumn(), null, 'still unverified');
         $this->assertEqual((int)$db->query("SELECT COUNT(*) FROM verification_codes vc JOIN users u ON u.id = vc.user_id WHERE u.email='guess@example.com'")->fetchColumn(), 0, 'the code is gone');
+        // AUTH-17 (Phase B.4, 2026-11-10): a newly sent code works again.
+        $guessId = $db->query("SELECT id FROM users WHERE email='guess@example.com'")->fetchColumn();
+        $stmt = $db->prepare('INSERT INTO verification_codes (id,user_id,code_hash,created_at,expires_at,type) VALUES (?,?,?,?,?,?)');
+        $stmt->execute([AuthSystem::randomString(16), $guessId, storedHash('a1b2c3'), AuthSystem::now(), gmdate('c', time() + 3600), 'email']);
+        $res = AuthSystem::verify_email('guess@example.com', 'a1b2c3');
+        $this->assertEqual([$res['status_code'], $res['body']['status'] ?? null], [200, 'verified'], 'a newly sent code verifies');
 
         AuthSystem::signup('four@example.com','StrongPassword123456','Name');
         $four = $this->mailedCode();

@@ -295,6 +295,10 @@ namespace ComplianceModule.Tests
         /// {error: "grace_period_over"} and the request stays pending; a pending or approved request is never
         /// cancelled late. In: nothing. Out: asserts. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the
         /// test host's in-memory database; moves the shared clock and restores it.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.4 ruling af92d76, EXPORT-16): the late request
+        /// is now confirmed before the clock reaches will_delete_at, and stays "approved" after each refusal; it was left
+        /// pending and refused, which af92d76 overturns (a pending request can always be cancelled, see
+        /// CancelDeletion_PendingAlwaysCancellable_ConfirmedRefusedFromWillDeleteAt).
         /// </summary>
         // EXPORT-06
         [Fact]
@@ -307,6 +311,8 @@ namespace ComplianceModule.Tests
             var lateClient = _factory.CreateClient();
             lateClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", CustomWebApplicationFactory<ComplianceModule.Startup>.Token(lateUser));
             var late = await PostAs<DeletionResponse>(lateClient, "/compliance/delete", new DeletionRequestDto { Reason = "user_requested" });
+            // Phase B.4 (af92d76, 2026-11-10): confirmed, since only a confirmed request is refused after will_delete_at.
+            (await Confirm(lateClient, late.DeletionId, TokenOf(late.DeletionId))).EnsureSuccessStatusCode();
             // The stored will_delete_at (scheduled_for) of a deletion request. Touches: the in-memory database (read).
             DateTime ScheduledFor(string id)
             {
@@ -339,7 +345,82 @@ namespace ComplianceModule.Tests
                     var tooLate = await lateClient.DeleteAsync($"/compliance/delete/{late.DeletionId}");
                     Assert.Equal(HttpStatusCode.Conflict, tooLate.StatusCode);
                     Assert.Equal("grace_period_over", await ErrorOf(tooLate));
-                    Assert.Equal("pending", StatusOf(late.DeletionId));
+                    // Phase B.4 (af92d76, 2026-11-10): was "pending"; the late request is now confirmed first.
+                    Assert.Equal("approved", StatusOf(late.DeletionId));
+                }
+            }
+            finally
+            {
+                clock.Now = original;
+            }
+        }
+
+        /// <summary>
+        /// EXPORT-16 (Phase B.4 ruling af92d76): cancel follows the request's state. A pending (unconfirmed) request is
+        /// cancelled a day after will_delete_at; a confirmed one is cancelled one second before will_delete_at, and gets
+        /// 409 {error: "grace_period_over"} exactly at will_delete_at and one second after it, staying approved.
+        /// In: nothing. Out: asserts. Why: EXPORT-16 (af92d76). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        /// Touches: the test host's in-memory database and user store; moves the shared clock and restores it.
+        /// </summary>
+        // EXPORT-16
+        [Fact]
+        public async Task CancelDeletion_PendingAlwaysCancellable_ConfirmedRefusedFromWillDeleteAt()
+        {
+            // A new signed-in user with seeded data (one open deletion per user). Touches: the user store.
+            HttpClient NewUser()
+            {
+                var id = Guid.NewGuid();
+                _factory.Services.GetRequiredService<InMemoryUserDataStore>().Seed(id, SampleUser(id));
+                var client = _factory.CreateClient();
+                client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", CustomWebApplicationFactory<ComplianceModule.Startup>.Token(id));
+                return client;
+            }
+            // The stored row of a deletion request. Touches: the in-memory database (read).
+            DeletionRequest Row(string id)
+            {
+                using var scope = _factory.Services.CreateScope();
+                return scope.ServiceProvider.GetRequiredService<ComplianceDbContext>().DeletionRequests.AsNoTracking()
+                    .Single(d => d.Id == Guid.Parse(id));
+            }
+            // A confirmed (approved) deletion request of a new user. Touches: the test host.
+            async Task<(HttpClient client, string id)> Confirmed()
+            {
+                var client = NewUser();
+                var d = await PostAs<DeletionResponse>(client, "/compliance/delete", new DeletionRequestDto { Reason = "user_requested" });
+                (await Confirm(client, d.DeletionId, TokenOf(d.DeletionId))).EnsureSuccessStatusCode();
+                Assert.Equal("approved", Row(d.DeletionId).Status);
+                return (client, d.DeletionId);
+            }
+
+            var pending = await PostAs<DeletionResponse>(_client, "/compliance/delete", new DeletionRequestDto { Reason = "user_requested" });
+            var before = await Confirmed();
+            var at = await Confirmed();
+            var after = await Confirmed();
+            var clock = _factory.Services.GetRequiredService<ComplianceClock>();
+            var original = clock.Now;
+            try
+            {
+                var pendingDue = Row(pending.DeletionId).ScheduledFor;
+                clock.Now = () => pendingDue.AddDays(1);
+                var p = await _client.DeleteAsync($"/compliance/delete/{pending.DeletionId}");
+                Assert.Equal(HttpStatusCode.OK, p.StatusCode);
+                Assert.Equal("cancelled", (string)JObject.Parse(await p.Content.ReadAsStringAsync())["status"]);
+                Assert.Equal("cancelled", Row(pending.DeletionId).Status);
+
+                var beforeDue = Row(before.id).ScheduledFor;
+                clock.Now = () => beforeDue.AddSeconds(-1);
+                var b = await before.client.DeleteAsync($"/compliance/delete/{before.id}");
+                Assert.Equal(HttpStatusCode.OK, b.StatusCode);
+                Assert.Equal("cancelled", Row(before.id).Status);
+
+                foreach (var (req, offset) in new[] { (at, 0), (after, 1) })
+                {
+                    var due = Row(req.id).ScheduledFor;
+                    clock.Now = () => due.AddSeconds(offset);
+                    var refused = await req.client.DeleteAsync($"/compliance/delete/{req.id}");
+                    Assert.Equal(HttpStatusCode.Conflict, refused.StatusCode);
+                    Assert.Equal("grace_period_over", await ErrorOf(refused));
+                    Assert.Equal("approved", Row(req.id).Status);
                 }
             }
             finally

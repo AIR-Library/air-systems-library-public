@@ -262,6 +262,26 @@ test('STRIPEWH-06 correctly signed bodies that are not valid events are 400 inva
 });
 
 /**
+ * STRIPEWH-06 (spec db20a03, Phase B.4): a correctly signed, otherwise valid body holding "x": 1e400 (a non-finite
+ * number outside any TIME field), at the top level or inside data.object, is 400 invalid_payload and no event is
+ * recorded; the same body without it is applied.
+ * In: the spec's BODY. Out: assertions. Why: STRIPEWH-06 as amended by db20a03. 2026-11-10,
+ * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: an in-memory SQLite database only.
+ */
+// STRIPEWH-06
+test('STRIPEWH-06 a non-finite number anywhere in a signed body is 400 invalid_payload', async () => {
+  const env = setup();
+  const top = '{"x":1e400,' + BODY.slice(1);
+  const nested = BODY.replace('"object":{', '"object":{"x":1e400,');
+  assert.notStrictEqual(nested, BODY);
+  for (const body of [top, nested]) {
+    assert.deepStrictEqual(await deliver(env, body), { error: 'invalid_payload', status: 400 }, body.slice(0, 60));
+  }
+  assert.deepStrictEqual(counts(env.store), { events: 0, subs: 0 });
+  assert.deepStrictEqual(await deliver(env, BODY), APPLIED);
+});
+
+/**
  * STRIPEWH-07: customer.subscription.created with status active, a known price and metadata.user_id gives
  * {entitled: true, plan, status: "active", current_period_end, cancel_at_period_end}; before that event the user's
  * answer is the "none" answer, and the event leaves another user's answer as it was.
