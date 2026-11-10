@@ -107,7 +107,8 @@ IMPLEMENTATION:
 - Worker: Background process picks up enqueued jobs, runs, updates status
 - Retry: max_retries counts retries AFTER the first attempt, so a job runs at most max_retries + 1 times.
   Retry n (n = 1, 2, ...) waits 2^(n-1) seconds (1s, 2s, 4s, 8s, ...): next_retry_at = failed_at + that
-  delay, and retry_count = n while it waits. When attempt max_retries + 1 fails, status = 'failed' with
+  delay, and retry_count = n while it waits. While it waits its status is 'enqueued' and the worker skips
+  it until next_retry_at has passed. When attempt max_retries + 1 fails, status = 'failed' with
   retry_count = max_retries. Amended 2026-11-10 after review on PR 19.
 - Progress: Update job.progress as task completes (45/100 emails sent)
 - Atomic updates: Status changes are atomic (no race conditions)

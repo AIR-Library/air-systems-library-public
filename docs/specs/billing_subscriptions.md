@@ -13,7 +13,7 @@ name or in a comment on the line above it (for example `# BILL-01`), so a missin
 |---|---|
 | `BILL-01` | create_subscription happy path → stripe call made, DB record created |
 | `BILL-02` | create_subscription invalid tier → 400 {error: "invalid_tier"} |
-| `BILL-03` | change_plan happy path → stripe updated with the existing item id and the new price (no second item), proration calculated |
+| `BILL-03` | change_plan happy path → stripe updated with the existing item id and the new price (no second item), proration calculated; an unknown tier is 400 invalid_tier and a subscription without exactly one item is 409 subscription_item_ambiguous, both before any update |
 | `BILL-04` | queue_refund happy path → refund record created with status='queued' |
 | `BILL-05` | queue_refund amount exceeds invoice → 400 {error: "refund_exceeds_invoice"} |
 | `BILL-06` | handle_webhook payment_succeeded → invoice marked succeeded, audit logged |
@@ -36,8 +36,9 @@ FLOWS:
 
   2. change_plan(subscription_id, new_tier)
      Action:
-       - Read the subscription's current item id (stripe.subscriptions.retrieve, or the item id stored with the
-         subscription), then call stripe.subscriptions.update(stripe_subscription_id,
+       - Unknown new_tier -> 400 {error: "invalid_tier"}. Read the item id with stripe.subscriptions.retrieve;
+         a subscription that does not have exactly one item -> 409 {error: "subscription_item_ambiguous"}.
+         Both checks come before any update. Then call stripe.subscriptions.update(stripe_subscription_id,
            {items: [{id: current_item_id, price: price_id[new_tier]}], proration_behavior: 'create_prorations'})
          Without the item id Stripe ADDS a second item and bills both plans. Amended 2026-11-10 after review on PR 19.
        - DB: subscriptions.tier = new_tier, billing_cycle_anchor updated if needed
@@ -88,7 +89,7 @@ IMPLEMENTATION REQUIREMENTS:
 TESTS REQUIRED:
   - **BILL-01** create_subscription happy path → stripe call made, DB record created
   - **BILL-02** create_subscription invalid tier → 400 {error: "invalid_tier"}
-  - **BILL-03** change_plan happy path → stripe updated with the existing item id and the new price (no second item), proration calculated
+  - **BILL-03** change_plan happy path → stripe updated with the existing item id and the new price (no second item), proration calculated; an unknown tier is 400 invalid_tier and a subscription without exactly one item is 409 subscription_item_ambiguous, both before any update
   - **BILL-04** queue_refund happy path → refund record created with status='queued'
   - **BILL-05** queue_refund amount exceeds invoice → 400 {error: "refund_exceeds_invoice"}
   - **BILL-06** handle_webhook payment_succeeded → invoice marked succeeded, audit logged

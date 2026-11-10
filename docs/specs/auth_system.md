@@ -48,6 +48,7 @@ FLOWS TO BUILD (exact sequence — no deviations):
          list, and also reject the user's own email / name / the service name as the password
        - never store a password hint; never force periodic password changes
      On rejection return {error: "password_rejected", reason: "too_short" | "too_long" | "blocklisted"}
+     Checks run in that order and the first failure wins ("password123" is too_short, not blocklisted).
      -- never a message asking for upper-case, digits or symbols.
      Action: create user with status='unverified', hash password, send verification email
      Log: why_chain(flow="signup", decision_points=["email_unique", "password_strength", "rate_limit_ip_24h"])

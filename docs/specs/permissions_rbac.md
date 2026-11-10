@@ -16,7 +16,7 @@ name or in a comment on the line above it (for example `# RBAC-01`), so a missin
 | `RBAC-03` | require_authenticated on public → 401 |
 | `RBAC-04` | cascade_delete user → all related records deleted in transaction |
 | `RBAC-05` | cascade_delete deployment → all related records deleted |
-| `RBAC-06` | cascade_delete org → its deployments, API keys, invitations and memberships deleted; every member's user account kept, including a member who also belongs to another org (that membership untouched) |
+| `RBAC-06` | cascade_delete org → by an owner of that org only (another org's owner gets 404); its deployments, org API keys, invitations and memberships deleted; every member's user account and personal API keys kept, including a member who also belongs to another org (that membership untouched) |
 | `RBAC-07` | cascade on error → rollback (no partial deletes) |
 | `RBAC-08` | permission audit logged → queries show who accessed what |
 | `RBAC-09` | tier hierarchy → member cannot do admin actions, admin cannot do owner actions |
@@ -56,9 +56,11 @@ PERMISSION CHECKS (on every action):
        → Log: audit_log(action="deployment_deleted_cascade", deployment_id, deleted_items={dns: N, ...})
 
      if delete_organization(org_id):
-       → cascade: delete the org's deployments (each with the deployment cascade above), its API keys, its
-         pending invitations and its memberships (membership rows, or the user's link to this org where a
-         store models one org per user)
+       → Gate: the caller's membership row for org_id has role 'owner'; otherwise 404 (a global admin tier
+         is not enough: any owner of any org could delete every org).
+       → cascade: its deployments (each with the deployment cascade above), API keys whose org_id is this org
+         (a key without an org_id belongs to its user and is kept), ALL its invitations and its membership
+         rows. Memberships are rows (org_id, user_id, role) as in organizations_teams.md.
        → NEVER delete a user account or its sessions: a user may belong to several organizations
          (organizations_teams.md). Deleting an account is delete_user, a separate operation.
        → Log: audit_log(action="org_deleted_cascade", org_id,
@@ -84,7 +86,7 @@ TESTS REQUIRED:
   - **RBAC-03** require_authenticated on public → 401
   - **RBAC-04** cascade_delete user → all related records deleted in transaction
   - **RBAC-05** cascade_delete deployment → all related records deleted
-  - **RBAC-06** cascade_delete org → its deployments, API keys, invitations and memberships deleted; every member's user account kept, including a member who also belongs to another org (that membership untouched)
+  - **RBAC-06** cascade_delete org → by an owner of that org only (another org's owner gets 404); its deployments, org API keys, invitations and memberships deleted; every member's user account and personal API keys kept, including a member who also belongs to another org (that membership untouched)
   - **RBAC-07** cascade on error → rollback (no partial deletes)
   - **RBAC-08** permission audit logged → queries show who accessed what
   - **RBAC-09** tier hierarchy → member cannot do admin actions, admin cannot do owner actions

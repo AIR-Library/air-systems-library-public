@@ -24,7 +24,7 @@ name or in a comment on the line above it (for example `# TRIAL-01`), so a missi
 | `TRIAL-11` | trial_payment_timing FAIL → first payment 90 days after the trial ended, no earlier payment, rejected |
 | `TRIAL-12` | chargeback_history PASS → no chargebacks, allowed |
 | `TRIAL-13` | chargeback_history FAIL → 2+ chargebacks, requires prepayment |
-| `TRIAL-14` | device_fingerprint boundaries → 4 other users CHALLENGE, exactly 5 FAIL |
+| `TRIAL-14` | device_fingerprint boundaries → 4 other users CHALLENGE; exactly 5 FAIL, even when this user already has the device; a FAIL records no device row |
 | `TRIAL-15` | trial_payment_timing boundaries → 5 and 89 days after the trial CHALLENGE; 90 days with an earlier payment CHALLENGE |
 
 ## Contract
@@ -62,11 +62,14 @@ name or in a comment on the line above it (for example `# TRIAL-01`), so a missi
   4. DEVICE_FINGERPRINT
      device = {user_agent, screen_resolution, timezone, browser_language}
      device_hash = SHA256(device)
-     Query: SELECT COUNT(DISTINCT user_id) FROM device_fingerprints WHERE device_hash = ? AND user_id != ?
-            (count = OTHER users who used this device)
-     Decision: PASS if count < 2 OR the device is already one of this user's devices
-              CHALLENGE if count >= 2 AND count < 5
-              FAIL if count >= 5
+     Query: SELECT COUNT(DISTINCT user_id) FROM device_fingerprints
+            WHERE device_hash = ? AND (? IS NULL OR user_id != ?)      -- count = OTHER users on this device
+     Decision, in this order: FAIL if count >= 5
+                              PASS if count < 2
+                              PASS if this user already has a row for this device
+                              CHALLENGE otherwise
+     The device row is written AFTER the decision, and only for PASS or CHALLENGE. Signup runs this gate
+     before it records the device (recording first made every later check pass, so a device farm never failed).
      Amended 2026-11-10 after review on PR 19. The old CHALLENGE range (<= 5) overlapped FAIL (>= 5) at exactly 5.
      Log: why_chain(gate="device_fingerprint", device_hash, matching_users, decision)
      Action: if FAIL: return 403 {error: "device_suspected_fraud"}
@@ -74,7 +77,8 @@ name or in a comment on the line above it (for example `# TRIAL-01`), so a missi
 
   5. TRIAL_PAYMENT_TIMING (judged when a payment method is being added, so the payment date is now)
      trial_end = user.created_at + trial_days (trial_days is configuration, default 14)
-     days_after_trial = floor((now - trial_end) / 1 day)   -- negative while the trial is running
+     days_after_trial = floor((now - trial_end) / 1 day)   -- negative while the trial is running; floor
+                        rounds toward negative infinity (Math.floor, Math.floorDiv, div_euclid), not truncation
      earlier_payment = the ledger already has a payment_added_date for this user
      Decision: PASS if days_after_trial < 5
               FAIL if days_after_trial >= 90 AND NOT earlier_payment
@@ -157,6 +161,6 @@ TESTS REQUIRED:
   - **TRIAL-11** trial_payment_timing FAIL → first payment 90 days after the trial ended, no earlier payment, rejected
   - **TRIAL-12** chargeback_history PASS → no chargebacks, allowed
   - **TRIAL-13** chargeback_history FAIL → 2+ chargebacks, requires prepayment
-  - **TRIAL-14** device_fingerprint boundaries → 4 other users CHALLENGE, exactly 5 FAIL
+  - **TRIAL-14** device_fingerprint boundaries → 4 other users CHALLENGE; exactly 5 FAIL, even when this user already has the device; a FAIL records no device row
   - **TRIAL-15** trial_payment_timing boundaries → 5 and 89 days after the trial CHALLENGE; 90 days with an earlier payment CHALLENGE
 ```

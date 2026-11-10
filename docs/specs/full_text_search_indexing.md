@@ -88,9 +88,12 @@ ENDPOINTS:
 
 IMPLEMENTATION:
 - Storage: Simple inverted index (word → [document_ids]) or Elasticsearch
-- Tokenization: split on whitespace, lowercase, remove common words
-- Matching: text is lower-cased and split into words on anything that is not a letter or digit. A query
-  term matches a word that equals it or starts with it ("stri" finds "stripe"; "ripe" does not).
+- Matching: a word is a maximal run of Unicode letters and digits (\p{L} and \p{N}); everything else separates
+  words, and there are no stop words. Words are lower-cased with the language's locale-independent default
+  (Python str.lower, JavaScript toLowerCase, Java toLowerCase(Locale.ROOT), C# ToLowerInvariant, PHP
+  mb_strtolower, Go strings.ToLower, Rust to_lowercase). Queries are split the same way. A query
+  term matches a word that equals it or starts with it ("stri" finds "stripe"; "ripe" does not; "café"
+  is one word).
   A query of several terms returns only documents that match every term.
 - Relevance: a term that equals a word scores higher than a term that is only a prefix of one. Equal
   scores keep insertion order (the document indexed first comes first). Amended 2026-11-10 after review on PR 19.
