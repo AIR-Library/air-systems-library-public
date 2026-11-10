@@ -265,6 +265,55 @@ func TestQuietHoursSkip(t *testing.T) {
 	}
 }
 
+// TestQuietHoursChannelsAndEnd proves the Phase B.3 rulings: quiet hours are [start, end), so an email due
+// exactly at quiet_hours_end is sent; they hold email and SMS only, so inside the window an SMS is queued until
+// quiet_hours_end while an in-app message is stored at once (status sent, readable in the in-app list).
+// In: none. Out: test failures. Why: notifications spec IMPLEMENTATION, amended by commit d4f4ed7.
+// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite.
+// NOTIF-05
+func TestQuietHoursChannelsAndEnd(t *testing.T) {
+	s, _ := setupService(t)
+	ctx := context.Background()
+	start, end := "22:00", "08:00"
+	if err := s.UpdatePreferences(ctx, 160, &UpdatePreferencesRequest{QuietHoursStart: &start, QuietHoursEnd: &end,
+		ChannelsEnabled: map[string]bool{"sms": true}}); err != nil {
+		t.Fatalf("update prefs: %v", err)
+	}
+	day := time.Date(2026, time.March, 3, 0, 0, 0, 0, time.UTC)
+	inside := day.Add(23 * time.Hour)
+	s.SetClock(func() time.Time { return inside })
+	inApp, err := s.Send(ctx, &SendRequest{UserID: 160, TemplateKey: "welcome_email", Channel: ptrChannel(ChannelInApp),
+		Vars: map[string]interface{}{"app_name": "TestApp"}})
+	if err != nil || inApp.Status != StatusSent {
+		t.Fatalf("in-app inside quiet hours: expected sent at once, got %v %+v", err, inApp)
+	}
+	if logs, err := s.GetInAppNotifications(ctx, 160); err != nil || len(logs) != 1 {
+		t.Fatalf("in-app message not stored: %v %d", err, len(logs))
+	}
+	sms, err := s.Send(ctx, &SendRequest{UserID: 160, TemplateKey: "trial_ending_soon", Channel: ptrChannel(ChannelSMS),
+		Vars: map[string]interface{}{"days_left": 3}})
+	if err != nil || sms.Status != StatusQueued {
+		t.Fatalf("sms inside quiet hours: expected queued, got %v %+v", err, sms)
+	}
+	release := day.Add(32 * time.Hour)
+	var scheduled time.Time
+	if err := s.db.QueryRow(`SELECT scheduled_at FROM notification_logs WHERE message_id = ?`, sms.MessageID).Scan(&scheduled); err != nil {
+		t.Fatal(err)
+	}
+	if !scheduled.Equal(release) {
+		t.Fatalf("sms scheduled_at = %v, want %v", scheduled, release)
+	}
+	if n, err := s.DeliverDue(ctx, release); err != nil || n != 1 {
+		t.Fatalf("at exactly quiet_hours_end DeliverDue must send the sms, sent %d (%v)", n, err)
+	}
+	s.SetClock(func() time.Time { return release })
+	email, err := s.Send(ctx, &SendRequest{UserID: 160, TemplateKey: "welcome_email", Channel: ptrChannel(ChannelEmail),
+		Vars: map[string]interface{}{"app_name": "TestApp"}})
+	if err != nil || email.Status != StatusSent {
+		t.Fatalf("email due exactly at quiet_hours_end: expected sent, got %v %+v", err, email)
+	}
+}
+
 // NOTIF-06
 func TestDoNotDisturbSkip(t *testing.T) {
 	s, _ := setupService(t)
@@ -405,7 +454,9 @@ func TestRetryFailedEmail(t *testing.T) {
 // midnight. With 22:00-08:00, a send at 23:30 UTC and one at 03:00 UTC (given on a clock in another time
 // zone) are queued with scheduled_at = 08:00 UTC; 08:00 and 21:59 UTC are sent now. DeliverDue re-queues a
 // due message inside the window with scheduled_at = quiet_hours_end (step 3). Input: none; output: test
-// failures. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2). Touches: in-memory SQLite.
+// failures. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2). Changed the same day (Phase B.3,
+// commit d4f4ed7): the sends use email, since quiet hours no longer hold in-app messages (it used in-app).
+// Touches: in-memory SQLite.
 // NOTIF-05
 func TestQuietHoursCrossMidnightUTC(t *testing.T) {
 	s, _ := setupService(t)
@@ -429,7 +480,7 @@ func TestQuietHoursCrossMidnightUTC(t *testing.T) {
 	for _, c := range cases {
 		now := c.now
 		s.SetClock(func() time.Time { return now })
-		resp, err := s.Send(ctx, &SendRequest{UserID: 150, TemplateKey: "welcome_email", Channel: ptrChannel(ChannelInApp),
+		resp, err := s.Send(ctx, &SendRequest{UserID: 150, TemplateKey: "welcome_email", Channel: ptrChannel(ChannelEmail),
 			Vars: map[string]interface{}{"app_name": "TestApp"}})
 		if err != nil {
 			t.Fatalf("send at %v: %v", now, err)
@@ -451,7 +502,7 @@ func TestQuietHoursCrossMidnightUTC(t *testing.T) {
 	// back to 'queued' with scheduled_at = 08:00 UTC the next day and is sent then.
 	s.SetClock(func() time.Time { return day.Add(12 * time.Hour) })
 	due := day.Add(21 * time.Hour)
-	resp, err := s.Send(ctx, &SendRequest{UserID: 150, TemplateKey: "welcome_email", Channel: ptrChannel(ChannelInApp),
+	resp, err := s.Send(ctx, &SendRequest{UserID: 150, TemplateKey: "welcome_email", Channel: ptrChannel(ChannelEmail),
 		Vars: map[string]interface{}{"app_name": "TestApp"}, ScheduledAt: &due})
 	if err != nil || resp.Status != StatusQueued {
 		t.Fatalf("scheduled send: %v %+v", err, resp)

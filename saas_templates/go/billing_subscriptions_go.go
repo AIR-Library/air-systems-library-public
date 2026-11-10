@@ -388,9 +388,11 @@ func (s *BillingService) QueueRefund(ctx context.Context, invoiceID string, amou
 
 // HandleStripeWebhook verifies the Stripe-Signature header, then applies the event exactly once:
 // the events row (idempotency) and the event's changes commit in one transaction. Output:
-// {received:true}; 500 missing_webhook_secret when no secret is configured, 403 invalid_signature,
+// {received:true}; 500 missing_webhook_secret when no secret is configured, 400 invalid_signature,
 // 400 invalid_payload, or a storage error (Stripe then retries).
-// Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
+// Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Changed again the same day (Phase B.3, commit
+// d4f4ed7, BILL-09): a bad signature is 400 invalid_signature, Stripe's documented answer and the same as
+// stripe_webhook_entitlements (it was 403). Touches: database.
 func (s *BillingService) HandleStripeWebhook(ctx context.Context, payload []byte, sigHeader string) (map[string]interface{}, error) {
 	secret := s.WebhookSecret
 	if secret == "" {
@@ -400,7 +402,7 @@ func (s *BillingService) HandleStripeWebhook(ctx context.Context, payload []byte
 		return nil, &APIError{Code: "missing_webhook_secret", Message: "webhook secret not configured", Status: http.StatusInternalServerError}
 	}
 	if !verifySignature(payload, sigHeader, secret, s.now()) {
-		return nil, &APIError{Code: "invalid_signature", Message: "invalid webhook signature", Status: http.StatusForbidden}
+		return nil, &APIError{Code: "invalid_signature", Message: "invalid webhook signature", Status: http.StatusBadRequest}
 	}
 	var event stripe.Event
 	if err := json.Unmarshal(payload, &event); err != nil || event.ID == "" || event.Data == nil {

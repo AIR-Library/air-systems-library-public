@@ -534,6 +534,12 @@ func quietHoursEnd(now time.Time, start, end string) (time.Time, bool) {
 	return release, true
 }
 
+// quietHoursHold reports whether quiet hours hold a message on this channel: email and SMS only. An in-app
+// message interrupts no one and is stored at once. In: channel. Out: bool. Why: Phase B.3 ruling (commit
+// d4f4ed7, notifications spec IMPLEMENTATION: "Quiet hours hold email and SMS only"); in-app messages used to
+// be queued too. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+func quietHoursHold(ch Channel) bool { return ch == ChannelEmail || ch == ChannelSMS }
+
 // ---------------------------------------------------------------------------
 // Send
 // ---------------------------------------------------------------------------
@@ -575,7 +581,9 @@ func timeOrNil(t *time.Time) interface{} {
 // quiet_hours_end); otherwise delivered with up to 3 retries after the first attempt (4 attempts, waiting
 // 1 s, 2 s, 4 s; Phase B.2, NOTIF-08). Output:
 // SendResponse with the log's message id; an error only for bad input or storage failure.
-// Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database, providers (network).
+// Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Changed again the same day (Phase B.3, commit
+// d4f4ed7): quiet hours hold email and SMS only (quietHoursHold); an in-app message is stored at once.
+// Touches: database, providers (network).
 func (s *Service) Send(ctx context.Context, req *SendRequest) (*SendResponse, error) {
 	tmpl, ok := s.templates[req.TemplateKey]
 	if !ok {
@@ -628,7 +636,7 @@ func (s *Service) Send(ctx context.Context, req *SendRequest) (*SendResponse, er
 	if req.ScheduledAt != nil && req.ScheduledAt.After(now) {
 		t := *req.ScheduledAt
 		releaseAt = &t
-	} else if end, quiet := quietHoursEnd(now, deref(prefs.QuietHoursStart), deref(prefs.QuietHoursEnd)); quiet {
+	} else if end, quiet := quietHoursEnd(now, deref(prefs.QuietHoursStart), deref(prefs.QuietHoursEnd)); quiet && quietHoursHold(channel) {
 		releaseAt = &end
 	}
 	if releaseAt != nil {
@@ -723,7 +731,8 @@ const ClaimTimeout = 300 * time.Second
 // Each message is sent exactly once when no worker crashes, at least once after a crash. No in-process
 // timers: a scheduler or cron calls DeliverDue. In: the time to deliver for. Out: how many were sent.
 // Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (replaces ProcessQueued, which read and updated rows
-// without a claim, so two workers could send the same message). Touches: database, providers (network).
+// without a claim, so two workers could send the same message). Changed the same day (Phase B.3, commit
+// d4f4ed7): only email and SMS go back to 'queued' inside quiet hours. Touches: database, providers (network).
 func (s *Service) DeliverDue(ctx context.Context, now time.Time) (int, error) {
 	now = now.UTC()
 	// Step 1: re-queue stale claims.
@@ -848,7 +857,7 @@ func (s *Service) DeliverDue(ctx context.Context, now time.Time) (int, error) {
 		case prefs.DoNotDisturb:
 			err = final(StatusSkipped, nil, release, 0, "do_not_disturb")
 		default:
-			if end, quiet := quietHoursEnd(now, deref(prefs.QuietHoursStart), deref(prefs.QuietHoursEnd)); quiet {
+			if end, quiet := quietHoursEnd(now, deref(prefs.QuietHoursStart), deref(prefs.QuietHoursEnd)); quiet && quietHoursHold(q.channel) {
 				_, err = s.db.ExecContext(ctx, `UPDATE notification_logs SET status = ?, scheduled_at = ?, claimed_at = NULL
 					WHERE id = ? AND status = ? AND claimed_at = ?`, string(StatusQueued), end.UTC(), q.id, string(StatusSending), claimedAt)
 				break

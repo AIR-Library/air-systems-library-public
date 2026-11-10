@@ -294,7 +294,11 @@ func TestChangeRoleHappyPath(t *testing.T) {
 	}
 }
 
-// ADMIN-07
+// TestChangeRoleLastOwner proves the admin spec's LAST OWNER note: an owner cannot change their own role (400
+// cannot_change_own_role), which is why a direct change_role never reaches the last owner.
+// In: none. Out: test failures. Why: Phase B.3 (commit d4f4ed7) moved the ADMIN-07 id to the governance test
+// below, the only path that can still reach the last owner; this test no longer carries that id because it
+// does not prove that row. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the test SQLite database.
 func TestChangeRoleLastOwner(t *testing.T) {
 	mux := setupTestEnv(t)
 	ownerID := seedOwner(t)
@@ -312,6 +316,40 @@ func TestChangeRoleLastOwner(t *testing.T) {
 	_ = json.NewDecoder(resp.Body).Decode(&out)
 	if out["error"] != "cannot_change_own_role" {
 		t.Fatalf("expected cannot_change_own_role")
+	}
+}
+
+// TestGovernanceDemoteLastOwner proves ADMIN-07 the way the spec's LAST OWNER note says it must be proven:
+// approving a governance change_role that would demote the last active owner fails with 400
+// cannot_demote_last_owner, and the action stays pending, the owner stays owner and no audit row is written.
+// In: none. Out: test failures. Why: Phase B.3 ruling (commit d4f4ed7, admin spec "LAST OWNER").
+// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the test SQLite database.
+// ADMIN-07
+func TestGovernanceDemoteLastOwner(t *testing.T) {
+	mux := setupTestEnv(t)
+	ownerID := seedOwner(t)
+	res, err := db.Exec(`INSERT INTO actions (action_type,actor_id,target_resource_id,params,submitted_at,status) VALUES (?,?,?,?,?,?)`,
+		"change_role", ownerID, ownerID, `{"new_tier":"admin"}`, time.Now().UTC(), "pending")
+	if err != nil {
+		t.Fatalf("seed action: %v", err)
+	}
+	actID, _ := res.LastInsertId()
+	var auditsBefore int
+	db.QueryRow(`SELECT COUNT(*) FROM audit_log`).Scan(&auditsBefore)
+	resp := doRequest(mux, http.MethodPost, "/admin/governance/actions/"+strconv.FormatInt(actID, 10)+"/decide",
+		map[string]string{"decide": "approve"}, ownerID, "owner", nil)
+	var out map[string]interface{}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	if resp.Code != http.StatusBadRequest || out["error"] != "cannot_demote_last_owner" {
+		t.Fatalf("expected 400 cannot_demote_last_owner, got %d %v", resp.Code, out)
+	}
+	var status, role string
+	var auditsAfter int
+	db.QueryRow(`SELECT status FROM actions WHERE id=?`, actID).Scan(&status)
+	db.QueryRow(`SELECT role FROM users WHERE id=?`, ownerID).Scan(&role)
+	db.QueryRow(`SELECT COUNT(*) FROM audit_log`).Scan(&auditsAfter)
+	if status != "pending" || role != "owner" || auditsAfter != auditsBefore {
+		t.Fatalf("a refused approval changed something: status %q, role %q, audit rows %d->%d", status, role, auditsBefore, auditsAfter)
 	}
 }
 
@@ -903,7 +941,9 @@ func seedOwner(t *testing.T) int64 {
 // {error: "account_suspended"} before any gate (even with a bad CSRF token, the CSRF gate's 403 csrf_invalid
 // is never reached) and nothing changes: no user, no deployment, no audit row; reads are refused too.
 // Input: none; output: test failures. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, admin
-// spec "EVERY ACTION"; a suspended caller used to get 401 unauthenticated). Touches: the test SQLite database.
+// spec "EVERY ACTION"; a suspended caller used to get 401 unauthenticated). Changed 2026-11-10,
+// session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3, commit d4f4ed7: "before the CSRF check too"): an empty CSRF
+// token and a governance decide with a wrong token are refused the same way. Touches: the test SQLite database.
 // ADMIN-19
 func TestSuspendedCallerRefused(t *testing.T) {
 	mux := setupTestEnv(t)
@@ -924,6 +964,12 @@ func TestSuspendedCallerRefused(t *testing.T) {
 	}{
 		{http.MethodPost, "/admin/users/action", map[string]string{"action": "create", "email": "x@example.com", "name": "Xavier", "tier": "user"}, nil},
 		{http.MethodPost, "/admin/users/action", map[string]string{"action": "create", "email": "y@example.com", "name": "Yvonne", "tier": "user"},
+			map[string]string{csrfHeader: "wrong-token"}},
+		// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3, commit d4f4ed7: refused before the CSRF check
+		// too): an empty token, which the CSRF gate would answer 403 csrf_invalid, still gets account_suspended.
+		{http.MethodPost, "/admin/users/action", map[string]string{"action": "create", "email": "z@example.com", "name": "Zelda", "tier": "user"},
+			map[string]string{csrfHeader: ""}},
+		{http.MethodPost, "/admin/governance/actions/1/decide", map[string]string{"decide": "approve"},
 			map[string]string{csrfHeader: "wrong-token"}},
 		{http.MethodPost, "/admin/deployments/action", map[string]string{"action": "create", "customer_id": "7", "domain": "s.example.com", "tier": "solo", "theme_id": "1"}, nil},
 		{http.MethodPost, "/admin/customers/7/action", map[string]string{"action": "change_plan", "new_tier": "team"}, nil},

@@ -333,6 +333,10 @@ func TestHandleWebhookSubscriptionUpdated(t *testing.T) {
 	}
 }
 
+// TestWebhookInvalidSignature proves BILL-09: a bad Stripe-Signature is 400 invalid_signature.
+// In: none. Out: test failures. Why: Phase B.3 ruling (commit d4f4ed7): BILL-09 answers 400, Stripe's documented
+// answer and the same as stripe_webhook_entitlements; the assertion expected 403 before. 2026-11-10,
+// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the test database.
 // BILL-09
 func TestWebhookInvalidSignature(t *testing.T) {
 	svc := newTestService(t)
@@ -345,7 +349,7 @@ func TestWebhookInvalidSignature(t *testing.T) {
 		t.Fatal("expected signature error")
 	}
 	apiErr, ok := err.(*APIError)
-	if !ok || apiErr.Code != "invalid_signature" || apiErr.Status != http.StatusForbidden {
+	if !ok || apiErr.Code != "invalid_signature" || apiErr.Status != http.StatusBadRequest {
 		t.Fatalf("wrong error: %+v", err)
 	}
 }

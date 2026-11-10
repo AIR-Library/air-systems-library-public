@@ -189,6 +189,25 @@ func TestDeletionCancelWithinGrace(t *testing.T) {
 	}
 }
 
+// TestDeletionCancelAfterGrace proves the Phase B.3 ruling: cancelling after will_delete_at has passed (the
+// deletion is due but not yet run) is 409 grace_period_over, and the request stays as it was.
+// In: none. Out: test failures. Why: data_export_compliance spec endpoint 5, amended by commit d4f4ed7.
+// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+// EXPORT-06
+func TestDeletionCancelAfterGrace(t *testing.T) {
+	svc, _, _ := newFixedService(t0)
+	del, _ := svc.RequestDeletion(4, "user_requested")
+	before := del.Status
+	svc.nowFunc = func() time.Time { return del.WillDeleteAt.Add(time.Second) }
+	_, err := svc.CancelDeletion(4, del.ID)
+	if !errors.Is(err, ErrGraceElapsed) || err.Error() != "grace_period_over" || HTTPStatus(err) != 409 {
+		t.Fatalf("cancel after will_delete_at: expected 409 grace_period_over, got %v (%d)", err, HTTPStatus(err))
+	}
+	if del.Status != before {
+		t.Fatalf("a refused cancel changed the status to %s", del.Status)
+	}
+}
+
 // EXPORT-07
 // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: confirmed with the emailed token (any string used to
 // do), API keys and exports added, and the audit trail must now be KEPT (the old assertion required it to

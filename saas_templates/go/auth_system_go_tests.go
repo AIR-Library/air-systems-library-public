@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -220,6 +221,61 @@ func TestVerifyEmailHappyPath(t *testing.T) {
 	resp = as.VerifyEmail(ctx, "dave@example.com", code)
 	if resp["status"] != "verified" {
 		t.Fatalf("expected verified status, got %v", resp)
+	}
+}
+
+// TestVerifyEmailFiveWrongCodesInvalidate proves the Phase B.3 ruling on verify_email: after 5 wrong codes the
+// user's current code is invalid, so even the right code gets 400 code_invalid and the user stays unverified,
+// until a new code is sent (a new code row verifies); and with 4 wrong codes the right one, the 5th try, works.
+// In: none. Out: test failures. Why: auth spec flow 2 "Attempts", amended by commit d4f4ed7. It carries no
+// AUTH id: no row of the Required tests table names this rule. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+// Touches: the in-memory SQLite database.
+func TestVerifyEmailFiveWrongCodesInvalidate(t *testing.T) {
+	as, err := newTestAuth(t)
+	if err != nil {
+		t.Fatalf("NewAuthSystem failed: %v", err)
+	}
+	ctx := context.Background()
+	for i, who := range []string{"gina@example.com", "hank@example.com"} {
+		if resp := as.Signup(ctx, who, "StrongPassword!12345", "User", "192.0.2.7"); resp["success"] != true {
+			t.Fatalf("signup %s failed: %v", who, resp)
+		}
+		userID, _ := as.getUserIDByEmail(ctx, who)
+		code, err := as.getLatestVerificationCode(ctx, userID, "email")
+		if err != nil {
+			t.Fatal(err)
+		}
+		wrong := "000000"
+		if code == wrong {
+			wrong = "000001"
+		}
+		tries := 5 - i // gina: 5 wrong codes; hank: 4
+		for k := 0; k < tries; k++ {
+			if resp := as.VerifyEmail(ctx, who, wrong); resp["error"] != "code_invalid" {
+				t.Fatalf("%s wrong try %d: %v", who, k+1, resp)
+			}
+		}
+		resp := as.VerifyEmail(ctx, who, code)
+		if i == 0 {
+			if resp["error"] != "code_invalid" {
+				t.Fatalf("right code after 5 wrong ones: expected code_invalid, got %v", resp)
+			}
+			var verified sql.NullString
+			as.db.QueryRowContext(ctx, `SELECT email_verified_at FROM users WHERE id = ?`, userID).Scan(&verified)
+			if verified.Valid {
+				t.Fatal("the user was verified by an invalidated code")
+			}
+			now := as.now().UTC()
+			if _, err := as.db.ExecContext(ctx, `INSERT INTO verification_codes (user_id, code_hash, created_at, expires_at, type) VALUES (?, ?, ?, ?, 'email')`,
+				userID, as.hashSecret("654321"), now.Format(time.RFC3339), now.Add(time.Hour).Format(time.RFC3339)); err != nil {
+				t.Fatal(err)
+			}
+			if resp := as.VerifyEmail(ctx, who, "654321"); resp["status"] != "verified" {
+				t.Fatalf("a new code after the lock: expected verified, got %v", resp)
+			}
+		} else if resp["status"] != "verified" {
+			t.Fatalf("right code as the 5th try: expected verified, got %v", resp)
+		}
 	}
 }
 

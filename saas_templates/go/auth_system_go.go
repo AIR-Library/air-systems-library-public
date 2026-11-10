@@ -105,6 +105,7 @@ var schema = []string{
 		created_at TEXT NOT NULL,
 		expires_at TEXT NOT NULL,
 		type TEXT NOT NULL,
+		attempts INTEGER NOT NULL DEFAULT 0, -- tries of this email code (Phase B.3, 2026-11-10: 5 wrong ones invalidate it)
 		FOREIGN KEY(user_id) REFERENCES users(id)
 	);`,
 	// oauth_states and oauth_accounts added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the state an
@@ -523,18 +524,32 @@ func (a *AuthSystem) Signup(ctx context.Context, email, password, name, ip strin
 // injectable clock; the same day (Phase B.2, AUTH-16) the HMAC-SHA256 of the given code is compared, in constant
 // time, with the stored code_hash (the code was stored in plain text). Touches: SQLite.
 // [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
+// [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.3 (commit d4f4ed7): at most 5 tries per code, counted by
+// a conditional write on verification_codes.attempts before the compare; the 6th and later get code_invalid.
 func (a *AuthSystem) VerifyEmail(ctx context.Context, email, code string) jsonResponse {
 	decision := []string{}
-	var userID int64
+	var userID, codeID int64
 	var storedHash, expiresAt string
 	var emailVerifiedAt sql.NullString
 	err := a.db.QueryRowContext(ctx,
-		`SELECT vc.user_id, vc.code_hash, vc.expires_at, u.email_verified_at
+		`SELECT vc.id, vc.user_id, vc.code_hash, vc.expires_at, u.email_verified_at
 		 FROM verification_codes vc
 		 JOIN users u ON u.id = vc.user_id
 		 WHERE u.email = ? AND vc.type = 'email' ORDER BY vc.id DESC LIMIT 1`,
-		email).Scan(&userID, &storedHash, &expiresAt, &emailVerifiedAt)
+		email).Scan(&codeID, &userID, &storedHash, &expiresAt, &emailVerifiedAt)
 	if err != nil {
+		whyChain("verify_email", []string{"code_valid"})
+		return jsonError("code_invalid", "Invalid verification code")
+	}
+	// [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.3 (commit d4f4ed7, auth spec flow 2 "Attempts"): every
+	// try is counted first, in one conditional write, before the code is compared. A code that already had 5
+	// tries is invalid, so after 5 wrong codes even the right one gets code_invalid until a new code is sent
+	// (a new code is a new row with 0 tries). The right code on the 5th try still verifies.
+	res, err := a.db.ExecContext(ctx, `UPDATE verification_codes SET attempts = attempts + 1 WHERE id = ? AND attempts < 5`, codeID)
+	if err != nil {
+		return jsonError("internal_error", "database error")
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
 		whyChain("verify_email", []string{"code_valid"})
 		return jsonError("code_invalid", "Invalid verification code")
 	}
