@@ -65,8 +65,13 @@ const dbPromise = open({
 
 const rateLimits = {
   signup: new Map(), // ip -> [{ts}]
-  loginFail: new Map() // key(ip+user) -> [{ts}]
+  loginFail: new Map(), // key(ip+user) -> [{ts}]
+  resend: new Map() // email -> [ts] of accepted resend_verification requests (AUTH-18, 2026-11-10)
 };
+
+/** resend_verification: requests accepted per email per hour, and the resent code's life (AUTH-18, flow 2b). */
+const MAX_RESENDS_PER_HOUR = 3;
+const RESEND_CODE_TTL_MS = 10 * 60 * 1000;
 
 /** E-mails "sent" by the default in-memory mailer, newest last ({ to, subject, text }). Tests read codes here. */
 const sentEmails = [];
@@ -413,6 +418,64 @@ async function verify_email(email, code) {
 }
 
 /**
+ * Counts one resend_verification request for the email and says whether it is refused: true when 3 were already
+ * accepted in the last hour (the request is then not counted). The check and the count run with no await between
+ * them, so concurrent requests cannot pass the limit. In: the email. Out: boolean. Why: AUTH-18 (3 resends per email
+ * per hour). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: rateLimits.resend (memory).
+ */
+function isRateLimitedResend(email) {
+  const nowTs = nowMs();
+  const recent = (rateLimits.resend.get(email) || []).filter(ts => nowTs - ts < 60 * 60 * 1000);
+  if (recent.length >= MAX_RESENDS_PER_HOUR) {
+    rateLimits.resend.set(email, recent);
+    return true;
+  }
+  recent.push(nowTs);
+  rateLimits.resend.set(email, recent);
+  return false;
+}
+
+/**
+ * resend_verification(email) -> { success, status: 'sent' } (the spec's 202) | 429 { error: 'too_many_requests' }.
+ * For an unverified user it deletes the user's e-mail codes, stores a new 6-digit code (attempts 0, its HMAC-SHA256
+ * under AUTH_SECRET_KEY, 10-minute expiry) and e-mails it through the mailer. At most 3 requests per email per hour
+ * are accepted; the 4th within the hour is 429 and sends nothing. An unknown or already verified email gets the same
+ * { success, status: 'sent' } and nothing is sent, so the answer never says whether an account exists; those
+ * requests count toward the limit too. Why: AUTH-18 (auth spec flow 2b, commit 0eb5a4e): after 5 wrong codes
+ * (AUTH-17) nothing could issue a new code, so anyone who knew an email could block its verification.
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: users (read), verification_codes, audit_log, the mailer.
+ */
+async function resend_verification(email) {
+  const key = typeof email === 'string' ? email : '';
+  if (isRateLimitedResend(key)) {
+    logWhyChain('resend_verification', ['rate_limit_email_1h:failed']);
+    return fail(429, 'too_many_requests', 'Too many verification e-mails requested');
+  }
+  const sent = { success: true, status: 'sent' };
+  const db = await dbPromise;
+  const user = await db.get(`SELECT id, email_verified_at FROM users WHERE email = ?`, key);
+  if (!user || user.email_verified_at) {
+    // Unknown or already verified: the same answer as a real resend, and no e-mail (no account enumeration).
+    logWhyChain('resend_verification', ['rate_limit_email_1h', 'user_unverified:failed']);
+    return sent;
+  }
+  const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+  await db.run(`DELETE FROM verification_codes WHERE user_id = ? AND type = 'email'`, user.id);
+  await db.run(`
+    INSERT INTO verification_codes (id, user_id, code_hash, created_at, expires_at, type, attempts)
+    VALUES (?,?,?,?,?,?,0)`,
+    uuidv4(), user.id, hashSecret(code), now(), new Date(nowMs() + RESEND_CODE_TTL_MS).toISOString(), 'email');
+  await settings.mailer.send({
+    to: key,
+    subject: 'Verify your e-mail address',
+    text: `Your verification code is ${code}. It expires in 10 minutes.`,
+  });
+  logWhyChain('resend_verification', ['rate_limit_email_1h', 'user_unverified']);
+  await logAudit({ actor_id: user.id, action: 'verification_resent', resource_type: 'user', resource_id: user.id, old_value: null, new_value: null });
+  return sent;
+}
+
+/**
  * login(email, password, device_id, ip) -> authenticated (with refresh_token) | { success, status: 'mfa_required',
  * challenge_id } | { error, status, message }.
  * Gates: user_exists_and_verified and password_correct (401 invalid_credentials), rate_limit (429
@@ -634,9 +697,14 @@ async function verify_access_token(token) {
   return { success: true, status: 'ok', user: { id: user.id, email: user.email, tier: user.tier } };
 }
 
+/**
+ * Forgets every rate-limit window (tests call it between cases). Changed 2026-11-10,
+ * session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-18: also the resend_verification window). Touches: memory.
+ */
 function resetRateLimits() {
   rateLimits.signup.clear();
   rateLimits.loginFail.clear();
+  rateLimits.resend.clear();
 }
 
 module.exports = {
@@ -644,6 +712,7 @@ module.exports = {
   configure,
   signup,
   verify_email,
+  resend_verification,
   login,
   oauth_start,
   oauth_callback,

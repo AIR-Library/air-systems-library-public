@@ -160,6 +160,8 @@ const AUTH_ERRORS: Readonly<Record<string, [number, string]>> = {
   oauth_exchange_failed: [401, 'The provider did not accept the sign-in.'],
   email_not_verified: [403, 'The provider has not verified this email.'],
   oauth_not_configured: [503, 'Sign-in with this provider is not available.'],
+  // AUTH-18 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): a 4th resend_verification for one email within the hour.
+  too_many_requests: [429, 'Too many verification emails requested; try again later.'],
   internal_error: [500, 'Something went wrong.'],
 };
 
@@ -222,6 +224,9 @@ const MAX_EMAIL_CODE_ATTEMPTS = 5;
 /** How long an OAuth state is valid (AUTH spec: 10 minutes). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
 const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 
+/** resend_verification: requests accepted per email per hour (AUTH-18, flow 2b). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+const MAX_RESENDS_PER_HOUR = 3;
+
 class AuthSystem {
   private db: Db;
   private emailSender: EmailSender;
@@ -233,6 +238,8 @@ class AuthSystem {
   private refreshTokenExpiry: string;
   private signupIpLimiter: Map<string, number[]>;
   private loginLimiter: Map<string, number[]>;
+  /** Accepted resend_verification requests per email, as times in ms (AUTH-18, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). */
+  private resendLimiter: Map<string, number[]>;
   private signupWindowMs: number;
   private maxSignupsPerIP: number;
   private loginWindowMs: number;
@@ -282,6 +289,7 @@ class AuthSystem {
     this.maxLoginAttempts = options.maxLoginAttempts ?? 5;
     this.signupIpLimiter = new Map();
     this.loginLimiter = new Map();
+    this.resendLimiter = new Map();
     this.oauthClient = options.oauthClient ?? null;
     this.now = options.now ?? (() => new Date());
   }
@@ -567,6 +575,63 @@ class AuthSystem {
       return { status: 'verified', user_id: user[0].id, message: 'ready to login' };
     } catch (err) {
       this.logger.error('Verify email error', { err });
+      return fail('internal_error');
+    }
+  }
+
+  /**
+   * Counts one resend_verification request for the email on the injected clock and says whether it is accepted:
+   * false when 3 were already accepted in the last hour (that request is not counted). The check and the count run
+   * with no await between them, so concurrent requests cannot pass the limit. In: the email. Out: boolean.
+   * Why: AUTH-18 (3 resends per email per hour). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
+   */
+  private takeResend(email: string): boolean {
+    const now = this.now().getTime();
+    const valid = (this.resendLimiter.get(email) ?? []).filter(t => t > now - 60 * 60 * 1000);
+    const accepted = valid.length < MAX_RESENDS_PER_HOUR;
+    if (accepted) valid.push(now);
+    this.resendLimiter.set(email, valid);
+    return accepted;
+  }
+
+  /**
+   * Replaces an unverified user's email code and emails the new one (auth spec flow 2b).
+   * In: the email. Out: {status: 'sent', http_status: 202}, or {error, message, http_status}: 429 too_many_requests,
+   * 500 internal_error. At most 3 requests per email per hour are accepted; the 4th within the hour is 429 and sends
+   * nothing. For an unverified user it deletes the user's email codes, stores a new 6-digit code (attempts 0, its
+   * HMAC-SHA256 under the secret key, 10-minute expiry) and sends it through the email sender. An unknown or already
+   * verified email gets the same {status: 'sent', http_status: 202} and nothing is sent, so the answer never says
+   * whether an account exists; those requests count toward the limit too.
+   * Why: AUTH-18 (commit 0eb5a4e): after 5 wrong codes (AUTH-17) nothing could issue a new code, so anyone who knew an
+   * email could block its verification. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * Touches: the database (users read, verification_codes), the email sender, the audit log, memory (the limiter).
+   */
+  async resend_verification(email: string): Promise<any> {
+    const key = typeof email === 'string' ? email : '';
+    if (!this.takeResend(key)) {
+      await this.logWhyChain('resend_verification', ['rate_limit_email_1h:failed']);
+      return fail('too_many_requests');
+    }
+    const sent = { status: 'sent', http_status: 202 };
+    try {
+      const user = await this.db.query('SELECT id, email_verified_at FROM users WHERE email = $1', [key]);
+      if (user.length === 0 || user[0].email_verified_at !== null) {
+        // Unknown or already verified: the same answer as a real resend, and no email (no account enumeration).
+        await this.logWhyChain('resend_verification', ['rate_limit_email_1h', 'user_unverified:failed']);
+        return sent;
+      }
+      const code = randomInt(0, 1000000).toString().padStart(6, '0');
+      await this.db.execute('DELETE FROM verification_codes WHERE user_id = $1 AND type = \'email\'', [user[0].id]);
+      await this.db.execute(
+        'INSERT INTO verification_codes (user_id, code_hash, type, attempts, expires_at) VALUES ($1, $2, $3, 0, NOW() + INTERVAL \'10 minutes\')',
+        [user[0].id, this.hashSecret(code), 'email']
+      );
+      await this.emailSender.sendVerificationEmail(key, code);
+      await this.logWhyChain('resend_verification', ['rate_limit_email_1h', 'user_unverified']);
+      await this.logAudit('verification_resent', user[0].id);
+      return sent;
+    } catch (err) {
+      this.logger.error('Resend verification error', { err });
       return fail('internal_error');
     }
   }

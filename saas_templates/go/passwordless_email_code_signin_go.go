@@ -18,6 +18,7 @@ import (
 	"crypto/subtle"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"sort"
 	"strings"
 	"sync"
@@ -273,8 +274,21 @@ type VerifyResult struct {
 	Status     int    `json:"status"`
 	AccountID  string `json:"account_id,omitempty"`
 	Email      string `json:"email,omitempty"`
-	NewAccount bool   `json:"new_account,omitempty"`
+	NewAccount bool   `json:"new_account"`
 	Error      string `json:"error,omitempty"`
+}
+
+// MarshalJSON writes a success as {status, account_id, email, new_account}, with new_account present even when
+// false, and a refusal as {status, error}, the two shapes of the spec's verify.
+// In: the result. Out: its JSON. Why: review finding 4525344132 (new_account had omitempty, so a returning user's
+// reply had no new_account at all, unlike the other seven languages). 2026-11-10,
+// session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+func (v VerifyResult) MarshalJSON() ([]byte, error) {
+	if v.Error != "" {
+		return json.Marshal(map[string]any{"status": v.Status, "error": v.Error})
+	}
+	return json.Marshal(map[string]any{"status": v.Status, "account_id": v.AccountID, "email": v.Email,
+		"new_account": v.NewAccount})
 }
 
 // cryptoRandom reads n bytes from the system CSPRNG; it panics only when the OS has no randomness.

@@ -11,6 +11,7 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -453,6 +454,42 @@ func TestArchive13AllOrNothing(t *testing.T) {
 	}
 	if got := ExtractArchive(basic(), filepath.Join(parent, "missing", "out"), DefaultLimits()); got.Error != "target_unwritable" || got.Status != 500 || got.EntryIndex != -1 {
 		t.Fatalf("missing parent = %+v", got)
+	}
+}
+
+// TestArchive13D3IoFailureNamesTheEntry proves a D3 I/O failure names the entry being written. The target's
+// parent sits deep enough that the first entry fits but the second entry's full path is longer than the system's
+// path limit (its name passes every check of C: 4 parts of 200 bytes), so creating it fails with an I/O error. The
+// answer is 500 target_unwritable with entry_index 1, the target does not exist and no staging directory is left.
+// In: t. Out: pass/fail. Why: ARCHIVE-13 and the spec's CONVENTIONS (D3 names the entry being written; Go answered
+// -1, the same gap as review finding 4525344113). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+// Touches: temporary directories.
+func TestArchive13D3IoFailureNamesTheEntry(t *testing.T) {
+	limit := 4096 // Linux PATH_MAX
+	if runtime.GOOS == "darwin" {
+		limit = 1024
+	}
+	deep := t.TempDir()
+	for len(deep) < limit-600 {
+		deep = filepath.Join(deep, strings.Repeat("p", 200))
+		if err := os.Mkdir(deep, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	part := strings.Repeat("d", 200)
+	longName := strings.Join([]string{part, part, part, part, "f.txt"}, "/")
+	z := buildZip([]zentry{{name: "first.txt", data: []byte("ok")}, {name: longName, data: []byte("x")}}, "")
+	target := filepath.Join(deep, "target")
+	got := ExtractArchive(z, target, DefaultLimits())
+	if got.Error != "target_unwritable" || got.Status != 500 || got.EntryIndex != 1 {
+		t.Fatalf("D3 I/O failure = %+v, want target_unwritable 500 entry_index 1", got)
+	}
+	if _, err := os.Lstat(target); err == nil {
+		t.Fatal("the target exists")
+	}
+	left, err := os.ReadDir(deep)
+	if err != nil || len(left) != 0 {
+		t.Fatalf("left behind: %v %v", left, err)
 	}
 }
 

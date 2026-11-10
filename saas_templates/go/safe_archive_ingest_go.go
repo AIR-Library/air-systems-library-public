@@ -513,6 +513,9 @@ func ExtractArchive(data []byte, targetDir string, lim Limits) Result {
 // writeAll is D3: each entry in directory order, directories 0755, files created exclusively with 0644.
 // In: archive, checked archive, staging directory. Out: the files written, or a refusal.
 // Why: ARCHIVE-01, -07, -13, -14. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: files under staging.
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (same gap as review finding 4525344113): an I/O error
+// while writing an entry is 500 target_unwritable naming that entry's index, as the spec's CONVENTIONS say for
+// D3 (it answered -1).
 func writeAll(data []byte, c *checked, staging string) ([]FileInfo, *Result) {
 	fail := func(code string, status, idx int) ([]FileInfo, *Result) {
 		r := refuse(code, status, idx)
@@ -528,7 +531,7 @@ func writeAll(data []byte, c *checked, staging string) ([]FileInfo, *Result) {
 		}
 		if e.isDir {
 			if err := os.MkdirAll(dest, 0o755); err != nil {
-				return fail("target_unwritable", 500, -1)
+				return fail("target_unwritable", 500, idx)
 			}
 			continue
 		}
@@ -537,19 +540,19 @@ func writeAll(data []byte, c *checked, staging string) ([]FileInfo, *Result) {
 			return fail("corrupt_entry", 400, idx)
 		}
 		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-			return fail("target_unwritable", 500, -1)
+			return fail("target_unwritable", 500, idx)
 		}
 		f, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 		if err != nil {
 			if errors.Is(err, os.ErrExist) {
 				return fail("duplicate_name", 400, idx)
 			}
-			return fail("target_unwritable", 500, -1)
+			return fail("target_unwritable", 500, idx)
 		}
 		_, werr := f.Write(body)
 		cerr := f.Close()
 		if werr != nil || cerr != nil || os.Chmod(dest, 0o644) != nil {
-			return fail("target_unwritable", 500, -1)
+			return fail("target_unwritable", 500, idx)
 		}
 		sum := sha256.Sum256(body)
 		files = append(files, FileInfo{Path: string(e.name), Size: int64(len(body)), SHA256: hex.EncodeToString(sum[:])})

@@ -414,6 +414,36 @@ test('ARCHIVE-13 all or nothing; an existing target is 409; a missing parent is 
 });
 
 /**
+ * ARCHIVE-13, short writes: fs.writeSync is made to write at most 3 bytes per call (as a nearly full disk may);
+ * every file still lands whole, with the size and SHA-256 the answer reports. A writeSync that writes nothing is
+ * an I/O error: 500 target_unwritable naming entry_index 1 (docs/readme.txt, the first file written; the spec's
+ * CONVENTIONS: D3 names the entry being written), and no target or staging directory is left.
+ * In: the spec's BASIC archive. Out: assertions. Why: review finding 4525344169 (one writeSync call, its count
+ * ignored), and the D3 entry index (same gap as finding 4525344113). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+ * Touches: files under the OS temp directory; fs.writeSync is replaced for the test and restored.
+ */
+// ARCHIVE-13
+test('ARCHIVE-13 a short write is completed, and a write of nothing is target_unwritable', () => {
+  const realWriteSync = fs.writeSync;
+  try {
+    fs.writeSync = (fd, buf, offset, length) => realWriteSync(fd, buf, offset || 0, Math.min(3, length === undefined ? buf.length - (offset || 0) : length));
+    const { target } = freshTarget();
+    const r = extractArchive(BASIC, target);
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(fs.readFileSync(path.join(target, 'docs', 'readme.txt'), 'utf8'), 'hello\n');
+    assert.strictEqual(fs.readFileSync(path.join(target, 'data.csv'), 'utf8'), 'a,b\n1,2\n');
+    fs.writeSync = () => 0;
+    const stuck = freshTarget();
+    const refused = extractArchive(BASIC, stuck.target);
+    assert.deepStrictEqual(refused, { error: 'target_unwritable', status: 500, entry_index: 1 });
+    assert.strictEqual(fs.existsSync(stuck.target), false);
+    assert.deepStrictEqual(fs.readdirSync(stuck.parent), []);
+  } finally {
+    fs.writeSync = realWriteSync;
+  }
+});
+
+/**
  * ARCHIVE-14: names that do not unpack everywhere are 400 bad_name: CON.txt, com1.txt, COM0.txt, LPT0.txt, COM
  * followed by a superscript 1, CONIN$.txt, CONOUT$.txt, a name ending in a dot or a space, a?.txt, a segment of
  * 256 bytes, a name with a right-to-left override; a UTF-8 name with an accented letter is accepted; a file whose

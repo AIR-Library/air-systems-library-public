@@ -243,6 +243,60 @@ namespace AuthSystemTests
         }
 
         /// <summary>
+        /// resend_verification (auth spec flow 2b): a code spent by 5 wrong tries is replaced by a new 6-digit code (the
+        /// only email code row, Attempts 0, stored as its HMAC, valid 10 minutes), which is emailed and verifies; a 4th
+        /// resend for one email within the hour is too_many_requests and sends nothing; an unknown and an already
+        /// verified email get the same {status: "sent"} as a real resend and no email.
+        /// In: nothing. Out: asserts. Why: AUTH-18 (commit 0eb5a4e). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        /// Touches: the in-memory database and cache; the mocked email sender.
+        /// </summary>
+        // AUTH-18
+        [Fact]
+        public async Task ResendVerification_ReplacesSpentCode_LimitsToThreePerHour_HidesAccounts()
+        {
+            var sent = new List<(string Email, string Code)>();
+            _emailSenderMock.Setup(es => es.SendVerificationEmailAsync(It.IsAny<string>(), It.IsAny<string>()))
+                .Callback<string, string>((e, c) => sent.Add((e, c)))
+                .Returns(Task.CompletedTask);
+            await CreateService().SignupAsync("resend@example.com", "ThisIsAVeryLongPassword123!", "Resend User", "203.0.113.18");
+            var old = sent.Last().Code;
+            var wrong = old == "000000" ? "111111" : "000000";
+            for (var i = 0; i < 5; i++)
+                Assert.Equal("code_invalid", ((dynamic)await CreateService().VerifyEmailAsync("resend@example.com", wrong)).error);
+            Assert.Equal("code_invalid", ((dynamic)await CreateService().VerifyEmailAsync("resend@example.com", old)).error);
+
+            var before = sent.Count;
+            var started = DateTime.UtcNow;
+            Assert.Equal("sent", ((dynamic)await CreateService().ResendVerificationAsync("resend@example.com")).status);
+            Assert.Equal(before + 1, sent.Count);
+            var fresh = sent.Last();
+            Assert.Equal("resend@example.com", fresh.Email);
+            Assert.Matches("^[0-9]{6}$", fresh.Code);
+            using (var check = CreateDb())
+            {
+                var user = await check.Users.SingleAsync(u => u.Email == "resend@example.com");
+                var row = Assert.Single(check.VerificationCodes.Where(v => v.UserId == user.Id && v.Type == "email"));
+                Assert.Equal(Hash(fresh.Code), row.CodeHash);
+                Assert.Equal(0, row.Attempts);
+                Assert.InRange(row.ExpiresAt, started.AddMinutes(10), DateTime.UtcNow.AddMinutes(10));
+            }
+            Assert.Equal("verified", ((dynamic)await CreateService().VerifyEmailAsync("resend@example.com", fresh.Code)).status);
+
+            await CreateService().SignupAsync("limit@example.com", "ThisIsAVeryLongPassword123!", "Limit User", "203.0.113.19");
+            for (var i = 0; i < 3; i++)
+                Assert.Equal("sent", ((dynamic)await CreateService().ResendVerificationAsync("limit@example.com")).status);
+            before = sent.Count;
+            Assert.Equal("too_many_requests", ((dynamic)await CreateService().ResendVerificationAsync("limit@example.com")).error);
+            Assert.Equal(before, sent.Count);
+
+            var unknown = await CreateService().ResendVerificationAsync("nobody@example.com");
+            var verified = await CreateService().ResendVerificationAsync("resend@example.com");
+            Assert.Equal("sent", ((dynamic)unknown).status);
+            Assert.Equal(System.Text.Json.JsonSerializer.Serialize(unknown), System.Text.Json.JsonSerializer.Serialize(verified));
+            Assert.Equal(before, sent.Count);
+        }
+
+        /// <summary>
         /// AUTH-17 under a race (review finding 4525101240): the count is taken from the database, not from memory.
         /// Service A's context reads the code row (Attempts 0) and keeps that stale copy, as a request does that read
         /// before others wrote. Four wrong tries then go through other contexts (Attempts 4 in the database). A's wrong

@@ -108,6 +108,10 @@ namespace AOI.SafeArchiveIngest
         /// optional source of 16 hex characters for the staging name. Out: {ok, entries, total_bytes, files [{path, size,
         /// sha256}]} or the refusal. Why: ARCHIVE-01, 06, 07, 13, 14. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
         /// Touches: the file system under target_dir's parent.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (review finding 4525344113, spec CONVENTIONS: D3 names
+        /// the entry being written): an I/O error while entry i is written (MakeDirs, the file write) is now 500
+        /// target_unwritable with entry_index i, as in Python and TypeScript (it was always -1). The index is reset to
+        /// -1 before the D4 rename, so a failed rename still answers -1.
         /// </summary>
         public static ArchiveResult ExtractArchive(byte[] bytes, string targetDir, ArchiveLimits limits = null, Func<string> stagingSuffix = null)
         {
@@ -131,12 +135,15 @@ namespace AOI.SafeArchiveIngest
                 return ArchiveResult.Fail(500, "target_unwritable");
             }
 
+            // The entry D3 is writing; -1 outside D3 (review finding 4525344113: an I/O error names the entry).
+            long current = -1;
             try
             {
                 var files = new List<ArchiveFile>();
                 var root = Path.GetFullPath(staging) + Path.DirectorySeparatorChar;
-                for (var idx = 0; idx < parsed.Entries.Count; idx++)
+                for (current = 0; current < parsed.Entries.Count; current++)
                 {
+                    var idx = (int)current;
                     var e = parsed.Entries[idx];
                     // D3
                     var dest = Path.GetFullPath(Path.Combine(new[] { staging }.Concat(e.Parts).ToArray()));
@@ -164,13 +171,14 @@ namespace AOI.SafeArchiveIngest
                     }
                     files.Add(new ArchiveFile { Path = e.Name, Size = data.Length, Sha256 = Convert.ToHexString(SHA256.HashData(data)).ToLowerInvariant() });
                 }
-                // D4
+                // D4 (entry_index -1)
+                current = -1;
                 Directory.Move(staging, target);
                 return new ArchiveResult { Entries = parsed.Entries.Count, TotalBytes = parsed.Total, Files = files };
             }
             catch (Exception)
             {
-                return Abort(staging, ArchiveResult.Fail(500, "target_unwritable"));
+                return Abort(staging, ArchiveResult.Fail(500, "target_unwritable", current));
             }
         }
 

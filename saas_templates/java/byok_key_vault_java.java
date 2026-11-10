@@ -450,6 +450,11 @@ public final class ByokKeyVault {
      * (user_id, provider) order, with one conditional write per row (a row changed meanwhile is counted in neither
      * number). The ciphertext is never touched. VAULT-10. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
      * Touches: the store.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (the gap of review findings 4525344188 and 4525344204,
+     * found in Java by the previous fix pass): a row whose nonce (random_bytes not 12 bytes), seal or store write
+     * fails is counted in failed and the next row is still rewrapped; such an error used to end rewrap() with an
+     * exception and no {rewrapped, failed} count. A short nonce used to be sealed and stored as an envelope that
+     * cannot be opened; it is now refused before the seal. Nothing of the error is echoed.
      */
     public Map<String, Object> rewrap() {
         int rewrapped = 0, failed = 0;
@@ -462,10 +467,17 @@ public final class ByokKeyVault {
                 failed++;
                 continue;
             }
-            byte[] wrapNonce = randomBytes.apply(12);
-            String nw = envelope(masterKeys.get(activeKeyId), wrapNonce, dek, dekAad(activeKeyId, r.provider(), r.userId()));
-            java.util.Arrays.fill(dek, (byte) 0);
-            if (store.rewrap(r.userId(), r.provider(), activeKeyId, nw, r.wrappedDek(), now)) rewrapped++;
+            try {
+                byte[] wrapNonce = randomBytes.apply(12);
+                if (wrapNonce == null || wrapNonce.length != 12) throw new IllegalStateException("random_bytes_short");
+                String nw = envelope(masterKeys.get(activeKeyId), wrapNonce, dek, dekAad(activeKeyId, r.provider(), r.userId()));
+                if (store.rewrap(r.userId(), r.provider(), activeKeyId, nw, r.wrappedDek(), now)) rewrapped++;
+            } catch (RuntimeException e) {
+                // Count the row, go on with the next one, echo nothing (review findings 4525344188 / 4525344204).
+                failed++;
+            } finally {
+                java.util.Arrays.fill(dek, (byte) 0);
+            }
         }
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("rewrapped", rewrapped);

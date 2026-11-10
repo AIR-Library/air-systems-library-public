@@ -104,6 +104,12 @@ class FakeDb {
       user.status = 'verified';
       return { insertId: 0 };
     }
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-18): resend_verification deletes the user's email codes.
+    if (sql.startsWith("DELETE FROM verification_codes WHERE user_id = $1 AND type = 'email'")) {
+      const before = this.codes.length;
+      this.codes = this.codes.filter((c) => !(c.user_id === params[0] && c.type === 'email'));
+      return { insertId: 0, affectedRows: before - this.codes.length };
+    }
     if (sql.startsWith('DELETE FROM verification_codes WHERE id = $1')) {
       this.codes = this.codes.filter((c) => c.id !== params[0]);
       return { insertId: 0 };
@@ -652,6 +658,56 @@ describe('AuthSystem', () => {
         expect(await auth.verify_email('four@example.com', wrong)).toEqual(refused('code_invalid', 400));
       }
       expect(await auth.verify_email('four@example.com', code)).toMatchObject({ status: 'verified' });
+    });
+  });
+
+  /**
+   * resend_verification (auth spec flow 2b): a code spent by 5 wrong tries is replaced by a new 6-digit code (the only
+   * email code row, 0 attempts, stored as its HMAC), which is emailed and verifies; a 4th resend for one email within
+   * the hour is 429 too_many_requests and sends nothing, and after the hour one is accepted again; an unknown and an
+   * already verified email get the same {status: 'sent', http_status: 202} and no email.
+   * In: the in-memory stand-in and the injected clock. Out: assertions. Why: AUTH-18 (commit 0eb5a4e). 2026-11-10,
+   * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+   */
+  describe('resend_verification', () => {
+    // AUTH-18
+    it('replaces a spent code, allows 3 resends per hour, and answers unknown and verified emails the same', async () => {
+      await auth.signup('resend@example.com', STRONG, 'Resend User');
+      const old = mail[mail.length - 1].code;
+      const wrong = old === '000000' ? '111111' : '000000';
+      for (let i = 0; i < 5; i++) {
+        expect(await auth.verify_email('resend@example.com', wrong)).toEqual(refused('code_invalid', 400));
+      }
+      expect(await auth.verify_email('resend@example.com', old)).toEqual(refused('code_invalid', 400));
+      let sentBefore = mail.length;
+      expect(await auth.resend_verification('resend@example.com')).toEqual({ status: 'sent', http_status: 202 });
+      expect(mail.length).toBe(sentBefore + 1);
+      const fresh = mail[mail.length - 1];
+      expect(fresh.to).toBe('resend@example.com');
+      expect(fresh.code).toMatch(/^[0-9]{6}$/);
+      const user = db.users.find((u) => u.email === 'resend@example.com') as Row;
+      const rows = db.codes.filter((c) => c.user_id === user.id && c.type === 'email');
+      expect(rows.map((c) => [c.code_hash, c.attempts])).toEqual([[sha256(fresh.code), 0]]);
+      expect(await auth.verify_email('resend@example.com', fresh.code)).toMatchObject({ status: 'verified' });
+
+      await auth.signup('limit@example.com', STRONG, 'Limit User');
+      for (let i = 0; i < 3; i++) {
+        expect(await auth.resend_verification('limit@example.com')).toEqual({ status: 'sent', http_status: 202 });
+      }
+      sentBefore = mail.length;
+      clock = new Date(clock.getTime() + 59 * 60 * 1000);
+      expect(await auth.resend_verification('limit@example.com')).toEqual(refused('too_many_requests', 429));
+      expect(mail.length).toBe(sentBefore);
+      clock = new Date(clock.getTime() + 2 * 60 * 1000);
+      expect(await auth.resend_verification('limit@example.com')).toEqual({ status: 'sent', http_status: 202 });
+      expect(mail.length).toBe(sentBefore + 1);
+
+      sentBefore = mail.length;
+      const unknown = await auth.resend_verification('nobody@example.com');
+      const verified = await auth.resend_verification('resend@example.com');
+      expect(unknown).toEqual({ status: 'sent', http_status: 202 });
+      expect(verified).toEqual(unknown);
+      expect(mail.length).toBe(sentBefore);
     });
   });
 

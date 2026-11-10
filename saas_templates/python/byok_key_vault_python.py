@@ -359,7 +359,10 @@ class KeyVault:
     def rewrap(self) -> dict:
         """rewrap (OPERATOR ONLY): re-wrap each DEK not under active_key_id, in (user_id, provider) order, writing
         only if the row still holds the wrapped_dek read. ciphertext is never touched. Out: {rewrapped, failed}.
-        Why: VAULT-10. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the store."""
+        Why: VAULT-10. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the store.
+        Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (review finding 4525344204): a row whose nonce, seal or
+        store write raises is counted in failed and the next row is still rewrapped; such an error used to end
+        rewrap() with an exception and no {rewrapped, failed} count. Nothing of the error is echoed."""
         now = self._now()
         rewrapped = failed = 0
         active = self.active_key_id
@@ -371,11 +374,17 @@ class KeyVault:
             if dek is None or len(dek) != 32:
                 failed += 1
                 continue
-            wrap_nonce = self.random_bytes(12)
-            new_wrapped = gcm_seal(self.master_keys[active], wrap_nonce, dek,
-                                   dek_aad(active, row["provider"], row["user_id"]))
-            if self.store.rewrap_row(row["user_id"], row["provider"], active, new_wrapped, row["wrapped_dek"], now):
-                rewrapped += 1
+            try:
+                wrap_nonce = self.random_bytes(12)
+                if not isinstance(wrap_nonce, (bytes, bytearray)) or len(wrap_nonce) != 12:
+                    raise ValueError("random_bytes_short")
+                new_wrapped = gcm_seal(self.master_keys[active], bytes(wrap_nonce), dek,
+                                       dek_aad(active, row["provider"], row["user_id"]))
+                if self.store.rewrap_row(row["user_id"], row["provider"], active, new_wrapped, row["wrapped_dek"],
+                                         now):
+                    rewrapped += 1
+            except Exception:  # noqa: BLE001 -- review finding 4525344204: count the row, go on, echo nothing
+                failed += 1
         return {"rewrapped": rewrapped, "failed": failed}
 
     def list_audit(self, user_id: str) -> List[dict]:

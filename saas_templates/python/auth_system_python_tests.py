@@ -230,6 +230,58 @@ def test_verify_email_five_wrong_codes_invalidate_the_code(auth_system):
     assert auth_system.verify_email('other@example.com', other)['status'] == 'verified'
 
 
+# AUTH-18
+def test_resend_verification_replaces_spent_code_limits_and_hides_accounts(auth_system):
+    """resend_verification (auth spec flow 2b): a code spent by 5 wrong tries is replaced by a new one (the only email
+    code row, attempts 0, stored as its HMAC, expiring in 10 minutes), which is emailed and verifies; a 4th resend for
+    one email within the hour is {error: "too_many_requests"} and sends nothing, and after the hour a resend works
+    again; an unknown and an already verified email get the same {status: "sent"} as a real resend and no email.
+    In: the fixture, with an injected clock. Out: assertions. Why: AUTH-18 (commit 0eb5a4e). 2026-11-10,
+    session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite only; the fake email sender."""
+    now = [datetime(2026, 11, 10, 12, 0, tzinfo=timezone.utc)]
+    auth_system.clock = lambda: now[0]
+    auth_system.signup('test@example.com', 'a' * 16, 'Test User', '127.0.0.1')
+    old = _sent_code(auth_system, 'test@example.com')
+    wrong = '%06d' % ((int(old) + 1) % 1000000)
+    for _ in range(5):
+        assert auth_system.verify_email('test@example.com', wrong) == {'error': 'code_invalid'}
+    assert auth_system.verify_email('test@example.com', old) == {'error': 'code_invalid'}
+    sent_before = len(auth_system.sent_codes)
+    assert auth_system.resend_verification('test@example.com') == {'status': 'sent'}
+    assert len(auth_system.sent_codes) == sent_before + 1
+    to, new = auth_system.sent_codes[-1]
+    assert to == 'test@example.com' and len(new) == 6 and new.isdigit()
+    rows = auth_system.db.execute(
+        "SELECT code_hash, attempts, expires_at FROM verification_codes vc JOIN users u ON u.id = vc.user_id "
+        "WHERE u.email = 'test@example.com' AND vc.type = 'email'").fetchall()
+    assert len(rows) == 1
+    assert rows[0]['code_hash'] == _sha(new) and rows[0]['attempts'] == 0
+    assert datetime.fromisoformat(rows[0]['expires_at']) == now[0] + timedelta(minutes=10)
+    assert auth_system.verify_email('test@example.com', new)['status'] == 'verified'
+
+    # 3 resends per email per hour; the 4th is refused and sends nothing; an hour later one is accepted again.
+    auth_system.signup('other@example.com', 'a' * 16, 'Other User', '127.0.0.1')
+    for _ in range(3):
+        assert auth_system.resend_verification('other@example.com') == {'status': 'sent'}
+    sent_before = len(auth_system.sent_codes)
+    now[0] += timedelta(minutes=59)
+    assert auth_system.resend_verification('other@example.com') == {'error': 'too_many_requests'}
+    assert len(auth_system.sent_codes) == sent_before
+    now[0] += timedelta(minutes=2)
+    assert auth_system.resend_verification('other@example.com') == {'status': 'sent'}
+    assert len(auth_system.sent_codes) == sent_before + 1
+
+    # Unknown and verified emails: the same answer as a real resend, and no email.
+    sent_before = len(auth_system.sent_codes)
+    unknown = auth_system.resend_verification('nobody@example.com')
+    verified = auth_system.resend_verification('test@example.com')
+    assert unknown == verified == {'status': 'sent'}
+    assert len(auth_system.sent_codes) == sent_before
+    assert auth_system.db.execute(
+        "SELECT COUNT(*) FROM verification_codes vc JOIN users u ON u.id = vc.user_id "
+        "WHERE u.email = 'test@example.com'").fetchone()[0] == 0
+
+
 def _file_auth(path):
     """An AuthSystem on its own connection to the SQLite file at path, with a recording email sender, as one
     request's worker would have. In: the file path. Out: the AuthSystem. Why: review finding 4525101305 (a race

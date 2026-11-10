@@ -286,11 +286,33 @@ function readEntry(buf, e) {
 }
 
 /**
+ * Writes every byte of data to the open file fd, calling fs.writeSync again after a short write, and throws when a
+ * write makes no progress, so a short write can never pass as success.
+ * In: an open file descriptor, a Buffer. Out: nothing (throws on an I/O error or a write of 0 bytes).
+ * Why: review finding 4525344169: extractArchive made ONE fs.writeSync call and ignored its count, so a short write
+ * (a nearly full disk) left a truncated file that was renamed into place and reported with the full size and
+ * SHA-256. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the file behind fd.
+ */
+function writeWhole(fd, data) {
+  let offset = 0;
+  while (offset < data.length) {
+    const written = fs.writeSync(fd, data, offset, data.length - offset);
+    if (!(written > 0)) throw new Error('short_write');
+    offset += written;
+  }
+}
+
+/**
  * extract_archive(bytes, target_dir, limits) -> {ok: true, entries, total_bytes, files: [{path, size, sha256}]}
  * or a refusal. Checks A-C, then D: target must not exist (409), a 0700 staging directory beside it (500 when it
  * cannot be made), every entry written there (files exclusive-created, mode 0644), then one rename. Any refusal or
  * error after D2 removes the staging directory, so target_dir exists only when every file was written.
  * Why: ARCHIVE-01, ARCHIVE-13. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches files.
+ * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (review finding 4525344169): each file is written whole
+ * through writeWhole (it was one fs.writeSync whose short count was ignored).
+ * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (same gap as review finding 4525344113): an I/O error while
+ * an entry is written is 500 target_unwritable naming that entry's index, as the spec's CONVENTIONS say for D3; the
+ * index goes back to -1 before the D4 rename (it was always -1).
  */
 function extractArchive(bytes, targetDir, limits) {
   const c = check(bytes, withDefaults(limits));
@@ -309,10 +331,12 @@ function extractArchive(bytes, targetDir, limits) {
     return refuse('target_unwritable', 500);
   }
   const cleanup = () => { try { fs.rmSync(staging, { recursive: true, force: true }); } catch (e) { /* best effort */ } };
+  let current = -1;
   try {
     const root = path.resolve(staging);
     const files = [];
     for (const e of c.entries) {
+      current = e.index;
       const dest = path.resolve(path.join(staging, ...nameParts(e.name)));
       if (!dest.startsWith(root + path.sep)) { cleanup(); return refuse('unsafe_path', 400, e.index); }
       if (e.isDir) {
@@ -328,21 +352,22 @@ function extractArchive(bytes, targetDir, limits) {
         fd = fs.openSync(dest, 'wx', 0o644);
       } catch (err) {
         cleanup();
-        return err.code === 'EEXIST' ? refuse('duplicate_name', 400, e.index) : refuse('target_unwritable', 500);
+        return err.code === 'EEXIST' ? refuse('duplicate_name', 400, e.index) : refuse('target_unwritable', 500, e.index);
       }
       try {
         fs.fchmodSync(fd, 0o644);
-        fs.writeSync(fd, data);
+        writeWhole(fd, data);
       } finally {
         fs.closeSync(fd);
       }
       files.push({ path: e.name, size: data.length, sha256: crypto.createHash('sha256').update(data).digest('hex') });
     }
+    current = -1;
     fs.renameSync(staging, targetDir);
     return { ok: true, entries: c.entries.length, total_bytes: c.total, files };
   } catch (err) {
     cleanup();
-    return refuse('target_unwritable', 500);
+    return refuse('target_unwritable', 500, current);
   }
 }
 

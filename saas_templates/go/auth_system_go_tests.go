@@ -40,11 +40,18 @@ func plainSHA256Hex(s string) string {
 
 // fakeMailer records verification emails instead of sending them (no network in tests).
 // Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-01 "email sent").
-type fakeMailer struct{ sent map[string]string } // email -> code
+// calls counts every email sent (added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, AUTH-18: "no email").
+type fakeMailer struct {
+	sent  map[string]string // email -> latest code
+	calls int
+}
 
-// SendVerificationEmail records the code for the address.
+// SendVerificationEmail records the code for the address and counts the send.
+// In: the address and code. Out: nil. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-18: counts
+// calls). Touches: memory only.
 func (f *fakeMailer) SendVerificationEmail(_ context.Context, email, code string) error {
 	f.sent[email] = code
+	f.calls++
 	return nil
 }
 
@@ -278,6 +285,91 @@ func TestVerifyEmailFiveWrongCodesInvalidate(t *testing.T) {
 		} else if resp["status"] != "verified" {
 			t.Fatalf("right code as the 5th try: expected verified, got %v", resp)
 		}
+	}
+}
+
+// TestResendVerification proves auth spec flow 2b: a code spent by 5 wrong tries is replaced (the only email code
+// row, 0 attempts, stored as its HMAC, expiring in 10 minutes), emailed as 6 digits, and the new code verifies; a 4th
+// resend for one email within the hour is too_many_requests and sends nothing, and after the hour one is accepted
+// again; an unknown and an already verified email get the same {status: "sent"} as a real resend and no email.
+// In: none. Out: test failures. Why: AUTH-18 (commit 0eb5a4e). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+// Touches: the in-memory SQLite database; the fake mailer.
+// AUTH-18
+func TestResendVerification(t *testing.T) {
+	clock := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	mailer := &fakeMailer{sent: map[string]string{}}
+	as, err := NewAuthSystemWithOptions(Options{SecretKey: testSecretKey, Email: mailer, Now: func() time.Time { return clock }})
+	if err != nil {
+		t.Fatalf("NewAuthSystem failed: %v", err)
+	}
+	ctx := context.Background()
+	who := "rita@example.com"
+	if resp := as.Signup(ctx, who, "StrongPassword!12345", "Rita", "192.0.2.18"); resp["success"] != true {
+		t.Fatalf("signup failed: %v", resp)
+	}
+	old := mailer.sent[who]
+	wrong := "000000"
+	if old == wrong {
+		wrong = "000001"
+	}
+	for k := 0; k < 5; k++ {
+		if resp := as.VerifyEmail(ctx, who, wrong); resp["error"] != "code_invalid" {
+			t.Fatalf("wrong try %d: %v", k+1, resp)
+		}
+	}
+	if resp := as.VerifyEmail(ctx, who, old); resp["error"] != "code_invalid" {
+		t.Fatalf("the spent code: expected code_invalid, got %v", resp)
+	}
+	before := mailer.calls
+	if resp := as.ResendVerification(ctx, who); resp["status"] != "sent" || resp["success"] != true {
+		t.Fatalf("resend: %v", resp)
+	}
+	code := mailer.sent[who]
+	if mailer.calls != before+1 || len(code) != 6 || strings.Trim(code, "0123456789") != "" {
+		t.Fatalf("the resend must email one 6-digit code: calls %d -> %d, code %q", before, mailer.calls, code)
+	}
+	userID, _ := as.getUserIDByEmail(ctx, who)
+	var rows, attempts int
+	var hash, expires string
+	as.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM verification_codes WHERE user_id = ? AND type = 'email'`, userID).Scan(&rows)
+	as.db.QueryRowContext(ctx, `SELECT code_hash, attempts, expires_at FROM verification_codes WHERE user_id = ? AND type = 'email'`, userID).Scan(&hash, &attempts, &expires)
+	if rows != 1 || hash != sha256Hex(code) || attempts != 0 || expires != clock.Add(10*time.Minute).Format(time.RFC3339) {
+		t.Fatalf("stored code: rows %d, hash ok %v, attempts %d, expires %s", rows, hash == sha256Hex(code), attempts, expires)
+	}
+	if resp := as.VerifyEmail(ctx, who, code); resp["status"] != "verified" {
+		t.Fatalf("the new code: expected verified, got %v", resp)
+	}
+
+	other := "sam@example.com"
+	if resp := as.Signup(ctx, other, "StrongPassword!12345", "Sam", "192.0.2.18"); resp["success"] != true {
+		t.Fatalf("signup failed: %v", resp)
+	}
+	for k := 0; k < 3; k++ {
+		if resp := as.ResendVerification(ctx, other); resp["status"] != "sent" {
+			t.Fatalf("resend %d: %v", k+1, resp)
+		}
+	}
+	before = mailer.calls
+	clock = clock.Add(59 * time.Minute)
+	if resp := as.ResendVerification(ctx, other); resp["error"] != "too_many_requests" {
+		t.Fatalf("a 4th resend within the hour: expected too_many_requests, got %v", resp)
+	}
+	if mailer.calls != before {
+		t.Fatalf("a refused resend sent an email")
+	}
+	clock = clock.Add(2 * time.Minute)
+	if resp := as.ResendVerification(ctx, other); resp["status"] != "sent" || mailer.calls != before+1 {
+		t.Fatalf("a resend after the hour: %v, calls %d", resp, mailer.calls)
+	}
+
+	before = mailer.calls
+	unknown := as.ResendVerification(ctx, "nobody@example.com")
+	verified := as.ResendVerification(ctx, who)
+	if fmt.Sprint(unknown) != fmt.Sprint(verified) || unknown["status"] != "sent" || unknown["success"] != true {
+		t.Fatalf("unknown %v and verified %v must get the same sent answer", unknown, verified)
+	}
+	if mailer.calls != before {
+		t.Fatalf("an unknown or verified email was sent a code")
 	}
 }
 

@@ -423,6 +423,63 @@ class AuthSystem {
         return ['status_code'=>200,'body'=>['success'=>true,'status'=>'verified','user_id'=> (int)$row['id'],'message'=>'ready to login']];
     }
 
+    /** resend_verification: requests accepted per email per hour (AUTH-18). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+    public const RESENDS_PER_HOUR = 3;
+    /** Life of a resent verification code: 10 minutes (AUTH-18). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+    public const RESEND_CODE_EXPIRES = 600;
+
+    /**
+     * Replace an unverified user's e-mail code and e-mail the new one (auth_system.md flow 2b).
+     *
+     * Input: the email. Output: 202 {success, status: "sent"}, or 429 {error: "too_many_requests"}. At most 3
+     * requests per email per hour are accepted: the count and this request's row are one conditional INSERT into
+     * auth_attempts (bucket "resend:<email>"), so concurrent requests cannot pass the limit, and a 4th within the
+     * hour sends nothing. For an unverified user it deletes the user's e-mail codes, stores a new 6-digit code
+     * (attempts 0, its HMAC-SHA256 under AUTH_SECRET_KEY, 10-minute expiry) and sends it through the injected mailer.
+     * An unknown or already verified email gets the same 202 {success, status: "sent"} and nothing is sent, so the
+     * answer never says whether an account exists; those requests count toward the limit too.
+     * Why: AUTH-18 (commit 0eb5a4e): after 5 wrong codes (AUTH-17) nothing could issue a new code, so anyone who knew
+     * an email could block its verification. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches: the database (auth_attempts, users read, verification_codes, audit_log), the injected mailer.
+     */
+    public static function resend_verification(string $email): array {
+        $db = Database::get();
+        $now = self::t();
+        $bucket = 'resend:' . $email;
+        $db->prepare('DELETE FROM auth_attempts WHERE at < ?')->execute([$now - 86400]);
+        // Every number is bound as an integer: PDO binds execute()'s values as text, and SQLite orders any integer
+        // before any text, so "COUNT(*) < '3'" would always hold.
+        $stmt = $db->prepare('INSERT INTO auth_attempts (bucket, at) SELECT ?, ? WHERE (SELECT COUNT(*) FROM auth_attempts WHERE bucket = ? AND at > ?) < ?');
+        $stmt->bindValue(1, $bucket, PDO::PARAM_STR);
+        $stmt->bindValue(2, $now, PDO::PARAM_INT);
+        $stmt->bindValue(3, $bucket, PDO::PARAM_STR);
+        $stmt->bindValue(4, $now - 3600, PDO::PARAM_INT);
+        $stmt->bindValue(5, self::RESENDS_PER_HOUR, PDO::PARAM_INT);
+        $stmt->execute();
+        if ($stmt->rowCount() !== 1) {
+            self::logWhy('resend_verification', ['rate_limit_email_1h:failed']);
+            return ['status_code'=>429,'body'=>['error'=>'too_many_requests','message'=>'Too many verification e-mails requested']];
+        }
+        $sent = ['status_code'=>202,'body'=>['success'=>true,'status'=>'sent']];
+        $stmt = $db->prepare('SELECT id,email_verified_at FROM users WHERE email=?');
+        $stmt->execute([$email]);
+        $user = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$user || $user['email_verified_at']) {
+            // Unknown or already verified: the same answer as a real resend, and no e-mail (no account enumeration).
+            self::logWhy('resend_verification', ['rate_limit_email_1h', 'user_unverified:failed']);
+            return $sent;
+        }
+        $userId = (int)$user['id'];
+        $code = sprintf('%06d', random_int(0, 999999));
+        $db->prepare('DELETE FROM verification_codes WHERE user_id=? AND type=\'email\'')->execute([$userId]);
+        $db->prepare('INSERT INTO verification_codes (id,user_id,code_hash,created_at,expires_at,type,attempts) VALUES (?,?,?,?,?,?,0)')
+            ->execute([self::randomString(32), $userId, self::secretHash($code), self::now(), gmdate('c', $now + self::RESEND_CODE_EXPIRES), 'email']);
+        self::sendEmail($email, 'Verify your account', "Your code: $code");
+        self::logWhy('resend_verification', ['rate_limit_email_1h', 'user_unverified']);
+        self::auditLog($userId, 'verification_resent', 'user', $userId);
+        return $sent;
+    }
+
     /**
      * Log in: verified user and correct password -> 200 {status: "authenticated", session_id, token,
      * refresh_token, expires_in, user}, or 202 mfa_required with a challenge id; wrong password -> 401

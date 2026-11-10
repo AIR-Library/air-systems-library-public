@@ -484,6 +484,10 @@ final class KeyVault
      * rewrap (OPERATOR ONLY): re-wrap every DEK not under the active master key, never touching ciphertext;
      * a row changed meanwhile is left alone and counted in neither number. Out: {rewrapped, failed}.
      * Why: VAULT-10. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database, the CSPRNG.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (review finding 4525344188): a row whose nonce
+     * (random_bytes_short), seal or store write throws is counted in failed and the next row is still rewrapped;
+     * such an error used to leave rewrap() as an unhandled exception with no {rewrapped, failed} count. Nothing of
+     * the error is echoed.
      */
     public function rewrap(): array
     {
@@ -499,9 +503,14 @@ final class KeyVault
                 $failed++;
                 continue;
             }
-            $new = gcm_seal($this->masterKeys[$this->activeKeyId], $this->rand(12), $dek, self::dekAad($this->activeKeyId, $provider, $userId));
-            if ($this->store->rewrapRow($userId, $provider, $this->activeKeyId, $new, (string)$row['wrapped_dek'], $this->now())) {
-                $rewrapped++;
+            try {
+                $new = gcm_seal($this->masterKeys[$this->activeKeyId], $this->rand(12), $dek, self::dekAad($this->activeKeyId, $provider, $userId));
+                if ($this->store->rewrapRow($userId, $provider, $this->activeKeyId, $new, (string)$row['wrapped_dek'], $this->now())) {
+                    $rewrapped++;
+                }
+            } catch (\Throwable $e) {
+                // Review finding 4525344188: count the row, go on with the next one, echo nothing.
+                $failed++;
             }
         }
         return ['rewrapped' => $rewrapped, 'failed' => $failed];

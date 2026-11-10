@@ -222,6 +222,10 @@ namespace AuthSystem
         public const int MaxMfaAttemptsPerChallenge = 5;
         /// <summary>Wrong email verification codes for one user before the current code is invalidated (Phase B.3, 2026-11-10).</summary>
         public const int MaxEmailCodeAttempts = 5;
+        /// <summary>resend_verification requests accepted per email per hour (AUTH-18, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).</summary>
+        public const int MaxResendsPerHour = 3;
+        /// <summary>Life of a resent verification code in minutes (AUTH-18, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).</summary>
+        public const int ResendCodeMinutes = 10;
         /// <summary>Access-token lifetime in seconds (15 minutes).</summary>
         public const int AccessTokenSeconds = 900;
         /// <summary>Bucket used when a caller does not pass the client IP to <see cref="SignupAsync"/>: all such signups share one limit (fail closed).</summary>
@@ -403,6 +407,55 @@ namespace AuthSystem
             await LogWhyChainAsync("verify_email", new[] { "code_valid", "user_unverified" });
 
             return new { status = "verified", user_id = user.Id, message = "ready to login" };
+        }
+
+        /// <summary>
+        /// Flow 2b, resend_verification. At most <see cref="MaxResendsPerHour"/> requests per email per hour are accepted
+        /// (the check and the count are one step under the counter lock, so concurrent requests cannot pass it); a 4th
+        /// within the hour is {error: "too_many_requests"} (the spec's 429) and sends nothing. For an unverified user it
+        /// deletes the user's email codes, stores a new 6-digit code (Attempts 0, its HMAC-SHA256, valid
+        /// <see cref="ResendCodeMinutes"/> minutes) and emails it. An unknown or already verified email gets the same
+        /// {status: "sent"} (the spec's 202) and nothing is sent, so the answer never says whether an account exists;
+        /// those requests count toward the limit too. In: the email (trimmed and lower-cased, as signup stores it).
+        /// Out: {status: "sent"} or {error: "too_many_requests"}. Why: AUTH-18 (auth spec flow 2b, commit 0eb5a4e):
+        /// after 5 wrong codes (AUTH-17) nothing could issue a new code, so anyone who knew an email could block its
+        /// verification. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        /// Touches: users (read), verification_codes, audit_log, the cache, the email sender (network in production).
+        /// </summary>
+        public async Task<object> ResendVerificationAsync(string email)
+        {
+            var normalizedEmail = (email ?? string.Empty).Trim().ToLowerInvariant();
+            if (!TryTakeCounter($"resend_email:{normalizedEmail}", MaxResendsPerHour, TimeSpan.FromHours(1)))
+            {
+                await LogWhyChainAsync("resend_verification", new[] { "rate_limit_email_1h:failed" });
+                return new { error = "too_many_requests" };
+            }
+            var sent = new { status = "sent" };
+            var user = await _db.Users.FirstOrDefaultAsync(u => u.Email == normalizedEmail);
+            if (user == null || user.EmailVerifiedAt.HasValue)
+            {
+                // Unknown or already verified: the same answer as a real resend, and no email (no account enumeration).
+                await LogWhyChainAsync("resend_verification", new[] { "rate_limit_email_1h", "user_unverified:failed" });
+                return sent;
+            }
+            var old = await _db.VerificationCodes.Where(v => v.UserId == user.Id && v.Type == "email").ToListAsync();
+            _db.VerificationCodes.RemoveRange(old);
+            var code = GenerateVerificationCode();
+            _db.VerificationCodes.Add(new VerificationCode
+            {
+                UserId = user.Id,
+                CodeHash = HashSecret(code),
+                Type = "email",
+                Attempts = 0,
+                CreatedAt = DateTime.UtcNow,
+                ExpiresAt = DateTime.UtcNow.AddMinutes(ResendCodeMinutes)
+            });
+            await _db.SaveChangesAsync();
+
+            await _emailSender.SendVerificationEmailAsync(normalizedEmail, code);
+            await LogAuditAsync(user.Id, "verification_resent", "user", user.Id.ToString(), null, null);
+            await LogWhyChainAsync("resend_verification", new[] { "rate_limit_email_1h", "user_unverified" });
+            return sent;
         }
 
         /// <summary>
@@ -772,6 +825,26 @@ namespace AuthSystem
                 entry.Count++;
                 _cache.Set(key, entry, entry.ExpiresAt);
                 return entry.Count;
+            }
+        }
+
+        /// <summary>
+        /// Adds one to a rate-limit counter only while it is below max, in one step under the counter lock, so
+        /// concurrent callers cannot pass the limit. The window starts at the first hit and does not slide.
+        /// In: the key, the max and the window. Out: true when the hit was counted (allowed); false when the window was
+        /// already at max (refused, not counted). Why: AUTH-18 (3 resends per email per hour). 2026-11-10,
+        /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the cache.
+        /// </summary>
+        private bool TryTakeCounter(string key, int max, TimeSpan window)
+        {
+            lock (CounterGate)
+            {
+                if (!_cache.TryGetValue(key, out CounterEntry entry) || entry.ExpiresAt <= DateTimeOffset.UtcNow)
+                    entry = new CounterEntry { ExpiresAt = DateTimeOffset.UtcNow.Add(window) };
+                if (entry.Count >= max) return false;
+                entry.Count++;
+                _cache.Set(key, entry, entry.ExpiresAt);
+                return true;
             }
         }
 

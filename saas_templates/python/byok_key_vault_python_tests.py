@@ -323,6 +323,60 @@ def test_vault_10_rotation_and_rewrap():
     assert store.get_row("user_1", "acme")["wrapped_dek"] == SPEC_REWRAPPED
 
 
+class FailingRewrapStore(SqliteVaultStore):
+    """A store whose rewrap write raises for one user, as a database error would. In: the user id to fail.
+    Why: review finding 4525344204. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite."""
+
+    def __init__(self, fail_user):
+        """In: the user whose rewrap write raises. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP."""
+        super().__init__()
+        self.fail_user = fail_user
+
+    def rewrap_row(self, user_id, provider, active, new_wrapped, wrapped_read, now):
+        """Raise for fail_user; otherwise the real write. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP."""
+        if user_id == self.fail_user:
+            raise sqlite3.OperationalError("disk I/O error")
+        return super().rewrap_row(user_id, provider, active, new_wrapped, wrapped_read, now)
+
+
+# VAULT-10
+def test_vault_10_rewrap_counts_a_failing_row_and_goes_on():
+    """Three rows under k1; with k2 active, the middle row's store write raises: rewrap() returns {rewrapped: 2,
+    failed: 1}, the first and third rows are under k2 and open, the middle row is unchanged under k1. Then a random
+    source that fails for the middle row's nonce: again {rewrapped: 2, failed: 1}, the other two rewrapped.
+    In: none. Out: assertions. Why: review finding 4525344204 (a per-row error ended rewrap() with an exception and
+    no count). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite."""
+    keys = {u: "acme_" + u.replace("_", "") + "k3y0123456789abcdefWXYZ" for u in ("user_1", "user_2", "user_3")}
+    store = FailingRewrapStore("user_2")
+    v1, clock, _, _, _ = make(store=store)
+    for user, key in keys.items():
+        v1.save_key(user, "acme", key)
+    before = store.get_row("user_2", "acme")
+    v2 = KeyVault(store, {"k1": K1, "k2": K2}, "k2", PROVIDERS, FakeProvider(), clock=clock)
+    assert v2.rewrap() == {"rewrapped": 2, "failed": 1}
+    assert [store.get_row(u, "acme")["key_id"] for u in keys] == ["k2", "k1", "k2"]
+    assert store.get_row("user_2", "acme") == before
+    for user, key in keys.items():
+        assert v2.use_key(user, "acme", "chat") == {"key": key}
+
+    calls = []
+
+    def nonce_fails_second(n):
+        """os.urandom(n), except the second call returns too few bytes. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP."""
+        calls.append(n)
+        return os.urandom(n - 1) if len(calls) == 2 else os.urandom(n)
+
+    v1b, clock_b, _, _, store_b = make()
+    for user, key in keys.items():
+        v1b.save_key(user, "acme", key)
+    v2b = KeyVault(store_b, {"k1": K1, "k2": K2}, "k2", PROVIDERS, FakeProvider(), clock=clock_b,
+                   random_bytes=nonce_fails_second)
+    assert v2b.rewrap() == {"rewrapped": 2, "failed": 1}
+    assert [store_b.get_row(u, "acme")["key_id"] for u in keys] == ["k2", "k1", "k2"]
+    for user, key in keys.items():
+        assert v2b.use_key(user, "acme", "chat") == {"key": key}
+
+
 # VAULT-11
 def test_vault_11_keyring_and_config_checks():
     """A row under a key_id not in the keyring is 503 key_unavailable; bad master keys and an absent active id fail

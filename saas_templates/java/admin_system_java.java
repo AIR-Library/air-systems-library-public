@@ -1917,7 +1917,13 @@ class AdminGovernanceController {
         this.govService = govService;
     }
 
-    /** Admin-or-owner list of pending governance actions, oldest first. Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: reads the database. */
+    /**
+     * Admin-or-owner list of pending governance actions, oldest first. Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: reads the database.
+     * In: page (from 0) and size (1 to 100, default 20). Out: 200 [{action_id, action_type, actor, target_resource_id,
+     * reason, submitted_at, status, new_tier}]; new_tier is the tier a change_role will set (null for other types).
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (review on PR 22, Java admin_system): each entry now carries
+     * new_tier, so an approver can see what a change_role will set before approving it (it was left out).
+     */
     @GetMapping("/actions")
     public ResponseEntity<?> pending(@RequestParam(name = "page", defaultValue = "0") int page,
                                      @RequestParam(name = "size", defaultValue = "20") int size) {
@@ -1927,7 +1933,8 @@ class AdminGovernanceController {
         for (GovernanceAction a : govService.pendingActions(Math.max(0, page) * limit, limit)) {
             data.add(Payloads.map("action_id", a.getId(), "action_type", a.getActionType(), "actor", a.getActorId(),
                     "target_resource_id", a.getTargetResourceId(), "reason", a.getReason(),
-                    "submitted_at", Payloads.iso(a.getSubmittedAt()), "status", a.getStatus()));
+                    "submitted_at", Payloads.iso(a.getSubmittedAt()), "status", a.getStatus(),
+                    "new_tier", a.getNewTier()));
         }
         return ResponseEntity.ok(data);
     }

@@ -78,6 +78,27 @@ class AdminSystemTests {
         return mapper.readValue(body, mapper.getTypeFactory().constructCollectionType(List.class, Map.class));
     }
 
+    /**
+     * One pending governance action as GET /admin/governance/actions lists it to the owner, paging 100 at a time;
+     * null when it is not listed. In: the action id. Out: the listed entry. Why: review on PR 22 (Java admin_system:
+     * the list must show a change_role's new_tier). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: reads
+     * the test database.
+     */
+    private Map<String, Object> pendingAction(Long actionId) throws Exception {
+        for (int page = 0; ; page++) {
+            String body = mockMvc.perform(get("/admin/governance/actions")
+                            .param("page", String.valueOf(page)).param("size", "100")
+                            .with(auth(owner)))
+                    .andExpect(status().isOk())
+                    .andReturn().getResponse().getContentAsString();
+            List<Map<String, Object>> rows = mapper.readValue(body, mapper.getTypeFactory().constructCollectionType(List.class, Map.class));
+            if (rows.isEmpty()) return null;
+            for (Map<String, Object> r : rows) {
+                if (r.get("action_id") != null && actionId.equals(((Number) r.get("action_id")).longValue())) return r;
+            }
+        }
+    }
+
     private RequestPostProcessor auth(User u) {
         return request -> {
             request.addHeader("X-User-Id", u.getId().toString());
@@ -787,6 +808,8 @@ class AdminSystemTests {
      * Governance approve executes a change_role on a user who is not the last owner: the role changes, the action is
      * approved and role_changed is audited. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3: change_role
      * became a governance action type for ADMIN-07). Touches: the test database.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (review on PR 22, Java admin_system): before the approval,
+     * GET /admin/governance/actions lists the action with new_tier "admin", so the approver sees what it will set.
      */
     // ADMIN-16
     @Test
@@ -800,6 +823,10 @@ class AdminSystemTests {
         ga.setNewTier("admin");
         ga.setReason("promote");
         gaRepo.save(ga);
+        Map<String, Object> listed = pendingAction(ga.getId());
+        Assertions.assertNotNull(listed, "the pending change_role is listed");
+        Assertions.assertEquals("change_role", listed.get("action_type"));
+        Assertions.assertEquals("admin", listed.get("new_tier"), "the list shows the tier the change_role will set");
         mockMvc.perform(post("/admin/governance/actions/" + ga.getId() + "/decide")
                         .header("X-Decide", "approve")
                         .with(auth(owner)))

@@ -34,6 +34,7 @@ public static class SafeArchiveIngestTests
             TestFlagsAndMethods();
             TestHeaderMismatch();
             TestAllOrNothing();
+            TestD3IoFailureNamesTheEntry();
             TestBadNames();
         }
         finally
@@ -458,6 +459,34 @@ public static class SafeArchiveIngestTests
         var unwritable = SafeArchiveIngest.ExtractArchive(Basic(), orphan);
         Eq(("target_unwritable", 500, -1L), (unwritable.Error, unwritable.Status, unwritable.EntryIndex), "a missing parent");
         Check(!Directory.Exists(Path.Combine(parent, "missing-parent")), "the parent was not created");
+    }
+
+    /// <summary>
+    /// D3 I/O failure: the target's parent sits deep enough that the first entry fits but the second entry's full path
+    /// is longer than the system's path limit (its name passes every check of C: 4 parts of 200 bytes), so writing it
+    /// fails with an I/O error. The answer is 500 target_unwritable naming entry_index 1, the entry being written, and
+    /// nothing is left behind. In: none. Out: counted checks. Why: review finding 4525344113 (spec CONVENTIONS: D3
+    /// names the entry being written; C# answered -1). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// Touches: temp folders.
+    /// </summary>
+    // ARCHIVE-13
+    public static void TestD3IoFailureNamesTheEntry()
+    {
+        if (OperatingSystem.IsWindows()) return; // the path limit used here is Linux/macOS PATH_MAX (4096 / 1024)
+        var limit = OperatingSystem.IsMacOS() ? 1024 : 4096;
+        var parent = Parent();
+        var deep = parent;
+        while (deep.Length < limit - 600)
+        {
+            deep = Path.Combine(deep, new string('p', 200));
+            Directory.CreateDirectory(deep);
+        }
+        var longName = string.Join("/", Enumerable.Repeat(new string('d', 200), 4)) + "/f.txt";
+        var zip = BuildZip(new[] { new Z("first.txt", "ok"), new Z(longName, "x") });
+        var r = SafeArchiveIngest.ExtractArchive(zip, Path.Combine(deep, "target"));
+        Eq(("target_unwritable", 500, 1L), (r.Error, r.Status, r.EntryIndex), "a D3 I/O failure names entry 1");
+        Check(!Directory.Exists(Path.Combine(deep, "target")), "the target does not exist");
+        Eq(0, Directory.GetFileSystemEntries(deep).Length, "no staging directory is left");
     }
 
     /// <summary>

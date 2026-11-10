@@ -89,6 +89,9 @@ class AuthSystem:
         self.oauth_profile = oauth_profile or _unconfigured_oauth_client
         self.mfa_max_attempts = 5
         self.email_code_max_attempts = 5
+        # AUTH-18 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): resend_verification limits and the resent code's life.
+        self.resend_max_per_hour = 3
+        self.resend_code_expires_minutes = 10
         self.jwt_secret = jwt_secret or secrets.token_urlsafe(32)
         self.bcrypt_rounds = bcrypt_rounds
         self.access_token_expires_minutes = access_token_expires_minutes
@@ -204,6 +207,14 @@ class AuthSystem:
             flow TEXT NOT NULL,
             decision_points TEXT NOT NULL
         );
+        -- AUTH-18 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): one row per accepted resend_verification request,
+        -- for every email asked about (known or not), so the 3-per-hour limit answers the same for any address.
+        CREATE TABLE IF NOT EXISTS verification_resends (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL,
+            requested_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_verification_resends_email ON verification_resends(email, requested_at);
         CREATE TABLE IF NOT EXISTS rate_limit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ip TEXT NOT NULL,
@@ -496,6 +507,56 @@ class AuthSystem:
                            old_value={"email_verified_at": None, "status": "unverified"}, 
                            new_value={"email_verified_at": now_iso, "status": "verified"})
         return {"status": "verified", "user_id": user_id, "message": "ready to login"}
+
+    def resend_verification(self, email: str) -> Dict[str, Any]:
+        """Flow 2b: replace an unverified user's email code and email the new one.
+
+        In: the email. Out: {status: "sent"} (the spec's 202) or {error: "too_many_requests"} (the spec's 429).
+        For an unverified user it deletes the user's email codes, stores a new 6-digit code (attempts 0, its
+        HMAC-SHA256 under AUTH_SECRET_KEY, 10-minute expiry) and sends it through the injected email_sender. At most 3
+        requests per email per hour are accepted: the 4th within the hour is too_many_requests and sends nothing. An
+        unknown or already verified email gets the same {status: "sent"} and nothing is sent, so the answer never says
+        whether an account exists; those requests count toward the limit too, so the 429 says nothing either. The
+        count and the new request's row are one conditional INSERT, so concurrent requests cannot pass the limit.
+        Why: AUTH-18 (auth_system.md flow 2b, commit 0eb5a4e): after 5 wrong codes (AUTH-17) nothing could issue a new
+        code, so anyone who knew an email could block its verification. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        Touches: SQLite (verification_resends, users read, verification_codes, audit_log, why_chain_log), the email
+        sender (network in production)."""
+        if not isinstance(email, str):
+            email = ""
+        now = self._now()
+        cursor = self.db.cursor()
+        cursor.execute(
+            """INSERT INTO verification_resends (email, requested_at)
+               SELECT ?, ? WHERE (SELECT COUNT(*) FROM verification_resends
+                                  WHERE email = ? AND requested_at > ?) < ?""",
+            (email, now.isoformat(), email, (now - timedelta(hours=1)).isoformat(), self.resend_max_per_hour)
+        )
+        accepted = cursor.rowcount == 1
+        self.db.commit()
+        if not accepted:
+            self._log_why_chain("resend_verification", ["rate_limit_email_1h:failed"])
+            return {"error": "too_many_requests"}
+        cursor.execute("SELECT id, email_verified_at FROM users WHERE email = ?", (email,))
+        user = cursor.fetchone()
+        if not user or user[1] is not None:
+            # Unknown or already verified: the same answer as a real resend, and no email (no account enumeration).
+            self._log_why_chain("resend_verification", ["rate_limit_email_1h", "user_unverified:failed"])
+            return {"status": "sent"}
+        user_id = user[0]
+        code = self._generate_verification_code()
+        cursor.execute("DELETE FROM verification_codes WHERE user_id = ? AND type = 'email'", (user_id,))
+        cursor.execute(
+            """INSERT INTO verification_codes (user_id, code_hash, created_at, expires_at, type, attempts)
+               VALUES (?, ?, ?, ?, 'email', 0)""",
+            (user_id, self._hash_secret(code), now.isoformat(),
+             (now + timedelta(minutes=self.resend_code_expires_minutes)).isoformat())
+        )
+        self.db.commit()
+        self.email_sender(email, code)
+        self._log_why_chain("resend_verification", ["rate_limit_email_1h", "user_unverified"])
+        self._log_audit_log("verification_resent", actor_id=user_id, resource_type="user", resource_id=user_id)
+        return {"status": "sent"}
 
     def login(self, email: str, password: str, device_id: str, ip: str) -> Dict[str, Any]:
         """Flow 3: sign in with email and password; an MFA user gets a challenge instead of a session.

@@ -77,6 +77,7 @@ class TestRunner {
         $this->testOauthStateIsSingleUseAndExpires();
         $this->testServiceRefusesToStartWithoutSecretKey();
         $this->testFiveWrongVerificationCodesInvalidateTheCode();
+        $this->testResendVerification();
         echo "\nPassed: {$this->passed}, Failed: {$this->failed}\n";
         // A failed assertion must fail the run; it used to exit 0 whatever happened (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
         exit($this->failed > 0 ? 1 : 0);
@@ -584,6 +585,70 @@ class TestRunner {
         }
         $res = AuthSystem::verify_email('four@example.com', $four);
         $this->assertEqual([$res['status_code'], $res['body']['status'] ?? null], [200, 'verified'], 'the right code as the 5th try verifies');
+    }
+
+    /**
+     * resend_verification (auth_system.md flow 2b): a code spent by 5 wrong tries is replaced by a new 6-digit code
+     * (the only e-mail code row, 0 attempts, stored as its HMAC, expiring in 10 minutes), which is e-mailed and
+     * verifies; a 4th resend for one email within the hour is 429 too_many_requests and sends nothing, and after the
+     * hour one is accepted again; an unknown and an already verified email get the same 202 {success, status: "sent"}
+     * and no e-mail. Input: none. Output: assertions. Why: AUTH-18 (commit 0eb5a4e). 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory database; the clock is injected and restored.
+     */
+    // AUTH-18
+    private function testResendVerification(): void {
+        $this->resetDB();
+        $db = Database::get();
+        $GLOBALS['clock_now'] = 1_762_776_000; // 2025-11-10T12:00:00Z
+        $mailer = function (string $to, string $subject, string $body): void { $GLOBALS['sent_mail'][] = [$to, $subject, $body]; };
+        $oauth = function (string $provider, string $code): array {
+            if (!isset($GLOBALS['oauth_profiles'][$provider . ':' . $code])) { throw new RuntimeException('bad code'); }
+            return $GLOBALS['oauth_profiles'][$provider . ':' . $code];
+        };
+        AuthSystem::configure(fn(): int => $GLOBALS['clock_now'], $mailer, $oauth);
+        try {
+            AuthSystem::signup('resend@example.com','StrongPassword123456','Name');
+            $old = $this->mailedCode();
+            for ($i = 1; $i <= 5; $i++) {
+                AuthSystem::verify_email('resend@example.com', 'wrong' . $i);
+            }
+            $res = AuthSystem::verify_email('resend@example.com', $old);
+            $this->assertEqual([$res['status_code'], $res['body']['error'] ?? null], [400, 'code_invalid'], 'AUTH-18: the code is spent');
+            $mails = count($GLOBALS['sent_mail']);
+            $res = AuthSystem::resend_verification('resend@example.com');
+            $this->assertEqual([$res['status_code'], $res['body']], [202, ['success'=>true,'status'=>'sent']], 'AUTH-18: resend answers 202 sent');
+            $this->assertEqual(count($GLOBALS['sent_mail']), $mails + 1, 'AUTH-18: one e-mail is sent');
+            $this->assertEqual(end($GLOBALS['sent_mail'])[0], 'resend@example.com', 'AUTH-18: to the user');
+            $fresh = $this->mailedCode();
+            $this->assertEqual(preg_match('/^[0-9]{6}$/', $fresh), 1, 'AUTH-18: a 6-digit code');
+            $rows = $db->query("SELECT vc.code_hash, vc.attempts, vc.expires_at FROM verification_codes vc JOIN users u ON u.id = vc.user_id WHERE u.email='resend@example.com' AND vc.type='email'")->fetchAll(PDO::FETCH_ASSOC);
+            $this->assertEqual($rows, [['code_hash'=>storedHash($fresh),'attempts'=>0,'expires_at'=>gmdate('c', $GLOBALS['clock_now'] + 600)]], 'AUTH-18: one new code row, 0 attempts, its HMAC, 10 minutes');
+            $res = AuthSystem::verify_email('resend@example.com', $fresh);
+            $this->assertEqual([$res['status_code'], $res['body']['status'] ?? null], [200, 'verified'], 'AUTH-18: the new code verifies');
+
+            AuthSystem::signup('limit@example.com','StrongPassword123456','Name');
+            for ($i = 1; $i <= 3; $i++) {
+                $res = AuthSystem::resend_verification('limit@example.com');
+                $this->assertEqual($res['status_code'], 202, "AUTH-18: resend $i accepted");
+            }
+            $mails = count($GLOBALS['sent_mail']);
+            $GLOBALS['clock_now'] += 59 * 60;
+            $res = AuthSystem::resend_verification('limit@example.com');
+            $this->assertEqual([$res['status_code'], $res['body']['error'] ?? null], [429, 'too_many_requests'], 'AUTH-18: a 4th resend within the hour is 429');
+            $this->assertEqual(count($GLOBALS['sent_mail']), $mails, 'AUTH-18: a refused resend sends nothing');
+            $GLOBALS['clock_now'] += 2 * 60;
+            $res = AuthSystem::resend_verification('limit@example.com');
+            $this->assertEqual([$res['status_code'], count($GLOBALS['sent_mail'])], [202, $mails + 1], 'AUTH-18: after the hour a resend is accepted');
+
+            $mails = count($GLOBALS['sent_mail']);
+            $unknown = AuthSystem::resend_verification('nobody@example.com');
+            $verified = AuthSystem::resend_verification('resend@example.com');
+            $this->assertEqual($unknown, ['status_code'=>202,'body'=>['success'=>true,'status'=>'sent']], 'AUTH-18: an unknown email gets 202 sent');
+            $this->assertEqual($verified, $unknown, 'AUTH-18: a verified email gets the same answer');
+            $this->assertEqual(count($GLOBALS['sent_mail']), $mails, 'AUTH-18: neither is sent an e-mail');
+        } finally {
+            AuthSystem::configure(null, $mailer, $oauth);
+        }
     }
 }
 $runner = new TestRunner();

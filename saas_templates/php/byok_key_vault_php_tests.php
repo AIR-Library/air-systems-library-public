@@ -343,6 +343,48 @@ function test_vault10_rotation(): void
     eq(REWRAPPED, $s->getRow('user_1', 'acme')['wrapped_dek'], 'row unchanged');
 }
 
+// VAULT-10
+/**
+ * VAULT-10, a failing row: three rows under k1; with k2 active, a trigger makes the middle row's rewrap write fail
+ * as a database error would. rewrap() returns {rewrapped: 2, failed: 1}; the first and third rows are under k2 and
+ * open; the middle row is unchanged under k1. Then a random source that is short for the middle row's nonce: again
+ * {rewrapped: 2, failed: 1}. In: none. Out: assertions. Why: review finding 4525344188 (a per-row error left
+ * rewrap() as an unhandled exception with no count). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+ * Touches: in-memory SQLite.
+ */
+function test_vault10_rewrap_counts_a_failing_row(): void
+{
+    $users = ['user_1', 'user_2', 'user_3'];
+    $keys = ['k1' => seq(0x00, 32), 'k2' => seq(0x40, 32)];
+    [$v1, $s, $p, $c] = world();
+    foreach ($users as $u) {
+        $v1->saveKey($u, 'acme', theKey());
+    }
+    $before = $s->getRow('user_2', 'acme');
+    $s->db->exec("CREATE TRIGGER fail_user_2 BEFORE UPDATE OF wrapped_dek ON provider_keys WHEN NEW.user_id = 'user_2'
+        BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END");
+    [$v2] = world($keys, 'k2', $s, $c, null, $p);
+    eq(['rewrapped' => 2, 'failed' => 1], $v2->rewrap(), 'a failing store write is counted');
+    eq(['k2', 'k1', 'k2'], array_map(static fn(string $u): string => (string)$s->getRow($u, 'acme')['key_id'], $users), 'key ids');
+    eq($before, $s->getRow('user_2', 'acme'), 'the failing row is unchanged');
+    foreach ($users as $u) {
+        eq(['key' => theKey()], $v2->useKey($u, 'acme', 'chat'), "$u opens");
+    }
+
+    [$w1, $s2, $p2, $c2] = world();
+    foreach ($users as $u) {
+        $w1->saveKey($u, 'acme', theKey());
+    }
+    $calls = 0;
+    $short = static function (int $n) use (&$calls): string {
+        $calls++;
+        return random_bytes($calls === 2 ? $n - 1 : $n);
+    };
+    $w2 = new KeyVault($s2, $keys, 'k2', providers(), $p2, static fn(): int => $c2->now, $short);
+    eq(['rewrapped' => 2, 'failed' => 1], $w2->rewrap(), 'a short nonce is counted');
+    eq(['k2', 'k1', 'k2'], array_map(static fn(string $u): string => (string)$s2->getRow($u, 'acme')['key_id'], $users), 'key ids after a short nonce');
+}
+
 // VAULT-11
 /** VAULT-11: key_unavailable and construction refusals. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite. */
 function test_vault11_config(): void

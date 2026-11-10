@@ -7,6 +7,7 @@ package passwordless
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"regexp"
 	"strings"
@@ -120,6 +121,45 @@ func TestEmailCode01SignInAndSignUp(t *testing.T) {
 	acc, _ = r.store.FindAccountByEmail("inv@example.com")
 	if acc.EmailVerifiedAt == nil || *acc.EmailVerifiedAt != r.now {
 		t.Fatalf("email_verified_at not set: %+v", acc)
+	}
+}
+
+// TestEmailCode01VerifyReplyJSONShapes marshals verify's two answers: a returning user's reply carries
+// "new_account": false (it was dropped by omitempty), a new user's carries true, and a refusal is exactly
+// {status, error}. In: none. Out: test failures. Why: review finding 4525344132 (spec verify: {status: 200,
+// account_id, email, new_account}; a refusal is {error, status}). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+// Touches: memory only.
+// EMAILCODE-01
+func TestEmailCode01VerifyReplyJSONShapes(t *testing.T) {
+	r := newRig(t, "")
+	r.svc.Start("back@example.com", "203.0.113.7")
+	first := r.svc.Verify("back@example.com", r.sender.lastCode(), "203.0.113.7")
+	r.svc.Start("back@example.com", "203.0.113.7")
+	again := r.svc.Verify("back@example.com", r.sender.lastCode(), "203.0.113.7")
+	refused := r.svc.Verify("back@example.com", "12345", "203.0.113.7")
+	shapes := map[string]VerifyResult{"new": first, "returning": again, "refused": refused}
+	want := map[string]map[string]any{
+		"new":       {"status": float64(200), "account_id": first.AccountID, "email": "back@example.com", "new_account": true},
+		"returning": {"status": float64(200), "account_id": first.AccountID, "email": "back@example.com", "new_account": false},
+		"refused":   {"status": float64(400), "error": "invalid_code"},
+	}
+	for name, result := range shapes {
+		raw, err := json.Marshal(result)
+		if err != nil {
+			t.Fatalf("%s: marshal: %v", name, err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatalf("%s: unmarshal %s: %v", name, raw, err)
+		}
+		if len(got) != len(want[name]) {
+			t.Fatalf("%s: JSON %s, want the keys of %v", name, raw, want[name])
+		}
+		for k, v := range want[name] {
+			if got[k] != v {
+				t.Fatalf("%s: JSON %s, want %s = %v", name, raw, k, v)
+			}
+		}
 	}
 }
 

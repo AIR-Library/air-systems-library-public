@@ -29,6 +29,7 @@ public class byok_key_vault_java_tests {
             testTamperedRows();
             testReplace();
             testRotation();
+            testRewrapCountsAFailingRow();
             testKeyUnavailableAndConfig();
             testHourlyLimit();
             testDelete();
@@ -311,6 +312,70 @@ public class byok_key_vault_java_tests {
         check(KEY.equals(v3.useKey("user_1", "acme", "x").get("key")) && key2.equals(v3.useKey("user_2", "beta", "x").get("key")), "every key opens without k1");
         check(!fx.store.rewrap("user_1", "acme", "k2", "other", "stale-value", fx.now), "conditional rewrap write: no row changed");
         check(fx.store.get("user_1", "acme").wrappedDek().equals(r.wrappedDek()), "row unchanged");
+    }
+
+    /**
+     * A Store that delegates to an InMemoryStore but whose rewrap write throws for one user, as a database error
+     * would. Why: the rewrap gap of review findings 4525344188 / 4525344204. 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+     */
+    static final class FailingRewrapStore implements ByokKeyVault.Store {
+        final ByokKeyVault.InMemoryStore inner;
+        final String failUser;
+
+        /** In: the store to delegate to, the user whose rewrap write throws. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+        FailingRewrapStore(ByokKeyVault.InMemoryStore inner, String failUser) {
+            this.inner = inner;
+            this.failUser = failUser;
+        }
+
+        public ByokKeyVault.KeyRow get(String u, String p) { return inner.get(u, p); }
+        public List<ByokKeyVault.KeyRow> listForUser(String u) { return inner.listForUser(u); }
+        public List<ByokKeyVault.KeyRow> listAll() { return inner.listAll(); }
+        public void saveWithAudit(ByokKeyVault.KeyRow row, String action, long at) { inner.saveWithAudit(row, action, at); }
+        public void markUsedWithAudit(String u, String p, long now, String purpose, String keyId) { inner.markUsedWithAudit(u, p, now, purpose, keyId); }
+        public boolean deleteWithAudit(String u, String p, long now) { return inner.deleteWithAudit(u, p, now); }
+        public boolean bumpWindow(String u, long w) { return inner.bumpWindow(u, w); }
+        public List<ByokKeyVault.AuditRow> audit(String u) { return inner.audit(u); }
+
+        /** Throws for failUser (nothing written); otherwise the real conditional write. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+        public boolean rewrap(String u, String p, String newKeyId, String newWrapped, String wrappedRead, long now) {
+            if (u.equals(failUser)) throw new IllegalStateException("disk I/O error");
+            return inner.rewrap(u, p, newKeyId, newWrapped, wrappedRead, now);
+        }
+    }
+
+    // VAULT-10
+    /**
+     * A failing row between two good ones: three rows under k1; with k2 active, the middle row's store write throws:
+     * rewrap() returns {rewrapped: 2, failed: 1}, the first and third rows are under k2 and open, the middle row is
+     * unchanged under k1. Then a random source that is short for the middle row's nonce: again {rewrapped: 2,
+     * failed: 1}, and every key still opens. In: none. Out: checks. Why: the rewrap gap of review findings 4525344188
+     * / 4525344204, found in Java by the previous fix pass. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches: memory only.
+     */
+    static void testRewrapCountsAFailingRow() {
+        String[] users = {"user_1", "user_2", "user_3"};
+        Fx fx = new Fx();
+        for (String u : users) fx.vault.saveKey(u, "acme", KEY);
+        ByokKeyVault.KeyRow before = fx.store.get("user_2", "acme");
+        FailingRewrapStore failing = new FailingRewrapStore(fx.store, "user_2");
+        ByokKeyVault v2 = new ByokKeyVault(failing, keyring("k1", "k2"), "k2", providers(), fx.client, () -> fx.now, fx.rnd);
+        Map<String, Object> rw = v2.rewrap();
+        check(Integer.valueOf(2).equals(rw.get("rewrapped")) && Integer.valueOf(1).equals(rw.get("failed")), "a failing store write is counted " + rw);
+        check(fx.store.get("user_1", "acme").keyId().equals("k2") && fx.store.get("user_3", "acme").keyId().equals("k2"), "the good rows are under k2");
+        check(before.equals(fx.store.get("user_2", "acme")), "the failing row is unchanged");
+        for (String u : users) check(KEY.equals(v2.useKey(u, "acme", "x").get("key")), u + " opens");
+
+        Fx fy = new Fx();
+        for (String u : users) fy.vault.saveKey(u, "acme", KEY);
+        int[] calls = {0};
+        IntFunction<byte[]> shortSecond = n -> fy.rnd.apply(++calls[0] == 2 ? n - 1 : n);
+        ByokKeyVault w2 = new ByokKeyVault(fy.store, keyring("k1", "k2"), "k2", providers(), fy.client, () -> fy.now, shortSecond);
+        Map<String, Object> rw2 = w2.rewrap();
+        check(Integer.valueOf(2).equals(rw2.get("rewrapped")) && Integer.valueOf(1).equals(rw2.get("failed")), "a short nonce is counted " + rw2);
+        check(fy.store.get("user_2", "acme").keyId().equals("k1"), "the row with the short nonce stays under k1");
+        for (String u : users) check(KEY.equals(w2.useKey(u, "acme", "x").get("key")), u + " opens after a short nonce");
     }
 
     /** Test helper: true when the constructor call fails with this ConfigException code. Touches: nothing. Phase D wave 1, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */

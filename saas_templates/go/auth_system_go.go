@@ -34,7 +34,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
+	"math/big"
 	"os"
 	"strings"
 	"sync"
@@ -56,6 +58,10 @@ const (
 	serviceName        = "MyService"
 	maxSignupPerIP24h  = 5
 	maxLoginFails15m   = 5
+	// AUTH-18 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): ResendVerification accepts 3 requests per email per
+	// hour, and the code it sends lives 10 minutes.
+	maxResendsPerHour = 3
+	resendCodeTTL     = 10 * time.Minute
 	passwordMinLength  = 15
 	passwordMaxLength  = 64
 )
@@ -347,6 +353,7 @@ type AuthSystem struct {
 	now       func() time.Time
 	signups   *rateLimiter
 	loginFail *rateLimiter
+	resends   *rateLimiter // AUTH-18: ResendVerification requests per email (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
 }
 
 // NewAuthSystem creates an instance on an in-memory SQLite DB with a random JWT secret and no email
@@ -399,7 +406,8 @@ func NewAuthSystemWithOptions(opts Options) (*AuthSystem, error) {
 		}
 	}
 	return &AuthSystem{db: db, jwtSecret: secret, secretKey: secretKey, email: opts.Email, oauth: opts.OAuth, now: now,
-		signups: &rateLimiter{buckets: map[string]*rateBucket{}}, loginFail: &rateLimiter{buckets: map[string]*rateBucket{}}}, nil
+		signups: &rateLimiter{buckets: map[string]*rateBucket{}}, loginFail: &rateLimiter{buckets: map[string]*rateBucket{}},
+		resends: &rateLimiter{buckets: map[string]*rateBucket{}}}, nil
 }
 
 // getUserIDByEmail retrieves user ID by email (test helper).
@@ -583,6 +591,78 @@ func (a *AuthSystem) VerifyEmail(ctx context.Context, email, code string) jsonRe
 		"user_id": userID,
 		"message": "ready to login",
 	})
+}
+
+// generateDigitCode returns a uniformly random 6-digit code ("000000" to "999999") from crypto/rand.
+// In: none. Out: the code, or an error from the random source. Why: AUTH-18 (flow 2b issues a 6-digit code).
+// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: crypto/rand.
+func generateDigitCode() (string, error) {
+	n, err := rand.Int(rand.Reader, big.NewInt(1000000))
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%06d", n.Int64()), nil
+}
+
+// ResendVerification replaces an unverified user's email code and emails the new one (auth spec flow 2b).
+// In: the email. Out: {success: true, status: "sent"} (the spec's 202), or {error: too_many_requests} (the spec's
+// 429), or {error: email_unavailable | internal_error}. At most 3 requests per email per hour are accepted; the 4th
+// within the hour is too_many_requests and sends nothing. For an unverified user it deletes the user's email codes,
+// stores a new 6-digit code (attempts 0, its HMAC-SHA256 under the secret key, 10-minute expiry) and sends it
+// through the EmailSender; a failed send rolls the change back. An unknown or already verified email gets the same
+// {status: "sent"} and nothing is sent, so the answer never says whether an account exists; those requests count
+// toward the limit too. Why: AUTH-18 (commit 0eb5a4e): after 5 wrong codes (AUTH-17) nothing could issue a new code,
+// so anyone who knew an email could block its verification. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+// Touches: SQLite (users read, verification_codes, audit_log), memory (the limiter), the email sender.
+func (a *AuthSystem) ResendVerification(ctx context.Context, email string) jsonResponse {
+	if a.email == nil {
+		return jsonError("email_unavailable", "No email sender is configured")
+	}
+	now := a.now()
+	if !a.resends.hit(email, maxResendsPerHour, time.Hour, now) {
+		whyChain("resend_verification", []string{"rate_limit_email_1h:failed"})
+		return jsonError("too_many_requests", "Too many verification emails requested")
+	}
+	sent := jsonSuccess(map[string]interface{}{"status": "sent"})
+	var userID int64
+	var verifiedAt sql.NullString
+	err := a.db.QueryRowContext(ctx, `SELECT id, email_verified_at FROM users WHERE email = ?`, email).Scan(&userID, &verifiedAt)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && verifiedAt.Valid) {
+		// Unknown or already verified: the same answer as a real resend, and no email (no account enumeration).
+		whyChain("resend_verification", []string{"rate_limit_email_1h", "user_unverified:failed"})
+		return sent
+	}
+	if err != nil {
+		return jsonError("internal_error", "database error")
+	}
+	code, err := generateDigitCode()
+	if err != nil {
+		return jsonError("internal_error", "random source error")
+	}
+	utc := now.UTC()
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return jsonError("internal_error", "database error")
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `DELETE FROM verification_codes WHERE user_id = ? AND type = 'email'`, userID); err != nil {
+		return jsonError("internal_error", "database error")
+	}
+	if _, err = tx.ExecContext(ctx,
+		`INSERT INTO verification_codes (user_id, code_hash, created_at, expires_at, type, attempts) VALUES (?, ?, ?, ?, 'email', 0)`,
+		userID, a.hashSecret(code), utc.Format(time.RFC3339), utc.Add(resendCodeTTL).Format(time.RFC3339)); err != nil {
+		return jsonError("internal_error", "database error")
+	}
+	if err := a.email.SendVerificationEmail(ctx, email, code); err != nil {
+		return jsonError("email_unavailable", "The verification email could not be sent")
+	}
+	if err := tx.Commit(); err != nil {
+		return jsonError("internal_error", "database error")
+	}
+	whyChain("resend_verification", []string{"rate_limit_email_1h", "user_unverified"})
+	auditLog(ctx, a.db, sql.NullInt64{Int64: userID, Valid: true},
+		"verification_resent", "user", sql.NullInt64{Int64: userID, Valid: true}, "", "")
+	return sent
 }
 
 // Login checks the password and either opens a session or, with MFA on, starts a challenge.

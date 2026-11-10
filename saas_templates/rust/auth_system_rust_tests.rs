@@ -244,6 +244,67 @@ fn test_verify_email_five_wrong_codes_kill_the_code() {
     assert_eq!(verify(&mut auth_system, "four@example.com", &code).unwrap().data.status(), "verified");
 }
 
+/// What: AUTH-18, resend_verification (auth spec flow 2b): a code spent by 5 wrong tries is replaced by a new
+/// 6-digit code (the only email code row, 0 attempts, stored as its HMAC, expiring in 10 minutes), which is emailed
+/// and verifies; a 4th resend for one email within the hour is 429 too_many_requests and sends nothing, and after the
+/// hour one is accepted again; an unknown and an already verified email get the same 202 sent and no email.
+/// In: none. Out: panics on a wrong answer. Why: AUTH-18 (commit 0eb5a4e). 2026-11-10,
+/// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite; the in-memory mailer; the fixed clock.
+// AUTH-18
+#[test]
+fn test_resend_verification_replaces_limits_and_hides_accounts() {
+    let (mut sys, mailer, _, now) = setup();
+    let sent_count = |m: &InMemoryMailer| m.sent.lock().unwrap().len();
+    sys.signup(SignupRequest { email: "resend@example.com".into(), password: PASSWORD.into(), name: "Resend".into() }).unwrap();
+    let old = last_code(&mailer, "resend@example.com");
+    let wrong = if old == "000000" { "111111" } else { "000000" };
+    for _ in 0..5 {
+        let err = sys.verify_email(VerifyEmailRequest { email: "resend@example.com".into(), code_or_token: wrong.into() }).unwrap_err();
+        assert_eq!(err, AuthError::CodeInvalid);
+    }
+    let err = sys.verify_email(VerifyEmailRequest { email: "resend@example.com".into(), code_or_token: old.clone() }).unwrap_err();
+    assert_eq!(err, AuthError::CodeInvalid);
+    let before = sent_count(&mailer);
+    let r = sys.resend_verification("resend@example.com").unwrap();
+    assert_eq!(r, AuthResponse { success: true, data: AuthData::Sent });
+    assert_eq!(r.data.status(), "sent");
+    assert_eq!(sent_count(&mailer), before + 1);
+    let fresh = last_code(&mailer, "resend@example.com");
+    assert!(fresh.len() == 6 && fresh.bytes().all(|b| b.is_ascii_digit()), "a 6-digit code: {fresh}");
+    let rows: Vec<(String, i64, i64)> = {
+        let mut st = sys
+            .conn
+            .prepare("SELECT vc.code_hash, vc.attempts, vc.expires_at FROM verification_codes vc JOIN users u ON u.id = vc.user_id WHERE u.email = 'resend@example.com' AND vc.type = 'email'")
+            .unwrap();
+        let mapped = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        mapped.map(|x| x.unwrap()).collect()
+    };
+    assert_eq!(rows, vec![(sha256_hex(&fresh), 0, now.load(Ordering::SeqCst) + 600)]);
+    assert_eq!(sys.verify_email(VerifyEmailRequest { email: "resend@example.com".into(), code_or_token: fresh }).unwrap().data.status(), "verified");
+
+    sys.signup(SignupRequest { email: "limit@example.com".into(), password: PASSWORD.into(), name: "Limit".into() }).unwrap();
+    for _ in 0..3 {
+        assert_eq!(sys.resend_verification("limit@example.com").unwrap().data, AuthData::Sent);
+    }
+    let before = sent_count(&mailer);
+    now.fetch_add(59 * 60, Ordering::SeqCst);
+    let err = sys.resend_verification("limit@example.com").unwrap_err();
+    assert_eq!(err, AuthError::TooManyRequests);
+    let (body, status) = err.to_response();
+    assert_eq!((status, body["error"].as_str()), (429, Some("too_many_requests")));
+    assert_eq!(sent_count(&mailer), before);
+    now.fetch_add(2 * 60, Ordering::SeqCst);
+    assert_eq!(sys.resend_verification("limit@example.com").unwrap().data, AuthData::Sent);
+    assert_eq!(sent_count(&mailer), before + 1);
+
+    let before = sent_count(&mailer);
+    let unknown = sys.resend_verification("nobody@example.com").unwrap();
+    let verified = sys.resend_verification("resend@example.com").unwrap();
+    assert_eq!(unknown, AuthResponse { success: true, data: AuthData::Sent });
+    assert_eq!(verified, unknown);
+    assert_eq!(sent_count(&mailer), before);
+}
+
 // AUTH-07
 #[test]
 fn test_login_happy_path() {
