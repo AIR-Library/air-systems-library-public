@@ -193,6 +193,12 @@ namespace AdminSystem
         public Guid? ApprovedBy { get; set; }
         public DateTime? ApprovedAt { get; set; }
         public string RejectionReason { get; set; }
+
+        /// <summary>
+        /// The action's parameter, when its type needs one: for "change_role", the new tier ("Admin" or "User").
+        /// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3, ADMIN-07 through governance). Pure data.
+        /// </summary>
+        public string NewValue { get; set; }
     }
 
     public class AuditLogEntry
@@ -414,7 +420,8 @@ namespace AdminSystem
 
     /// <summary>
     /// What approving a governance action runs: action_type -> executor(action) returning a short execution result.
-    /// ADMIN-16 "approve -> action executed". "suspend_user" is built in; an app registers the rest. Added 2026-11-10,
+    /// ADMIN-16 "approve -> action executed". "suspend_user" and "change_role" (Phase B.3, ADMIN-07; 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP) are built in; an app registers the rest. Added 2026-11-10,
     /// session_012zDydZCZ4AChqhEZ4oVtaP (approve only flipped the status). Touches: whatever an executor touches.
     /// </summary>
     public static class GovernanceExecutors
@@ -432,6 +439,32 @@ namespace AdminSystem
                 user.Status = "suspended";
                 return "user_suspended";
             };
+            ByType["change_role"] = ExecuteChangeRole;
+        }
+
+        /// <summary>
+        /// The built-in "change_role" executor: sets the target user's tier to the action's NewValue (Admin or User;
+        /// Owner is never assigned here). Refuses an unknown user (404 user_not_found), an invalid tier (400
+        /// invalid_tier) and a change that would demote the last active owner (400 cannot_demote_last_owner); a refusal
+        /// throws, so DecideGovernanceAction leaves the action pending and changes nothing. On success writes the audit
+        /// row role_changed (actor = the action's submitter) and returns "role_changed". In: the action. Out: the
+        /// execution result. Why: admin spec LAST OWNER (Phase B.3): ADMIN-07 is proven through a governance-approved
+        /// change_role. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory users and audit log.
+        /// </summary>
+        private static string ExecuteChangeRole(GovernanceAction ga)
+        {
+            var target = Database.Users.FirstOrDefault(u => u.UserId == ga.TargetResourceId)
+                ?? throw new ApiException("user_not_found", "User does not exist");
+            Validation.ValidateTier(ga.NewValue, allowOwner: false);
+            var newRole = (Role)Enum.Parse(typeof(Role), ga.NewValue, true);
+            var activeOwners = Database.Users.Count(u => u.Tier == Role.Owner && u.Status == "active");
+            if (target.Tier == Role.Owner && target.Status == "active" && activeOwners <= 1 && newRole != Role.Owner)
+                throw new ApiException("cannot_demote_last_owner", "Cannot demote last active owner");
+            var oldTier = target.Tier.ToString();
+            AuditLogger.Log("role_changed", ga.ActorId, resourceType: "user", resourceId: target.UserId,
+                oldValue: oldTier, newValue: newRole.ToString());
+            target.Tier = newRole;
+            return "role_changed";
         }
 
         static GovernanceExecutors() => Reset();

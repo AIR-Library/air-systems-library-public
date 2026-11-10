@@ -189,6 +189,55 @@ namespace AuthSystemTests
             Assert.Equal("code_expired", ((dynamic)result).error);
         }
 
+        /// <summary>
+        /// Auth spec flow 2 "Attempts" (Phase B.3 ruling): 4 wrong codes leave the code usable; the 5th wrong code
+        /// invalidates it, so the right code is then code_invalid and the user stays unverified; a new code
+        /// (as signup sends) works. A second user with 4 wrong tries then the right one is verified. In: nothing.
+        /// Out: asserts. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory database.
+        /// </summary>
+        [Fact]
+        public async Task VerifyEmail_FiveWrongCodes_InvalidateTheCode()
+        {
+            using var db = CreateDb();
+            var user = new User { Email = "guess@example.com", PasswordHash = BCrypt.Net.BCrypt.HashPassword("password"), Status = "unverified" };
+            var other = new User { Email = "four@example.com", PasswordHash = BCrypt.Net.BCrypt.HashPassword("password"), Status = "unverified" };
+            db.Users.AddRange(user, other);
+            await db.SaveChangesAsync();
+            foreach (var u in new[] { user, other })
+                db.VerificationCodes.Add(new VerificationCode
+                {
+                    UserId = u.Id, CodeHash = Hash("123456"), Type = "email",
+                    CreatedAt = DateTime.UtcNow, ExpiresAt = DateTime.UtcNow.AddMinutes(15)
+                });
+            await db.SaveChangesAsync();
+
+            for (var i = 0; i < 4; i++)
+                Assert.Equal("code_invalid", ((dynamic)await CreateService().VerifyEmailAsync("four@example.com", "00000" + i)).error);
+            Assert.Equal("verified", ((dynamic)await CreateService().VerifyEmailAsync("four@example.com", "123456")).status);
+
+            for (var i = 0; i < 5; i++)
+                Assert.Equal("code_invalid", ((dynamic)await CreateService().VerifyEmailAsync("guess@example.com", "00000" + i)).error);
+            Assert.Equal("code_invalid", ((dynamic)await CreateService().VerifyEmailAsync("guess@example.com", "123456")).error);
+            Assert.Equal("code_invalid", ((dynamic)await CreateService().VerifyEmailAsync("guess@example.com", "123456")).error);
+            using (var check = CreateDb())
+            {
+                Assert.Null((await check.Users.FindAsync(user.Id)).EmailVerifiedAt);
+                Assert.Empty(check.VerificationCodes.Where(v => v.UserId == user.Id));
+            }
+
+            // a new code is sent: it works
+            using (var resend = CreateDb())
+            {
+                resend.VerificationCodes.Add(new VerificationCode
+                {
+                    UserId = user.Id, CodeHash = Hash("654321"), Type = "email",
+                    CreatedAt = DateTime.UtcNow, ExpiresAt = DateTime.UtcNow.AddMinutes(15)
+                });
+                await resend.SaveChangesAsync();
+            }
+            Assert.Equal("verified", ((dynamic)await CreateService().VerifyEmailAsync("guess@example.com", "654321")).status);
+        }
+
         // AUTH-07
         [Fact]
         public async Task Login_NoMFA_ReturnsToken()

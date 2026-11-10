@@ -638,6 +638,52 @@ namespace NotificationsTests
         }
 
         /// <summary>
+        /// NOTIF-05 (Phase B.3 ruling): the quiet-hours window is [start, end). With quiet hours 22:00-07:00, an email
+        /// due exactly at 07:00 is not held (scheduled_at stays 07:00) and deliver_due sends it at 07:00; an email due
+        /// at 06:59:59 is held until 07:00. Quiet hours hold email and SMS only: at 23:00 an SMS is held until 07:00,
+        /// while an in-app message is stored at once (scheduled_at = now) and deliver_due delivers it at 23:00.
+        /// In: nothing. Out: asserts. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: process memory only.
+        /// </summary>
+        // NOTIF-05
+        [Fact]
+        public async Task QuietHours_EndIsExclusive_InAppNotHeld()
+        {
+            var (sp, clock, outbox, worker) = Build();
+            using var _ = sp;
+            var now = clock.Now(); // 2026-11-10 23:00 UTC
+            var sevenAm = new DateTime(2026, 11, 11, 7, 0, 0, DateTimeKind.Utc);
+            Assert.Null(await InScope(sp, (svc, _) => svc.UpdatePreferencesAsync(41, new UpdatePrefRequest
+            {
+                QuietHoursStart = "22:00", QuietHoursEnd = "07:00",
+                ChannelsEnabled = new Dictionary<string, bool> { ["email"] = true, ["sms"] = true, ["in_app"] = true }
+            })));
+
+            Assert.False(NotificationService.IsInQuietHours(await InScope(sp, (svc, _) => svc.GetPreferencesAsync(41)), sevenAm));
+            Assert.True(NotificationService.IsInQuietHours(await InScope(sp, (svc, _) => svc.GetPreferencesAsync(41)), sevenAm.AddSeconds(-1)));
+
+            var atEnd = await InScope(sp, (svc, _) => svc.SendAsync(41, "welcome_email", "email", AppVars, sevenAm));
+            Assert.Equal(("queued", sevenAm), ((await Log(sp, atEnd.MessageId!)).Status, (await Log(sp, atEnd.MessageId!)).ScheduledAt));
+            var justBefore = await InScope(sp, (svc, _) => svc.SendAsync(41, "welcome_email", "email", AppVars, sevenAm.AddSeconds(-1)));
+            Assert.Equal(sevenAm, (await Log(sp, justBefore.MessageId!)).ScheduledAt);
+
+            var sms = await InScope(sp, (svc, _) => svc.SendAsync(41, "welcome_email", "sms", AppVars, null));
+            Assert.Equal(("queued", sevenAm), ((await Log(sp, sms.MessageId!)).Status, (await Log(sp, sms.MessageId!)).ScheduledAt));
+
+            var inApp = await InScope(sp, (svc, _) => svc.SendAsync(41, "welcome_email", "in_app", AppVars, null));
+            Assert.Equal(now, (await Log(sp, inApp.MessageId!)).ScheduledAt);
+            Assert.Equal(1, await worker.DeliverDueAsync(now, CancellationToken.None)); // only the in-app message
+            Assert.Equal("sent", (await Log(sp, inApp.MessageId!)).Status);
+            Assert.Equal("queued", (await Log(sp, atEnd.MessageId!)).Status);
+            Assert.Equal("queued", (await Log(sp, sms.MessageId!)).Status);
+            Assert.Empty(outbox.Messages);
+
+            Assert.Equal(3, await worker.DeliverDueAsync(sevenAm, CancellationToken.None));
+            Assert.Equal("sent", (await Log(sp, atEnd.MessageId!)).Status);
+            Assert.Equal("sent", (await Log(sp, justBefore.MessageId!)).Status);
+            Assert.Equal("sent", (await Log(sp, sms.MessageId!)).Status);
+        }
+
+        /// <summary>
         /// NOTIF-12: a send 30 days ahead is not sent now; deliver_due sends it once due, exactly once (a second pass sends
         /// nothing); a user who unsubscribed meanwhile is skipped; a row stuck at 'sending' over 300 s is re-queued and
         /// sent, one stuck less long is left alone.

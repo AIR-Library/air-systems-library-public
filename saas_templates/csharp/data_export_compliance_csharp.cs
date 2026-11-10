@@ -673,6 +673,9 @@ namespace ComplianceModule
         /// not_found, and so is a completed one, to every caller (EXPORT-13/15, spec clarified in 3abb340); a cancelled
         /// (or failed) one is 409 deletion_not_pending.
         /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 / EXPORT-15: the code was cannot_cancel).
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3 ruling, endpoint 5): once will_delete_at
+        /// (ScheduledFor) has been reached by the injected clock, the deletion is due (the worker runs rows with
+        /// scheduled_for &lt;= now) and cancelling is 409 grace_period_over; the row is left as it was.
         /// Touches: deletion_requests, audit_logs.
         /// </summary>
         public async Task<ServiceResult<object>> CancelDeletionAsync(Guid userId, Guid deletionId, CancellationToken ct)
@@ -680,6 +683,7 @@ namespace ComplianceModule
             var d = await _db.DeletionRequests.FirstOrDefaultAsync(x => x.Id == deletionId, ct);
             if (d == null || d.UserId != userId || d.Status == "completed") return new(null, "not_found", 404);
             if (!StillPending(d)) return new(null, "deletion_not_pending", 409);
+            if (_clock.Now() >= d.ScheduledFor) return new(null, "grace_period_over", 409); // Phase B.3, 2026-11-10
             d.Status = "cancelled";
             d.ConfirmationTokenHash = null;
             d.TokenExpiresAt = null;

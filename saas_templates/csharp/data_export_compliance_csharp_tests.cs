@@ -289,6 +289,65 @@ namespace ComplianceModule.Tests
             Assert.Equal("cancelled", (string)cancelResponseObj.status);
         }
 
+        /// <summary>
+        /// EXPORT-06 (Phase B.3 ruling, endpoint 5): the grace period ends at will_delete_at. One second before it a
+        /// cancel still works; once the clock reaches it (the deletion is due but not yet run) cancel is 409
+        /// {error: "grace_period_over"} and the request stays pending; a pending or approved request is never
+        /// cancelled late. In: nothing. Out: asserts. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the
+        /// test host's in-memory database; moves the shared clock and restores it.
+        /// </summary>
+        // EXPORT-06
+        [Fact]
+        public async Task CancelDeletion_AfterWillDeleteAt_IsGracePeriodOver()
+        {
+            // one open deletion per user, so the second request belongs to a second user
+            var early = await PostAs<DeletionResponse>(_client, "/compliance/delete", new DeletionRequestDto { Reason = "user_requested" });
+            var lateUser = Guid.NewGuid();
+            _factory.Services.GetRequiredService<InMemoryUserDataStore>().Seed(lateUser, SampleUser(lateUser));
+            var lateClient = _factory.CreateClient();
+            lateClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", CustomWebApplicationFactory<ComplianceModule.Startup>.Token(lateUser));
+            var late = await PostAs<DeletionResponse>(lateClient, "/compliance/delete", new DeletionRequestDto { Reason = "user_requested" });
+            // The stored will_delete_at (scheduled_for) of a deletion request. Touches: the in-memory database (read).
+            DateTime ScheduledFor(string id)
+            {
+                using var scope = _factory.Services.CreateScope();
+                return scope.ServiceProvider.GetRequiredService<ComplianceDbContext>().DeletionRequests.AsNoTracking()
+                    .Single(d => d.Id == Guid.Parse(id)).ScheduledFor;
+            }
+            // The stored status of a deletion request. Touches: the in-memory database (read).
+            string StatusOf(string id)
+            {
+                using var scope = _factory.Services.CreateScope();
+                return scope.ServiceProvider.GetRequiredService<ComplianceDbContext>().DeletionRequests.AsNoTracking()
+                    .Single(d => d.Id == Guid.Parse(id)).Status;
+            }
+
+            var clock = _factory.Services.GetRequiredService<ComplianceClock>();
+            var original = clock.Now;
+            try
+            {
+                var earlyDue = ScheduledFor(early.DeletionId);
+                clock.Now = () => earlyDue.AddSeconds(-1);
+                var inTime = await _client.DeleteAsync($"/compliance/delete/{early.DeletionId}");
+                inTime.EnsureSuccessStatusCode();
+                Assert.Equal("cancelled", StatusOf(early.DeletionId));
+
+                var lateDue = ScheduledFor(late.DeletionId);
+                foreach (var at in new[] { lateDue, lateDue.AddSeconds(1), lateDue.AddDays(2) })
+                {
+                    clock.Now = () => at;
+                    var tooLate = await lateClient.DeleteAsync($"/compliance/delete/{late.DeletionId}");
+                    Assert.Equal(HttpStatusCode.Conflict, tooLate.StatusCode);
+                    Assert.Equal("grace_period_over", await ErrorOf(tooLate));
+                    Assert.Equal("pending", StatusOf(late.DeletionId));
+                }
+            }
+            finally
+            {
+                clock.Now = original;
+            }
+        }
+
         [Fact]
         public async Task DeletionRequiresConfirmationToken()
         {

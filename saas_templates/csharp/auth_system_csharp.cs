@@ -140,6 +140,14 @@ namespace AuthSystem
         public DateTime ExpiresAt { get; set; }
         public string Type { get; set; }
         public User User { get; set; }
+
+        /// <summary>
+        /// Wrong email codes tried against this user's current code (verify_email only). At
+        /// <see cref="AuthService.MaxEmailCodeAttempts"/> the code is deleted, so even the right code is code_invalid until
+        /// a new code is sent (a new row starts at 0). Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3,
+        /// auth spec flow 2 "Attempts"). Pure data.
+        /// </summary>
+        public int Attempts { get; set; }
     }
 
     public class AuditLog
@@ -207,6 +215,8 @@ namespace AuthSystem
         public const int MaxFailedLoginsPer15Min = 5;
         /// <summary>Wrong TOTP codes allowed on one MFA challenge before it is destroyed.</summary>
         public const int MaxMfaAttemptsPerChallenge = 5;
+        /// <summary>Wrong email verification codes for one user before the current code is invalidated (Phase B.3, 2026-11-10).</summary>
+        public const int MaxEmailCodeAttempts = 5;
         /// <summary>Access-token lifetime in seconds (15 minutes).</summary>
         public const int AccessTokenSeconds = 900;
         /// <summary>Bucket used when a caller does not pass the client IP to <see cref="SignupAsync"/>: all such signups share one limit (fail closed).</summary>
@@ -321,6 +331,9 @@ namespace AuthSystem
         /// code_expired}. Repaired 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): sets status so login accepts
         /// the user, constant-time comparison, wrong vs expired codes reported apart. Changed the same day (Phase B.2,
         /// AUTH-16): the stored value is the code's HMAC-SHA256, compared in constant time with the hash of the code given.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3, flow 2 "Attempts"): a wrong code adds one to
+        /// the attempts of the user's current code(s); the 5th wrong code deletes them, so further tries, even with the
+        /// right code, get code_invalid until a new code is sent (a 6-digit code must not be guessable by retrying).
         /// Touches: users, verification_codes, audit_log.
         /// </summary>
         public async Task<object> VerifyEmailAsync(string email, string code)
@@ -336,7 +349,17 @@ namespace AuthSystem
             var providedHash = code == null ? null : HashSecret(code);
             var verification = candidates.FirstOrDefault(v => SecretEquals(v.CodeHash, providedHash));
             if (verification == null)
+            {
+                // Phase B.3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): count the wrong try against the current
+                // code; the 5th wrong try invalidates it.
+                foreach (var current in candidates)
+                {
+                    current.Attempts++;
+                    if (current.Attempts >= MaxEmailCodeAttempts) _db.VerificationCodes.Remove(current);
+                }
+                if (candidates.Count > 0) await _db.SaveChangesAsync();
                 return new { error = "code_invalid" };
+            }
             if (verification.ExpiresAt <= DateTime.UtcNow)
                 return new { error = "code_expired" };
 
