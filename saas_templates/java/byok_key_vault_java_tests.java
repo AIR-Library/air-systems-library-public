@@ -323,22 +323,30 @@ public class byok_key_vault_java_tests {
         final ByokKeyVault.InMemoryStore inner;
         final String failUser;
 
-        /** In: the store to delegate to, the user whose rewrap write throws. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+        /** In: the store to delegate to, the user whose rewrap write throws. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+         *  Every Store method below carries @Override so a change to the interface fails to compile here (code-quality
+         *  review on PR 22). */
         FailingRewrapStore(ByokKeyVault.InMemoryStore inner, String failUser) {
             this.inner = inner;
             this.failUser = failUser;
         }
 
+        @Override
         public ByokKeyVault.KeyRow get(String u, String p) { return inner.get(u, p); }
         public List<ByokKeyVault.KeyRow> listForUser(String u) { return inner.listForUser(u); }
         public List<ByokKeyVault.KeyRow> listAll() { return inner.listAll(); }
+        @Override
         public void saveWithAudit(ByokKeyVault.KeyRow row, String action, long at) { inner.saveWithAudit(row, action, at); }
+        @Override
         public void markUsedWithAudit(String u, String p, long now, String purpose, String keyId) { inner.markUsedWithAudit(u, p, now, purpose, keyId); }
+        @Override
         public boolean deleteWithAudit(String u, String p, long now) { return inner.deleteWithAudit(u, p, now); }
+        @Override
         public boolean bumpWindow(String u, long w) { return inner.bumpWindow(u, w); }
         public List<ByokKeyVault.AuditRow> audit(String u) { return inner.audit(u); }
 
         /** Throws for failUser (nothing written); otherwise the real conditional write. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+        @Override
         public boolean rewrap(String u, String p, String newKeyId, String newWrapped, String wrappedRead, long now) {
             if (u.equals(failUser)) throw new IllegalStateException("disk I/O error");
             return inner.rewrap(u, p, newKeyId, newWrapped, wrappedRead, now);
