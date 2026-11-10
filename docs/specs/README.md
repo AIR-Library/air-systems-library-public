@@ -9,7 +9,7 @@ Python, JavaScript, TypeScript, Java, C#, PHP, Go and Rust. Code lives in
 | admin_system | [admin_system.md](admin_system.md) | 19 |
 | api_keys_service_accounts | [api_keys_service_accounts.md](api_keys_service_accounts.md) | 9 |
 | audit_logging | [audit_logging.md](audit_logging.md) | 10 |
-| auth_system | [auth_system.md](auth_system.md) | 17 |
+| auth_system | [auth_system.md](auth_system.md) | 18 |
 | background_jobs_task_queue | [background_jobs_task_queue.md](background_jobs_task_queue.md) | 9 |
 | billing_subscriptions | [billing_subscriptions.md](billing_subscriptions.md) | 10 |
 | byok_key_vault | [byok_key_vault.md](byok_key_vault.md) | 14 |

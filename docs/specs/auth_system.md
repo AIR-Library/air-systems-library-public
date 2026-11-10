@@ -28,6 +28,7 @@ name or in a comment on the line above it (for example `# AUTH-01`), so a missin
 | `AUTH-15` | token_refresh banned user → 403 {error: "user_banned"} |
 | `AUTH-16` | login returns a refresh_token that token_refresh accepts; the sessions table holds only its HMAC-SHA256 under AUTH_SECRET_KEY, a verification code is stored only as its HMAC, and the service refuses to start without a 32-byte key |
 | `AUTH-17` | verify_email: a wrong code is 400 code_invalid; after 5 wrong codes the right code is also 400 code_invalid; after 4 wrong codes the right one verifies; a newly sent code works again |
+| `AUTH-18` | resend_verification: a code spent by 5 wrong tries is replaced, and the new code verifies; a 4th resend within the hour is 429 too_many_requests; an unknown and a verified email get the same 202 sent and no email |
 
 ## Contract
 
@@ -69,6 +70,13 @@ FLOWS TO BUILD (exact sequence — no deviations):
      Log: audit_log(action="email_verified", user_id)
      Return: {status: "verified", user_id, message: "ready to login"}
 
+  2b. resend_verification(email)
+     For an unverified user: deletes the user's email codes, issues a new 6-digit code (attempts 0, stored as its
+     keyed hash, 10-minute expiry) and emails it. At most 3 resends per email per hour: a 4th within the hour is
+     429 {error: "too_many_requests"} and sends nothing. An unknown or already verified email gets the same
+     202 {status: "sent"} as a real resend and sends nothing, so the answer never says whether an account
+     exists. Why: without it, 5 wrong codes (AUTH-17) would lock a user out of verifying for good. Amended
+     2026-11-10 after review on PR 22.
   3. login(email, password, device_id, ip)
      Gates: user_exists_and_verified, password_correct, mfa_enabled_check, rate_limit (5 failed per 15min per ip/user)
      Sub-flow if MFA enabled: return {status: "mfa_required", challenge_id}
@@ -161,4 +169,5 @@ TESTS REQUIRED:
   - **AUTH-15** token_refresh banned user → 403 {error: "user_banned"}
   - **AUTH-16** login returns a refresh_token that token_refresh accepts; the sessions table holds only its HMAC-SHA256 under AUTH_SECRET_KEY, a verification code is stored only as its HMAC, and the service refuses to start without a 32-byte key
   - **AUTH-17** verify_email: a wrong code is 400 code_invalid; after 5 wrong codes the right code is also 400 code_invalid; after 4 wrong codes the right one verifies; a newly sent code works again
+  - **AUTH-18** resend_verification: a code spent by 5 wrong tries is replaced, and the new code verifies; a 4th resend within the hour is 429 too_many_requests; an unknown and a verified email get the same 202 sent and no email
 ```
