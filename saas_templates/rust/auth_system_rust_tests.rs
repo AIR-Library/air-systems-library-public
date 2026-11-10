@@ -192,10 +192,11 @@ fn test_verify_email_expired_code() {
 fn test_verify_email_happy_path() {
     let (mut auth_system, mailer, _, _) = setup();
     auth_system.signup(SignupRequest { email: "test@example.com".into(), password: PASSWORD.into(), name: "Test User".into() }).unwrap();
-    // a wrong code does not verify
+    // a wrong code does not verify (changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, spec Phase B.4: the
+    // answer is 400 code_invalid, it was 401 invalid_code)
     assert_eq!(
         auth_system.verify_email(VerifyEmailRequest { email: "test@example.com".into(), code_or_token: "not-the-code".into() }).unwrap_err(),
-        AuthError::InvalidCode
+        AuthError::CodeInvalid
     );
 
     let verify_req = VerifyEmailRequest { email: "test@example.com".to_string(), code_or_token: last_code(&mailer, "test@example.com") };
@@ -204,6 +205,43 @@ fn test_verify_email_happy_path() {
     let response = result.unwrap();
     assert!(response.success);
     assert_eq!(response.data.status(), "verified");
+}
+
+/// What: AUTH-17: a wrong verification code is 400 code_invalid; after 5 wrong codes the right code is also
+/// 400 code_invalid and the user stays unverified; after 4 wrong codes the right one verifies; a newly sent code
+/// works again. In: none. Out: panics on a wrong answer. Why: spec Phase B.3 / B.4 (AUTH-17).
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite.
+// AUTH-17
+#[test]
+fn test_verify_email_five_wrong_codes_kill_the_code() {
+    let (mut auth_system, mailer, _, _) = setup();
+    let verify = |sys: &mut AuthSystem, email: &str, code: &str| sys.verify_email(VerifyEmailRequest { email: email.into(), code_or_token: code.into() });
+    let wrong_for = |code: &str| if code == "000000" { "111111".to_string() } else { "000000".to_string() };
+    // five wrong codes, then the right one is refused too
+    auth_system.signup(SignupRequest { email: "five@example.com".into(), password: PASSWORD.into(), name: "Five".into() }).unwrap();
+    let code = last_code(&mailer, "five@example.com");
+    for _ in 0..5 {
+        let err = verify(&mut auth_system, "five@example.com", &wrong_for(&code)).unwrap_err();
+        assert_eq!(err, AuthError::CodeInvalid);
+        let (body, status) = err.to_response();
+        assert_eq!((status, body["error"].as_str()), (400, Some("code_invalid")));
+    }
+    let err = verify(&mut auth_system, "five@example.com", &code).unwrap_err();
+    assert_eq!(err, AuthError::CodeInvalid);
+    assert_eq!(err.to_response().1, 400);
+    assert_eq!(auth_system.login(login_req("five@example.com", PASSWORD)).unwrap_err(), AuthError::EmailNotVerified);
+    // a newly sent code works again
+    let user_id: i64 = auth_system.conn.query_row("SELECT id FROM users WHERE email = 'five@example.com'", [], |r| r.get(0)).unwrap();
+    auth_system.send_email_code(user_id, "five@example.com").unwrap();
+    let fresh = last_code(&mailer, "five@example.com");
+    assert_eq!(verify(&mut auth_system, "five@example.com", &fresh).unwrap().data.status(), "verified");
+    // four wrong codes, then the right one (the fifth try) verifies
+    auth_system.signup(SignupRequest { email: "four@example.com".into(), password: PASSWORD.into(), name: "Four".into() }).unwrap();
+    let code = last_code(&mailer, "four@example.com");
+    for _ in 0..4 {
+        assert_eq!(verify(&mut auth_system, "four@example.com", &wrong_for(&code)).unwrap_err(), AuthError::CodeInvalid);
+    }
+    assert_eq!(verify(&mut auth_system, "four@example.com", &code).unwrap().data.status(), "verified");
 }
 
 // AUTH-07

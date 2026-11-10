@@ -601,7 +601,8 @@ impl NotificationService {
     }
 
     /// What: send one templated notification. Order: unknown template or channel -> error;
-    /// do-not-disturb -> skipped; a future `scheduled_at`, or now inside the user's quiet hours ->
+    /// do-not-disturb -> skipped; a future `scheduled_at`, or now inside the user's quiet hours [start, end)
+    /// for any channel but in-app (Phase B.3 ruling, 2026-11-10: quiet hours hold email and SMS only) ->
     /// stored 'queued' with scheduled_at (the requested time, or the next quiet_hours_end) for
     /// `deliver_due`; a disabled or unavailable channel -> skipped; otherwise up to 4 attempts (3 retries; changed 2026-11-10, Phase B.2) with
     /// exponential backoff -> sent or failed. Every outcome is logged under the returned message id.
@@ -635,7 +636,10 @@ impl NotificationService {
             return skip("do_not_disturb", requested);
         }
         let mut due = scheduled_at.filter(|t| *t > now);
-        if due.is_none() && in_quiet_hours(&prefs, now) {
+        // quiet hours hold email and SMS only: an in-app message is stored at once (Phase B.3 ruling,
+        // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP); a channel that cannot be chosen is held as before
+        let in_app_now = matches!(Self::choose_channel(&prefs, requested, &template), Ok(c) if c == "in_app");
+        if due.is_none() && !in_app_now && in_quiet_hours(&prefs, now) {
             due = prefs.quiet_hours_end.as_deref().and_then(|end| quiet_hours_end_after(now, end));
         }
         if let Some(at) = due {
@@ -787,8 +791,9 @@ impl NotificationService {
                     continue;
                 }
             };
-            // 3b. quiet hours as they are now (Phase B.2, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
-            if in_quiet_hours(&prefs, now) {
+            // 3b. quiet hours as they are now (Phase B.2, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP); they hold
+            // email and SMS only, an in-app message is stored at once (Phase B.3 ruling, 2026-11-10)
+            if channel != "in_app" && in_quiet_hours(&prefs, now) {
                 if let Some(end) = prefs.quiet_hours_end.as_deref().and_then(|end| quiet_hours_end_after(now, end)) {
                     counts.deferred += self.conn.execute(
                         "UPDATE notification_logs SET status = 'queued', scheduled_at = ?2, claimed_at = NULL

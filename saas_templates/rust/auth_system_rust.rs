@@ -58,6 +58,9 @@ pub enum AuthError {
     TooManySignups,
     TooManyAttempts,
     InvalidCode,
+    /// verify_email's refusal of a wrong, used-up or unknown code: 400 code_invalid (Phase B.3/B.4, 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP; it answered 401 invalid_code, and 429 after 5 wrong codes).
+    CodeInvalid,
     CodeExpired,
     InvalidCredentials,
     EmailNotVerified,
@@ -84,6 +87,7 @@ impl AuthError {
             AuthError::TooManySignups => ("too_many_signups_from_ip", 429, None),
             AuthError::TooManyAttempts => ("too_many_attempts", 429, None),
             AuthError::InvalidCode => ("invalid_code", 401, None),
+            AuthError::CodeInvalid => ("code_invalid", 400, None),
             AuthError::CodeExpired => ("code_expired", 400, None),
             AuthError::InvalidCredentials => ("invalid_credentials", 401, None),
             AuthError::EmailNotVerified => ("email_not_verified", 403, None),
@@ -566,15 +570,18 @@ impl AuthSystem {
     }
 
     /// What: flow 2. Gates: an unexpired, unused code that matches (5 tries), user still unverified.
-    /// Unknown emails give `InvalidCode` (no account probing). Out: verified.
+    /// Unknown emails give `CodeInvalid` (no account probing). Out: verified.
+    /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec Phase B.3 and B.4, AUTH-17): a wrong code is
+    /// 400 code_invalid (was 401 invalid_code), and after 5 wrong codes the current code is dead: every further
+    /// try, the right code included, is 400 code_invalid (was 429 too_many_attempts) until a new code is sent.
     /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
     /// [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
     pub fn verify_email(&mut self, req: VerifyEmailRequest) -> Result<AuthResponse, AuthError> {
         let email = req.email.trim().to_lowercase();
         let user: Option<(i64, Option<i64>)> = self.conn.query_row("SELECT id, email_verified_at FROM users WHERE email = ?1", params![email], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-        let Some((user_id, verified_at)) = user else { return Err(AuthError::InvalidCode) };
+        let Some((user_id, verified_at)) = user else { return Err(AuthError::CodeInvalid) };
         if verified_at.is_some() {
-            return Err(AuthError::InvalidCode);
+            return Err(AuthError::CodeInvalid);
         }
         let code: Option<(String, String, i64, i64)> = self
             .conn
@@ -585,14 +592,14 @@ impl AuthSystem {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        let Some((code_id, code_hash, expires_at, attempts)) = code else { return Err(AuthError::InvalidCode) };
+        let Some((code_id, code_hash, expires_at, attempts)) = code else { return Err(AuthError::CodeInvalid) };
         if attempts >= 5 {
-            return Err(AuthError::TooManyAttempts);
+            return Err(AuthError::CodeInvalid);
         }
         if !ct_eq(self.hash_secret(req.code_or_token.trim()).as_bytes(), code_hash.as_bytes()) {
             self.conn.execute("UPDATE verification_codes SET attempts = attempts + 1 WHERE id = ?1", params![code_id])?;
             self.why("verify_email", &["code_valid"], "wrong_code");
-            return Err(AuthError::InvalidCode);
+            return Err(AuthError::CodeInvalid);
         }
         if self.now() >= expires_at {
             return Err(AuthError::CodeExpired);

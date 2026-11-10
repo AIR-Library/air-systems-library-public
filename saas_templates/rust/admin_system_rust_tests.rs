@@ -167,6 +167,12 @@ fn test_change_role_happy_path() {
     assert_eq!(audited, 1);
 }
 
+/// What: ADMIN-07: demoting the last active owner is 400 cannot_demote_last_owner. Changed 2026-11-10,
+/// session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3 ruling and the spec's change_role "Order"): an owner demoting
+/// themselves now meets the own-account gate first (cannot_change_own_role, asserted below), so the last-owner
+/// refusal is proven where the spec says it is reachable: the remaining active owner approving a governance
+/// change_role that demotes them. The approval fails with 400, the role is unchanged and the action stays
+/// pending. In: none. Out: panics on a wrong answer. Touches: in-memory SQLite.
 // ADMIN-07
 #[test]
 fn test_change_role_last_owner() {
@@ -174,9 +180,36 @@ fn test_change_role_last_owner() {
     let owner = system.get_user_by_email("owner@example.com").unwrap().unwrap();
     let resp = system.change_role(&owner, owner.id, "user"); // role, Phase B.2 (was "basic")
     match resp {
+        Response::Error { error, .. } => assert_eq!(error, "cannot_change_own_role"),
+        _ => panic!("Expected error"),
+    }
+    let second = system.create_user(&owner, "owner2@example.com", "Owner Two", "owner", false).unwrap();
+    let owner2_id = second.data["user_id"].as_i64().unwrap();
+    let now = Utc::now().to_rfc3339();
+    system
+        .conn
+        .execute(
+            "INSERT INTO governance_actions (action_type,actor_id,target_resource_id,reason,submitted_at,status,params) VALUES ('change_role',?1,?2,'reorg',?3,'pending',?4)",
+            params![owner.id, owner2_id, now, r#"{"new_tier":"admin"}"#],
+        )
+        .unwrap();
+    let action = system.conn.last_insert_rowid();
+    // the first owner is suspended, so owner2 is the last active owner
+    let owner2 = system.get_user_by_id(owner2_id).unwrap();
+    system.suspend_user(&owner2, owner.id, "policy").unwrap();
+    let resp = system.decide_governance_action(&owner2, action, "approve", None);
+    match &resp {
         Response::Error { error, .. } => assert_eq!(error, "cannot_demote_last_owner"),
         _ => panic!("Expected error"),
     }
+    assert_eq!(resp.status(), 400);
+    assert_eq!(system.get_user_by_id(owner2_id).unwrap().tier, Role::Owner);
+    let status: String = system.conn.query_row("SELECT status FROM governance_actions WHERE id = ?1", params![action], |r| r.get(0)).unwrap();
+    assert_eq!(status, "pending");
+    // with another active owner the same approval executes
+    system.create_user(&owner2, "owner3@example.com", "Owner Three", "owner", false).unwrap();
+    system.decide_governance_action(&owner2, action, "approve", None).unwrap();
+    assert_eq!(system.get_user_by_id(owner2_id).unwrap().tier, Role::Admin);
 }
 
 /// What: ADMIN-08: suspending a user changes their status. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the status assertion
@@ -628,6 +661,29 @@ fn test_suspended_owner_is_refused_everywhere() {
     let after = (snapshot(), state("SELECT group_concat(tier || status, ',') FROM users"), state("SELECT group_concat(tier || status, ',') FROM deployments"), state("SELECT tier FROM customers"));
     assert_eq!(after, before, "nothing changed");
     STRIPE_CALLS.with(|c| assert!(c.borrow().is_empty(), "no provider call"));
+}
+
+/// What: ADMIN-19 and the Phase B.3 ruling: the request check refuses a suspended caller with 403
+/// account_suspended BEFORE the CSRF check, so a suspended owner with a wrong CSRF token still gets
+/// account_suspended; an active owner with a wrong token gets 403 csrf_invalid, and the right token passes.
+/// In: none. Out: panics on a wrong answer. Why: spec EVERY ACTION ("the CSRF check included").
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite.
+// ADMIN-19
+#[test]
+fn test_suspended_caller_refused_before_csrf() {
+    let system = setup().with_csrf_token("session-csrf-token-1");
+    let owner = system.get_user_by_email("owner@example.com").unwrap().unwrap();
+    assert_eq!(system.verify_request(&owner, "session-csrf-token-1").unwrap().id, owner.id);
+    let wrong = system.verify_request(&owner, "forged").unwrap_err();
+    assert!(matches!(&wrong, AdminError::Forbidden(c) if c == "csrf_invalid"));
+    assert_eq!(status_for("csrf_invalid"), 403);
+    let second = system.create_user(&owner, "second@example.com", "Second Owner", "owner", false).unwrap();
+    let second = system.get_user_by_id(second.data["user_id"].as_i64().unwrap()).unwrap();
+    system.suspend_user(&second, owner.id, "policy").unwrap();
+    for token in ["forged", "", "session-csrf-token-1"] {
+        let r = system.verify_request(&owner, token).unwrap_err();
+        assert!(matches!(&r, AdminError::Forbidden(c) if c == "account_suspended"), "{:?}", r);
+    }
 }
 
 /// What: the TIERS rule (Phase B.2), part of ADMIN-06/12/14: users.tier is the staff role and a customer's
