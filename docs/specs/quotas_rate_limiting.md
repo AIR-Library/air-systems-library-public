@@ -23,6 +23,7 @@ name or in a comment on the line above it (for example `# QUOTA-01`), so a missi
 | `QUOTA-10` | feature_gate FAIL → feature unavailable, 403 with upgrade hint |
 | `QUOTA-11` | month rollover → usage_metrics reset for new month |
 | `QUOTA-12` | tier upgrade → limits updated immediately |
+| `QUOTA-13` | a limit of -1 is unlimited → enterprise storage upload of any size stored, and enterprise API calls past every other tier's limit never get 429 from the quota |
 
 ## Contract
 
@@ -87,4 +88,5 @@ TESTS REQUIRED:
   - **QUOTA-10** feature_gate FAIL → feature unavailable, 403 with upgrade hint
   - **QUOTA-11** month rollover → usage_metrics reset for new month
   - **QUOTA-12** tier upgrade → limits updated immediately
+  - **QUOTA-13** a limit of -1 is unlimited → enterprise storage upload of any size stored, and enterprise API calls past every other tier's limit never get 429 from the quota
 ```

@@ -13,8 +13,8 @@ name or in a comment on the line above it (for example `# JOBS-01`), so a missin
 |---|---|
 | `JOBS-01` | Enqueue job, worker picks it up, status becomes running |
 | `JOBS-02` | Job completes, status becomes completed, results available |
-| `JOBS-03` | Job fails, auto-retries with exponential backoff |
-| `JOBS-04` | Job exceeds max_retries, status becomes failed |
+| `JOBS-03` | Job fails, auto-retries with exponential backoff (retry 1 after 1s, retry 2 after 2s; retry_count counts them) |
+| `JOBS-04` | Job exceeds max_retries: with max_retries = 3 it runs 4 times, then status failed and retry_count = 3 |
 | `JOBS-05` | User cancels before job starts, status becomes cancelled |
 | `JOBS-06` | Progress tracking (45/100 updates in real-time) |
 | `JOBS-07` | Scheduled jobs: only run after scheduled_at time |
@@ -105,7 +105,10 @@ ENDPOINTS:
 IMPLEMENTATION:
 - Queue: Redis or database-backed queue (simple polling)
 - Worker: Background process picks up enqueued jobs, runs, updates status
-- Retry: Exponential backoff (1s, 2s, 4s, 8s, ... up to max_retries)
+- Retry: max_retries counts retries AFTER the first attempt, so a job runs at most max_retries + 1 times.
+  Retry n (n = 1, 2, ...) waits 2^(n-1) seconds (1s, 2s, 4s, 8s, ...): next_retry_at = failed_at + that
+  delay, and retry_count = n while it waits. When attempt max_retries + 1 fails, status = 'failed' with
+  retry_count = max_retries. Amended 2026-11-10 after review on PR 19.
 - Progress: Update job.progress as task completes (45/100 emails sent)
 - Atomic updates: Status changes are atomic (no race conditions)
 - Scheduled jobs: Check scheduled_at before moving to running
@@ -122,8 +125,8 @@ TASKS TO BUILD:
 TESTS:
 - **JOBS-01** Enqueue job, worker picks it up, status becomes running
 - **JOBS-02** Job completes, status becomes completed, results available
-- **JOBS-03** Job fails, auto-retries with exponential backoff
-- **JOBS-04** Job exceeds max_retries, status becomes failed
+- **JOBS-03** Job fails, auto-retries with exponential backoff (retry 1 after 1s, retry 2 after 2s; retry_count counts them)
+- **JOBS-04** Job exceeds max_retries: with max_retries = 3 it runs 4 times, then status failed and retry_count = 3
 - **JOBS-05** User cancels before job starts, status becomes cancelled
 - **JOBS-06** Progress tracking (45/100 updates in real-time)
 - **JOBS-07** Scheduled jobs: only run after scheduled_at time

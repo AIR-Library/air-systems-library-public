@@ -13,13 +13,13 @@ name or in a comment on the line above it (for example `# SEARCH-01`), so a miss
 |---|---|
 | `SEARCH-01` | Index user, search finds it |
 | `SEARCH-02` | Index deployment, query works |
-| `SEARCH-03` | Partial match: "stri" finds "stripe" |
+| `SEARCH-03` | Partial match: "stri" finds "stripe"; "ripe" does not |
 | `SEARCH-04` | Filters: tier:team returns only team tier |
 | `SEARCH-05` | Facets: shows count per status |
 | `SEARCH-06` | Unindex: document no longer found after delete |
 | `SEARCH-07` | Real-time: index updated within 100ms of create |
 | `SEARCH-08` | Performance: 1M documents, search returns <200ms |
-| `SEARCH-09` | Relevance: exact match ranks higher than partial |
+| `SEARCH-09` | Relevance: exact word match ranks higher than prefix match; equal scores keep insertion order |
 
 ## Contract
 
@@ -89,7 +89,11 @@ ENDPOINTS:
 IMPLEMENTATION:
 - Storage: Simple inverted index (word → [document_ids]) or Elasticsearch
 - Tokenization: split on whitespace, lowercase, remove common words
-- Relevance: simple scoring (exact match > partial match > prefix match)
+- Matching: text is lower-cased and split into words on anything that is not a letter or digit. A query
+  term matches a word that equals it or starts with it ("stri" finds "stripe"; "ripe" does not).
+  A query of several terms returns only documents that match every term.
+- Relevance: a term that equals a word scores higher than a term that is only a prefix of one. Equal
+  scores keep insertion order (the document indexed first comes first). Amended 2026-11-10 after review on PR 19.
 - Filters: metadata fields indexed separately, checked during query
 - Facets: COUNT(*) GROUP BY metadata_field
 - Real-time: index updated immediately on create/update
@@ -104,11 +108,11 @@ SEARCH EXAMPLES:
 TESTS:
 - **SEARCH-01** Index user, search finds it
 - **SEARCH-02** Index deployment, query works
-- **SEARCH-03** Partial match: "stri" finds "stripe"
+- **SEARCH-03** Partial match: "stri" finds "stripe"; "ripe" does not
 - **SEARCH-04** Filters: tier:team returns only team tier
 - **SEARCH-05** Facets: shows count per status
 - **SEARCH-06** Unindex: document no longer found after delete
 - **SEARCH-07** Real-time: index updated within 100ms of create
 - **SEARCH-08** Performance: 1M documents, search returns <200ms
-- **SEARCH-09** Relevance: exact match ranks higher than partial
+- **SEARCH-09** Relevance: exact word match ranks higher than prefix match; equal scores keep insertion order
 ```

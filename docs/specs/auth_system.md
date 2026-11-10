@@ -13,7 +13,7 @@ name or in a comment on the line above it (for example `# AUTH-01`), so a missin
 |---|---|
 | `AUTH-01` | signup happy path (valid email, strong password) → user created, email sent |
 | `AUTH-02` | signup duplicate email → 409 {error: "email_already_exists"} |
-| `AUTH-03` | signup weak password → 400 {error: "password_too_weak"} |
+| `AUTH-03` | signup weak password → 400 {error: "password_rejected", reason: "too_short"} |
 | `AUTH-04` | signup IP rate limit → 429 {error: "too_many_signups_from_ip"} |
 | `AUTH-05` | verify_email happy path → user status changed to verified |
 | `AUTH-06` | verify_email expired code → 400 {error: "code_expired"} |
@@ -127,7 +127,7 @@ IMPLEMENTATION REQUIREMENTS:
 TESTS REQUIRED:
   - **AUTH-01** signup happy path (valid email, strong password) → user created, email sent
   - **AUTH-02** signup duplicate email → 409 {error: "email_already_exists"}
-  - **AUTH-03** signup weak password → 400 {error: "password_too_weak"}
+  - **AUTH-03** signup weak password → 400 {error: "password_rejected", reason: "too_short"}
   - **AUTH-04** signup IP rate limit → 429 {error: "too_many_signups_from_ip"}
   - **AUTH-05** verify_email happy path → user status changed to verified
   - **AUTH-06** verify_email expired code → 400 {error: "code_expired"}

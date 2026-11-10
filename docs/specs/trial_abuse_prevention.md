@@ -19,11 +19,13 @@ name or in a comment on the line above it (for example `# TRIAL-01`), so a missi
 | `TRIAL-06` | ip_signup_rate_limit PASS → < 5 signups from IP, allowed |
 | `TRIAL-07` | ip_signup_rate_limit FAIL → 10+ signups from IP, rejected 429 |
 | `TRIAL-08` | device_fingerprint PASS → device < 2 users, allowed |
-| `TRIAL-09` | device_fingerprint FAIL → device > 5 users, rejected |
-| `TRIAL-10` | trial_payment_timing PASS → payment within trial window, allowed |
-| `TRIAL-11` | trial_payment_timing FAIL → trial ended, no payment, trying to re-add, rejected |
+| `TRIAL-09` | device_fingerprint FAIL → device used by 5 or more other users, rejected |
+| `TRIAL-10` | trial_payment_timing PASS → first payment 4 days after the trial ended (and one during the trial), allowed |
+| `TRIAL-11` | trial_payment_timing FAIL → first payment 90 days after the trial ended, no earlier payment, rejected |
 | `TRIAL-12` | chargeback_history PASS → no chargebacks, allowed |
 | `TRIAL-13` | chargeback_history FAIL → 2+ chargebacks, requires prepayment |
+| `TRIAL-14` | device_fingerprint boundaries → 4 other users CHALLENGE, exactly 5 FAIL |
+| `TRIAL-15` | trial_payment_timing boundaries → 5 and 89 days after the trial CHALLENGE; 90 days with an earlier payment CHALLENGE |
 
 ## Contract
 
@@ -60,21 +62,25 @@ name or in a comment on the line above it (for example `# TRIAL-01`), so a missi
   4. DEVICE_FINGERPRINT
      device = {user_agent, screen_resolution, timezone, browser_language}
      device_hash = SHA256(device)
-     Query: SELECT COUNT(DISTINCT user_id) FROM device_fingerprints WHERE device_hash = ?
-     Decision: PASS if count < 2 OR device matches user's known devices
-              CHALLENGE if count >= 2 AND <= 5
+     Query: SELECT COUNT(DISTINCT user_id) FROM device_fingerprints WHERE device_hash = ? AND user_id != ?
+            (count = OTHER users who used this device)
+     Decision: PASS if count < 2 OR the device is already one of this user's devices
+              CHALLENGE if count >= 2 AND count < 5
               FAIL if count >= 5
+     Amended 2026-11-10 after review on PR 19. The old CHALLENGE range (<= 5) overlapped FAIL (>= 5) at exactly 5.
      Log: why_chain(gate="device_fingerprint", device_hash, matching_users, decision)
      Action: if FAIL: return 403 {error: "device_suspected_fraud"}
              if CHALLENGE: send email "new device login detected"
 
-  5. TRIAL_PAYMENT_TIMING
-     trial_start_date = user.created_at
-     now = datetime.utcnow()
-     Days since trial started: days_elapsed = (now - trial_start_date).days
-     Decision: PASS if (days_elapsed < trial_days + 5) AND (payment_method_added_date > trial_start_date)
-              CHALLENGE if (days_elapsed > trial_days + 30) AND (payment_method_added_date > trial_start_date + trial_days)
-              FAIL if (trial_ended) AND (user never added payment) AND (now trying to re-add after 90+ days)
+  5. TRIAL_PAYMENT_TIMING (judged when a payment method is being added, so the payment date is now)
+     trial_end = user.created_at + trial_days (trial_days is configuration, default 14)
+     days_after_trial = floor((now - trial_end) / 1 day)   -- negative while the trial is running
+     earlier_payment = the ledger already has a payment_added_date for this user
+     Decision: PASS if days_after_trial < 5
+              FAIL if days_after_trial >= 90 AND NOT earlier_payment
+              CHALLENGE otherwise (5 to 89 days after the trial, or 90+ days with an earlier payment)
+     A first payment has no earlier date to compare: it is judged by the rule above with the payment date
+     = now. Amended 2026-11-10 after review on PR 19.
      Log: why_chain(gate="trial_payment_timing", trial_duration, payment_delay, decision)
      Action: if FAIL: return 403 {error: "trial_ended_no_payment_cannot_retry"}
              if CHALLENGE: user.abuse_flags += "late_payment_entry"
@@ -146,9 +152,11 @@ TESTS REQUIRED:
   - **TRIAL-06** ip_signup_rate_limit PASS → < 5 signups from IP, allowed
   - **TRIAL-07** ip_signup_rate_limit FAIL → 10+ signups from IP, rejected 429
   - **TRIAL-08** device_fingerprint PASS → device < 2 users, allowed
-  - **TRIAL-09** device_fingerprint FAIL → device > 5 users, rejected
-  - **TRIAL-10** trial_payment_timing PASS → payment within trial window, allowed
-  - **TRIAL-11** trial_payment_timing FAIL → trial ended, no payment, trying to re-add, rejected
+  - **TRIAL-09** device_fingerprint FAIL → device used by 5 or more other users, rejected
+  - **TRIAL-10** trial_payment_timing PASS → first payment 4 days after the trial ended (and one during the trial), allowed
+  - **TRIAL-11** trial_payment_timing FAIL → first payment 90 days after the trial ended, no earlier payment, rejected
   - **TRIAL-12** chargeback_history PASS → no chargebacks, allowed
   - **TRIAL-13** chargeback_history FAIL → 2+ chargebacks, requires prepayment
+  - **TRIAL-14** device_fingerprint boundaries → 4 other users CHALLENGE, exactly 5 FAIL
+  - **TRIAL-15** trial_payment_timing boundaries → 5 and 89 days after the trial CHALLENGE; 90 days with an earlier payment CHALLENGE
 ```

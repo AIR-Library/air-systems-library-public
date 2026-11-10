@@ -6,8 +6,11 @@ LIFESPAN: permanent -- CI runs it in the `readme` job (.github/workflows/ci.yml)
 What it checks, on a throwaway copy of the folder layout (no language toolchain needed, nothing is run):
   * a system declared in docs/specs/README.md whose files are gone from a language is still a suite there, so the
     runner reports it MISSING (never excused) instead of skipping it;
-  * the README table keeps a declared system with no files, shown failing in every language.
-Why     CodeRabbit's review of PR 19 asked for a regression check for a suite with both files absent. 2026-11-10,
+  * the README table keeps a declared system with no files, shown failing in every language;
+  * a spec's required test ids are read from its table, and a tests file that never names one is caught (the
+    runner then reports the suite INCOMPLETE), with QUOTA-1 not counting as QUOTA-10.
+Why     CodeRabbit's review of PR 19 asked for a regression check for a suite with both files absent; the spec-id
+        check was added the same day for the owner's "not missing anything". 2026-11-10,
         session_012zDydZCZ4AChqhEZ4oVtaP.
 Touches a temporary directory only.
 """
@@ -31,6 +34,14 @@ SPEC_INDEX = """# System specs
 | beta | [beta.md](beta.md) | 1 |
 """
 
+ALPHA_SPEC = """# Alpha
+
+| id | what it proves |
+|---|---|
+| `ALPHA-01` | first |
+| `ALPHA-10` | tenth |
+"""
+
 
 class LayoutTest(unittest.TestCase):
     """Builds a small library layout in a temp folder and points both tools at it."""
@@ -41,6 +52,7 @@ class LayoutTest(unittest.TestCase):
         root = Path(self.tmp.name)
         (root / "docs" / "specs").mkdir(parents=True)
         (root / "docs" / "specs" / "README.md").write_text(SPEC_INDEX)
+        (root / "docs" / "specs" / "alpha.md").write_text(ALPHA_SPEC)
         (root / "ci").mkdir()
         (root / "ci" / "baseline.json").write_text(json.dumps({"known_failing": []}))
         py = root / "saas_templates" / "python"
@@ -70,6 +82,17 @@ class LayoutTest(unittest.TestCase):
         self.assertNotIn("✅", beta)
         self.assertEqual(beta.count("❌"), len(readme_status.LANGS))
         self.assertTrue(table.startswith("1 of 16 suites pass."))
+
+    def test_spec_ids_come_from_the_table(self) -> None:
+        """alpha's spec table lists ALPHA-01 and ALPHA-10; beta has no spec file, so it requires nothing yet."""
+        self.assertEqual(run_suites.spec_ids("alpha"), ["ALPHA-01", "ALPHA-10"])
+        self.assertEqual(run_suites.spec_ids("beta"), [])
+
+    def test_missing_spec_id_is_caught_and_prefix_does_not_count(self) -> None:
+        """A tests file naming ALPHA-01 and ALPHA-1 lacks ALPHA-10; naming both ids lacks nothing."""
+        self.assertEqual(run_suites.missing_spec_ids("alpha", "# ALPHA-01\n# ALPHA-1\n"), ["ALPHA-10"])
+        self.assertEqual(run_suites.missing_spec_ids("alpha", "// ALPHA-01\n// ALPHA-10 boundary\n"), [])
+        self.assertEqual(run_suites.missing_spec_ids("alpha", "# XALPHA-01 ALPHA-100\n"), ["ALPHA-01", "ALPHA-10"])
 
 
 if __name__ == "__main__":

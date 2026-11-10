@@ -21,6 +21,8 @@ name or in a comment on the line above it (for example `# NOTIF-01`), so a missi
 | `NOTIF-08` | Retry: failed email retries and eventually succeeds |
 | `NOTIF-09` | Unsubscribe: user unsubscribed, future emails skipped |
 | `NOTIF-10` | User preferences honored: channels_enabled respected |
+| `NOTIF-11` | Unsubscribe link: a valid token unsubscribes; a missing or altered token is refused (403) and the user stays subscribed |
+| `NOTIF-12` | Scheduled send: a send 30 days ahead is not sent now; deliver_due sends it once due, exactly once |
 
 ## Contract
 
@@ -75,7 +77,7 @@ ENDPOINTS:
 
 4. Get user preferences
    GET /users/:user_id/notification-preferences
-   Response: { user_id, do_not_disturb: false, quiet_hours_start: '22:00', quiet_hours_end: '08:00', channels_enabled: { email: true, sms: false, in_app: true } }
+   Response: { user_id, do_not_disturb: false, quiet_hours_start: null, quiet_hours_end: null, channels_enabled: { email: true, sms: false, in_app: true } }
 
 5. Update user preferences
    PUT /users/:user_id/notification-preferences
@@ -90,7 +92,19 @@ IMPLEMENTATION:
 - Do-not-disturb: Skip sending if enabled, log as 'skipped'
 - Templating: Simple variable substitution {variable_name} → value
 - Retry: Email/SMS failures retry 3x with exponential backoff
-- Unsubscribe: Include unsubscribe link in emails (legal requirement)
+- Unsubscribe: Include unsubscribe link in emails (legal requirement). The link is
+  <base_url>/unsubscribe?user_id=<id>&channel=<channel>&token=<token> with
+  token = lowercase hex of HMAC-SHA256(secret, "unsubscribe:" + user_id + ":" + channel), the secret
+  coming from configuration (never hard-coded). The unsubscribe handler recomputes the token and compares
+  it in constant time; a missing or wrong token is refused (403) and changes nothing. An unsigned link lets
+  anyone unsubscribe anyone. Amended 2026-11-10 after review on PR 19.
+- Default preferences for a user who has set none: do_not_disturb false, no quiet hours, channels_enabled
+  {email: true, sms: false, in_app: true}. SMS is opt-in: it costs money per message and marketing texts
+  need the recipient's prior consent in many countries, so it is never on until the user turns it on.
+- Scheduled sends (scheduled_at in the future) are stored as 'queued' with their scheduled_at and sent by
+  deliver_due(now), never by an in-process timer (lost on restart). deliver_due claims each due row
+  ('queued' -> 'sending' with a conditional update, so two workers cannot both send it) and returns a row
+  left at 'sending' for more than 5 minutes (a crashed worker) to 'queued'.
 
 TESTS:
 - **NOTIF-01** Send email with template variables
@@ -103,4 +117,6 @@ TESTS:
 - **NOTIF-08** Retry: failed email retries and eventually succeeds
 - **NOTIF-09** Unsubscribe: user unsubscribed, future emails skipped
 - **NOTIF-10** User preferences honored: channels_enabled respected
+- **NOTIF-11** Unsubscribe link: a valid token unsubscribes; a missing or altered token is refused (403) and the user stays subscribed
+- **NOTIF-12** Scheduled send: a send 30 days ahead is not sent now; deliver_due sends it once due, exactly once
 ```

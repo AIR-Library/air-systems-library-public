@@ -18,8 +18,10 @@ name or in a comment on the line above it (for example `# IDEM-01`), so a missin
 | `IDEM-05` | required operation with no key -> 400 |
 | `IDEM-06` | the same key under two different scopes runs twice (independent) |
 | `IDEM-07` | an expired key runs the operation again |
-| `IDEM-08` | an operation that raises frees the key: a retry with the same key runs the operation |
+| `IDEM-08` | an operation that raises OperationFailed frees the key: a retry with the same key runs the operation |
 | `IDEM-09` | error responses carry content_type "application/problem+json" and a body with type, title, detail |
+| `IDEM-10` | an operation that raises any other error leaves the key 'uncertain': a retry gets 409 outcome_unknown and the operation count stays at 1; after release() a retry runs it |
+| `IDEM-11` | resolve() on an 'uncertain' key stores the given response; a retry returns it without running the operation |
 
 ## Contract
 
@@ -30,7 +32,7 @@ PURPOSE:
   Make POST/PATCH safe to retry: the same request with the same key runs ONCE (no double charges).
 
 SCHEMA:
-  idempotency_records (scope, idem_key, request_fingerprint, status 'in_progress'|'completed',
+  idempotency_records (scope, idem_key, request_fingerprint, status 'in_progress'|'completed'|'uncertain',
                        response_status INT NULL, response_body TEXT NULL, created_at, expires_at,
                        PRIMARY KEY (scope, idem_key))
 
@@ -40,7 +42,14 @@ ENDPOINTS / FUNCTIONS:
       it returns {status, body} and its responses are served as "application/json".
       Every error (400/409/422) is served as "application/problem+json".
       Check order: missing key -> 400; different fingerprint -> 422 (even while the first request is still
-      in progress); same fingerprint still in progress -> 409; completed -> the stored response.
+      in progress); same fingerprint still in progress -> 409; same fingerprint whose outcome is uncertain ->
+      409 with problem type "outcome_unknown"; completed -> the stored response.
+  release(scope, idempotency_key) -> bool
+      Frees an 'uncertain' key once reconciliation shows the first attempt did nothing, so a retry runs the
+      operation. Returns false (and changes nothing) for a key that is not 'uncertain'.
+  resolve(scope, idempotency_key, status, body) -> bool
+      Stores the outcome that reconciliation found for an 'uncertain' key as 'completed', so a retry gets
+      that stored response. Returns false (and changes nothing) for a key that is not 'uncertain'.
   is_required(method, path) -> bool (configurable; POST and PATCH by default)
   purge_expired()
 
@@ -60,9 +69,17 @@ IMPLEMENTATION -- RULES (quoted, section 2.7 "Error Handling"):
   - Claim the key atomically (insert-if-absent) so two concurrent requests cannot both run.
   - An EXPIRED record counts as absent: the claim replaces it and the operation runs again. (The last
     TypeScript build kept the stale record and served its old response forever.)
-  - If the operation raises/throws, DELETE the in_progress record, then re-raise -- otherwise the key is
-    stuck "in progress" (409) until it expires. (The last JavaScript build tried this and crashed with a
-    ReferenceError inside its own catch block.)
+  - An operation reports a DEFINITE failure (it did nothing, e.g. a validation error or a provider decline)
+    by raising OperationFailed: `OperationFailed` (Python, JavaScript, TypeScript), `OperationFailedException`
+    (Java, C#, PHP), an error wrapping `ErrOperationFailed` (Go, checked with errors.Is), or
+    `OpError::Failed` (Rust). Then DELETE the in_progress record and re-raise, so a retry runs again
+    (IDEM-08). (The last JavaScript build tried this and crashed with a ReferenceError in its catch block.)
+  - ANY OTHER error (a timeout, a dropped connection, a crash after the provider was called) means the
+    outcome is unknown: the charge may have happened. Set the record to 'uncertain' and re-raise. A retry
+    with the same key gets 409 outcome_unknown and the operation does NOT run (IDEM-10), until release()
+    or resolve() settles it (IDEM-10, IDEM-11). Deleting the key here would let a retry charge twice.
+  - An 'uncertain' record never expires and purge_expired() keeps it: only release() or resolve() clears it.
+    Amended 2026-11-10 after review on PR 19.
 
 TESTS:
   - **IDEM-01** first call runs the operation once
@@ -72,6 +89,8 @@ TESTS:
   - **IDEM-05** required operation with no key -> 400
   - **IDEM-06** the same key under two different scopes runs twice (independent)
   - **IDEM-07** an expired key runs the operation again
-  - **IDEM-08** an operation that raises frees the key: a retry with the same key runs the operation
+  - **IDEM-08** an operation that raises OperationFailed frees the key: a retry with the same key runs the operation
   - **IDEM-09** error responses carry content_type "application/problem+json" and a body with type, title, detail
+  - **IDEM-10** an operation that raises any other error leaves the key 'uncertain': a retry gets 409 outcome_unknown and the operation count stays at 1; after release() a retry runs it
+  - **IDEM-11** resolve() on an 'uncertain' key stores the given response; a retry returns it without running the operation
 ```
