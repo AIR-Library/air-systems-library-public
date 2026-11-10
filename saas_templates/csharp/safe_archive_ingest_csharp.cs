@@ -371,7 +371,7 @@ namespace AOI.SafeArchiveIngest
                 using var input = new MemoryStream(raw);
                 using var inflater = new DeflateStream(input, CompressionMode.Decompress);
                 var cap = e.USize + 1;
-                var output = new MemoryStream();
+                using var output = new MemoryStream();
                 var buffer = new byte[8192];
                 while (output.Length < cap)
                 {

@@ -316,6 +316,9 @@ namespace AOI.StripeWebhookEntitlements
         /// </summary>
         public WebhookResult HandleWebhook(byte[] payload, string header)
         {
+            // A null body is an empty body: its signature then fails like any other (400), never a crash.
+            // Code-quality review on PR 22, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+            payload ??= Array.Empty<byte>();
             var now = _clock();
             var verified = VerifySignature(payload, header, _webhookSecret, now);
             if (!verified.Ok) return verified;
@@ -344,13 +347,17 @@ namespace AOI.StripeWebhookEntitlements
                 if (id == null || !EventIdShape.IsMatch(id) || type == null || type.Length < 1 || type.Length > 100 ||
                     type.Any(c => c < ' ' || c > '~') || created == null || obj?.ValueKind != JsonValueKind.Object)
                     return WebhookResult.Fail(400, "invalid_payload");
+                // Both were checked just above; non-null locals make that explicit inside the transaction (code-quality
+                // review on PR 22, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
+                var createdAt = created.Value;
+                var objElement = obj.Value;
                 try
                 {
                     var result = _store.InTransaction(() =>
                     {
-                        if (!_store.InsertEvent(new StripeEventRow { EventId = id, Type = type, Created = created.Value, ReceivedAt = now }))
+                        if (!_store.InsertEvent(new StripeEventRow { EventId = id, Type = type, Created = createdAt, ReceivedAt = now }))
                             return "duplicate";
-                        var applied = Apply(type, created.Value, obj.Value, now);
+                        var applied = Apply(type, createdAt, objElement, now);
                         _store.SetEventResult(id, applied);
                         return applied;
                     });
