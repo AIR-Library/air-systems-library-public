@@ -308,6 +308,49 @@ describe('NotificationService', () => {
     }
   });
 
+  /**
+   * NOTIF-05 (Phase B.3 ruling): the quiet window is [start, end), so an email sent exactly at quiet_hours_end goes
+   * out at once (one minute earlier it is queued for the end); quiet hours hold email and SMS only, so an in-app
+   * message inside the window is stored as 'sent' at once, and a due in-app row is delivered by deliverDue inside the
+   * window instead of being handed back. In: a service on a pinned clock. Out: assertions only.
+   * Why: Phase D wave 1, owner request 2026-11-10 (B.3 rulings). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * Touches: in-memory SQLite and a fake mail transport only.
+   */
+  // NOTIF-05
+  test('Quiet hours are [start, end) and hold email and SMS only; in-app is stored at once', async () => {
+    let clock = new Date('2026-04-11T07:59:00.000Z');
+    const sendMail = jest.fn(async (_mail: any) => ({}));
+    const svc = new NotificationService(':memory:', { sendMail } as any, mockSmsClient, { now: () => clock, unsubscribeSecret: SECRET });
+    await svc.init();
+    const row = (id: string) => svc.track({ message_id: id, status: 'queued' });
+    try {
+      await svc.updateUserPreferences(61, { quiet_hours_start: '22:00', quiet_hours_end: '08:00' });
+      const before = await svc.sendSingle({ user_id: 61, template_key: 'welcome_email', channel: 'email', vars: { app_name: 'Q' }, scheduled_at: null });
+      expect(before.status).toBe('queued');
+      expect((await row(before.message_id))?.scheduled_at).toBe('2026-04-11T08:00:00.000Z');
+      expect(sendMail).toHaveBeenCalledTimes(0);
+
+      clock = new Date('2026-04-11T08:00:00.000Z');
+      const atEnd = await svc.sendSingle({ user_id: 61, template_key: 'welcome_email', channel: 'email', vars: { app_name: 'Q' }, scheduled_at: null });
+      expect(atEnd.status).toBe('sent');
+      expect(sendMail).toHaveBeenCalledTimes(1);
+
+      clock = new Date('2026-04-11T02:30:00.000Z');
+      const inApp = await svc.sendSingle({ user_id: 61, template_key: 'welcome_email', channel: 'in_app', vars: { app_name: 'Q' }, scheduled_at: null });
+      expect(inApp.status).toBe('sent');
+      expect((await row(inApp.message_id))?.scheduled_at).toBeNull();
+
+      const laterInApp = await svc.sendSingle({ user_id: 61, template_key: 'welcome_email', channel: 'in_app', vars: { app_name: 'Q' }, scheduled_at: '2026-04-11T03:00:00.000Z' });
+      expect(laterInApp.status).toBe('queued');
+      clock = new Date('2026-04-11T03:00:00.000Z');
+      expect(await svc.deliverDue()).toEqual({ delivered: 1, failed: 0, skipped: 0, message_ids: [laterInApp.message_id] });
+      expect((await row(laterInApp.message_id))?.status).toBe('sent');
+      expect(sendMail).toHaveBeenCalledTimes(1);
+    } finally {
+      await svc.close();
+    }
+  });
+
   // NOTIF-09
   test('Unsubscribe: user unsubscribed, future emails skipped', async () => {
     // Unsubscribe by disabling email channel

@@ -976,6 +976,49 @@ describe('AdminSystem', () => {
       (pool as unknown as { users: MockRow[] }).users.find((u) => u.id === 2)!.status = 'suspended';
       await expect(admin.searchAuditLog(adminCtx, {})).rejects.toMatchObject({ code: 'account_suspended', status: 403 });
     });
+
+    /**
+     * ADMIN-19 (Phase B.3 ruling): the suspended check comes before the CSRF check too. A suspended owner sending a
+     * WRONG and an EMPTY CSRF token to every action that checks CSRF gets 403 account_suspended, never csrf_mismatch,
+     * and nothing changes. In: the fakes. Out: assertions only. Why: Phase D wave 1, owner request 2026-11-10 (B.3
+     * rulings). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: fakes only.
+     */
+    // ADMIN-19
+    it('a suspended owner with a wrong CSRF token gets account_suspended, not csrf_mismatch', async () => {
+      const customerId = pool.seedCustomer({ email: 'c@example.com', name: 'C', tier: 'solo' });
+      const invoiceId = pool.seedInvoice({ customer_id: customerId, amount: 10, status: 'succeeded' });
+      const depId = pool.seedDeployment({ customer_id: customerId, domain: 'c.example.com', tier: 'solo' });
+      const actionId = pool.seedGovernanceAction({ action_type: 'suspend_user', actor: 2, target_resource_id: 3, reason: 'x' });
+      (pool as unknown as { users: MockRow[] }).users.find((u) => u.id === 1)!.status = 'suspended';
+      const before = JSON.stringify(pool);
+
+      for (const csrf of ['wrong-csrf', '']) {
+        const calls: Array<() => Promise<unknown>> = [
+          () => admin.createUser(ownerCtx, csrf, { email: 'n@example.com', name: 'N', tier: 'user', notify: true }),
+          () => admin.resetPassword(ownerCtx, csrf, { user_id: 2 }),
+          () => admin.changeRole(ownerCtx, csrf, { user_id: 2, new_tier: 'user' }),
+          () => admin.suspendUser(ownerCtx, csrf, { user_id: 3, reason: 'x' }),
+          () => admin.changePlan(ownerCtx, csrf, customerId, { new_tier: 'team' }),
+          () => admin.queueRefund(ownerCtx, csrf, customerId, { invoice_id: invoiceId, amount: 5, reason: 'x' }),
+          () => admin.createDeployment(ownerCtx, csrf, { customer_id: customerId, domain: 'd.example.com', tier: 'solo', theme_id: 1 }),
+          () => admin.publishDeployment(ownerCtx, csrf, { deployment_id: depId }),
+          () => admin.suspendDeployment(ownerCtx, csrf, { deployment_id: depId, reason: 'x' }),
+          () => admin.retireDeployment(ownerCtx, csrf, { deployment_id: depId }),
+          () => admin.decideGovernanceAction(ownerCtx, csrf, actionId, 'approve', {}),
+        ];
+        for (const call of calls) {
+          await expect(call()).rejects.toMatchObject({ code: 'account_suspended', status: 403 });
+        }
+      }
+      expect(JSON.stringify(pool)).toBe(before);
+      expect(stripe.calls).toHaveLength(0);
+      expect(email.invites).toHaveLength(0);
+
+      // The same wrong token from the active owner is the CSRF refusal: the order is suspended first, then CSRF.
+      (pool as unknown as { users: MockRow[] }).users.find((u) => u.id === 1)!.status = 'active';
+      await expect(admin.changeRole(ownerCtx, 'wrong-csrf', { user_id: 2, new_tier: 'user' }))
+        .rejects.toMatchObject({ code: 'csrf_mismatch', status: 403 });
+    });
   });
 
   /**

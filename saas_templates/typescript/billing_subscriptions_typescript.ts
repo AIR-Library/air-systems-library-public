@@ -538,10 +538,12 @@ export const handle_stripe_webhook = async (event: Stripe.Event): Promise<{recei
  * endpoint secret (Stripe's library checks the HMAC in constant time and rejects stale timestamps), then applies the
  * event with {@link handle_stripe_webhook}.
  * In: the raw body exactly as received, the Stripe-Signature header, and the secret (default STRIPE_WEBHOOK_SECRET).
- * Out: { received: true }, { error: 'invalid_signature', message, code: 403 }, { error: 'webhook_not_configured',
+ * Out: { received: true }, { error: 'invalid_signature', message, code: 400 }, { error: 'webhook_not_configured',
  * message, code: 500 } or the handler's error.
  * Why: the spec requires verification before processing and the TypeScript template had none (added 2026-11-10,
  * session session_012zDydZCZ4AChqhEZ4oVtaP). Touches: Postgres via the handler; nothing when the signature fails.
+ * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3 ruling, BILL-09): a bad signature answers 400
+ * invalid_signature (it was 403), Stripe's documented answer and the same as stripe_webhook_entitlements.
  */
 export const verify_and_handle_stripe_webhook = async (
   rawBody: string | Buffer,
@@ -557,7 +559,7 @@ export const verify_and_handle_stripe_webhook = async (
     event = getStripe().webhooks.constructEvent(rawBody, signature, webhookSecret);
   } catch {
     // The reason is not echoed: it would help someone probing the endpoint.
-    return { error: 'invalid_signature', message: 'Webhook signature verification failed', code: 403 };
+    return { error: 'invalid_signature', message: 'Webhook signature verification failed', code: 400 };
   }
   return handle_stripe_webhook(event);
 };

@@ -666,4 +666,36 @@ async function rejection(fn: () => Promise<unknown>): Promise<ComplianceError> {
     assertEquals(cancelCompleted.code, 'not_found', 'cancel of a completed request is not_found');
     assertEquals((await rejection(() => service.cancelDeletion('admin_999', gdpr.deletion_id))).status, 404, 'and 404 to anyone else');
   });
+
+  /**
+   * EXPORT-06 (Phase B.3 ruling): a deletion can be cancelled until will_delete_at; once will_delete_at has passed
+   * (the deletion is due but the worker has not run it yet) cancel is 409 {error: "grace_period_over"} and the
+   * request is unchanged, confirmed or not. One second before will_delete_at the cancel still succeeds.
+   * In: the shared service and its mock clock. Out: throws on failure. Why: Phase D wave 1, owner request 2026-11-10
+   * (B.3 rulings). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+   */
+  // EXPORT-06
+  test('Deletion: cancelling after will_delete_at is 409 grace_period_over', async () => {
+    seedUser();
+    const due = await service.requestDeletion('user_123', 'user_requested');
+    await service.confirmDeletion('user_123', due.deletion_id, tokenFromEmail(email, 'alice@example.com'));
+    clock.advanceDays(30);
+    assertEquals(clock.now().toISOString(), due.will_delete_at, 'the clock is exactly at will_delete_at');
+    const over = await rejection(() => service.cancelDeletion('user_123', due.deletion_id));
+    assertEquals(over.status, 409, 'cancel after will_delete_at is 409');
+    assertEquals(over.code, 'grace_period_over', 'cancel after will_delete_at is grace_period_over');
+    assertEquals(db.deletionRequests.find(r => r.id === due.deletion_id)!.status, 'approved', 'the refused cancel changes nothing');
+
+    seedUser();
+    const unconfirmed = await service.requestDeletion('user_123', 'user_requested');
+    clock.advanceDays(31);
+    const late = await rejection(() => service.cancelDeletion('user_123', unconfirmed.deletion_id));
+    assertEquals(late.code, 'grace_period_over', 'an unconfirmed request past will_delete_at is grace_period_over too');
+
+    seedUser();
+    const inTime = await service.requestDeletion('user_123', 'user_requested');
+    clock.advanceHours(30 * 24 - 1 / 3600);
+    const cancelled = await service.cancelDeletion('user_123', inTime.deletion_id);
+    assertEquals(cancelled.status, 'cancelled', 'one second before will_delete_at the cancel succeeds');
+  });
 }

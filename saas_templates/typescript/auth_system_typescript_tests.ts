@@ -103,6 +103,13 @@ class FakeDb {
       this.codes = this.codes.filter((c) => c.id !== params[0]);
       return { insertId: 0 };
     }
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3 ruling): verify_email counts each try first on each
+    // live code, one conditional write per row, and reports whether the row took it.
+    if (sql.startsWith('UPDATE verification_codes SET attempts = attempts + 1 WHERE id = $1 AND attempts < $2')) {
+      const hit = this.codes.filter((c) => c.id === params[0] && c.attempts < params[1]);
+      hit.forEach((c) => { c.attempts += 1; });
+      return { insertId: 0, affectedRows: hit.length };
+    }
     if (sql.startsWith('UPDATE verification_codes SET attempts = attempts + 1 WHERE code_hash = $1')) {
       this.codes.filter((c) => c.code_hash === params[0]).forEach((c) => { c.attempts += 1; });
       return { insertId: 0 };
@@ -594,6 +601,83 @@ describe('AuthSystem', () => {
       } finally {
         if (saved === undefined) delete process.env.AUTH_SECRET_KEY; else process.env.AUTH_SECRET_KEY = saved;
       }
+    });
+  });
+
+  /**
+   * verify_email attempts (auth flow 2, Phase B.3 ruling): 5 wrong codes invalidate the user's current code, so the
+   * 6th try is 400 code_invalid even with the right code and the user stays unverified; with 4 wrong codes the right
+   * one (the 5th try) still verifies; a newly sent code (a new code row, 0 attempts) works again.
+   * In: the in-memory stand-in. Out: assertions only. Why: Phase D wave 1, owner request 2026-11-10 (B.3 rulings).
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+   */
+  describe('verify_email attempts', () => {
+    it('5 wrong codes invalidate the code: the right code is then 400 code_invalid until a new code is sent', async () => {
+      await auth.signup('guess@example.com', STRONG, 'Guess User');
+      const { code } = mail[mail.length - 1];
+      const wrong = code === '000000' ? '111111' : '000000';
+      for (let i = 0; i < 5; i++) {
+        expect(await auth.verify_email('guess@example.com', wrong)).toEqual(refused('code_expired', 400));
+      }
+      expect(await auth.verify_email('guess@example.com', code)).toEqual(refused('code_invalid', 400));
+      expect(await auth.verify_email('guess@example.com', wrong)).toEqual(refused('code_invalid', 400));
+      const user = db.users.find((u) => u.email === 'guess@example.com') as Row;
+      expect(user.email_verified_at).toBeNull();
+      expect(db.codes.filter((c) => c.user_id === user.id)[0].attempts).toBe(5);
+
+      // A new code is sent: a fresh row with 0 attempts, which verifies.
+      await db.execute('INSERT INTO verification_codes (user_id, code_hash, type, expires_at) VALUES ($1, $2, $3, NOW())',
+        [user.id, sha256('424242'), 'email']);
+      expect((await auth.verify_email('guess@example.com', '424242')).status).toBe('verified');
+    });
+
+    it('4 wrong codes, then the right code on the 5th try is accepted', async () => {
+      await auth.signup('four@example.com', STRONG, 'Four User');
+      const { code } = mail[mail.length - 1];
+      const wrong = code === '000000' ? '111111' : '000000';
+      for (let i = 0; i < 4; i++) {
+        expect(await auth.verify_email('four@example.com', wrong)).toEqual(refused('code_expired', 400));
+      }
+      expect(await auth.verify_email('four@example.com', code)).toMatchObject({ status: 'verified' });
+    });
+  });
+
+  /**
+   * verify_access_token (auth flow 7): a token from login verifies to {status: 'ok', user: {id, email, tier}}; a
+   * token signed with another key, with another HMAC algorithm (HS512, same key), with alg "none", a malformed one and
+   * one naming no user are 401 invalid_token; one past its expiry on the injected clock is 401 token_expired; a
+   * suspended or banned user is 403 user_banned; a token for a user that no longer exists is 401 invalid_token.
+   * In: the in-memory stand-in and the injected clock. Out: assertions only. Why: auth spec flow 7 was missing from
+   * the TypeScript build (Phase D wave 1, owner request 2026-11-10). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * Touches: memory only.
+   */
+  describe('verify_access_token', () => {
+    it('accepts a valid HS256 token and refuses every other one with the spec error', async () => {
+      const user = await verifiedUser('tok@example.com');
+      const session = await auth.login('tok@example.com', STRONG, 'device-t', '1.2.3.10');
+      expect(await auth.verify_access_token(session.token)).toEqual({
+        status: 'ok', user: { id: user.id, email: 'tok@example.com', tier: 'free' },
+      });
+
+      const payload = { userId: user.id, tier: 'free' };
+      expect(await auth.verify_access_token(jwt.sign(payload, 'another-secret'))).toEqual(refused('invalid_token', 401));
+      expect(await auth.verify_access_token(jwt.sign(payload, SECRET, { algorithm: 'HS512' }))).toEqual(refused('invalid_token', 401));
+      const b64 = (o: object) => Buffer.from(JSON.stringify(o)).toString('base64url');
+      const unsigned = `${b64({ alg: 'none', typ: 'JWT' })}.${b64(payload)}.`;
+      expect(await auth.verify_access_token(unsigned)).toEqual(refused('invalid_token', 401));
+      expect(await auth.verify_access_token('not-a-token')).toEqual(refused('invalid_token', 401));
+      expect(await auth.verify_access_token('')).toEqual(refused('invalid_token', 401));
+      expect(await auth.verify_access_token(jwt.sign({ tier: 'free' }, SECRET))).toEqual(refused('invalid_token', 401));
+      expect(await auth.verify_access_token(jwt.sign({ userId: 999999, tier: 'free' }, SECRET))).toEqual(refused('invalid_token', 401));
+
+      clock = new Date(clock.getTime() + 16 * 60 * 1000);
+      expect(await auth.verify_access_token(session.token)).toEqual(refused('token_expired', 401));
+      clock = new Date(clock.getTime() - 16 * 60 * 1000);
+
+      user.status = 'suspended';
+      expect(await auth.verify_access_token(session.token)).toEqual(refused('user_banned', 403));
+      user.status = 'banned';
+      expect(await auth.verify_access_token(session.token)).toEqual(refused('user_banned', 403));
     });
   });
 });

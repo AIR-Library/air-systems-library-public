@@ -146,6 +146,8 @@ const AUTH_ERRORS: Readonly<Record<string, [number, string]>> = {
   password_rejected: [400, 'Choose a different password.'],
   too_many_signups_from_ip: [429, 'Too many signups from this address; try again later.'],
   code_expired: [400, 'The code is wrong or has expired.'],
+  code_invalid: [400, 'Too many wrong codes; ask for a new code.'],
+  token_expired: [401, 'The token has expired.'],
   already_verified: [409, 'This email is already verified.'],
   invalid_credentials: [401, 'Email or password is wrong.'],
   too_many_login_attempts: [429, 'Too many sign-in attempts; try again later.'],
@@ -207,6 +209,13 @@ function sameHash(a: unknown, b: unknown): boolean {
   }
   return timingSafeEqual(Buffer.from(a, 'hex'), Buffer.from(b, 'hex'));
 }
+
+/**
+ * Wrong verification codes one user's current code survives (AUTH spec flow 2, Phase B.3 ruling): after 5 wrong
+ * codes that code is spent and every further try, the right code included, is 400 code_invalid until a new code is
+ * sent. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+ */
+const MAX_EMAIL_CODE_ATTEMPTS = 5;
 
 /** How long an OAuth state is valid (AUTH spec: 10 minutes). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
 const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
@@ -470,6 +479,11 @@ class AuthSystem {
    * at rest" line): the code was stored and matched in plain text in SQL; errors now carry their HTTP status.
    * Touches: the database (users, verification_codes), the audit log.
    * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
+   * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.3 ruling (auth flow 2 "Attempts"): each try is COUNTED
+   * FIRST on every live code that still has tries left, with one conditional write per row (UPDATE ... SET attempts =
+   * attempts + 1 WHERE id = ? AND attempts < 5), and only the rows whose write succeeded are compared. After 5 wrong
+   * codes the user's current code is spent: every further try, the right code too, is 400 code_invalid until a new
+   * code is sent (a new code row starts at 0 attempts). Before, a 6-digit code could be guessed by retrying.
    */
   async verify_email(email: string, code_or_token: string): Promise<any> {
     try {
@@ -484,12 +498,29 @@ class AuthSystem {
       }
 
       const live = await this.db.query(
-        'SELECT id, code_hash FROM verification_codes WHERE user_id = $1 AND type = \'email\' AND expires_at > NOW()',
+        'SELECT id, code_hash, attempts FROM verification_codes WHERE user_id = $1 AND type = \'email\' AND expires_at > NOW()',
         [user[0].id]
       );
+      if (live.length === 0) {
+        await this.logWhyChain('verify_email', ['code_valid', 'user_unverified']);
+        return fail('code_expired');
+      }
+      // Count the try first, one conditional write per live code; a code with 5 wrong tries takes no more.
+      const counted: any[] = [];
+      for (const row of live) {
+        const res = await this.db.execute(
+          'UPDATE verification_codes SET attempts = attempts + 1 WHERE id = $1 AND attempts < $2',
+          [row.id, MAX_EMAIL_CODE_ATTEMPTS]
+        );
+        if (res.affectedRows === 1) counted.push(row);
+      }
+      if (counted.length === 0) {
+        await this.logWhyChain('verify_email', ['code_valid', 'user_unverified']);
+        return fail('code_invalid');
+      }
       const given = this.hashSecret(code_or_token);
       let match: any = null;
-      for (const row of live) {
+      for (const row of counted) {
         if (sameHash(row.code_hash, given)) match = row; // every row is compared, so the time does not say which
       }
       if (match === null) {
@@ -791,6 +822,53 @@ class AuthSystem {
       return { status: 'ok', token: newToken, expires_in: 900 };
     } catch (err) {
       this.logger.error('Token refresh error', { err });
+      return fail('internal_error');
+    }
+  }
+
+  /**
+   * Verifies an access token (spec flow 7): the step every authenticated request calls, which produces the verified
+   * user that permissions_rbac's require_authenticated(current_user) assumes. Read-only.
+   * Gates, in order: signature_valid (HS256 ONLY: the algorithm is passed explicitly to jwt.verify, the token's own
+   * header alg is never trusted and "none" is refused), not_expired (against the injected clock), and
+   * user_exists_and_active (status not 'suspended' or 'banned').
+   * In: the token (the `token` a session-creating flow or token_refresh returned). Out: {status: 'ok', user: {id,
+   * email, tier}} or {error, message, http_status}: 401 invalid_token (bad signature, another algorithm, malformed,
+   * no user id, unknown user), 401 token_expired, 403 user_banned.
+   * Why: auth spec flow 7, missing from the TypeScript build (Phase D wave 1, owner request 2026-11-10).
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database (one parameterized read of users).
+   */
+  async verify_access_token(token: string): Promise<any> {
+    const decisions = ['signature_valid', 'not_expired', 'user_active'];
+    try {
+      let claims: any;
+      try {
+        claims = jwt.verify(String(token ?? ''), this.jwtSecret, {
+          algorithms: ['HS256'],
+          clockTimestamp: Math.floor(this.now().getTime() / 1000),
+        });
+      } catch (err: any) {
+        await this.logWhyChain('verify_access_token', decisions);
+        return fail(err?.name === 'TokenExpiredError' ? 'token_expired' : 'invalid_token');
+      }
+      const userId = claims && typeof claims === 'object' ? claims.userId : undefined;
+      if (typeof userId !== 'number' || !Number.isSafeInteger(userId)) {
+        await this.logWhyChain('verify_access_token', decisions);
+        return fail('invalid_token');
+      }
+      const rows = await this.db.query('SELECT id, email, tier, status FROM users WHERE id = $1', [userId]);
+      if (rows.length === 0) {
+        await this.logWhyChain('verify_access_token', decisions);
+        return fail('invalid_token');
+      }
+      if (rows[0].status === 'suspended' || rows[0].status === 'banned') {
+        await this.logWhyChain('verify_access_token', decisions);
+        return fail('user_banned');
+      }
+      await this.logWhyChain('verify_access_token', decisions);
+      return { status: 'ok', user: { id: rows[0].id, email: rows[0].email, tier: rows[0].tier } };
+    } catch (err) {
+      this.logger.error('Verify access token error', { err });
       return fail('internal_error');
     }
   }
