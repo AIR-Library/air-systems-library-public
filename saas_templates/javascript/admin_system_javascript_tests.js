@@ -161,14 +161,47 @@ describe('Admin System Tests', () => {
     expect(audit).toBeDefined();
   });
 
-  // ADMIN-07
-  test('change_role last_owner → 400 {error: "cannot_demote_last_owner"}', async () => {
+  /**
+   * change_role on the caller's own account is refused by the gate user_id != current_user_id (400
+   * cannot_change_own_role), even for the last active owner: the spec runs the gate before the last-owner check, so a
+   * direct change_role never reaches that check (Phase B.3; ADMIN-07 is proven through governance below).
+   * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (it expected cannot_demote_last_owner, the answer of the
+   * old check order). Touches the test database.
+   */
+  test('change_role own role → 400 {error: "cannot_change_own_role"}, role unchanged', async () => {
     const res = await agent
       .post('/admin/users/action')
       .set(authHeaders(1, 'owner'))
       .send({ action: 'change_role', user_id: 1, new_tier: 'admin' });
     expect(res.status).toBe(400);
+    expect(res.body.error).toBe('cannot_change_own_role');
+    expect((await knex('users').where({ id: 1 }).first()).tier).toBe('owner');
+  });
+
+  /**
+   * ADMIN-07 (Phase B.3): the last active owner is reached only through a governance-approved change_role. The
+   * owner approving a change_role (submitted by an admin) that would demote the last active owner gets 400
+   * cannot_demote_last_owner; the action stays pending, the owner keeps the role, and no audit row is written.
+   * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches the test database.
+   */
+  // ADMIN-07
+  test('governance-approved change_role demoting the last active owner → 400 {error: "cannot_demote_last_owner"}, still pending', async () => {
+    await knex('governance_actions').insert({
+      id: 70, action_type: 'change_role', actor_id: 2, target_resource_id: 1, reason: 'Rotate ownership',
+      status: 'pending', payload: JSON.stringify({ new_tier: 'admin' }),
+    });
+    const auditBefore = (await knex('audit_logs').count('id as n').first()).n;
+    const res = await agent
+      .post('/admin/governance/actions/70/decide')
+      .set(authHeaders(1, 'owner'))
+      .send({ decide: 'approve' });
+    expect(res.status).toBe(400);
     expect(res.body.error).toBe('cannot_demote_last_owner');
+    const action = await knex('governance_actions').where({ id: 70 }).first();
+    expect(action.status).toBe('pending');
+    expect(action.approved_by).toBeNull();
+    expect((await knex('users').where({ id: 1 }).first()).tier).toBe('owner');
+    expect((await knex('audit_logs').count('id as n').first()).n).toBe(auditBefore);
   });
 
   // ADMIN-08
@@ -508,6 +541,10 @@ describe('Admin System Tests', () => {
       agent.post('/admin/users/action').set(authHeaders(9, 'owner'))
         .send({ action: 'create', email: 'by-suspended@example.com', name: 'By Suspended', tier: 'user' }),
       agent.post('/admin/users/action').set({ ...authHeaders(9, 'owner'), 'X-CSRF-Token': 'wrong' })
+        .send({ action: 'suspend', user_id: 2, reason: 'x' }),
+      // Phase B.3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): no CSRF header at all is still account_suspended,
+      // never csrf_token_invalid: the suspended check runs before the CSRF check.
+      agent.post('/admin/users/action').set({ Authorization: authHeaders(9, 'owner').Authorization })
         .send({ action: 'suspend', user_id: 2, reason: 'x' }),
       agent.post('/admin/customers/1/action').set(authHeaders(9, 'owner')).send({ action: 'change_plan', new_tier: 'team' }),
       agent.post('/admin/deployments/action').set(authHeaders(9, 'owner')).send({ action: 'retire', deployment_id: 1 }),

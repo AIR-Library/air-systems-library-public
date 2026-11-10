@@ -4,7 +4,7 @@ const TEST_SECRET_KEY = 'test-secret-key-0123456789abcdef-auth';
 process.env.AUTH_SECRET_KEY = TEST_SECRET_KEY;
 const crypto = require('crypto');
 const { initDB, configure, signup, verify_email, login, oauth_start, oauth_callback, mfa_challenge, token_refresh, dbPromise,
-  resetRateLimits, sentEmails } = require('./auth_system_javascript');
+  resetRateLimits, sentEmails, hashSecret } = require('./auth_system_javascript');
 const { expect } = require('@jest/globals');
 const speakeasy = require('speakeasy');
 
@@ -133,6 +133,51 @@ describe('Auth System Tests', () => {
     const res = await verify_email(email, emailedCode(email));
     expect(res.error).toBe('code_expired');
     expect(res.status).toBe(400);
+  });
+
+  /**
+   * Phase B.3 (auth flow 2 "Attempts"): 5 wrong codes invalidate the user's current code. Every further try, the
+   * right code included, is 400 code_invalid and the user stays unverified; a new code (stored as a resend would store
+   * it, 0 tries) then verifies the user. Separately, after 4 wrong codes the right one (the 5th try) is accepted.
+   * In: the test database and mailer. Out: assertions. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * Touches: the test database.
+   */
+  // AUTH-05
+  test('verify_email: 5 wrong codes invalidate the code until a new code is sent', async () => {
+    const db = await dbPromise;
+    const email = 'guess@example.com';
+    await signup(email, 'StrongPassword123456', 'Gus', ip);
+    const right = emailedCode(email);
+    const wrong = right === '000000' ? '111111' : '000000';
+    for (let i = 0; i < 5; i++) {
+      const res = await verify_email(email, wrong);
+      expect(res.error).toBe('invalid_code');
+      expect(res.status).toBe(400);
+    }
+    for (let i = 0; i < 2; i++) {
+      const res = await verify_email(email, right);
+      expect(res.error).toBe('code_invalid');
+      expect(res.status).toBe(400);
+    }
+    const user = await db.get('SELECT id, email_verified_at FROM users WHERE email = ?', email);
+    expect(user.email_verified_at).toBeNull();
+    // A new code is sent: a fresh row with 0 tries, which verifies the user.
+    await db.run(`DELETE FROM verification_codes WHERE user_id = ? AND type = 'email'`, user.id);
+    const fresh = 'a1b2c3';
+    await db.run(`INSERT INTO verification_codes (id, user_id, code_hash, created_at, expires_at, type)
+      VALUES (?,?,?,?,?,?)`, `fresh-${user.id}`, user.id, hashSecret(fresh), new Date().toISOString(),
+    new Date(Date.now() + 60 * 60 * 1000).toISOString(), 'email');
+    const ok = await verify_email(email, fresh);
+    expect(ok.status).toBe('verified');
+
+    const email4 = 'four-tries@example.com';
+    await signup(email4, 'StrongPassword123456', 'Fay', ip);
+    const right4 = emailedCode(email4);
+    const wrong4 = right4 === '000000' ? '111111' : '000000';
+    for (let i = 0; i < 4; i++) expect((await verify_email(email4, wrong4)).error).toBe('invalid_code');
+    const fifth = await verify_email(email4, right4);
+    expect(fifth.status).toBe('verified');
+    expect((await db.get('SELECT email_verified_at FROM users WHERE email = ?', email4)).email_verified_at).not.toBeNull();
   });
 
   // AUTH-07

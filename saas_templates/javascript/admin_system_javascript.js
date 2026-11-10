@@ -516,6 +516,9 @@ function createAdminSystem(options = {}) {
    * session_012zDydZCZ4AChqhEZ4oVtaP). The last-owner check runs before the self check: an active owner acting on
    * another active owner always leaves two, so the last owner can only be the caller, and "cannot demote the last
    * owner" is then the reason that matters (spec test "change_role last_owner"). Touches: database.
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3): the direct route now applies the self gate before
+   * calling this, so the last-owner answer is reached only by approving a governance change_role (ADMIN-07); a
+   * refusal here throws, which rolls the approval's transaction back and leaves the action pending.
    */
   async function changeRole(trx, actorId, userId, newTier) {
     if (!validateTier(newTier)) throw new AdminError(400, 'invalid_tier', 'Invalid tier');
@@ -572,6 +575,8 @@ function createAdminSystem(options = {}) {
   /**
    * POST /admin/users/action (owner): create | reset_password | change_role | suspend.
    * In: { action, ... } per spec. Out: { success: true, ... } or { error, message }.
+   * change_role refuses the caller's own account (400 cannot_change_own_role) before any check, as the spec's gate
+   * order says (Phase B.3, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
    * Why: spec endpoint; rebuilt 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP behind the token gate (see module header). Touches: database, e-mail.
    */
   app.post('/admin/users/action', requireOwner, route(async (req) => {
@@ -621,6 +626,10 @@ function createAdminSystem(options = {}) {
     if (action === 'change_role') {
       const userId = toId(req.body.user_id);
       if (!userId || !req.body.new_tier) throw new AdminError(400, 'missing_params', 'user_id, new_tier required');
+      // Gate user_id != current_user_id runs before the checks (spec change_role), so a direct change_role never
+      // reaches the last active owner; only a governance approval can (ADMIN-07, Phase B.3, 2026-11-10,
+      // session_012zDydZCZ4AChqhEZ4oVtaP).
+      if (userId === actorId) throw new AdminError(400, 'cannot_change_own_role', 'Cannot change own role');
       const out = await knex.transaction((trx) => changeRole(trx, actorId, userId, req.body.new_tier));
       return { success: true, ...out };
     }

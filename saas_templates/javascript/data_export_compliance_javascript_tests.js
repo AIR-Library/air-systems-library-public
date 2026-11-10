@@ -452,4 +452,47 @@ describe('Deletion rules amended 2026-11-10', () => {
         expect(strangerOnCompleted.status).toBe(404);
         expect(strangerOnCompleted.body.error).toBe('not_found');
     });
+
+    /**
+     * EXPORT-06 (Phase B.3): the user can cancel only WITHIN the grace period. One second before will_delete_at a
+     * confirmed request is cancelled (200); at will_delete_at, and after it, while the deletion is due but has not
+     * run yet, cancel is 409 {error: "grace_period_over"}, the request stays approved, and the due deletion still runs.
+     * In: the test app and clock. Out: assertions. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches the test database.
+     */
+    // EXPORT-06
+    test('Cancel after will_delete_at has passed → 409 grace_period_over; one second before it → cancelled', async () => {
+        const start = clock;
+        const confirmAndSchedule = async (userId) => {
+            await seedUser(userId, `${userId}@example.com`);
+            const d = await requestDeletion(userId, 'user_requested');
+            const ok = await request(app).post(`/compliance/delete/${d.deletion_id}/confirm`).set(authFor(userId))
+                .send({ confirmation_token: d.token });
+            expect(ok.body.status).toBe('approved');
+            return d;
+        };
+        const cancel = (deletionId, userId) => request(app).delete(`/compliance/delete/${deletionId}`).set(authFor(userId));
+        try {
+            const early = await confirmAndSchedule('b3-early');
+            clock = Date.parse(early.will_delete_at) - 1000;
+            const inTime = await cancel(early.deletion_id, 'b3-early');
+            expect(inTime.status).toBe(200);
+            expect(inTime.body).toEqual({ success: true, status: 'cancelled' });
+
+            clock = start;
+            const late = await confirmAndSchedule('b3-late');
+            for (const at of [Date.parse(late.will_delete_at), Date.parse(late.will_delete_at) + DAY_MS]) {
+                clock = at;
+                const res = await cancel(late.deletion_id, 'b3-late');
+                expect(res.status).toBe(409);
+                expect(res.body.error).toBe('grace_period_over');
+                expect((await get('SELECT status FROM deletion_requests WHERE id = ?', [late.deletion_id])).status).toBe('approved');
+            }
+            expect(await service.processDueDeletions()).toContain(late.deletion_id);
+            expect(await get('SELECT id FROM users WHERE id = ?', ['b3-late'])).toBeUndefined();
+            expect(await get('SELECT id FROM users WHERE id = ?', ['b3-early'])).toBeDefined();
+        } finally {
+            clock = start;
+        }
+    });
 });
