@@ -454,3 +454,34 @@ fn test_log_validation_and_admin_only_reads() {
     assert_eq!(logger.search(&user, "plan", None, None).unwrap_err().to_response().1, 403);
     assert_eq!(logger.query_logs(&admin(), QueryLogsParams::default()).unwrap().total, 1);
 }
+
+/// What: AUDIT-10 (Phase B.2 refusal codes): log() refuses an actor_type other than user / service /
+/// api_key (400 invalid_actor_type), a 'user' actor without actor_id or with an empty one (400
+/// actor_required), and a 'service' actor without actor_service (400 actor_service_required), even when
+/// actor_id is given; nothing is written for a refused entry, and a service entry with actor_service is
+/// accepted. In: none. Out: panics on a wrong answer. Why: the audit spec's refusal list amended
+/// 2026-11-10 (Phase B.2: one answer in every language). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+/// Touches: memory only.
+// AUDIT-10
+#[test]
+fn test_log_refuses_bad_actor_codes() {
+    let logger = setup_logger();
+    let refused = |r: LogMutationRequest| logger.log_mutation(r).unwrap_err();
+    for bad in ["admin", "", "USER"] {
+        let e = refused(LogMutationRequest { actor_type: bad.into(), ..req("1", "plan_changed", "subscription", "s1") });
+        assert_eq!((e.code(), e.status()), ("invalid_actor_type", 400), "actor_type {:?}", bad);
+    }
+    for actor_id in [None, Some(String::new())] {
+        let e = refused(LogMutationRequest { actor_id, ..req("1", "plan_changed", "subscription", "s1") });
+        assert_eq!((e.code(), e.status()), ("actor_required", 400));
+    }
+    let e = refused(LogMutationRequest { actor_type: "service".into(), actor_service: None, ..req("billing", "plan_changed", "subscription", "s1") });
+    assert_eq!((e.code(), e.status()), ("actor_service_required", 400), "actor_id does not stand in for actor_service");
+    assert!(dump(&logger, "audit_log").is_empty());
+    assert!(dump(&logger, "audit_personal").is_empty());
+    let ok = logger
+        .log_mutation(LogMutationRequest { actor_type: "service".into(), actor_id: None, actor_service: Some("billing".into()), ..req("x", "plan_changed", "subscription", "s1") })
+        .unwrap();
+    assert!(ok.success);
+    assert_eq!(logger.query_logs(&admin(), QueryLogsParams::default()).unwrap().logs[0].actor_service.as_deref(), Some("billing"));
+}

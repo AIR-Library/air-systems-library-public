@@ -1,6 +1,9 @@
 //! Admin system tests (GEMINI spec, template #2).
 //! Corrected 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP; each change is marked "Corrected" where it
-//! is made. Touches: in-memory SQLite only.
+//! is made. Corrected 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP, Phase B.2 TIERS rule): users.tier is now the
+//! staff role (owner / admin / user) and a customer's or deployment's tier the plan (solo / team / enterprise);
+//! the tests used the old mixed tiers (enterprise = owner, premium = admin, basic = user, and basic / premium
+//! as plans), so each value is replaced by its role or plan; no assertion was dropped. Touches: in-memory SQLite only.
 use super::*;
 use rusqlite::Connection;
 use std::cell::RefCell;
@@ -18,7 +21,7 @@ struct MockStripe {
 impl StripeClient for MockStripe {
     /// What: the stored items, or one default item. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
     fn retrieve_subscription(&self, stripe_id: &str) -> AdminResult<Vec<SubscriptionItem>> {
-        Ok(self.items.borrow().get(stripe_id).cloned().unwrap_or_else(|| vec![SubscriptionItem { id: format!("si_{}", stripe_id), price: "price_basic".into() }]))
+        Ok(self.items.borrow().get(stripe_id).cloned().unwrap_or_else(|| vec![SubscriptionItem { id: format!("si_{}", stripe_id), price: "price_solo".into() }]))
     }
     /// What: record (subscription, "item=price proration") per update. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
     fn update_subscription(&self, stripe_id: &str, update: &SubscriptionUpdate) -> AdminResult<()> {
@@ -56,7 +59,7 @@ fn setup() -> AdminSystem {
         .conn
         .execute(
             "INSERT INTO users (email,name,tier,status,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6)",
-            params!["owner@example.com", "Owner", "enterprise", "active", now, now],
+            params!["owner@example.com", "Owner", "owner", "active", now, now], // role, Phase B.2 (was "enterprise")
         )
         .unwrap();
     system
@@ -69,7 +72,7 @@ fn setup() -> AdminSystem {
 fn test_create_user_happy_path() {
     let system = setup();
     let owner = system.get_user_by_email("owner@example.com").unwrap().unwrap();
-    let resp = system.create_user(&owner, "new@example.com", "New User", "basic", true);
+    let resp = system.create_user(&owner, "new@example.com", "New User", "user", true);
     match resp {
         Response::Success { data, .. } => {
             let uid: i64 = serde_json::from_value(data.get("user_id").unwrap().clone()).unwrap();
@@ -89,9 +92,9 @@ fn test_create_user_duplicate_email() {
     let system = setup();
     let owner = system.get_user_by_email("owner@example.com").unwrap().unwrap();
     system
-        .create_user(&owner, "dup@example.com", "Dup", "basic", true)
+        .create_user(&owner, "dup@example.com", "Dup", "user", true)
         .unwrap();
-    let resp = system.create_user(&owner, "dup@example.com", "Dup2", "basic", true);
+    let resp = system.create_user(&owner, "dup@example.com", "Dup2", "user", true);
     // Corrected 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): the spec's code is "email_exists"
     // ("create user duplicate email -> 409 {error: "email_exists"}"), not "conflict".
     match resp {
@@ -105,11 +108,11 @@ fn test_create_user_duplicate_email() {
 fn test_create_user_non_owner() {
     let system = setup();
     let user = system
-        .create_user(&system.get_user_by_email("owner@example.com").unwrap().unwrap(), "user@example.com", "User", "basic", true)
+        .create_user(&system.get_user_by_email("owner@example.com").unwrap().unwrap(), "user@example.com", "User", "user", true)
         .unwrap();
     let uid: i64 = serde_json::from_value(user.data.get("user_id").unwrap().clone()).unwrap();
     let normal = system.get_user_by_id(uid).unwrap();
-    let resp = system.create_user(&normal, "another@example.com", "Another", "basic", true);
+    let resp = system.create_user(&normal, "another@example.com", "Another", "user", true);
     match resp {
         Response::Error { error, .. } => assert_eq!(error, "owner_only"),
         _ => panic!("Expected owner_only"),
@@ -130,7 +133,7 @@ fn test_reset_password_happy_path() {
         _ => panic!("Expected own reset error"),
     }
     let new_user = system
-        .create_user(&owner, "reset@example.com", "Reset", "basic", true)
+        .create_user(&owner, "reset@example.com", "Reset", "user", true)
         .unwrap();
     let uid: i64 = serde_json::from_value(new_user.data.get("user_id").unwrap().clone()).unwrap();
     let resp = system.reset_password(&owner, uid);
@@ -150,16 +153,16 @@ fn test_change_role_happy_path() {
     let system = setup();
     let owner = system.get_user_by_email("owner@example.com").unwrap().unwrap();
     let new_user = system
-        .create_user(&owner, "role@example.com", "Role", "basic", true)
+        .create_user(&owner, "role@example.com", "Role", "user", true)
         .unwrap();
     let uid: i64 = serde_json::from_value(new_user.data.get("user_id").unwrap().clone()).unwrap();
-    let resp = system.change_role(&owner, uid, "premium");
+    let resp = system.change_role(&owner, uid, "admin"); // role, Phase B.2 (was "premium")
     match resp {
         Response::Success { .. } => {}
         _ => panic!("Expected success"),
     }
     // ADMIN-06 "role changed + audit logged" (assertions added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
-    assert_eq!(system.get_user_by_id(uid).unwrap().tier, Tier::Premium);
+    assert_eq!(system.get_user_by_id(uid).unwrap().tier, Role::Admin);
     let audited: i64 = system.conn.query_row("SELECT COUNT(*) FROM audit_logs WHERE action = 'role_changed' AND resource_id = ?1", params![uid], |r| r.get(0)).unwrap();
     assert_eq!(audited, 1);
 }
@@ -169,7 +172,7 @@ fn test_change_role_happy_path() {
 fn test_change_role_last_owner() {
     let system = setup();
     let owner = system.get_user_by_email("owner@example.com").unwrap().unwrap();
-    let resp = system.change_role(&owner, owner.id, "basic");
+    let resp = system.change_role(&owner, owner.id, "user"); // role, Phase B.2 (was "basic")
     match resp {
         Response::Error { error, .. } => assert_eq!(error, "cannot_demote_last_owner"),
         _ => panic!("Expected error"),
@@ -184,7 +187,7 @@ fn test_suspend_user_happy_path() {
     let system = setup();
     let owner = system.get_user_by_email("owner@example.com").unwrap().unwrap();
     let new_user = system
-        .create_user(&owner, "suspend@example.com", "Suspend", "basic", true)
+        .create_user(&owner, "suspend@example.com", "Suspend", "user", true)
         .unwrap();
     let uid: i64 = serde_json::from_value(new_user.data.get("user_id").unwrap().clone()).unwrap();
     let resp = system.suspend_user(&owner, uid, "violation");
@@ -225,7 +228,7 @@ fn test_customers_list() {
                 params![
                     format!("cust{}@example.com", i),
                     format!("Customer {}", i),
-                    "basic",
+                    "solo", // plan, Phase B.2 (was "basic")
                     now,
                     0,
                     "active"
@@ -267,7 +270,7 @@ fn test_customers_detail() {
             params![
                 "cust@example.com",
                 "Customer",
-                "basic",
+                "solo", // plan, Phase B.2 (was "basic")
                 now,
                 0,
                 "active"
@@ -304,7 +307,7 @@ fn test_change_plan() {
             params![
                 "cust@example.com",
                 "Customer",
-                "basic",
+                "solo", // plan, Phase B.2 (was "basic")
                 now,
                 0,
                 "active",
@@ -316,27 +319,27 @@ fn test_change_plan() {
     // Corrected 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): the customer now has a subscription id,
     // because the spec's change_plan updates the subscription at the payment provider (a customer
     // with none cannot change plan); the provider call is asserted.
-    let resp = system.change_plan(&owner, cid, "premium");
+    let resp = system.change_plan(&owner, cid, "team"); // plan, Phase B.2 (was "premium")
     match resp {
         Response::Success { .. } => {}
         _ => panic!("Expected success"),
     }
     // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-12 amendment): the update carries the existing
     // item id with the new price and create_prorations (no second item)
-    STRIPE_CALLS.with(|c| assert_eq!(c.borrow().as_slice(), [("sub_1".to_string(), "si_sub_1=price_premium create_prorations".to_string())]));
+    STRIPE_CALLS.with(|c| assert_eq!(c.borrow().as_slice(), [("sub_1".to_string(), "si_sub_1=price_team create_prorations".to_string())]));
     let audited: i64 = system
         .conn
         .query_row("SELECT COUNT(*) FROM audit_logs WHERE action = 'plan_changed' AND resource_id = ?1 AND actor_id = ?2", params![cid, owner.id], |r| r.get(0))
         .unwrap();
     assert_eq!(audited, 1);
     let tier: String = system.conn.query_row("SELECT tier FROM customers WHERE id = ?1", params![cid], |r| r.get(0)).unwrap();
-    assert_eq!(tier, "premium");
+    assert_eq!(tier, "team");
 
     // two items (or an unknown tier) are refused before any update, and nothing changes
     STRIPE_ITEMS.with(|i| {
         i.borrow_mut().insert("sub_1".into(), vec![
-            SubscriptionItem { id: "si_a".into(), price: "price_premium".into() },
-            SubscriptionItem { id: "si_b".into(), price: "price_basic".into() },
+            SubscriptionItem { id: "si_a".into(), price: "price_team".into() },
+            SubscriptionItem { id: "si_b".into(), price: "price_solo".into() },
         ])
     });
     match system.change_plan(&owner, cid, "enterprise") {
@@ -387,7 +390,7 @@ fn test_create_deployment() {
             params![
                 "cust@example.com",
                 "Customer",
-                "basic",
+                "solo", // plan, Phase B.2 (was "basic")
                 now,
                 0,
                 "active"
@@ -395,7 +398,7 @@ fn test_create_deployment() {
         )
         .unwrap();
     let cid = system.conn.last_insert_rowid();
-    let resp = system.create_deployment(&owner, cid, "example.com", "basic", "theme1");
+    let resp = system.create_deployment(&owner, cid, "example.com", "solo", "theme1"); // plan, Phase B.2 (was "basic")
     let dep_id = match resp {
         Response::Success { data, .. } => data["deployment_id"].as_i64().unwrap(),
         _ => panic!("Expected success"),
@@ -404,11 +407,13 @@ fn test_create_deployment() {
     let (status, config): (String, String) = system.conn.query_row("SELECT status, config FROM deployments WHERE id = ?1", params![dep_id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
     assert_eq!(status, "draft");
     let config: serde_json::Value = serde_json::from_str(&config).unwrap();
-    assert_eq!((config["theme"].as_str(), config["tier"].as_str()), (Some("theme1"), Some("basic")));
+    assert_eq!((config["theme"].as_str(), config["tier"].as_str()), (Some("theme1"), Some("solo")));
 }
 
 /// What: ADMIN-15: publishing needs the owner AND the safety flag; then the status is live. Changed
-/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the safety-flag gate and live-status assertions were added. Touches: in-memory SQLite.
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the safety-flag gate and live-status assertions were added.
+/// Changed 2026-11-10 (Phase B.2): a new deployment has domain_verified false and publish is refused
+/// (domain_not_verified) until `verify_domain` sets it. Touches: in-memory SQLite.
 // ADMIN-15
 #[test]
 fn test_publish_deployment() {
@@ -422,7 +427,7 @@ fn test_publish_deployment() {
             params![
                 "cust@example.com",
                 "Customer",
-                "basic",
+                "solo", // plan, Phase B.2 (was "basic")
                 now,
                 0,
                 "active"
@@ -430,12 +435,20 @@ fn test_publish_deployment() {
         )
         .unwrap();
     let cid = system.conn.last_insert_rowid();
-    let dep_resp = system.create_deployment(&owner, cid, "example.com", "basic", "theme1");
+    let dep_resp = system.create_deployment(&owner, cid, "example.com", "solo", "theme1"); // plan, Phase B.2 (was "basic")
     // Corrected 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): `Response` is an enum, so its data is
     // reached through `unwrap()` as in the other tests (`dep_resp.data` could not compile).
     let dep_id: i64 = serde_json::from_value(dep_resp.unwrap().data.get("deployment_id").unwrap().clone()).unwrap();
     // ADMIN-15 double gate (added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): with the safety flag
     // off an owner still cannot publish
+    // Phase B.2 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): domain_verified starts false and publish needs it
+    let verified: bool = system.conn.query_row("SELECT domain_verified FROM deployments WHERE id = ?1", params![dep_id], |r| r.get(0)).unwrap();
+    assert!(!verified);
+    let refused = system.publish_deployment(&owner, dep_id);
+    assert_eq!((refused.status(), refused.clone()), (400, Response::Error { error: "domain_not_verified".into(), message: "domain not verified".into() }));
+    assert!(system.verify_domain(&owner, dep_id).is_success());
+    let verified: bool = system.conn.query_row("SELECT domain_verified FROM deployments WHERE id = ?1", params![dep_id], |r| r.get(0)).unwrap();
+    assert!(verified);
     let mut system = system;
     system.safety.can_publish = false;
     match system.publish_deployment(&owner, dep_id) {
@@ -462,7 +475,7 @@ fn test_governance_approve() {
     // Corrected 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): the action targeted user 1, which is the
     // approving owner himself; approving executes the action, and deleting the last active owner is
     // refused by the spec's safety rules. It now targets a separate user, whose deletion is asserted.
-    let target = system.create_user(&owner, "target@example.com", "Target", "basic", false).unwrap();
+    let target = system.create_user(&owner, "target@example.com", "Target", "user", false).unwrap();
     let target_id: i64 = serde_json::from_value(target.data.get("user_id").unwrap().clone()).unwrap();
     // Insert pending action
     let now = Utc::now().to_rfc3339();
@@ -522,7 +535,7 @@ fn test_audit_log_search() {
     let system = setup();
     let owner = system.get_user_by_email("owner@example.com").unwrap().unwrap();
     // Create a user to generate audit log
-    system.create_user(&owner, "audit@example.com", "Audit", "basic", true).unwrap();
+    system.create_user(&owner, "audit@example.com", "Audit", "user", true).unwrap();
     let now = Utc::now();
     let resp = system.search_audit_log(&owner, None, None, None, 10, 0);
     match resp {
@@ -534,9 +547,9 @@ fn test_audit_log_search() {
     }
     // ADMIN-18 "filters applied, pagination works" (assertions added 2026-11-10,
     // session_012zDydZCZ4AChqhEZ4oVtaP): three users created -> three user_created rows, newest first
-    let second = system.create_user(&owner, "audit2@example.com", "Audit Two", "basic", false).unwrap();
+    let second = system.create_user(&owner, "audit2@example.com", "Audit Two", "user", false).unwrap();
     let second_id = second.data["user_id"].as_i64().unwrap();
-    system.create_user(&owner, "audit3@example.com", "Audit Three", "basic", false).unwrap();
+    system.create_user(&owner, "audit3@example.com", "Audit Three", "user", false).unwrap();
     let uid = system.get_user_by_email("audit@example.com").unwrap().unwrap().id;
     system.suspend_user(&owner, uid, "test").unwrap();
     let search = |action: Option<&str>, rid: Option<i64>, range: Option<(&str, &str)>, limit: i64, offset: i64| {
@@ -553,4 +566,110 @@ fn test_audit_log_search() {
     let future = (now + chrono::Duration::days(1)).to_rfc3339();
     let far = (now + chrono::Duration::days(2)).to_rfc3339();
     assert!(search(None, None, Some((&future, &far)), 10, 0).is_empty());
+}
+/// What: ADMIN-19: a suspended owner calling any admin action gets 403 account_suspended before any gate
+/// (even where another check would also refuse, e.g. a blank reason or their own id), and nothing changes:
+/// no user, customer, deployment, refund, governance or audit row is written. In: none. Out: panics on a
+/// wrong answer. Why: ADMIN-19 (Phase B.2, 2026-11-10). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+/// Touches: in-memory SQLite.
+// ADMIN-19
+#[test]
+fn test_suspended_owner_is_refused_everywhere() {
+    let system = setup();
+    let owner = system.get_user_by_email("owner@example.com").unwrap().unwrap();
+    let other = system.create_user(&owner, "second@example.com", "Second Owner", "owner", false).unwrap();
+    let other_id = other.data["user_id"].as_i64().unwrap();
+    let now = Utc::now().to_rfc3339();
+    system.conn.execute("INSERT INTO customers (email,name,tier,signup_date,invoice_count,status,stripe_subscription_id) VALUES ('c@example.com','C','solo',?1,0,'active','sub_9')", params![now]).unwrap();
+    let cid = system.conn.last_insert_rowid();
+    let dep = system.create_deployment(&owner, cid, "suspended.example.com", "team", "theme1").unwrap().data["deployment_id"].as_i64().unwrap();
+    system.verify_domain(&owner, dep).unwrap();
+    system.conn.execute("INSERT INTO invoices (id, amount, status) VALUES (7, 1000, 'succeeded')", []).unwrap();
+    system.conn.execute("INSERT INTO governance_actions (action_type,actor_id,target_resource_id,reason,submitted_at,status) VALUES ('suspend_user',?1,?2,'x',?3,'pending')", params![owner.id, other_id, now]).unwrap();
+    let action = system.conn.last_insert_rowid();
+    // the second owner suspends the first
+    let second = system.get_user_by_id(other_id).unwrap();
+    system.suspend_user(&second, owner.id, "policy").unwrap();
+    let snapshot = || -> Vec<i64> {
+        ["users", "customers", "deployments", "refunds", "governance_actions", "audit_logs", "password_resets"]
+            .iter()
+            .map(|t| system.conn.query_row(&format!("SELECT COUNT(*) FROM {}", t), [], |r| r.get(0)).unwrap())
+            .collect()
+    };
+    let state = |sql: &str| -> String { system.conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+    let before = (snapshot(), state("SELECT group_concat(tier || status, ',') FROM users"), state("SELECT group_concat(tier || status, ',') FROM deployments"), state("SELECT tier FROM customers"));
+    let calls = [
+        system.create_user(&owner, "x@example.com", "X Person", "user", true),
+        system.reset_password(&owner, other_id),
+        system.change_role(&owner, other_id, "user"),
+        system.suspend_user(&owner, other_id, "x"),
+        system.suspend_user(&owner, owner.id, ""),
+        system.list_customers(&owner, 1, 10),
+        system.get_customer(&owner, cid),
+        system.change_plan(&owner, cid, "team"),
+        system.queue_refund(&owner, 7, 100, "x"),
+        system.create_deployment(&owner, cid, "other.example.com", "solo", "theme1"),
+        system.verify_domain(&owner, dep),
+        system.publish_deployment(&owner, dep),
+        system.suspend_deployment(&owner, dep, " "),
+        system.retire_deployment(&owner, dep),
+        system.list_governance_actions(&owner, 1, 10),
+        system.decide_governance_action(&owner, action, "approve", None),
+        system.decide_governance_action(&owner, action, "reject", Some("no")),
+        system.search_audit_log(&owner, None, None, None, 10, 0),
+    ];
+    for (i, resp) in calls.iter().enumerate() {
+        match resp {
+            Response::Error { error, .. } => assert_eq!(error, "account_suspended", "call {}", i),
+            _ => panic!("call {} succeeded for a suspended owner", i),
+        }
+        assert_eq!(resp.status(), 403, "call {}", i);
+    }
+    let after = (snapshot(), state("SELECT group_concat(tier || status, ',') FROM users"), state("SELECT group_concat(tier || status, ',') FROM deployments"), state("SELECT tier FROM customers"));
+    assert_eq!(after, before, "nothing changed");
+    STRIPE_CALLS.with(|c| assert!(c.borrow().is_empty(), "no provider call"));
+}
+
+/// What: the TIERS rule (Phase B.2), part of ADMIN-06/12/14: users.tier is the staff role and a customer's
+/// or deployment's tier the plan; a plan value where a role is expected (create_user, change_role) or a role
+/// value where a plan is expected (change_plan, create_deployment) is 400 invalid_tier and nothing changes;
+/// an "enterprise" customer plan does not make anyone an owner. In: none. Out: panics on a wrong answer.
+/// Why: the old `Tier` read the enterprise plan as the owner role. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+/// Touches: in-memory SQLite.
+// ADMIN-06
+// ADMIN-12
+// ADMIN-14
+#[test]
+fn test_roles_and_plans_are_not_mixed() {
+    let system = setup();
+    let owner = system.get_user_by_email("owner@example.com").unwrap().unwrap();
+    let user = system.create_user(&owner, "staff@example.com", "Staff", "user", false).unwrap().data["user_id"].as_i64().unwrap();
+    let now = Utc::now().to_rfc3339();
+    system.conn.execute("INSERT INTO customers (email,name,tier,signup_date,invoice_count,status,stripe_subscription_id) VALUES ('c@example.com','C','solo',?1,0,'active','sub_5')", params![now]).unwrap();
+    let cid = system.conn.last_insert_rowid();
+    let code = |r: Response| -> (u16, String) {
+        let status = r.status();
+        match r {
+            Response::Error { error, .. } => (status, error),
+            _ => (status, "success".into()),
+        }
+    };
+    for plan in ["solo", "team", "enterprise"] {
+        assert_eq!(code(system.create_user(&owner, &format!("{}@example.com", plan), "Some One", plan, false)), (400, "invalid_tier".into()));
+        assert_eq!(code(system.change_role(&owner, user, plan)), (400, "invalid_tier".into()));
+    }
+    for role in ["owner", "admin", "user"] {
+        assert_eq!(code(system.change_plan(&owner, cid, role)), (400, "invalid_tier".into()));
+        assert_eq!(code(system.create_deployment(&owner, cid, &format!("{}.example.com", role), role, "theme1")), (400, "invalid_tier".into()));
+    }
+    assert_eq!(system.get_user_by_id(user).unwrap().tier, Role::User);
+    let deployments: i64 = system.conn.query_row("SELECT COUNT(*) FROM deployments", [], |r| r.get(0)).unwrap();
+    assert_eq!(deployments, 0);
+    STRIPE_CALLS.with(|c| assert!(c.borrow().is_empty()));
+    // a valid plan and a valid role still work, and the enterprise plan is not the owner role
+    assert!(system.change_plan(&owner, cid, "enterprise").is_success());
+    assert!(system.change_role(&owner, user, "admin").is_success());
+    let staff = system.get_user_by_id(user).unwrap();
+    assert!(staff.is_admin_or_owner() && !staff.is_owner());
+    assert_eq!(code(system.create_user(&staff, "y@example.com", "Y Person", "user", false)), (403, "owner_only".into()));
 }

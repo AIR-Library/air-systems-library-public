@@ -134,7 +134,9 @@ async fn test_deletion_grace_period_and_cancel() {
 }
 
 /// What: EXPORT-07/08: the cascade deletes sessions and API keys and keeps the audit log. Changed
-/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the API-key assertion was added. Touches: memory only.
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the API-key assertion was added. Corrected 2026-11-10
+/// (session_012zDydZCZ4AChqhEZ4oVtaP, Phase B.2 bug): the kept login row no longer names the user (its
+/// user_id is NULL); it asserted the row still carried user_id 1. Touches: memory only.
 // EXPORT-07
 // EXPORT-08
 #[tokio::test]
@@ -160,12 +162,15 @@ async fn test_cascade_delete_preserves_audit_log() {
     let key_cnt: i64 = svc.db().query_row("SELECT COUNT(*) FROM api_keys WHERE user_id = ?1", params![1], |r| r.get(0)).unwrap();
     assert_eq!(key_cnt, 0);
 
-    // Audit log must still exist (the login row, plus the cascade's own record)
+    // Audit log must still exist (the login row, plus the cascade's own record), without the user's id
+    // (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, Phase B.2: nothing personal remains after the cascade)
     let audit_cnt: i64 = svc
         .db()
-        .query_row("SELECT COUNT(*) FROM audit_log WHERE user_id = ?1 AND action = 'login'", params![1], |r| r.get(0))
+        .query_row("SELECT COUNT(*) FROM audit_log WHERE id = 'a1' AND user_id IS NULL AND action = 'login'", [], |r| r.get(0))
         .unwrap();
     assert_eq!(audit_cnt, 1);
+    let named: i64 = svc.db().query_row("SELECT COUNT(*) FROM audit_log WHERE user_id = ?1", params![1], |r| r.get(0)).unwrap();
+    assert_eq!(named, 0, "no audit row names the deleted user");
 }
 
 /// What: EXPORT-10: an admin sees every export and deletion request; a non-admin is refused. Changed
@@ -221,7 +226,9 @@ async fn test_signed_link_works_and_expires_after_7_days() {
 /// Added 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP), spec "30-day grace period enforced": a confirmed
 /// deletion does not run before 30 days, runs after, and keeps the audit log. Changed the same day for
 /// the EXPORT-05/12 amendment: the reason is user_requested (a statutory reason now has no grace
-/// period), will_delete_at is requested_at + 30 days, and confirm takes the caller.
+/// period), will_delete_at is requested_at + 30 days, and confirm takes the caller. Corrected 2026-11-10
+/// (Phase B.2 bug): the kept audit rows are counted without user_id, which the cascade now clears, and a
+/// cancel after the grace period is the 409 `GracePeriodOver`.
 // EXPORT-05
 #[tokio::test]
 async fn test_deletion_runs_only_after_grace_period() {
@@ -235,12 +242,14 @@ async fn test_deletion_runs_only_after_grace_period() {
     now.fetch_add(29 * 86_400, Ordering::SeqCst);
     assert_eq!(svc.process_due_deletions().await.unwrap(), 0);
     now.fetch_add(86_400, Ordering::SeqCst);
-    assert!(svc.cancel_deletion(1, d.deletion_id.clone()).await.is_err());
+    assert_eq!(svc.cancel_deletion(1, d.deletion_id.clone()).await.unwrap_err(), ComplianceError::GracePeriodOver);
     assert_eq!(svc.process_due_deletions().await.unwrap(), 1);
     let users: i64 = svc.db().query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0)).unwrap();
     assert_eq!(users, 0);
-    let audit: i64 = svc.db().query_row("SELECT COUNT(*) FROM audit_log WHERE user_id = 1", [], |r| r.get(0)).unwrap();
+    let audit: i64 = svc.db().query_row("SELECT COUNT(*) FROM audit_log WHERE user_id IS NULL", [], |r| r.get(0)).unwrap();
     assert!(audit >= 3);
+    let named: i64 = svc.db().query_row("SELECT COUNT(*) FROM audit_log WHERE user_id = 1", [], |r| r.get(0)).unwrap();
+    assert_eq!(named, 0);
 }
 
 /// Added 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP), CodeRabbit review on PR 19: an export made
@@ -248,6 +257,7 @@ async fn test_deletion_runs_only_after_grace_period() {
 /// the deletion that link is refused, the file is gone from storage and the export row is gone.
 /// Changed 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP) for the EXPORT-12/13 amendment: the reason is
 /// user_requested (a statutory reason now has no grace period) and the service has an audit eraser.
+/// Corrected 2026-11-10 (Phase B.2 bug): the cascade's audit row no longer carries user_id 1.
 /// Touches: memory only.
 #[tokio::test]
 async fn test_deletion_removes_exports_and_refuses_old_link() {
@@ -282,7 +292,7 @@ async fn test_deletion_removes_exports_and_refuses_old_link() {
     assert!(storage.files.lock().unwrap().is_empty(), "export file must be removed from storage");
     let rows: i64 = svc.db().query_row("SELECT COUNT(*) FROM export_requests WHERE user_id = 1", [], |r| r.get(0)).unwrap();
     assert_eq!(rows, 0);
-    let audit: i64 = svc.db().query_row("SELECT COUNT(*) FROM audit_log WHERE user_id = 1 AND action = 'user_deleted_cascade'", [], |r| r.get(0)).unwrap();
+    let audit: i64 = svc.db().query_row("SELECT COUNT(*) FROM audit_log WHERE user_id IS NULL AND action = 'user_deleted_cascade'", [], |r| r.get(0)).unwrap();
     assert_eq!(audit, 1);
 }
 
@@ -407,25 +417,30 @@ async fn test_statutory_deletion_has_no_grace_period() {
 
 /// What: an audit eraser on its own connection to the same shared-cache in-memory database, reading
 /// uncommitted rows, so it can see the cascade's state at the moment it is called: whether the user
-/// row still exists and the last audit action logged for the user. 2026-11-10,
-/// session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-13). Touches: in-memory SQLite (read).
+/// row still exists, the last audit row's action and its user_id, and how many audit rows still name the
+/// user. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-13). Changed 2026-11-10 (Phase B.2 bug): it
+/// read the last action "for the user"; the cascade now clears the user's id on the local audit rows just
+/// before calling the eraser, so it reads the last row overall and the count still naming the user.
+/// Touches: in-memory SQLite (read).
 struct ObservingEraser {
     conn: Mutex<Connection>,
-    seen: Arc<Mutex<Vec<(i64, i64, Option<String>)>>>,
+    seen: Arc<Mutex<Vec<(i64, i64, Option<(String, Option<i64>)>, i64)>>>,
 }
 
 /// What: `AuditEraser` for the observing fake. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
 impl AuditEraser for ObservingEraser {
-    /// What: record (user id, user rows left, last audit action for the user). 2026-11-10,
-    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite (read).
+    /// What: record (user id, user rows left, last audit row's (action, user_id), audit rows still naming
+    /// the user). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP; changed the same day (Phase B.2 bug).
+    /// Touches: in-memory SQLite (read).
     fn erase_subject(&self, user_id: i64) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         let users: i64 = conn.query_row("SELECT COUNT(*) FROM users WHERE id = ?1", params![user_id], |r| r.get(0)).map_err(|e| e.to_string())?;
-        let last: Option<String> = conn
-            .query_row("SELECT action FROM audit_log WHERE user_id = ?1 ORDER BY rowid DESC LIMIT 1", params![user_id], |r| r.get(0))
+        let last: Option<(String, Option<i64>)> = conn
+            .query_row("SELECT action, user_id FROM audit_log ORDER BY rowid DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()
             .map_err(|e| e.to_string())?;
-        self.seen.lock().unwrap().push((user_id, users, last));
+        let named: i64 = conn.query_row("SELECT COUNT(*) FROM audit_log WHERE user_id = ?1", params![user_id], |r| r.get(0)).map_err(|e| e.to_string())?;
+        self.seen.lock().unwrap().push((user_id, users, last, named));
         Ok(())
     }
 }
@@ -446,6 +461,8 @@ impl AuditEraser for FailingEraser {
 /// for the user is the cascade's); nothing is logged for the user after it; deletion_requests.user_id
 /// is NULL once completed. A failing eraser rolls the whole cascade back, and with no eraser configured
 /// nothing is deleted. In: none. Out: panics on a wrong order. Why: 2026-11-10 amendment (EXPORT-13).
+/// Corrected 2026-11-10 (Phase B.2 bug): the local audit rows no longer carry user_id 1 when the eraser
+/// runs or after, so the "last row" checks read the last row overall and its NULL user_id.
 /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite (shared cache).
 // EXPORT-13
 #[tokio::test]
@@ -468,9 +485,12 @@ async fn test_cascade_calls_audit_eraser_last() {
     let d = svc.request_account_deletion(1, DeletionReason::GdprRightToBeForgotten).await.unwrap();
     svc.confirm_deletion(1, d.deletion_id.clone(), &last_token(&mailer)).await.unwrap();
 
-    assert_eq!(*seen.lock().unwrap(), vec![(1, 0, Some("user_deleted_cascade".to_string()))]);
-    let last: String = svc.db().query_row("SELECT action FROM audit_log WHERE user_id = 1 ORDER BY rowid DESC LIMIT 1", [], |r| r.get(0)).unwrap();
-    assert_eq!(last, "user_deleted_cascade", "nothing is logged for the user after the eraser");
+    assert_eq!(*seen.lock().unwrap(), vec![(1, 0, Some(("user_deleted_cascade".to_string(), None)), 0)]);
+    let last: (String, Option<i64>) =
+        svc.db().query_row("SELECT action, user_id FROM audit_log ORDER BY rowid DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!(last, ("user_deleted_cascade".to_string(), None), "nothing is logged for the user after the eraser");
+    let named: i64 = svc.db().query_row("SELECT COUNT(*) FROM audit_log WHERE user_id = 1", [], |r| r.get(0)).unwrap();
+    assert_eq!(named, 0, "no audit row names the erased user");
     let (uid, status): (Option<i64>, String) =
         svc.db().query_row("SELECT user_id, status FROM deletion_requests WHERE id = ?1", params![d.deletion_id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
     assert_eq!((uid, status.as_str()), (None, "completed"));
@@ -511,6 +531,9 @@ async fn test_cascade_rolls_back_when_audit_erase_fails() {
 /// What: EXPORT-14: nothing is deleted before confirm; a wrong token, a reused token and a token over
 /// 24 hours old are refused; another user's deletion request is 404 (DeletionNotFound) for confirm and
 /// cancel. In: none. Out: panics on a wrong answer. Why: 2026-11-10 amendment (EXPORT-14).
+/// Corrected 2026-11-10 (Phase B.2, EXPORT-15): the wrong and expired token assertions expected
+/// `TokenMismatch` and `TokenExpired`; the spec now gives both one answer, `InvalidConfirmationToken`
+/// (400 invalid_confirmation_token), and the 404 carries code not_found.
 /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
 // EXPORT-14
 #[tokio::test]
@@ -531,15 +554,16 @@ async fn test_deletion_confirmation_token_rules() {
     // another user's request: 404 for confirm (even with the right token) and cancel
     assert_eq!(svc.confirm_deletion(2, d.deletion_id.clone(), &token).await.unwrap_err(), ComplianceError::DeletionNotFound);
     assert_eq!(svc.cancel_deletion(2, d.deletion_id.clone()).await.unwrap_err(), ComplianceError::DeletionNotFound);
+    assert_eq!((ComplianceError::DeletionNotFound.status(), ComplianceError::DeletionNotFound.code()), (404, "not_found"));
     // wrong token
-    assert_eq!(svc.confirm_deletion(1, d.deletion_id.clone(), &"0".repeat(64)).await.unwrap_err(), ComplianceError::TokenMismatch);
+    assert_eq!(svc.confirm_deletion(1, d.deletion_id.clone(), &"0".repeat(64)).await.unwrap_err(), ComplianceError::InvalidConfirmationToken);
     // a token is bound to its own deletion id
     let d2 = svc.request_account_deletion(2, DeletionReason::UserRequested).await.unwrap();
     let token2 = last_token(&mailer);
-    assert_eq!(svc.confirm_deletion(1, d.deletion_id.clone(), &token2).await.unwrap_err(), ComplianceError::TokenMismatch);
+    assert_eq!(svc.confirm_deletion(1, d.deletion_id.clone(), &token2).await.unwrap_err(), ComplianceError::InvalidConfirmationToken);
     // expired after 24 hours
     now.fetch_add(24 * 3600, Ordering::SeqCst);
-    assert_eq!(svc.confirm_deletion(1, d.deletion_id.clone(), &token).await.unwrap_err(), ComplianceError::TokenExpired);
+    assert_eq!(svc.confirm_deletion(1, d.deletion_id.clone(), &token).await.unwrap_err(), ComplianceError::InvalidConfirmationToken);
     let users: i64 = svc.db().query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0)).unwrap();
     assert_eq!(users, 2);
     // a fresh request: confirm once, then the same token is refused
@@ -548,4 +572,70 @@ async fn test_deletion_confirmation_token_rules() {
     svc.confirm_deletion(1, d3.deletion_id.clone(), &token3).await.unwrap();
     assert!(svc.confirm_deletion(1, d3.deletion_id.clone(), &token3).await.is_err());
     let _ = d2;
+}
+
+/// What: EXPORT-15: a wrong, a reused and an expired token all get the same 400
+/// invalid_confirmation_token (same variant, code and status) and leave the request as it was; confirm and
+/// cancel of a cancelled request get 409 deletion_not_pending, even with that request's still-valid token;
+/// confirm and cancel of a completed request get 404 not_found (it has no owner any more), whether it was
+/// completed by the cascade (user_id NULL) or is a completed row that still names its user; nothing
+/// changes. In: none. Out: panics on a wrong answer. Why: EXPORT-15 (Phase B.2: one answer in every
+/// language; completed -> 404 as amended in commit 3abb340). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+/// Touches: memory only.
+// EXPORT-15
+#[tokio::test]
+async fn test_confirmation_one_answer_and_closed_request_codes() {
+    let (svc, mailer, now) = build_service();
+    let status_of = |id: &str| -> String { svc.db().query_row("SELECT status FROM deletion_requests WHERE id = ?1", params![id], |r| r.get(0)).unwrap() };
+    let mut answers = Vec::new();
+    // wrong
+    let wrong = svc.request_account_deletion(1, DeletionReason::UserRequested).await.unwrap();
+    answers.push(svc.confirm_deletion(1, wrong.deletion_id.clone(), &"f".repeat(64)).await.unwrap_err());
+    assert_eq!(status_of(&wrong.deletion_id), "pending");
+    // reused
+    let reused = svc.request_account_deletion(1, DeletionReason::UserRequested).await.unwrap();
+    let reused_token = last_token(&mailer);
+    svc.confirm_deletion(1, reused.deletion_id.clone(), &reused_token).await.unwrap();
+    answers.push(svc.confirm_deletion(1, reused.deletion_id.clone(), &reused_token).await.unwrap_err());
+    assert_eq!(status_of(&reused.deletion_id), "approved");
+    // expired (24 hours and one second later)
+    let expired = svc.request_account_deletion(1, DeletionReason::UserRequested).await.unwrap();
+    let expired_token = last_token(&mailer);
+    now.fetch_add(24 * 3600 + 1, Ordering::SeqCst);
+    answers.push(svc.confirm_deletion(1, expired.deletion_id.clone(), &expired_token).await.unwrap_err());
+    assert_eq!(status_of(&expired.deletion_id), "pending");
+    for a in &answers {
+        assert_eq!(a, &ComplianceError::InvalidConfirmationToken);
+        assert_eq!((a.status(), a.code()), (400, "invalid_confirmation_token"));
+        assert_eq!(a.to_string(), answers[0].to_string(), "the reply never says which");
+    }
+    let users: i64 = svc.db().query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0)).unwrap();
+    assert_eq!(users, 1, "nothing deleted");
+
+    // cancelled: a fresh request with its still-valid token, cancelled by the owner -> 409
+    let cancelled = svc.request_account_deletion(1, DeletionReason::UserRequested).await.unwrap();
+    let cancelled_token = last_token(&mailer);
+    svc.cancel_deletion(1, cancelled.deletion_id.clone()).await.unwrap();
+    let c = svc.confirm_deletion(1, cancelled.deletion_id.clone(), &cancelled_token).await.unwrap_err();
+    assert_eq!(c, ComplianceError::DeletionNotPending);
+    assert_eq!((c.status(), c.code()), (409, "deletion_not_pending"));
+    assert_eq!(svc.cancel_deletion(1, cancelled.deletion_id.clone()).await.unwrap_err(), ComplianceError::DeletionNotPending);
+    assert_eq!(status_of(&cancelled.deletion_id), "cancelled", "nothing changed");
+
+    // completed but still naming its user (a row completed by another path), token still valid -> 404
+    let marked = svc.request_account_deletion(1, DeletionReason::UserRequested).await.unwrap();
+    let marked_token = last_token(&mailer);
+    svc.db().execute("UPDATE deletion_requests SET status = 'completed' WHERE id = ?1", params![marked.deletion_id]).unwrap();
+    let c = svc.confirm_deletion(1, marked.deletion_id.clone(), &marked_token).await.unwrap_err();
+    assert_eq!((c.clone(), c.status(), c.code()), (ComplianceError::DeletionNotFound, 404, "not_found"));
+    assert_eq!(svc.cancel_deletion(1, marked.deletion_id.clone()).await.unwrap_err(), ComplianceError::DeletionNotFound);
+    assert_eq!(status_of(&marked.deletion_id), "completed", "nothing changed");
+
+    // completed by the cascade (statutory, erased on confirm): user_id is NULL -> 404 to the old owner
+    let gone = svc.request_account_deletion(1, DeletionReason::GdprRequest).await.unwrap();
+    let gone_token = last_token(&mailer);
+    svc.confirm_deletion(1, gone.deletion_id.clone(), &gone_token).await.unwrap();
+    assert_eq!(status_of(&gone.deletion_id), "completed");
+    assert_eq!(svc.confirm_deletion(1, gone.deletion_id.clone(), &gone_token).await.unwrap_err(), ComplianceError::DeletionNotFound);
+    assert_eq!(svc.cancel_deletion(1, gone.deletion_id.clone()).await.unwrap_err(), ComplianceError::DeletionNotFound);
 }

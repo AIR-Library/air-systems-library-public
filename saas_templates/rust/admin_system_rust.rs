@@ -2,8 +2,9 @@
 //! (GEMINI dispatch spec, template #2; docs/SPEC_auth_admin_trial_abuse.md part 2).
 //!
 //! What: `AdminSystem` runs the spec's admin actions on SQLite. Mutations require an active owner,
-//! reads an active admin or owner (the admin tier is the user's `tier`: enterprise = owner,
-//! premium = admin, basic = user, as in the spec's "change_role(user_id, new_tier)"). Safety rules:
+//! reads an active admin or owner (users.tier is the staff `Role`: owner, admin or user; a customer's or
+//! deployment's tier is the `Plan`: solo, team or enterprise, and one is never accepted for the other:
+//! 400 invalid_tier). A suspended caller is refused before any gate with 403 account_suspended. Safety rules:
 //! nobody can suspend, reset or change themselves, the last active owner can never be demoted,
 //! suspended, reset or deleted, refunds are only queued, plan changes go through the payment provider,
 //! publishing needs a verified domain and the publish safety flag, and governance approvals execute
@@ -11,6 +12,11 @@
 //! Why: the old file did not compile (`NO_PARAMS` is gone from the SQLite crate, private helpers the
 //! tests call, an enum used as a struct), its "CSRF check" always passed, and it decided ownership from
 //! a billing tier without saying so. Rewritten 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+//! Amended 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, ADMIN-19 and the TIERS rule): the old
+//! `Tier` mixed the two (enterprise = owner, premium = admin, basic = user), so a plan name could make a
+//! staff owner; it is split into `Role` and `Plan`. A suspended caller gets 403 account_suspended (it got
+//! owner_only). deployments.domain_verified is set by `verify_domain` and publish requires it.
+//! `Response::status` gives each answer's HTTP status.
 //! Touches: the SQLite database it owns; money through `StripeClient` (plan changes; refunds are
 //! only queued); email through `Mailer`; domain checks through `DomainVerifier`; OS randomness.
 //! CSRF tokens are checked by the HTTP layer before these methods are called.
@@ -25,58 +31,96 @@ use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-/// What: the user tiers; for admin purposes enterprise is owner, premium admin, basic user.
+/// What: the staff role stored in users.tier: user < admin < owner (create, change_role, last-owner
+/// rules). Why: Phase B.2 TIERS rule (2026-11-10): users.tier is the role, never a plan; this replaces
+/// the old `Tier` (basic / premium / enterprise), which read a billing plan as a staff role.
 /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Tier {
-    Basic,
-    Premium,
-    Enterprise,
+pub enum Role {
+    User,
+    Admin,
+    Owner,
 }
 
-/// What: methods of `Tier`, each documented below. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
-impl Tier {
-    /// What: the stored name. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+/// What: methods of `Role`, each documented below. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+impl Role {
+    /// What: the stored name. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
     pub fn as_str(&self) -> &'static str {
         match self {
-            Tier::Basic => "basic",
-            Tier::Premium => "premium",
-            Tier::Enterprise => "enterprise",
+            Role::User => "user",
+            Role::Admin => "admin",
+            Role::Owner => "owner",
         }
     }
-    /// What: parse a tier name, or `Validation("invalid_tier")`. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
-    pub fn parse(s: &str) -> AdminResult<Tier> {
+    /// What: parse a role ('owner' | 'admin' | 'user'); anything else, a plan name included, is
+    /// `Validation("invalid_tier")` (400). In: the name. Out: the role or the error. Why: Phase B.2 TIERS
+    /// rule. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+    pub fn parse(s: &str) -> AdminResult<Role> {
         match s {
-            "basic" => Ok(Tier::Basic),
-            "premium" => Ok(Tier::Premium),
-            "enterprise" => Ok(Tier::Enterprise),
+            "user" => Ok(Role::User),
+            "admin" => Ok(Role::Admin),
+            "owner" => Ok(Role::Owner),
             _ => Err(AdminError::Validation("invalid_tier".into())),
         }
     }
 }
 
-/// What: an admin-side user. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+/// What: a customer's or deployment's plan: solo, team or enterprise (change_plan, create_deployment,
+/// prices). Why: Phase B.2 TIERS rule (2026-11-10): a plan is never a staff role.
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Plan {
+    Solo,
+    Team,
+    Enterprise,
+}
+
+/// What: methods of `Plan`, each documented below. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+impl Plan {
+    /// What: the stored name. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Plan::Solo => "solo",
+            Plan::Team => "team",
+            Plan::Enterprise => "enterprise",
+        }
+    }
+    /// What: parse a plan ('solo' | 'team' | 'enterprise'); anything else, a role name included, is
+    /// `Validation("invalid_tier")` (400). In: the name. Out: the plan or the error. Why: Phase B.2 TIERS
+    /// rule. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+    pub fn parse(s: &str) -> AdminResult<Plan> {
+        match s {
+            "solo" => Ok(Plan::Solo),
+            "team" => Ok(Plan::Team),
+            "enterprise" => Ok(Plan::Enterprise),
+            _ => Err(AdminError::Validation("invalid_tier".into())),
+        }
+    }
+}
+
+/// What: an admin-side user; `tier` is the staff role (users.tier, changed to `Role` 2026-11-10, Phase B.2).
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct User {
     pub id: i64,
     pub email: String,
     pub name: String,
-    pub tier: Tier,
+    pub tier: Role,
     pub status: String,
     pub created_at: String,
 }
 
 /// What: methods of `User`, each documented below. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
 impl User {
-    /// What: may this user run owner-only actions? Active and enterprise tier. 2026-11-10,
-    /// session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// What: may this user run owner-only actions? Active and role owner (it was the enterprise plan
+    /// until 2026-11-10, Phase B.2). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
     pub fn is_owner(&self) -> bool {
-        self.status == "active" && self.tier == Tier::Enterprise
+        self.status == "active" && self.tier == Role::Owner
     }
-    /// What: may this user run read-only admin actions? Active and premium or enterprise.
-    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// What: may this user run read-only admin actions? Active and role admin or owner (changed
+    /// 2026-11-10, Phase B.2). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
     pub fn is_admin_or_owner(&self) -> bool {
-        self.status == "active" && self.tier >= Tier::Premium
+        self.status == "active" && self.tier >= Role::Admin
     }
 }
 
@@ -165,6 +209,30 @@ impl Response {
     pub fn is_success(&self) -> bool {
         matches!(self, Response::Success { .. })
     }
+    /// What: the HTTP status a server sends with this answer: 200 for a success, else `status_for(code)`.
+    /// Out: the status. Why: Phase B.2 (ADMIN-19 is "403 account_suspended"; the template had no status).
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+    pub fn status(&self) -> u16 {
+        match self {
+            Response::Success { .. } => 200,
+            Response::Error { error, .. } => status_for(error),
+        }
+    }
+}
+
+/// What: the HTTP status of an error code: 403 for the gates (owner_only, admin_only, account_suspended,
+/// publishing_disabled), 404 not_found, 409 for conflicts (email_exists, domain_taken,
+/// subscription_item_ambiguous, already_decided), 500 internal_error, 400 for every validation code.
+/// In: the code. Out: the status. Why: Phase B.2 (2026-11-10). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+/// Touches: nothing.
+pub fn status_for(code: &str) -> u16 {
+    match code {
+        "owner_only" | "admin_only" | "account_suspended" | "publishing_disabled" => 403,
+        "not_found" => 404,
+        "email_exists" | "domain_taken" | "subscription_item_ambiguous" | "already_decided" => 409,
+        "internal_error" => 500,
+        _ => 400,
+    }
 }
 
 /// What: one item of a provider subscription (its id and the price it bills). 2026-11-10,
@@ -229,9 +297,11 @@ pub struct Email {
     pub body: String,
 }
 
-/// Tier name -> the provider's price id (placeholders; set real ids from configuration).
+/// What: plan name -> the provider's price id (placeholders; set real ids from configuration). Changed
+/// 2026-11-10 (Phase B.2): keyed by plan (solo / team / enterprise), not the old basic / premium tiers.
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
 pub fn default_price_ids() -> HashMap<String, String> {
-    [("basic", "price_basic"), ("premium", "price_premium"), ("enterprise", "price_enterprise")].iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+    [("solo", "price_solo"), ("team", "price_team"), ("enterprise", "price_enterprise")].iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
 }
 
 /// What: the admin system. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: see module doc.
@@ -298,18 +368,21 @@ impl AdminSystem {
         self.outbox.borrow().clone()
     }
 
-    /// What: create the tables. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (DDL).
+    /// What: create the tables. Changed 2026-11-10 (Phase B.2 TIERS rule): users.tier holds a role
+    /// ('owner' | 'admin' | 'user'), customers.tier and deployments.tier a plan ('solo' | 'team' |
+    /// 'enterprise'), each enforced by a CHECK; deployments.domain_verified defaults to 0.
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (DDL).
     pub fn init_schema(&self) -> AdminResult<()> {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
-                tier TEXT NOT NULL CHECK (tier IN ('basic','premium','enterprise')), status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+                tier TEXT NOT NULL CHECK (tier IN ('owner','admin','user')), status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS password_resets (token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires_at TEXT NOT NULL, used_at TEXT NULL);
-             CREATE TABLE IF NOT EXISTS customers (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL, name TEXT NOT NULL, tier TEXT NOT NULL,
+             CREATE TABLE IF NOT EXISTS customers (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL, name TEXT NOT NULL, tier TEXT NOT NULL CHECK (tier IN ('solo','team','enterprise')),
                 signup_date TEXT NOT NULL, invoice_count INTEGER NOT NULL, status TEXT NOT NULL, stripe_subscription_id TEXT NULL,
                 subscription_status TEXT NULL, payment_method TEXT NULL, address TEXT NULL, notes TEXT NULL);
              CREATE TABLE IF NOT EXISTS invoices (id INTEGER PRIMARY KEY AUTOINCREMENT, customer_id INTEGER NULL, amount INTEGER NOT NULL, status TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS deployments (id INTEGER PRIMARY KEY AUTOINCREMENT, customer_id INTEGER NOT NULL REFERENCES customers(id), domain TEXT NOT NULL,
-                tier TEXT NOT NULL, status TEXT NOT NULL, theme TEXT NOT NULL, config TEXT NOT NULL, domain_verified INTEGER NOT NULL DEFAULT 0,
+                tier TEXT NOT NULL CHECK (tier IN ('solo','team','enterprise')), status TEXT NOT NULL, theme TEXT NOT NULL, config TEXT NOT NULL, domain_verified INTEGER NOT NULL DEFAULT 0,
                 published_at TEXT NULL, suspend_reason TEXT NULL, archived_at TEXT NULL);
              CREATE TABLE IF NOT EXISTS governance_actions (id INTEGER PRIMARY KEY AUTOINCREMENT, action_type TEXT NOT NULL, actor_id INTEGER NOT NULL,
                 target_resource_id INTEGER NOT NULL, reason TEXT, submitted_at TEXT NOT NULL, status TEXT NOT NULL, approved_by INTEGER,
@@ -322,17 +395,32 @@ impl AdminSystem {
         Ok(())
     }
 
-    /// What: re-read the caller and require an active owner (never trust the passed-in struct's tier).
+    /// What: re-read the caller from the database (never trust the passed-in struct) and refuse a
+    /// suspended one with `Forbidden("account_suspended")` (403) before any other gate. In: the session
+    /// user; `gate` is the code for an unknown caller. Out: the stored caller. Why: ADMIN-19 (Phase B.2,
+    /// 2026-11-10: a suspended owner got owner_only, or a suspended admin admin_only).
     /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (read).
+    fn caller(&self, current: &User, gate: &str) -> AdminResult<User> {
+        let me = self.get_user_by_id(current.id).map_err(|_| AdminError::Forbidden(gate.into()))?;
+        if me.status == "suspended" {
+            return Err(AdminError::Forbidden("account_suspended".into()));
+        }
+        Ok(me)
+    }
+
+    /// What: require an active owner: a suspended caller is account_suspended first, anyone else not an
+    /// active owner is owner_only. Changed 2026-11-10 (Phase B.2, ADMIN-19). 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (read).
     fn require_owner(&self, current: &User) -> AdminResult<User> {
-        let me = self.get_user_by_id(current.id).map_err(|_| AdminError::Forbidden("owner_only".into()))?;
+        let me = self.caller(current, "owner_only")?;
         if me.is_owner() { Ok(me) } else { Err(AdminError::Forbidden("owner_only".into())) }
     }
 
-    /// What: re-read the caller and require an active admin or owner. 2026-11-10,
+    /// What: require an active admin or owner: a suspended caller is account_suspended first, anyone else
+    /// is admin_only. Changed 2026-11-10 (Phase B.2, ADMIN-19). 2026-11-10,
     /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (read).
     fn require_admin_or_owner(&self, current: &User) -> AdminResult<User> {
-        let me = self.get_user_by_id(current.id).map_err(|_| AdminError::Forbidden("admin_only".into()))?;
+        let me = self.caller(current, "admin_only")?;
         if me.is_admin_or_owner() { Ok(me) } else { Err(AdminError::Forbidden("admin_only".into())) }
     }
 
@@ -349,7 +437,7 @@ impl AdminSystem {
     /// What: map a user row. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
     fn user_row(r: &rusqlite::Row) -> rusqlite::Result<User> {
         let tier: String = r.get(3)?;
-        Ok(User { id: r.get(0)?, email: r.get(1)?, name: r.get(2)?, tier: Tier::parse(&tier).unwrap_or(Tier::Basic), status: r.get(4)?, created_at: r.get(5)? })
+        Ok(User { id: r.get(0)?, email: r.get(1)?, name: r.get(2)?, tier: Role::parse(&tier).unwrap_or(Role::User), status: r.get(4)?, created_at: r.get(5)? })
     }
 
     /// What: a user by id, or `NotFound`. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
@@ -371,7 +459,7 @@ impl AdminSystem {
 
     /// What: number of active owners. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
     fn active_owner_count(&self) -> AdminResult<i64> {
-        Ok(self.conn.query_row("SELECT COUNT(*) FROM users WHERE tier = 'enterprise' AND status = 'active'", [], |r| r.get(0))?)
+        Ok(self.conn.query_row("SELECT COUNT(*) FROM users WHERE tier = 'owner' AND status = 'active'", [], |r| r.get(0))?)
     }
 
     /// What: is this user the last active owner? 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
@@ -380,7 +468,8 @@ impl AdminSystem {
     }
 
     /// What: users action=create. Gates: owner, valid email/name/tier, unique email. Creates an
-    /// active user and (if `notify`) queues an invite email. Out: `{user_id, email, tier, created_at}`
+    /// active user and (if `notify`) queues an invite email. `tier` is the staff role (owner / admin /
+    /// user; a plan name is invalid_tier, Phase B.2). Out: `{user_id, email, tier, created_at}`
     /// or `email_exists`. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database, email.
     pub fn create_user(&self, current: &User, email: &str, name: &str, tier: &str, notify: bool) -> Response {
         let run = || -> AdminResult<Value> {
@@ -393,7 +482,7 @@ impl AdminSystem {
             if name.chars().count() < 2 || name.chars().count() > 100 {
                 return Err(AdminError::Validation("invalid_name".into()));
             }
-            let tier = Tier::parse(tier)?;
+            let tier = Role::parse(tier)?;
             if self.get_user_by_email(&email)?.is_some() {
                 return Err(AdminError::Conflict("email_exists".into()));
             }
@@ -440,15 +529,16 @@ impl AdminSystem {
         run().map(Response::success).unwrap_or_else(Response::from_error)
     }
 
-    /// What: users action=change_role (tier). Gates: owner, valid tier, the last active owner cannot be
-    /// demoted, nobody changes their own role. Out: `{user_id, old_tier, new_tier}`. 2026-11-10,
-    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
+    /// What: users action=change_role (tier). Gates: owner, valid role (owner / admin / user; a plan
+    /// name is invalid_tier, Phase B.2), the last active owner cannot be demoted, nobody changes their own
+    /// role. Out: `{user_id, old_tier, new_tier}`. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// Touches: database.
     pub fn change_role(&self, current: &User, user_id: i64, new_tier: &str) -> Response {
         let run = || -> AdminResult<Value> {
             let me = self.require_owner(current)?;
-            let new_tier = Tier::parse(new_tier)?;
+            let new_tier = Role::parse(new_tier)?;
             let target = self.get_user_by_id(user_id)?;
-            if self.is_last_active_owner(&target)? && new_tier != Tier::Enterprise {
+            if self.is_last_active_owner(&target)? && new_tier != Role::Owner {
                 return Err(AdminError::Validation("cannot_demote_last_owner".into()));
             }
             if user_id == me.id {
@@ -529,7 +619,8 @@ impl AdminSystem {
         run().map(Response::success).unwrap_or_else(Response::from_error)
     }
 
-    /// What: customers action=change_plan. Gate: owner. The billing rule (billing_subscriptions.md flow
+    /// What: customers action=change_plan. `new_tier` is a plan (solo / team / enterprise; a role name is
+    /// invalid_tier, Phase B.2). Gate: owner. The billing rule (billing_subscriptions.md flow
     /// 2): an unknown tier is `invalid_tier`; the provider subscription is retrieved and one without
     /// exactly one item is `subscription_item_ambiguous` (409); both before any update. Then the update is
     /// `items: [{id: current_item_id, price}]` with 'create_prorations' (never a bare price, which adds a
@@ -540,7 +631,7 @@ impl AdminSystem {
     pub fn change_plan(&self, current: &User, customer_id: i64, new_tier: &str) -> Response {
         let run = || -> AdminResult<Value> {
             let me = self.require_owner(current)?;
-            let tier = Tier::parse(new_tier)?;
+            let tier = Plan::parse(new_tier)?;
             let (old_tier, sub): (String, Option<String>) = self
                 .conn
                 .query_row("SELECT tier, stripe_subscription_id FROM customers WHERE id = ?1", params![customer_id], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -604,13 +695,14 @@ impl AdminSystem {
     }
 
     /// What: deployments action=create. Gate: owner. Customer exists, domain valid and not used by a
-    /// live or draft deployment, theme id given. Creates a draft with an initial config.
+    /// live or draft deployment, theme id given, `tier` a plan (solo / team / enterprise; a role name is
+    /// invalid_tier, Phase B.2). Creates a draft with an initial config and domain_verified false.
     /// Out: `{deployment_id, domain, tier}`. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
     /// Touches: database.
     pub fn create_deployment(&self, current: &User, customer_id: i64, domain: &str, tier: &str, theme_id: &str) -> Response {
         let run = || -> AdminResult<Value> {
             let me = self.require_owner(current)?;
-            let tier = Tier::parse(tier)?;
+            let tier = Plan::parse(tier)?;
             let domain = domain.trim().to_lowercase();
             if !valid_domain(&domain) {
                 return Err(AdminError::Validation("invalid_domain".into()));
@@ -640,19 +732,47 @@ impl AdminSystem {
         run().map(Response::success).unwrap_or_else(Response::from_error)
     }
 
+    /// What: deployments action=verify_domain. Gate: owner. Asks the `DomainVerifier` whether the
+    /// deployment's domain points at us; if so sets deployments.domain_verified = true and audits
+    /// 'domain_verified', else `domain_not_verified` (400) and nothing changes. In: caller, deployment id.
+    /// Out: `{deployment_id, domain, domain_verified: true}`. Why: Phase B.2 TIERS/deployments rule
+    /// (2026-11-10): deployments carry domain_verified and publish reads it (publish used to ask the
+    /// verifier itself). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database, domain
+    /// verification (network in a real implementation).
+    pub fn verify_domain(&self, current: &User, deployment_id: i64) -> Response {
+        let run = || -> AdminResult<Value> {
+            let me = self.require_owner(current)?;
+            let domain: String = self
+                .conn
+                .query_row("SELECT domain FROM deployments WHERE id = ?1", params![deployment_id], |r| r.get(0))
+                .optional()?
+                .ok_or_else(|| AdminError::NotFound("deployment".into()))?;
+            if !self.domains.is_verified(&domain) {
+                return Err(AdminError::Validation("domain_not_verified".into()));
+            }
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute("UPDATE deployments SET domain_verified = 1 WHERE id = ?1", params![deployment_id])?;
+            Self::audit(&tx, "domain_verified", me.id, "deployment", deployment_id, None, Some(json!({ "domain": domain, "domain_verified": true })), None)?;
+            tx.commit()?;
+            Ok(json!({ "deployment_id": deployment_id, "domain": domain, "domain_verified": true }))
+        };
+        run().map(Response::success).unwrap_or_else(Response::from_error)
+    }
+
     /// What: deployments action=publish. Gates: owner AND the `can_publish` safety flag; the deployment
-    /// is a draft with a theme and its domain is verified now by the `DomainVerifier`.
-    /// Out: `{deployment_id, status: "live", public_url}`. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
-    /// Touches: database, domain verification.
+    /// is a draft with a theme and deployments.domain_verified is true (set by `verify_domain`), else
+    /// `domain_not_verified`. Out: `{deployment_id, status: "live", public_url}`. Changed 2026-11-10 (Phase
+    /// B.2): the stored domain_verified is required (it asked the verifier and set the column itself).
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
     pub fn publish_deployment(&self, current: &User, deployment_id: i64) -> Response {
         let run = || -> AdminResult<Value> {
             let me = self.require_owner(current)?;
             if !self.safety.can_publish {
                 return Err(AdminError::Forbidden("publishing_disabled".into()));
             }
-            let (status, domain, theme): (String, String, String) = self
+            let (status, domain, theme, verified): (String, String, String, bool) = self
                 .conn
-                .query_row("SELECT status, domain, theme FROM deployments WHERE id = ?1", params![deployment_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .query_row("SELECT status, domain, theme, domain_verified FROM deployments WHERE id = ?1", params![deployment_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
                 .optional()?
                 .ok_or_else(|| AdminError::NotFound("deployment".into()))?;
             if status != "draft" {
@@ -661,11 +781,11 @@ impl AdminSystem {
             if theme.is_empty() {
                 return Err(AdminError::Validation("theme_not_set".into()));
             }
-            if !self.domains.is_verified(&domain) {
+            if !verified {
                 return Err(AdminError::Validation("domain_not_verified".into()));
             }
             let tx = self.conn.unchecked_transaction()?;
-            tx.execute("UPDATE deployments SET status = 'live', domain_verified = 1, published_at = ?1 WHERE id = ?2", params![now(), deployment_id])?;
+            tx.execute("UPDATE deployments SET status = 'live', published_at = ?1 WHERE id = ?2", params![now(), deployment_id])?;
             Self::audit(&tx, "deployment_published", me.id, "deployment", deployment_id, Some(json!({ "status": status })), Some(json!({ "status": "live" })), None)?;
             tx.commit()?;
             Ok(json!({ "deployment_id": deployment_id, "status": "live", "public_url": format!("https://{}", domain) }))
@@ -673,10 +793,15 @@ impl AdminSystem {
         run().map(Response::success).unwrap_or_else(Response::from_error)
     }
 
-    /// What: set a deployment's status with an audit row (suspend or retire). 2026-11-10,
-    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
+    /// What: set a deployment's status with an audit row (suspend or retire). The owner gate (and the
+    /// account_suspended refusal) comes first; then, for a suspend (`reason` given), the reason must not be
+    /// blank (reason_required). Changed 2026-11-10 (Phase B.2, ADMIN-19: the reason check ran before the
+    /// gate). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
     fn set_deployment_status(&self, current: &User, deployment_id: i64, status: &str, action: &str, reason: Option<&str>) -> AdminResult<Value> {
         let me = self.require_owner(current)?;
+        if reason.map_or(false, |r| r.trim().is_empty()) {
+            return Err(AdminError::Validation("reason_required".into()));
+        }
         let old: String = self
             .conn
             .query_row("SELECT status FROM deployments WHERE id = ?1", params![deployment_id], |r| r.get(0))
@@ -695,12 +820,9 @@ impl AdminSystem {
         Ok(json!({ "deployment_id": deployment_id, "status": status }))
     }
 
-    /// What: deployments action=suspend (reason required). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
-    /// Touches: database.
+    /// What: deployments action=suspend (reason required, checked after the owner gate since 2026-11-10,
+    /// Phase B.2). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
     pub fn suspend_deployment(&self, current: &User, deployment_id: i64, reason: &str) -> Response {
-        if reason.trim().is_empty() {
-            return Response::error("reason_required", "reason required");
-        }
         self.set_deployment_status(current, deployment_id, "suspended", "deployment_suspended", Some(reason)).map(Response::success).unwrap_or_else(Response::from_error)
     }
 

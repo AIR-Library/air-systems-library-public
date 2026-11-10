@@ -12,10 +12,14 @@
 //! Amended the same day (TRIAL-09/10/11/14/15): the device gate's order is FAIL >= 5 other users, PASS
 //! < 2, PASS for a known device, else CHALLENGE, and it records the device only after a PASS/CHALLENGE;
 //! payment timing counts whole days after trial_end = created_at + trial_days (default 14).
+//! Amended 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP, Phase B.2): payment timing reads created_at from
+//! a `users` table (a mirror of the auth system's users, filled by `insert_user` and by `signup`); a user
+//! with no users row FAILs closed with 403 user_not_found (it returned PASS), and a user with no ledger row
+//! is judged from users.created_at with no earlier payment.
 //! Touches: the SQLite database it owns (in memory for tests); no network, no money.
 
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{params, Connection, Result as SqlResult};
+use rusqlite::{params, Connection, OptionalExtension, Result as SqlResult};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -76,7 +80,8 @@ pub struct DeviceInfo {
 }
 
 /// What: the FAIL response a caller returns for a gate (error code and HTTP status from the spec).
-/// In: the gate result. Out: `Some(ErrorResponse)` on FAIL, `None` otherwise.
+/// In: the gate result. Out: `Some(ErrorResponse)` on FAIL, `None` otherwise. Changed 2026-11-10 (Phase B.2):
+/// gate 5's FAIL for a user with no users row is 403 user_not_found.
 /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
 pub fn fail_response(result: &GateResult) -> Option<ErrorResponse> {
     if result.decision != Decision::Fail {
@@ -87,6 +92,8 @@ pub fn fail_response(result: &GateResult) -> Option<ErrorResponse> {
         "payment_method_history" => ("payment_method_used_for_multiple_trials", 403),
         "ip_signup_rate_limit" => ("too_many_signups_from_ip", 429),
         "device_fingerprint" => ("device_suspected_fraud", 403),
+        // Phase B.2 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): an unknown user fails closed with its own code.
+        "trial_payment_timing" if result.rule_inputs["error"] == "user_not_found" => ("user_not_found", 403),
         "trial_payment_timing" => ("trial_ended_no_payment_cannot_retry", 403),
         _ => ("chargeback_history_requires_prepayment", 403),
     };
@@ -144,8 +151,9 @@ impl Database {
     }
 
     /// What: the spec's tables (ledger gains `stripe_customer_id`, the link from a user to the payment
-    /// provider's customer id that gate 6 needs). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
-    /// Touches: database (DDL).
+    /// provider's customer id that gate 6 needs), and `users` (id, email, created_at), the auth system's
+    /// users as gate 5 reads them (added 2026-11-10, Phase B.2: trial_end = users.created_at + trial_days).
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (DDL).
     fn migrate(conn: &Connection) -> SqlResult<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS trial_abuse_ledger (
@@ -162,6 +170,7 @@ impl Database {
              CREATE TABLE IF NOT EXISTS gate_decisions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, gate_name TEXT NOT NULL, decision TEXT NOT NULL,
                 rule_inputs TEXT NOT NULL, rule_outputs TEXT NOT NULL, created_at TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, email TEXT, created_at TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS signups (id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT NOT NULL, created_at TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS stripe_events (id INTEGER PRIMARY KEY AUTOINCREMENT, customer TEXT NOT NULL, type TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS refunds (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, status TEXT NOT NULL);",
@@ -285,23 +294,29 @@ impl Database {
     }
 
     /// What: gate 5, judged when a payment method is being added (the payment date is now).
-    /// trial_end = the user's created_at (earliest trial_started_at, else signup_date, in the ledger) +
-    /// trial_days; days_after_trial = floor((now - trial_end) / 1 day), rounding toward negative infinity
-    /// (negative while the trial runs); earlier_payment = the ledger already has a payment_added_date for
-    /// this user. PASS if days_after_trial < 5; FAIL if days_after_trial >= 90 and no earlier payment;
-    /// CHALLENGE otherwise. No ledger row -> PASS (no trial to abuse).
+    /// trial_end = users.created_at + trial_days; days_after_trial = floor((now - trial_end) / 1 day),
+    /// rounding toward negative infinity (negative while the trial runs); earlier_payment = the ledger
+    /// already has a payment_added_date for this user. PASS if days_after_trial < 5; FAIL if
+    /// days_after_trial >= 90 and no earlier payment; CHALLENGE otherwise. A user with no users row (or an
+    /// unreadable created_at) is FAIL with rule_inputs.error = "user_not_found" (fail closed; 403 through
+    /// `fail_response`); a user with no ledger row is judged from users.created_at with no earlier payment.
     /// In: user. Out: `GateResult`. Why: 2026-11-10 amendment (TRIAL-10/11/15): the old rule measured from
-    /// the trial start with ad-hoc windows. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// the trial start with ad-hoc windows; changed 2026-11-10 (Phase B.2 bug): an unknown user returned
+    /// PASS and created_at came from the ledger. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
     /// Touches: database, clock.
     pub fn check_trial_payment_timing(&self, user_id: i64) -> SqlResult<GateResult> {
-        let (created, earlier_payments): (Option<String>, i64) = self.conn.query_row(
-            "SELECT MIN(COALESCE(trial_started_at, signup_date)), COUNT(payment_added_date) FROM trial_abuse_ledger WHERE user_id = ?1",
-            params![user_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
+        let created: Option<String> = self
+            .conn
+            .query_row("SELECT created_at FROM users WHERE id = ?1", params![user_id], |r| r.get(0))
+            .optional()?;
         let Some(created) = created.as_deref().and_then(|t| DateTime::parse_from_rfc3339(t).ok()).map(|d| d.with_timezone(&Utc)) else {
-            return self.decide(Some(user_id), "trial_payment_timing", Decision::Pass, json!({ "reason": "no_trial_record" }));
+            return self.decide(Some(user_id), "trial_payment_timing", Decision::Fail, json!({ "reason": "user_not_found", "error": "user_not_found" }));
         };
+        let earlier_payments: i64 = self.conn.query_row(
+            "SELECT COUNT(payment_added_date) FROM trial_abuse_ledger WHERE user_id = ?1",
+            params![user_id],
+            |r| r.get(0),
+        )?;
         let trial_end = created + Duration::days(self.trial_days);
         let days_after_trial = ((self.clock)() - trial_end).num_seconds().div_euclid(86_400);
         let earlier_payment = earlier_payments > 0;
@@ -350,6 +365,8 @@ impl Database {
     /// device row. Otherwise the device gate has written its row (PASS or CHALLENGE), and the signup and a
     /// ledger row with gate_flags {email, ip, device} are recorded. In: the new user's id (created by the
     /// auth system), email, the server-observed IP, device. Out: the three gate results, or the FAIL body.
+    /// Since 2026-11-10 (Phase B.2) a recorded signup also adds the user's `users` row (created_at = now)
+    /// if the auth system has not, so gate 5 can measure the trial.
     /// Why: 2026-11-10 amendment (TRIAL-09/14): recording the device first made every later check pass.
     /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database, clock.
     pub fn signup(&self, user_id: i64, email: &str, ip: &str, device: &DeviceInfo) -> SqlResult<Result<SignupGates, ErrorResponse>> {
@@ -373,7 +390,23 @@ impl Database {
              VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?5)",
             params![user_id, email.trim().to_lowercase(), ip.trim(), Self::device_hash(device), now, flags.to_string()],
         )?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO users (id, email, created_at) VALUES (?1, ?2, ?3)",
+            params![user_id, email.trim().to_lowercase(), now],
+        )?;
         Ok(Ok(SignupGates { email: email_gate, ip: ip_gate, device: device_gate }))
+    }
+
+    /// What: record (or replace) a user as the auth system created them; gate 5 measures the trial from
+    /// created_at. In: user id, email, created_at. Out: `()`. Why: Phase B.2 (2026-11-10): trial_end =
+    /// users.created_at + trial_days, and a user with no users row fails closed.
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
+    pub fn insert_user(&self, user_id: i64, email: Option<&str>, created_at: DateTime<Utc>) -> SqlResult<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO users (id, email, created_at) VALUES (?1, ?2, ?3)",
+            params![user_id, email.map(|e| e.trim().to_lowercase()), created_at.to_rfc3339()],
+        )?;
+        Ok(())
     }
 
     /// What: device rows recorded for a user (for audits and tests). 2026-11-10,

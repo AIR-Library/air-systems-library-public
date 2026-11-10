@@ -443,3 +443,167 @@ impl Sender for CrashOnceSender {
         Ok(())
     }
 }
+
+/// What: a service on a named shared-cache in-memory database, with a second connection to the same
+/// database so a test can read stored columns the API does not return (status, scheduled_at), a
+/// recording sender and a movable clock. In: a database name unique to the test, the start time.
+/// Out: (service, reader connection, delivered messages, clock). Why: Phase B.2 tests (NOTIF-05/07) must
+/// prove what is stored. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite.
+fn shared_service(name: &str, start: DateTime<Utc>) -> (NotificationService, Connection, std::rc::Rc<std::cell::RefCell<Vec<OutgoingMessage>>>, std::rc::Rc<std::cell::Cell<DateTime<Utc>>>) {
+    use rusqlite::OpenFlags;
+    let uri = format!("file:{}?mode=memory&cache=shared", name);
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_URI;
+    let main = Connection::open_with_flags(&uri, flags).unwrap();
+    let reader = Connection::open_with_flags(&uri, flags).unwrap();
+    let delivered = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let now = std::rc::Rc::new(std::cell::Cell::new(start));
+    let clock = now.clone();
+    let service = NotificationService::new(main, Box::new(RecordingSender(delivered.clone())), SECRET)
+        .unwrap()
+        .with_sleeper(Box::new(|_| {}))
+        .with_clock(Box::new(move || clock.get()));
+    (service, reader, delivered, now)
+}
+
+/// What: the stored (status, scheduled_at, opened_at) of a message, read through the second connection.
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2). Touches: in-memory SQLite (read).
+fn stored(reader: &Connection, id: &str) -> (String, Option<String>, Option<String>) {
+    reader
+        .query_row("SELECT status, scheduled_at, opened_at FROM notification_logs WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+}
+
+/// What: NOTIF-05 (Phase B.2 wording): quiet hours are HH:MM in UTC and may cross midnight. With a
+/// 22:00-08:00 window, a send at 23:00 is queued with scheduled_at = 08:00 the next day and one at 07:59
+/// with 08:00 the same day; sends at 08:00 and 21:59 go out now. A message scheduled (outside quiet hours)
+/// for 23:30 that deliver_due finds due at 23:30 is not sent: it goes back to 'queued' with scheduled_at =
+/// 08:00 the next day (counted as deferred), and the 08:00 run sends it once. In: none. Out: panics on a
+/// wrong answer. Why: Phase B.2 bug: deliver_due did not re-check quiet hours.
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite.
+// NOTIF-05
+#[test]
+fn test_quiet_hours_cross_midnight_and_deliver_due_requeues() {
+    let (service, reader, delivered, now) = shared_service("notif05_b2", fixed_time(2026, 1, 15, 12, 0));
+    service
+        .update_user_preferences(
+            1,
+            &UserNotificationPreferencesUpdate {
+                do_not_disturb: None,
+                quiet_hours_start: Some("22:00".to_string()),
+                quiet_hours_end: Some("08:00".to_string()),
+                channels_enabled: None,
+            },
+        )
+        .unwrap();
+    let vars: HashMap<String, String> = [("app_name".to_string(), "TestApp".to_string())].into_iter().collect();
+    let next_8 = "2026-01-16T08:00:00.000000Z".to_string();
+
+    now.set(fixed_time(2026, 1, 15, 23, 0));
+    let late = service.send_single_notification(1, "welcome_email", Some("email"), &vars, None).unwrap();
+    assert_eq!(late.status, "queued");
+    assert_eq!(stored(&reader, &late.message_id).1, Some(next_8.clone()));
+    now.set(fixed_time(2026, 1, 16, 7, 59));
+    let early = service.send_single_notification(1, "welcome_email", Some("email"), &vars, None).unwrap();
+    assert_eq!(early.status, "queued");
+    assert_eq!(stored(&reader, &early.message_id).1, Some(next_8.clone()));
+    // both go out at quiet_hours_end
+    let counts = service.deliver_due(fixed_time(2026, 1, 16, 8, 0)).unwrap();
+    assert_eq!((counts.sent, counts.deferred), (2, 0));
+    for (h, m) in [(8, 0), (21, 59)] {
+        now.set(fixed_time(2026, 1, 16, h, m));
+        let r = service.send_single_notification(1, "welcome_email", Some("email"), &vars, None).unwrap();
+        assert_eq!(r.status, "sent", "{:02}:{:02} is outside quiet hours", h, m);
+    }
+    let sent_before = delivered.borrow().len();
+
+    // scheduled at noon for 23:30 (no quiet hours apply to the scheduling itself)
+    now.set(fixed_time(2026, 1, 16, 12, 0));
+    let at = fixed_time(2026, 1, 16, 23, 30);
+    let sched = service.send_single_notification(1, "welcome_email", Some("email"), &vars, Some(at)).unwrap();
+    assert_eq!(sched.status, "queued");
+    let counts = service.deliver_due(at).unwrap();
+    assert_eq!((counts.sent, counts.deferred), (0, 1));
+    let (status, scheduled_at, _) = stored(&reader, &sched.message_id);
+    assert_eq!((status.as_str(), scheduled_at), ("queued", Some("2026-01-17T08:00:00.000000Z".to_string())));
+    assert_eq!(delivered.borrow().len(), sent_before, "nothing sent inside quiet hours");
+    assert_eq!(service.deliver_due(fixed_time(2026, 1, 17, 7, 59)).unwrap().sent, 0);
+    let counts = service.deliver_due(fixed_time(2026, 1, 17, 8, 0)).unwrap();
+    assert_eq!((counts.sent, counts.deferred), (1, 0));
+    assert_eq!(stored(&reader, &sched.message_id).0, "sent");
+    assert_eq!(delivered.borrow().iter().filter(|m| m.message_id == sched.message_id).count(), 1);
+}
+
+/// What: NOTIF-07 (Phase B.2 wording): GET /notifications/open/:message_id (`open_message`, this template
+/// has no router) sets opened_at and status 'opened' the first time; a second call an hour later changes
+/// nothing (opened_at keeps the first time); every call, an unknown id and a not-yet-sent (queued) message
+/// included, answers 204, and the queued message is not marked opened. In: none. Out: panics on a wrong
+/// answer. Why: NOTIF-07 now names the endpoint and its once-only rule. 2026-11-10,
+/// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite.
+// NOTIF-07
+#[test]
+fn test_open_endpoint_sets_opened_once_and_answers_204() {
+    let (service, reader, _, now) = shared_service("notif07_b2", fixed_time(2026, 1, 15, 12, 0));
+    let vars: HashMap<String, String> = [("app_name".to_string(), "TestApp".to_string())].into_iter().collect();
+    let sent = service.send_single_notification(1, "welcome_email", Some("email"), &vars, None).unwrap();
+    assert_eq!(stored(&reader, &sent.message_id).0, "sent");
+    now.set(fixed_time(2026, 1, 15, 12, 5));
+    assert_eq!(service.open_message(&sent.message_id).unwrap(), 204);
+    let first = stored(&reader, &sent.message_id);
+    assert_eq!((first.0.as_str(), first.2.as_deref()), ("opened", Some("2026-01-15T12:05:00.000000Z")));
+    now.set(fixed_time(2026, 1, 15, 13, 5));
+    assert_eq!(service.open_message(&sent.message_id).unwrap(), 204);
+    assert_eq!(stored(&reader, &sent.message_id), first, "a second open changes nothing");
+    assert_eq!(service.track_message_status(&sent.message_id).unwrap().status, "opened");
+    assert_eq!(service.open_message("no-such-message").unwrap(), 204);
+    let queued = service.send_single_notification(1, "welcome_email", Some("email"), &vars, Some(fixed_time(2026, 2, 1, 0, 0))).unwrap();
+    assert_eq!(service.open_message(&queued.message_id).unwrap(), 204);
+    assert_eq!(stored(&reader, &queued.message_id).0, "queued");
+    assert_eq!(stored(&reader, &queued.message_id).2, None);
+}
+
+/// What: a provider that refuses its first `fail_first` sends, then accepts; it counts every call.
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, NOTIF-08). Touches: memory.
+struct FlakySender {
+    fail_first: u32,
+    calls: std::rc::Rc<std::cell::Cell<u32>>,
+}
+
+/// What: `Sender` for the flaky provider. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+impl Sender for FlakySender {
+    /// What: count the call; refuse while within `fail_first`, else accept. 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
+    fn send(&self, _message: &OutgoingMessage) -> Result<(), String> {
+        self.calls.set(self.calls.get() + 1);
+        if self.calls.get() <= self.fail_first {
+            return Err(format!("provider down (call {})", self.calls.get()));
+        }
+        Ok(())
+    }
+}
+
+/// What: NOTIF-08 (Phase B.2 wording): a failed email is retried at most 3 times after the first attempt,
+/// waiting 1 s, 2 s and 4 s. A sender that fails 3 times and recovers is called 4 times and the message
+/// is 'sent'; one that fails 4 times is called exactly 4 times (never a 5th) and the message is 'failed'.
+/// In: none. Out: panics on a wrong count or wait. Why: the spec now fixes the counting (it was 3 attempts
+/// in all, 0.5 s / 1 s). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+// NOTIF-08
+#[test]
+fn test_retry_three_times_after_first_attempt() {
+    for (fail_first, status) in [(3, "sent"), (4, "failed")] {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let waits = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let record = waits.clone();
+        let service = NotificationService::new(Connection::open_in_memory().unwrap(), Box::new(FlakySender { fail_first, calls: calls.clone() }), SECRET)
+            .unwrap()
+            .with_sleeper(Box::new(move |d| record.borrow_mut().push(d)))
+            .with_clock(Box::new(|| fixed_time(2026, 1, 15, 12, 0)));
+        let vars: HashMap<String, String> = [("app_name".to_string(), "TestApp".to_string())].into_iter().collect();
+        let resp = service.send_single_notification(1, "welcome_email", Some("email"), &vars, None).unwrap();
+        assert_eq!(resp.status, status, "{} failures", fail_first);
+        assert_eq!(service.track_message_status(&resp.message_id).unwrap().status, status);
+        assert_eq!(calls.get(), 4, "{} failures: the first attempt and 3 retries", fail_first);
+        let secs: Vec<u64> = waits.borrow().iter().map(|d| d.as_secs()).collect();
+        assert_eq!(secs, vec![1, 2, 4]);
+    }
+    assert_eq!(MAX_ATTEMPTS, 4);
+}
