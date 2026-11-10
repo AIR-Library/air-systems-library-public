@@ -475,6 +475,62 @@ test('VAULT-13 delete_key removes the row and audits once; a second delete is fa
 });
 
 /**
+ * VAULT-13, a failing store: when the key_deleted audit write fails, deleteKey returns 500 storage_failed (not an
+ * exception), the row stays (the transaction rolled back) and no key_deleted row exists; a later delete on a working
+ * store succeeds.
+ * In: none. Out: assertions. Why: VAULT-13, spec CONVENTIONS; review finding 4525101278.
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: an in-memory SQLite database only.
+ */
+// VAULT-13
+test('VAULT-13 delete_key with a failing store answers 500 storage_failed and keeps the row', async () => {
+  /** A store whose key_deleted audit write fails. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches the database. */
+  class FailingDeleteStore extends SqliteVaultStore {
+    /** Throws for key_deleted rows while `failing`, else writes. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+    insertAudit(a) {
+      if (this.failing && a.action === 'key_deleted') throw new Error('disk full');
+      super.insertAudit(a);
+    }
+  }
+  const store = new FailingDeleteStore();
+  const env = setup({ store });
+  await env.vault.saveKey('user_1', 'acme', KEY);
+  store.failing = true;
+  assert.deepStrictEqual(env.vault.deleteKey('user_1', 'acme'), { error: 'storage_failed', status: 500 });
+  assert.strictEqual(rawRows(store).length, 1);
+  assert.deepStrictEqual(env.vault.listAudit('user_1').map(a => a.action), ['key_saved']);
+  store.failing = false;
+  assert.deepStrictEqual(env.vault.deleteKey('user_1', 'acme'), { deleted: true });
+});
+
+/**
+ * VAULT-10, a failing rewrap write: with two rows under k1 and the store's write failing for the first one, rewrap()
+ * returns {rewrapped: 1, failed: 1}: the failure is counted, the first row is unchanged and the run still re-wraps
+ * the second row (it does not stop at the first failure).
+ * In: none. Out: assertions. Why: VAULT-10; review finding 4525101278. 2026-11-10,
+ * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: an in-memory SQLite database only.
+ */
+// VAULT-10
+test('VAULT-10 rewrap counts a failed store write in failed and goes on with the next row', async () => {
+  /** A store whose rewrap write fails for user_1. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches the database. */
+  class FailingRewrapStore extends SqliteVaultStore {
+    /** Throws for user_1, else writes. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches the database. */
+    rewrapRow(userId, ...rest) {
+      if (userId === 'user_1') throw new Error('disk full');
+      return super.rewrapRow(userId, ...rest);
+    }
+  }
+  const store = new FailingRewrapStore();
+  const env1 = setup({ store });
+  await env1.vault.saveKey('user_1', 'acme', KEY);
+  await env1.vault.saveKey('user_2', 'acme', KEY);
+  const before = store.getRow('user_1', 'acme');
+  const env2 = setup({ store, masterKeys: { k1: K1, k2: K2 }, activeKeyId: 'k2' });
+  assert.deepStrictEqual(env2.vault.rewrap(), { rewrapped: 1, failed: 1 });
+  assert.deepStrictEqual(store.getRow('user_1', 'acme'), before);
+  assert.strictEqual(store.getRow('user_2', 'acme').key_id, 'k2');
+});
+
+/**
  * VAULT-14: with real randomness, the same key saved for two users gives different ciphertext, different
  * wrapped_dek and different nonces.
  * In: the spec's TEST VECTORS for this row. Out: assertions (the test fails on any mismatch).

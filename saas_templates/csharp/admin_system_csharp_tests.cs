@@ -789,6 +789,42 @@ public class AdminControllerTests
         Assert.Contains(Database.AuditLog, l => l.Action == "role_changed" && l.ResourceId == owner2.UserId && l.OldValue == "Owner" && l.NewValue == "User");
     }
 
+    /// <summary>
+    /// ADMIN-07 (admin spec LAST OWNER, approver rule): an admin's governance change_role that targets the approving
+    /// owner, while a second active owner exists (so the last-owner check passes), is refused with 400
+    /// cannot_change_own_role; the action stays pending, the approver's tier is unchanged and nothing is audited.
+    /// With the only active owner as target the last-owner answer still comes first.
+    /// In: nothing. Out: asserts. Why: review finding 4525101209. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// Touches: the in-memory admin state.
+    /// </summary>
+    // ADMIN-07
+    [Fact]
+    public void Governance_ChangeRole_TargetIsApprover_Refused()
+    {
+        var owner = CreateOwner();
+        var admin = CreateAdmin();
+        SetupAuth(owner);
+        var csrf = GetCsrfToken(owner);
+        var self = new GovernanceAction
+        {
+            ActionType = "change_role", ActorId = admin.UserId, TargetResourceId = owner.UserId,
+            NewValue = "Admin", Reason = "hand over"
+        };
+        Database.GovernanceActions.Add(self);
+        // the only active owner: the last-owner check answers first
+        Assert.Equal("cannot_demote_last_owner", Assert.Throws<ApiException>(() => _controller.DecideGovernanceAction(csrf, self.ActionId, "approve")).Code);
+
+        CreateOwner("owner2@example.com");
+        var auditBefore = Database.AuditLog.Count;
+        var ex = Assert.Throws<ApiException>(() => _controller.DecideGovernanceAction(csrf, self.ActionId, "approve"));
+        Assert.Equal("cannot_change_own_role", ex.Code);
+        Assert.Equal(400, ex.Status);
+        Assert.Equal("pending", self.Status);
+        Assert.Null(self.ApprovedBy);
+        Assert.Equal(Role.Owner, owner.Tier);
+        Assert.Equal(auditBefore, Database.AuditLog.Count);
+    }
+
     // ADMIN-17
     [Fact]
     public void Governance_Reject_LogsReason()

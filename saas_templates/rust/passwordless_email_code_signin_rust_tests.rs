@@ -153,6 +153,23 @@ fn test_emailcode_02_storage() {
     }
 }
 
+/// What: EMAILCODE-02, a missing IP: ip_hash("") equals ip_hash("unknown"), and a start with no IP bumps the
+/// "start-ip#" key of "unknown", so requests without an IP share one rate window.
+/// In: none. Out: panics on a mismatch.
+/// Why: spec CONVENTIONS (a missing IP is the text "unknown"); review finding 4525101359.
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
+// EMAILCODE-02
+#[test]
+fn test_emailcode_02_missing_ip_is_unknown() {
+    let h = harness();
+    let unknown = h.svc.ip_hash("unknown");
+    assert_eq!(h.svc.ip_hash(""), unknown);
+    assert_ne!(h.svc.ip_hash(""), h.svc.hmac_hex("ip:")[..32].to_string());
+    h.svc.start("user@example.com", "").unwrap();
+    let t = h.store.tables.lock().unwrap().clone();
+    assert!(t.rate_windows.keys().any(|k| k.0 == format!("start-ip#{}", unknown)));
+}
+
 /// What: EMAILCODE-03, a code works once. Why: EMAILCODE-03. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
 /// Touches: memory.
 // EMAILCODE-03

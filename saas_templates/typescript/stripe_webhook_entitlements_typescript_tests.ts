@@ -426,6 +426,46 @@ test('STRIPEWH-13 checkout.session.completed fetches the subscription; a raising
 });
 
 /**
+ * STRIPEWH-13, overlapping deliveries: delivery A (checkout.session.completed) waits on a Stripe fetch that then
+ * throws; delivery B (a subscription update) is sent while A waits. A answers 500 and is not recorded; B answers
+ * 200 applied and its event row and subscription row are still stored afterwards, so A's rollback never erases B.
+ * In: fakes. Out: assertions only. Why: review finding 4525101396 (A's snapshot rollback erased B's result).
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+ */
+// STRIPEWH-13
+test('STRIPEWH-13 overlapping deliveries: a failing fetch rolls back only its own delivery', async () => {
+  const clock = { now: 1700000000 };
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  const store = new InMemoryEntitlementStore();
+  const svc = new StripeWebhookEntitlements({
+    webhookSecret: SECRET,
+    pricePlans: { price_pro_monthly: 'pro' },
+    stripeClient: {
+      retrieveSubscription: async () => {
+        await gate;
+        throw new Error('stripe unavailable');
+      },
+    },
+    userExists: (u: string) => ['user_1', 'user_9'].includes(u),
+    store,
+    clock: () => clock.now,
+  });
+  const session = { id: 'cs_1', mode: 'subscription', subscription: 'sub_co', client_reference_id: 'user_9' };
+  const a = body('evt_a', 'checkout.session.completed', 1700000000, session);
+  const pa = svc.handleWebhook(a, signPayload(a, SECRET, clock.now));
+  const pb = svc.handleWebhook(BODY, signPayload(BODY, SECRET, clock.now));
+  await new Promise((r) => setImmediate(r));
+  release();
+  assert.deepEqual(await pa, { status: 500, error: 'processing_failed' });
+  assert.deepEqual(await pb, { status: 200, received: true, result: 'applied' });
+  assert.equal(store.getEvent('evt_a'), undefined);
+  assert.equal(store.getEvent('evt_test_0001')!.result, 'applied');
+  assert.equal(store.getSubscription('sub_test_0001')!.user_id, 'user_1');
+  assert.equal(svc.getEntitlement('user_1').plan, 'pro');
+});
+
+/**
  * STRIPEWH-14: two subscriptions, user found through stored rows, a subscription never moves user.
  * In: the spec's vectors and fakes. Out: assertions only. Why: STRIPEWH-14 (Phase D wave 1, owner request
  * 2026-11-10). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.

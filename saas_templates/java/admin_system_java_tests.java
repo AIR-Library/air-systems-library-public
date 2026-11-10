@@ -747,6 +747,43 @@ class AdminSystemTests {
     }
 
     /**
+     * ADMIN-07 (spec LAST OWNER, approver rule): with a second active owner present, so the last-owner check passes,
+     * approving a governance change_role whose target is the approving owner is refused with 400
+     * cannot_change_own_role; the action stays pending, the approver keeps the owner role and no role_changed row is
+     * written. In: the seeded users and one extra owner. Out: assertions. Why: review finding 4525101248.
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the test database.
+     */
+    // ADMIN-07
+    @Test
+    void testGovernanceChangeRoleTargetIsApproverRefused() throws Exception {
+        User second = new User(); second.setEmail("gov-second-owner@example.com"); second.setName("Second"); second.setTier("owner");
+        userRepo.save(second);
+        try {
+            Assertions.assertTrue(userRepo.findActiveOwners().size() >= 2);
+            GovernanceAction ga = new GovernanceAction();
+            ga.setActionType("change_role");
+            ga.setActorId(admin.getId());
+            ga.setTargetResourceId(owner.getId());
+            ga.setNewTier("admin");
+            ga.setReason("approver demotes self");
+            gaRepo.save(ga);
+            mockMvc.perform(post("/admin/governance/actions/" + ga.getId() + "/decide")
+                            .header("X-Decide", "approve")
+                            .with(auth(owner)))
+                    .andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.error").value("cannot_change_own_role"));
+            Assertions.assertEquals("pending", gaRepo.findById(ga.getId()).orElseThrow().getStatus());
+            Assertions.assertEquals("owner", userRepo.findById(owner.getId()).orElseThrow().getTier());
+            Assertions.assertEquals(0, auditRows("role_changed", owner.getId()).size());
+        } finally {
+            User x = userRepo.findById(second.getId()).orElseThrow();
+            x.setTier("user");
+            x.setStatus("deleted");
+            userRepo.save(x);
+        }
+    }
+
+    /**
      * Governance approve executes a change_role on a user who is not the last owner: the role changes, the action is
      * approved and role_changed is audited. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3: change_role
      * became a governance action type for ADMIN-07). Touches: the test database.

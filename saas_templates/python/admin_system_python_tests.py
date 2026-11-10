@@ -181,6 +181,33 @@ class TestAdminSystem(unittest.TestCase):
             self.sys.users_action(CSRF_TOKEN, owner2_id, "change_role", {"user_id": owner2_id, "new_tier": "admin"})
         self.assertEqual(ctx.exception.code, "cannot_change_own_role")
 
+    # ADMIN-07
+    def test_governance_change_role_target_is_approver(self):
+        """Spec LAST OWNER, approver rule: with a second active owner (so the last-owner check passes), approving a
+        governance change_role whose target is the approver is 400 cannot_change_own_role; the approver keeps the
+        owner role, no role_changed row is written and the action stays pending.
+        In: the test fixtures. Out: assertions. Why: the PR 22 review (findings 4525101209, 4525101248, 4525101339
+        found the gap in C#, Java and Rust; Python had it too). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        Touches: in-memory SQLite only."""
+        cur = self.sys.conn.cursor()
+        cur.execute(
+            """INSERT INTO users (email, name, tier, created_at, last_active_at)
+               VALUES ('owner2@example.com', 'Owner2', 'owner', ?, ?)""",
+            (self._now(), self._now())
+        )
+        owner2_id = cur.lastrowid
+        self.sys.conn.commit()
+        action_id = self.sys.create_governance_action(owner2_id, "change_role", "user", self.owner_id,
+                                                      {"new_tier": "admin"})
+        with self.assertRaises(HTTPError) as ctx:
+            self.sys.decide_governance_action(CSRF_TOKEN, self.owner_id, action_id, "approve", {})
+        self.assertEqual((ctx.exception.status, ctx.exception.code), (400, "cannot_change_own_role"))
+        self.assertEqual(self.sys._get_user_by_id(self.owner_id)["tier"], "owner")
+        cur.execute("SELECT status FROM governance_actions WHERE id = ?", (action_id,))
+        self.assertEqual(cur.fetchone()[0], "pending")
+        cur.execute("SELECT COUNT(*) FROM audit_log WHERE action = 'role_changed'")
+        self.assertEqual(cur.fetchone()[0], 0)
+
     # ADMIN-08
     def test_suspend_user_happy_path(self):
         payload = {"user_id": self.user_id, "reason": "violation"}

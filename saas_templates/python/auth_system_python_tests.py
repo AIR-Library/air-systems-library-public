@@ -230,6 +230,99 @@ def test_verify_email_five_wrong_codes_invalidate_the_code(auth_system):
     assert auth_system.verify_email('other@example.com', other)['status'] == 'verified'
 
 
+def _file_auth(path):
+    """An AuthSystem on its own connection to the SQLite file at path, with a recording email sender, as one
+    request's worker would have. In: the file path. Out: the AuthSystem. Why: review finding 4525101305 (a race
+    needs two connections). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: that SQLite file."""
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    auth = AuthSystem(conn, jwt_secret='test_secret', bcrypt_rounds=4, secret_key=TEST_SECRET_KEY)
+    auth.sent_codes = []
+    auth.email_sender = lambda email, code: auth.sent_codes.append((email, code))
+    return auth
+
+
+# AUTH-17
+def test_verify_email_attempts_counted_in_database_when_tries_race(tmp_path):
+    """The race of review finding 4525101305, made deterministic with two connections to one database file. Four
+    wrong codes are tried. Request A (the right code) reads the user's codes; before A goes on, request B (another
+    connection) tries a 5th wrong code, which spends the code. A must then answer code_invalid and the user must
+    stay unverified: the count is taken in the database when A writes, not from what A read. Before the fix A
+    compared using its stale read (attempts = 4) and verified on what was really the 6th try.
+    In: pytest's tmp_path. Out: assertions. Why: review finding 4525101305 (CWE-367), auth spec flow 2 "Attempts".
+    2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: a SQLite file under tmp_path."""
+    db_file = tmp_path / 'auth.db'
+    a = _file_auth(db_file)
+    b = _file_auth(db_file)
+    try:
+        a.signup('race@example.com', 'a' * 16, 'Race User', '127.0.0.1')
+        code = _sent_code(a, 'race@example.com')
+        wrong = '%06d' % ((int(code) + 1) % 1000000)
+        for _ in range(4):
+            assert b.verify_email('race@example.com', wrong) == {'error': 'code_invalid'}
+        real_hash = a._hash_secret
+        raced = []
+
+        def hash_then_let_b_in(value):
+            """A's first hash runs after A read the codes: let B try a 5th wrong code then. 2026-11-10,
+            session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the SQLite file (through B)."""
+            if not raced:
+                raced.append(b.verify_email('race@example.com', wrong))
+            return real_hash(value)
+
+        a._hash_secret = hash_then_let_b_in
+        assert a.verify_email('race@example.com', code) == {'error': 'code_invalid'}
+        assert raced == [{'error': 'code_invalid'}]
+        a._hash_secret = real_hash
+        row = b.db.execute("SELECT email_verified_at FROM users WHERE email = 'race@example.com'").fetchone()
+        assert row['email_verified_at'] is None
+        attempts = b.db.execute("SELECT attempts FROM verification_codes").fetchone()['attempts']
+        assert attempts == 5
+        assert b.verify_email('race@example.com', code) == {'error': 'code_invalid'}
+    finally:
+        a.db.close()
+        b.db.close()
+
+
+# AUTH-17
+def test_verify_email_why_chain_never_commits_the_flow_early(auth_system):
+    """_log_why_chain commits; during verify_email it is only ever called with no transaction open, for a wrong, an
+    expired, a spent and the right code, so it can never commit part of the flow early. The answers are the spec's.
+    In: the fixture. Out: assertions. Why: review finding 4525101305. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    Touches: in-memory SQLite only."""
+    open_at_call = []
+    real_log = auth_system._log_why_chain
+
+    def watching_log(flow, points):
+        """Records whether a transaction is open, then logs. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP."""
+        open_at_call.append(auth_system.db.in_transaction)
+        return real_log(flow, points)
+
+    auth_system._log_why_chain = watching_log
+    auth_system.signup('t@example.com', 'a' * 16, 'T', '127.0.0.1')
+    auth_system.signup('x@example.com', 'a' * 16, 'X', '127.0.0.1')
+    code = _sent_code(auth_system, 't@example.com')
+    wrong = '%06d' % ((int(code) + 1) % 1000000)
+    assert auth_system.verify_email('t@example.com', wrong) == {'error': 'code_invalid'}
+    old = _sent_code(auth_system, 'x@example.com')
+    past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    auth_system.db.execute("UPDATE verification_codes SET expires_at = ? WHERE code_hash = ?", (past, _sha(old)))
+    auth_system.db.commit()
+    assert auth_system.verify_email('x@example.com', old) == {'error': 'code_expired'}
+    attempts = auth_system.db.execute("SELECT attempts FROM verification_codes WHERE code_hash = ?",
+                                      (_sha(old),)).fetchone()[0]
+    assert attempts == 0
+    for _ in range(4):
+        assert auth_system.verify_email('t@example.com', wrong) == {'error': 'code_invalid'}
+    assert auth_system.verify_email('t@example.com', code) == {'error': 'code_invalid'}
+    expires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    user_id = auth_system.db.execute("SELECT id FROM users WHERE email = 't@example.com'").fetchone()[0]
+    auth_system.db.execute("INSERT INTO verification_codes (user_id, code_hash, created_at, expires_at, type) "
+                           "VALUES (?, ?, ?, ?, 'email')", (user_id, _sha('654321'), expires, expires))
+    auth_system.db.commit()
+    assert auth_system.verify_email('t@example.com', '654321')['status'] == 'verified'
+    assert len(open_at_call) >= 8 and not any(open_at_call)
+
 # AUTH-07
 def test_login_happy_path_no_mfa(auth_system):
     # Create verified user

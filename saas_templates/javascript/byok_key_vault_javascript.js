@@ -366,16 +366,29 @@ class KeyVault {
 
   /**
    * delete_key(user_id, provider) -> {deleted: true} with key_deleted, or {deleted: false} with no audit row.
-   * Why: VAULT-07, VAULT-13. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches the database.
+   * When the store fails (the delete and its audit row are one transaction, rolled back together) the answer is
+   * the returned refusal {error: 'storage_failed', status: 500}, never an exception, as in the C#, Go, PHP and
+   * Rust ports and the spec's CONVENTIONS (a refusal is a returned value).
+   * In: userId, provider. Out: {deleted} or {error, status}.
+   * Why: VAULT-07, VAULT-13; review finding 4525101278 (a store failure was thrown). 2026-11-10,
+   * session_012zDydZCZ4AChqhEZ4oVtaP. Touches the database.
    */
   deleteKey(userId, provider) {
-    return { deleted: this.store.deleteRow(userId, provider, this.clock()) };
+    try {
+      return { deleted: this.store.deleteRow(userId, provider, this.clock()) };
+    } catch (err) {
+      return { error: 'storage_failed', status: 500 };
+    }
   }
 
   /**
    * rewrap() -> {rewrapped, failed}. OPERATOR ONLY. Re-wraps each DEK not under the active key; the write is
-   * conditional on the wrapped_dek that was read, and the ciphertext is never touched. Why: VAULT-10.
-   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches the database.
+   * conditional on the wrapped_dek that was read, and the ciphertext is never touched. A row whose write fails
+   * in the store (rolled back with its audit row) counts in `failed` and the run goes on with the next row, as
+   * the Rust and TypeScript ports do: one bad write never stops the operator run partway.
+   * In: none. Out: {rewrapped, failed}.
+   * Why: VAULT-10; review finding 4525101278 (a rewrapRow failure stopped the run). 2026-11-10,
+   * session_012zDydZCZ4AChqhEZ4oVtaP. Touches the database.
    */
   rewrap() {
     let rewrapped = 0;
@@ -390,7 +403,11 @@ class KeyVault {
         wrapNonce, gcmSeal(this._keys.get(active), wrapNonce, dek, dekAad(active, row.provider, row.user_id))
       ]).toString('base64');
       dek.fill(0);
-      if (this.store.rewrapRow(row.user_id, row.provider, active, newWrapped, row.wrapped_dek, this.clock()) === 1) rewrapped++;
+      try {
+        if (this.store.rewrapRow(row.user_id, row.provider, active, newWrapped, row.wrapped_dek, this.clock()) === 1) rewrapped++;
+      } catch (err) {
+        failed++;
+      }
     }
     return { rewrapped, failed };
   }

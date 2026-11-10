@@ -1634,6 +1634,9 @@ class GovernanceService {
      * new_tier): 400 invalid_tier for anything but a staff role, 400 cannot_demote_last_owner when it would demote the
      * last active owner, otherwise the role changes and role_changed is audited. In: the approver and the action.
      * Out: the execution result. Touches: the database.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (review finding 4525101248; spec LAST OWNER, approver rule):
+     * a change_role whose target is the approver ({@code actor}) is refused with 400 cannot_change_own_role, checked
+     * AFTER the last-owner check, so the decision rolls back and the action stays pending, as in PHP and JavaScript.
      */
     private String execute(User actor, GovernanceAction ga) {
         Long target = ga.getTargetResourceId();
@@ -1647,6 +1650,9 @@ class GovernanceService {
                         .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "user_not_found"));
                 if (userService.isLastActiveOwner(u) && !Tiers.OWNER.equals(newTier)) {
                     throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "cannot_demote_last_owner");
+                }
+                if (u.getId().equals(actor.getId())) {
+                    throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "cannot_change_own_role");
                 }
                 String oldTier = u.getTier();
                 u.setTier(newTier);

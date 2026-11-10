@@ -173,6 +173,10 @@ fn test_change_role_happy_path() {
 /// refusal is proven where the spec says it is reachable: the remaining active owner approving a governance
 /// change_role that demotes them. The approval fails with 400, the role is unchanged and the action stays
 /// pending. In: none. Out: panics on a wrong answer. Touches: in-memory SQLite.
+/// Corrected 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (review finding 4525101321; spec LAST OWNER, approver
+/// rule): the last step asserted that owner2, approving an action that targets owner2, demoted itself to Admin. The
+/// spec refuses that with 400 cannot_change_own_role (PHP and JavaScript agree), so the step now asserts that
+/// refusal with the action still pending, and owner3 (another active owner) approves it to prove the execution.
 // ADMIN-07
 #[test]
 fn test_change_role_last_owner() {
@@ -206,10 +210,57 @@ fn test_change_role_last_owner() {
     assert_eq!(system.get_user_by_id(owner2_id).unwrap().tier, Role::Owner);
     let status: String = system.conn.query_row("SELECT status FROM governance_actions WHERE id = ?1", params![action], |r| r.get(0)).unwrap();
     assert_eq!(status, "pending");
-    // with another active owner the same approval executes
-    system.create_user(&owner2, "owner3@example.com", "Owner Three", "owner", false).unwrap();
-    system.decide_governance_action(&owner2, action, "approve", None).unwrap();
+    // with another active owner the last-owner check passes, but owner2 is the target and the approver:
+    // 400 cannot_change_own_role, still pending (review finding 4525101321, 2026-11-10,
+    // session_012zDydZCZ4AChqhEZ4oVtaP; this step asserted that owner2 demoted itself)
+    let third = system.create_user(&owner2, "owner3@example.com", "Owner Three", "owner", false).unwrap();
+    let owner3 = system.get_user_by_id(third.data["user_id"].as_i64().unwrap()).unwrap();
+    let resp = system.decide_governance_action(&owner2, action, "approve", None);
+    match &resp {
+        Response::Error { error, .. } => assert_eq!(error, "cannot_change_own_role"),
+        _ => panic!("Expected error"),
+    }
+    assert_eq!(resp.status(), 400);
+    assert_eq!(system.get_user_by_id(owner2_id).unwrap().tier, Role::Owner);
+    let status: String = system.conn.query_row("SELECT status FROM governance_actions WHERE id = ?1", params![action], |r| r.get(0)).unwrap();
+    assert_eq!(status, "pending");
+    // another owner approving it executes it
+    system.decide_governance_action(&owner3, action, "approve", None).unwrap();
     assert_eq!(system.get_user_by_id(owner2_id).unwrap().tier, Role::Admin);
+}
+
+/// What: ADMIN-07, approver rule: with two active owners, a governance change_role that targets the approving
+/// owner is 400 cannot_change_own_role, the approver keeps the owner role, no role_changed row is written and the
+/// action stays pending. In: none. Out: panics on a wrong answer.
+/// Why: spec LAST OWNER (approver rule); review finding 4525101339. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+/// Touches: in-memory SQLite.
+// ADMIN-07
+#[test]
+fn test_governance_change_role_target_is_approver() {
+    let system = setup();
+    let owner = system.get_user_by_email("owner@example.com").unwrap().unwrap();
+    let second = system.create_user(&owner, "owner2@example.com", "Owner Two", "owner", false).unwrap();
+    let owner2 = system.get_user_by_id(second.data["user_id"].as_i64().unwrap()).unwrap();
+    let now = Utc::now().to_rfc3339();
+    system
+        .conn
+        .execute(
+            "INSERT INTO governance_actions (action_type,actor_id,target_resource_id,reason,submitted_at,status,params) VALUES ('change_role',?1,?2,'self',?3,'pending',?4)",
+            params![owner2.id, owner.id, now, r#"{"new_tier":"user"}"#],
+        )
+        .unwrap();
+    let action = system.conn.last_insert_rowid();
+    let resp = system.decide_governance_action(&owner, action, "approve", None);
+    match &resp {
+        Response::Error { error, .. } => assert_eq!(error, "cannot_change_own_role"),
+        _ => panic!("Expected error"),
+    }
+    assert_eq!(resp.status(), 400);
+    assert_eq!(system.get_user_by_id(owner.id).unwrap().tier, Role::Owner);
+    let status: String = system.conn.query_row("SELECT status FROM governance_actions WHERE id = ?1", params![action], |r| r.get(0)).unwrap();
+    assert_eq!(status, "pending");
+    let audited: i64 = system.conn.query_row("SELECT COUNT(*) FROM audit_logs WHERE action = 'role_changed' AND resource_id = ?1", params![owner.id], |r| r.get(0)).unwrap();
+    assert_eq!(audited, 0);
 }
 
 /// What: ADMIN-08: suspending a user changes their status. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the status assertion

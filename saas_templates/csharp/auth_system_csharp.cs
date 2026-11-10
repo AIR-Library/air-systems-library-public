@@ -69,6 +69,11 @@ namespace AuthSystem
                 entity.Property(e => e.CreatedAt).IsRequired();
                 entity.Property(e => e.ExpiresAt).IsRequired();
                 entity.Property(e => e.Type).IsRequired().HasMaxLength(20);
+                // Attempts is a concurrency token (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, review finding
+                // 4525101240): EF then writes "SET Attempts = k + 1 WHERE Id = ? AND Attempts = k", ONE conditional
+                // write that fails (DbUpdateConcurrencyException) when another request counted a try first, so
+                // concurrent wrong codes can no longer all write the same k + 1. Touches: the model only.
+                entity.Property(e => e.Attempts).IsConcurrencyToken();
                 entity.HasOne(e => e.User).WithMany().HasForeignKey(e => e.UserId);
             });
 
@@ -334,6 +339,13 @@ namespace AuthSystem
         /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3, flow 2 "Attempts"): a wrong code adds one to
         /// the attempts of the user's current code(s); the 5th wrong code deletes them, so further tries, even with the
         /// right code, get code_invalid until a new code is sent (a 6-digit code must not be guessable by retrying).
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (review finding 4525101240, CWE-307): every try is
+        /// COUNTED FIRST, in one conditional database write per code (<see cref="TryCountEmailCodeAttemptAsync"/>),
+        /// and the code is compared only when that write succeeded, as Go, JavaScript and TypeScript do. Before, the
+        /// count was read, compared and written back as an absolute value, so N concurrent wrong guesses all wrote
+        /// Attempts + 1 and a batch cost one attempt. A code with 5 counted tries is spent: it is never compared again
+        /// and a wrong 5th try deletes it. The right code on a counted 5th try still verifies; an expired code on a
+        /// counted try is code_expired (the try counts, as in Go). Answers are unchanged (AUTH-17).
         /// Touches: users, verification_codes, audit_log.
         /// </summary>
         public async Task<object> VerifyEmailAsync(string email, string code)
@@ -347,31 +359,103 @@ namespace AuthSystem
                 .Where(v => v.UserId == user.Id && v.Type == "email")
                 .ToListAsync();
             var providedHash = code == null ? null : HashSecret(code);
-            var verification = candidates.FirstOrDefault(v => SecretEquals(v.CodeHash, providedHash));
-            if (verification == null)
+            // Review finding 4525101240 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): count the try in the database
+            // first; compare only a code whose conditional increment succeeded.
+            VerificationCode verification = null;
+            foreach (var current in candidates)
             {
-                // Phase B.3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): count the wrong try against the current
-                // code; the 5th wrong try invalidates it.
-                foreach (var current in candidates)
+                if (!await TryCountEmailCodeAttemptAsync(current))
+                    continue; // spent (5 counted tries), or deleted meanwhile: never compared
+                if (SecretEquals(current.CodeHash, providedHash))
                 {
-                    current.Attempts++;
-                    if (current.Attempts >= MaxEmailCodeAttempts) _db.VerificationCodes.Remove(current);
+                    verification = current;
+                    break;
                 }
-                if (candidates.Count > 0) await _db.SaveChangesAsync();
-                return new { error = "code_invalid" };
+                if (current.Attempts >= MaxEmailCodeAttempts)
+                    await RemoveSpentEmailCodeAsync(current);
             }
+            if (verification == null)
+                return new { error = "code_invalid" };
             if (verification.ExpiresAt <= DateTime.UtcNow)
                 return new { error = "code_expired" };
 
             user.EmailVerifiedAt = DateTime.UtcNow;
             user.Status = "verified";
             _db.VerificationCodes.Remove(verification);
-            await _db.SaveChangesAsync();
+            for (var round = 0; ; round++)
+            {
+                try
+                {
+                    await _db.SaveChangesAsync();
+                    break;
+                }
+                catch (DbUpdateConcurrencyException) when (round < MaxEmailCodeAttempts)
+                {
+                    // A racing wrong guess counted a try on this row after ours. Our try was counted and matched, so
+                    // finish: reload the row (it may be gone) and delete it again; the user's update is still pending.
+                    var entry = _db.Entry(verification);
+                    await entry.ReloadAsync();
+                    if (entry.State != EntityState.Detached) _db.VerificationCodes.Remove(verification);
+                }
+            }
 
             await LogAuditAsync(user.Id, "email_verified", "user", user.Id.ToString(), null, null);
             await LogWhyChainAsync("verify_email", new[] { "code_valid", "user_unverified" });
 
             return new { status = "verified", user_id = user.Id, message = "ready to login" };
+        }
+
+        /// <summary>
+        /// Counts one try against an email code in ONE conditional database write: Attempts is a concurrency token, so
+        /// EF writes "SET Attempts = k + 1 WHERE Id = ? AND Attempts = k" with k read below 5. When another request
+        /// counted first the write changes no row (DbUpdateConcurrencyException): the row is re-read from the database
+        /// and the count is tried again from the new value. Attempts only grow, so this loop ends within 5 rounds.
+        /// In: the tracked code row. Out: true when this try was counted (the caller may compare the code); false when
+        /// the code is spent (5 counted tries) or was deleted.
+        /// Why: review finding 4525101240 (CWE-307: concurrent wrong guesses all wrote the same Attempts + 1); auth
+        /// spec flow 2 "Attempts", AUTH-17. EF InMemory, which the tests use, has no ExecuteUpdateAsync, so the
+        /// conditional write is EF's own concurrency check. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        /// Touches: verification_codes.
+        /// </summary>
+        private async Task<bool> TryCountEmailCodeAttemptAsync(VerificationCode row)
+        {
+            var entry = _db.Entry(row);
+            for (var round = 0; round <= MaxEmailCodeAttempts; round++)
+            {
+                if (row.Attempts >= MaxEmailCodeAttempts) return false;
+                row.Attempts++;
+                try
+                {
+                    await _db.SaveChangesAsync();
+                    return true;
+                }
+                catch (DbUpdateConcurrencyException)
+                {
+                    await entry.ReloadAsync();
+                    if (entry.State == EntityState.Detached) return false;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Deletes an email code that has 5 counted tries (it is spent). Another request may have deleted it first;
+        /// that is the same outcome, so a concurrency failure only detaches the row.
+        /// In: the tracked code row. Out: nothing. Why: review finding 4525101240; auth spec flow 2 "Attempts" (a spent
+        /// code is gone until a new code is sent). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        /// Touches: verification_codes.
+        /// </summary>
+        private async Task RemoveSpentEmailCodeAsync(VerificationCode row)
+        {
+            _db.VerificationCodes.Remove(row);
+            try
+            {
+                await _db.SaveChangesAsync();
+            }
+            catch (DbUpdateConcurrencyException)
+            {
+                _db.Entry(row).State = EntityState.Detached;
+            }
         }
 
         /// <summary>

@@ -450,6 +450,10 @@ namespace AdminSystem
         /// row role_changed (actor = the action's submitter) and returns "role_changed". In: the action. Out: the
         /// execution result. Why: admin spec LAST OWNER (Phase B.3): ADMIN-07 is proven through a governance-approved
         /// change_role. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory users and audit log.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (review finding 4525101209): a change_role whose target
+        /// is the approver (the caller, AuthContext.CurrentUser) is refused with 400 cannot_change_own_role, checked
+        /// AFTER the last-owner check, so the action stays pending, as the spec's LAST OWNER block and PHP and
+        /// JavaScript say.
         /// </summary>
         private static string ExecuteChangeRole(GovernanceAction ga)
         {
@@ -460,6 +464,8 @@ namespace AdminSystem
             var activeOwners = Database.Users.Count(u => u.Tier == Role.Owner && u.Status == "active");
             if (target.Tier == Role.Owner && target.Status == "active" && activeOwners <= 1 && newRole != Role.Owner)
                 throw new ApiException("cannot_demote_last_owner", "Cannot demote last active owner");
+            if (AuthContext.CurrentUser != null && target.UserId == AuthContext.CurrentUser.UserId)
+                throw new ApiException("cannot_change_own_role", "Cannot change own role");
             var oldTier = target.Tier.ToString();
             AuditLogger.Log("role_changed", ga.ActorId, resourceType: "user", resourceId: target.UserId,
                 oldValue: oldTier, newValue: newRole.ToString());

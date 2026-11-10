@@ -373,6 +373,24 @@ test('VAULT-13 delete_key removes the row and writes key_deleted; a second delet
 });
 
 /**
+ * VAULT-13 with a failing store: when the key_deleted audit write throws, deleteKey returns 500 storage_failed
+ * instead of throwing, the row stays and no key_deleted row is written; once the store works the delete succeeds.
+ * In: fakes. Out: assertions only. Why: VAULT-13, spec CONVENTIONS; review finding 4525101375.
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+ */
+// VAULT-13
+test('VAULT-13 delete_key with a failing store answers 500 storage_failed and keeps the row', async () => {
+  const s = setup();
+  await s.vault.saveKey('user_1', 'acme', KEY);
+  s.store.failAuditWrites = true;
+  assert.deepEqual(s.vault.deleteKey('user_1', 'acme'), { error: 'storage_failed', status: 500 });
+  assert.equal(s.store.rows.size, 1);
+  s.store.failAuditWrites = false;
+  assert.deepEqual(s.vault.listAudit('user_1').map((a) => a.action), ['key_saved']);
+  assert.deepEqual(s.vault.deleteKey('user_1', 'acme'), { deleted: true });
+});
+
+/**
  * VAULT-14: real randomness: the same key for two users gives different ciphertext, wrapped DEK and nonces.
  * In: the spec's vectors and fakes. Out: assertions only. Why: VAULT-14 (Phase D wave 1, owner request
  * 2026-11-10). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.

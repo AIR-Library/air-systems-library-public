@@ -298,9 +298,14 @@ impl EmailCodeSignin {
         self.hmac_hex(&format!("code:{}:{}", self.email_hash(email), code))
     }
 
-    /// What: ip_hash(ip) = the first 32 characters of hmac_hex("ip:" + ip). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
-    /// Touches: nothing.
+    /// What: ip_hash(ip) = the first 32 characters of hmac_hex("ip:" + ip). A missing IP (the empty string, Rust's
+    /// absent value for this &str parameter) is the text "unknown", as the spec's CONVENTIONS say, so every
+    /// request without an IP shares one rate key.
+    /// In: the client IP. Out: 32 hex characters.
+    /// Why: spec HELPERS and CONVENTIONS; review finding 4525101359 (an empty IP hashed "ip:" instead of
+    /// "ip:unknown"). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
     pub fn ip_hash(&self, ip: &str) -> String {
+        let ip = if ip.is_empty() { "unknown" } else { ip };
         self.hmac_hex(&format!("ip:{}", ip))[..32].to_string()
     }
 

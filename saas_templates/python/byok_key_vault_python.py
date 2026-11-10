@@ -345,8 +345,16 @@ class KeyVault:
 
     def delete_key(self, user_id: str, provider: str) -> dict:
         """delete_key: {deleted: true} with a key_deleted audit row, or {deleted: false} when there was no row.
-        Why: VAULT-07, 13. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the store."""
-        return {"deleted": bool(self.store.delete_row(user_id, provider, self._now()))}
+        When the store fails (the delete and its audit row are one transaction, rolled back together) the answer
+        is the returned refusal 500 storage_failed, never an exception, as save_key and use_key answer and as the
+        C#, Go, PHP and Rust ports do (spec CONVENTIONS: a refusal is a returned value).
+        In: user_id, provider. Out: {deleted} or {error, status}.
+        Why: VAULT-07, 13; review finding 4525101312 (a store failure was raised). 2026-11-10,
+        session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the store."""
+        try:
+            return {"deleted": bool(self.store.delete_row(user_id, provider, self._now()))}
+        except Exception:  # noqa: BLE001 - fail closed without echoing anything
+            return _err("storage_failed", 500)
 
     def rewrap(self) -> dict:
         """rewrap (OPERATOR ONLY): re-wrap each DEK not under active_key_id, in (user_id, provider) order, writing

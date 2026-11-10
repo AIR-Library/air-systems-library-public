@@ -451,7 +451,9 @@ function make_dirs(string $path): bool
  * extract_archive: checks A, B, C, then D. target_dir must not exist; its parent must.
  * In: archive bytes, target_dir (from the server, never from the upload), limits.
  * Out: {ok: true, entries, total_bytes, files: [{path, size, sha256}]} or a refusal; target_dir exists only
- * when every file was written. Why: ARCHIVE-01, ARCHIVE-07, ARCHIVE-13, ARCHIVE-14. 2026-11-10,
+ * when every file was written. An I/O error while an entry is written (D3) names that entry's index; one in
+ * D2 or D4 names -1 (spec CONVENTIONS; review finding 4525101297, which found D3 answering -1).
+ * Why: ARCHIVE-01, ARCHIVE-07, ARCHIVE-13, ARCHIVE-14. 2026-11-10,
  * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: files (target_dir, its staging directory), the CSPRNG.
  */
 function extract_archive(string $bytes, string $targetDir, array $limits = []): array
@@ -469,10 +471,12 @@ function extract_archive(string $bytes, string $targetDir, array $limits = []): 
     if (!@mkdir($staging, 0700) || !@chmod($staging, 0700)) {
         return refuse('target_unwritable', 500);
     }
+    $current = -1;   // the entry D3 is writing; -1 outside D3 (finding 4525101297)
     try {
         $out = [];
         $base = normalise($staging) . '/';
         foreach ($c['_entries'] as $k => $r) {
+            $current = $k;
             $name = $r['is_dir'] ? substr($r['name'], 0, -1) : $r['name'];
             $dest = $staging . '/' . $name;
             if (strncmp(normalise($dest), $base, strlen($base)) !== 0) {
@@ -509,12 +513,13 @@ function extract_archive(string $bytes, string $targetDir, array $limits = []): 
             }
             $out[] = ['path' => $r['name'], 'size' => $r['usize'], 'sha256' => hash('sha256', $data)];
         }
+        $current = -1;
         if (!@rename($staging, $target)) {
             throw new \RuntimeException('io');
         }
     } catch (Throwable $e) {
         remove_tree($staging);
-        return refuse('target_unwritable', 500);
+        return refuse('target_unwritable', 500, $current);
     }
     return ['ok' => true, 'entries' => $c['entries'], 'total_bytes' => $c['total_bytes'], 'files' => $out];
 }

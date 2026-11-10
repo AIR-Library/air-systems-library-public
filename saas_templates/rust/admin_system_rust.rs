@@ -931,6 +931,13 @@ impl AdminSystem {
                             if self.is_last_active_owner(&user)? && new_tier != Role::Owner {
                                 return Err(AdminError::Validation("cannot_demote_last_owner".into()));
                             }
+                            // Spec LAST OWNER, approver rule (review findings 4525101339 and 4525101321; 2026-11-10,
+                            // session_012zDydZCZ4AChqhEZ4oVtaP): a change_role whose target is the approver is 400
+                            // cannot_change_own_role, after the last-owner check; tx is dropped, so the action stays
+                            // pending and nothing changes.
+                            if target == me.id {
+                                return Err(AdminError::Validation("cannot_change_own_role".into()));
+                            }
                             tx.execute("UPDATE users SET tier = ?1, updated_at = ?2 WHERE id = ?3", params![new_tier.as_str(), now(), target])?;
                             Self::audit(&tx, "role_changed", me.id, "user", target, Some(json!({ "tier": user.tier.as_str() })), Some(json!({ "tier": new_tier.as_str() })), None)?;
                             json!({ "user_id": target, "old_tier": user.tier.as_str(), "new_tier": new_tier.as_str() })

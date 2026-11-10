@@ -294,9 +294,29 @@ export class StripeWebhookEntitlements {
    * everything and answers 500 processing_failed so Stripe sends it again.
    * In: the RAW body (bytes or text), the Stripe-Signature header. Out: {status: 200, received: true, result} or a
    * refusal. Why: spec handle_webhook. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * Deliveries run ONE AT A TIME through a promise queue, as the JavaScript template does: the in-memory store's
+   * rollback restores a snapshot of both tables, so two deliveries interleaving across the awaited Stripe fetch
+   * would let one's rollback erase the other's saved (and already 200-answered) result. A delivery that fails
+   * does not stop the queue.
+   * Why (queue): review finding 4525101396. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
    * Touches: the store, the Stripe client (network for a real one), the clock.
    */
-  async handleWebhook(payload: string | Uint8Array, header: unknown): Promise<WebhookOk | WebhookRefusal> {
+  handleWebhook(payload: string | Uint8Array, header: unknown): Promise<WebhookOk | WebhookRefusal> {
+    const run = this.queue.then(() => this.handleOne(payload, header));
+    this.queue = run.catch(() => undefined);
+    return run;
+  }
+
+  /** The tail of the delivery queue; each delivery starts when the one before it has settled. */
+  private queue: Promise<unknown> = Promise.resolve();
+
+  /**
+   * The body of handleWebhook, run serially: verify, parse, then claim and apply in one transaction. The clock is
+   * read when the delivery's turn comes. In: the RAW body, the Stripe-Signature header. Out: as handleWebhook.
+   * Why: spec handle_webhook; review finding 4525101396 (moved out of handleWebhook so it can be queued).
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the store, the Stripe client, the clock.
+   */
+  private async handleOne(payload: string | Uint8Array, header: unknown): Promise<WebhookOk | WebhookRefusal> {
     const now = this.clock();
     const verified = verifySignature(payload, header, this.secret, now);
     if (!('ok' in verified)) return verified;

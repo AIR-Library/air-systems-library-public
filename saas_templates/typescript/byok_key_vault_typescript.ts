@@ -432,17 +432,24 @@ export class KeyVault {
 
   /**
    * Deletes the user's key for a provider. In: user id, provider. Out: {deleted: true} with the audit row
-   * key_deleted, or {deleted: false} (no audit row). Why: spec delete_key (VAULT-07, 13). 2026-11-10,
-   * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the store, the clock.
+   * key_deleted, {deleted: false} (no audit row), or 500 storage_failed when the store throws (the row and its
+   * audit row are one transaction, so nothing changed). The class promises a returned value, never an exception,
+   * as saveKey, useKey and rewrap already keep, and as the spec's CONVENTIONS require.
+   * Why: spec delete_key (VAULT-07, 13); review finding 4525101375 (a store failure escaped as an exception).
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the store, the clock.
    */
-  deleteKey(userId: string, provider: string): { deleted: boolean } {
-    const row = this.store.getRow(userId, provider);
-    if (!row) return { deleted: false };
-    const now = this.clock();
-    const deleted = this.store.deleteRow(userId, provider, {
-      user_id: userId, provider, action: 'key_deleted', purpose: null, key_id: row.key_id, at: now,
-    });
-    return { deleted };
+  deleteKey(userId: string, provider: string): { deleted: boolean } | VaultRefusal {
+    try {
+      const row = this.store.getRow(userId, provider);
+      if (!row) return { deleted: false };
+      const now = this.clock();
+      const deleted = this.store.deleteRow(userId, provider, {
+        user_id: userId, provider, action: 'key_deleted', purpose: null, key_id: row.key_id, at: now,
+      });
+      return { deleted };
+    } catch {
+      return { error: 'storage_failed', status: 500 };
+    }
   }
 
   /**

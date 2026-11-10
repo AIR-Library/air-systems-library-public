@@ -643,6 +643,11 @@ describe('AdminSystem', () => {
      * and changing your own role is cannot_change_own_role), so the refusal is proven where it is reachable, as in
      * Python: the remaining owner approving a governance change_role that demotes them; the action stays pending.
      * In: the mock pool. Out: assertions only. Touches: fakes only.
+     * Corrected 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec LAST OWNER, approver rule; the PR 22 review's
+     * findings 4525101321 and 4525101339 on the same Rust step): the last step had owner2 approve its own demotion
+     * once owner 1 was active again and asserted it went through. The spec refuses that with 400
+     * cannot_change_own_role and keeps the action pending, so the step now asserts that refusal, and owner 1, the
+     * other active owner, approves it to prove the execution.
      */
     // ADMIN-07
     it('demoting the last active owner returns 400 cannot_demote_last_owner', async () => {
@@ -663,10 +668,20 @@ describe('AdminSystem', () => {
         'SELECT action_id, action_type, actor, target_resource_id, reason, status FROM governance_actions WHERE action_id = ?', [actionId]);
       expect(actions[0].status).toBe('pending');
 
-      // With a second active owner the same governance demotion goes through.
+      // With a second active owner the last-owner check passes, but owner2 is the target and the approver: 400
+      // cannot_change_own_role and still pending (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP; this step asserted
+      // that owner2's own demotion went through). Owner 1 approving it executes it.
       await pool.execute("UPDATE users SET status = 'active' WHERE id = ?", [1]);
       (pool as unknown as { users: MockRow[] }).users.find((u) => u.id === 1)!.status = 'active';
-      const done = await admin.decideGovernanceAction(owner2Ctx, 'valid-csrf-token', actionId, 'approve', {});
+      await expect(
+        admin.decideGovernanceAction(owner2Ctx, 'valid-csrf-token', actionId, 'approve', {})
+      ).rejects.toMatchObject({ code: 'cannot_change_own_role', status: 400 });
+      const [still] = await pool.execute('SELECT id, tier, status FROM users WHERE id = ?', [owner2]);
+      expect(still[0].tier).toBe('owner');
+      const [pending] = await pool.execute(
+        'SELECT action_id, action_type, actor, target_resource_id, reason, status FROM governance_actions WHERE action_id = ?', [actionId]);
+      expect(pending[0].status).toBe('pending');
+      const done = await admin.decideGovernanceAction(ownerCtx, 'valid-csrf-token', actionId, 'approve', {});
       expect(done).toMatchObject({ success: true, status: 'approved' });
       const [after] = await pool.execute('SELECT id, tier, status FROM users WHERE id = ?', [owner2]);
       expect(after[0].tier).toBe('user');

@@ -353,6 +353,45 @@ func TestGovernanceDemoteLastOwner(t *testing.T) {
 	}
 }
 
+// TestGovernanceChangeRoleTargetIsApprover proves the spec's LAST OWNER approver rule: with a second active owner
+// (so the last-owner check passes), approving a governance change_role whose target is the approver is 400
+// cannot_change_own_role; the action stays pending, the approver stays owner and no audit row is written.
+// In: none. Out: test failures. Why: spec LAST OWNER (approver rule), the PR 22 review (findings 4525101209,
+// 4525101248, 4525101339 found the gap in C#, Java and Rust; Go had it too). 2026-11-10,
+// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the test SQLite database.
+// ADMIN-07
+func TestGovernanceChangeRoleTargetIsApprover(t *testing.T) {
+	mux := setupTestEnv(t)
+	ownerID := seedOwner(t)
+	if _, err := db.Exec(`INSERT INTO users (email,name,role,status,created_at) VALUES (?,?,?,?,?)`,
+		"owner3@example.com", "Owner3", "owner", "active", time.Now().UTC()); err != nil {
+		t.Fatalf("seed second owner: %v", err)
+	}
+	res, err := db.Exec(`INSERT INTO actions (action_type,actor_id,target_resource_id,params,submitted_at,status) VALUES (?,?,?,?,?,?)`,
+		"change_role", ownerID, ownerID, `{"new_tier":"admin"}`, time.Now().UTC(), "pending")
+	if err != nil {
+		t.Fatalf("seed action: %v", err)
+	}
+	actID, _ := res.LastInsertId()
+	var auditsBefore int
+	db.QueryRow(`SELECT COUNT(*) FROM audit_log`).Scan(&auditsBefore)
+	resp := doRequest(mux, http.MethodPost, "/admin/governance/actions/"+strconv.FormatInt(actID, 10)+"/decide",
+		map[string]string{"decide": "approve"}, ownerID, "owner", nil)
+	var out map[string]interface{}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	if resp.Code != http.StatusBadRequest || out["error"] != "cannot_change_own_role" {
+		t.Fatalf("expected 400 cannot_change_own_role, got %d %v", resp.Code, out)
+	}
+	var status, role string
+	var auditsAfter int
+	db.QueryRow(`SELECT status FROM actions WHERE id=?`, actID).Scan(&status)
+	db.QueryRow(`SELECT role FROM users WHERE id=?`, ownerID).Scan(&role)
+	db.QueryRow(`SELECT COUNT(*) FROM audit_log`).Scan(&auditsAfter)
+	if status != "pending" || role != "owner" || auditsAfter != auditsBefore {
+		t.Fatalf("a refused approval changed something: status %q, role %q, audit rows %d->%d", status, role, auditsBefore, auditsAfter)
+	}
+}
+
 // ADMIN-08
 func TestSuspendUserHappyPath(t *testing.T) {
 	mux := setupTestEnv(t)

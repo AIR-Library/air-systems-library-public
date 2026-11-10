@@ -384,6 +384,24 @@ def test_vault_13_delete():
     assert vault.use_key("user_1", "acme", "chat") == {"error": "key_not_found", "status": 404}
 
 
+# VAULT-13
+def test_vault_13_delete_with_failing_store():
+    """When the key_deleted audit write fails, delete_key returns 500 storage_failed (not an exception), the row
+    stays (the transaction rolled back) and no key_deleted row exists; on a working store the delete then succeeds.
+    In: none. Out: assertions. Why: VAULT-13, spec CONVENTIONS; review finding 4525101312.
+    2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite."""
+    failing = FailingAuditStore()
+    vault, clock, _, _, _ = make(store=failing)
+    vault.save_key("user_1", "acme", KEY)
+    failing.fail_actions = ("key_deleted",)
+    clock.now += 10
+    assert vault.delete_key("user_1", "acme") == {"error": "storage_failed", "status": 500}
+    assert failing.get_row("user_1", "acme") is not None
+    assert [a["action"] for a in vault.list_audit("user_1")] == ["key_saved"]
+    failing.fail_actions = ()
+    assert vault.delete_key("user_1", "acme") == {"deleted": True}
+
+
 # VAULT-14
 def test_vault_14_real_randomness():
     """With real randomness the same key for two users gives different ciphertext, wrapped_dek and nonces.

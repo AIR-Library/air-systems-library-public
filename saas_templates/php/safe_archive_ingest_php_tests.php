@@ -316,6 +316,28 @@ function test_archive13_all_or_nothing(): void
     eq(['dangling', 'target'], listing($parent), 'nothing else written');
 }
 
+// ARCHIVE-13
+/**
+ * ARCHIVE-13, D3 I/O failure: the target's parent sits deep enough that the first entry fits but the second
+ * entry's full path is longer than PHP_MAXPATHLEN (its name passes every check of C: 4 parts of 200 bytes), so
+ * writing it fails with an I/O error. The answer is 500 target_unwritable naming entry_index 1, the entry being
+ * written, and nothing is left behind.
+ * In: none. Out: assertions. Why: spec CONVENTIONS (D3 names the entry); review finding 4525101297.
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: files under a temporary directory.
+ */
+function test_archive13_d3_io_failure_names_the_entry(): void
+{
+    $parent = tmp_parent();
+    while (strlen($parent) < PHP_MAXPATHLEN - 600) {
+        $parent .= '/' . str_repeat('p', 200);
+        eq(true, mkdir($parent, 0700), 'deep parent created');
+    }
+    $long = implode('/', array_fill(0, 4, str_repeat('d', 200))) . '/f.txt';
+    $zip = build_zip([['name' => 'first.txt', 'data' => 'ok'], ['name' => $long, 'data' => 'x']]);
+    eq(['error' => 'target_unwritable', 'status' => 500, 'entry_index' => 1], extract_archive($zip, "$parent/target"), 'D3 I/O failure names entry 1');
+    eq([false, []], [file_exists("$parent/target"), listing($parent)], 'no target and no staging left');
+}
+
 // ARCHIVE-14
 /** ARCHIVE-14: names that do not unpack everywhere; execute bits dropped. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
 function test_archive14_bad_names(): void

@@ -420,7 +420,16 @@ class AuthSystem:
         [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.4 (af92d76, AUTH-17): a wrong code now answers
         {error: "code_invalid"} (it answered code_expired); only a code that matches a stored code whose expires_at
         has passed answers {error: "code_expired"}, and that try does not count as wrong. Both are the spec's 400
-        answers. Touches: SQLite (users, verification_codes, audit_log)."""
+        answers. Touches: SQLite (users, verification_codes, audit_log).
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Review finding 4525101305 (CWE-367): the attempts were read,
+        the code compared, and the wrong try written after, so concurrent requests that all read attempts = 4 could
+        each compare a guess. Now every try against a current code is counted FIRST, in one conditional write
+        (UPDATE ... SET attempts = attempts + 1 WHERE id = ? AND attempts < 5 AND expires_at > now), committed, and the
+        code is compared only when that write changed one row, as Go, JavaScript and TypeScript do. The right code
+        on a counted 5th try still verifies; after 5 counted tries every try is code_invalid. A code matching only
+        an EXPIRED row is still code_expired and is not counted (an expired code cannot verify, so it is compared
+        before counting). _log_why_chain and _log_audit_log commit, so they are called only when no transaction of
+        this flow is open: they cannot commit any of it early."""
         decision_points = []
         cursor = self.db.cursor()
         cursor.execute("SELECT id, email_verified_at FROM users WHERE email = ?", (email,))
@@ -433,40 +442,55 @@ class AuthSystem:
             self._log_why_chain("verify_email", decision_points + ["user_unverified:failed"])
             return {"error": "email_already_verified"}
         decision_points.append("user_unverified")
+        now_iso = self._now_iso()
         cursor.execute(
             """SELECT id, code_hash, attempts FROM verification_codes
                WHERE user_id = ? AND type = 'email' AND expires_at > ? ORDER BY id""",
-            (user_id, self._now_iso())
+            (user_id, now_iso)
         )
         current = cursor.fetchall()
         live = [row for row in current if (row[2] or 0) < self.email_code_max_attempts]
         supplied = self._hash_secret(code_or_token if isinstance(code_or_token, str) else "").encode("utf-8")
+        if current and not live:
+            # Every current code is spent (5 counted tries): code_invalid until a new code is sent; nothing compared.
+            self._log_why_chain("verify_email", [*decision_points, "code_valid:failed"])
+            return {"error": "code_invalid"}
+        # Phase B.4 (af92d76): the right code past its expiry is code_expired, and that try is not counted. Only
+        # EXPIRED rows are compared here; an expired code can never verify, so this compare gives a guesser nothing.
+        cursor.execute(
+            """SELECT code_hash FROM verification_codes
+               WHERE user_id = ? AND type = 'email' AND expires_at <= ?""",
+            (user_id, now_iso)
+        )
+        if any(hmac.compare_digest(str(row[0]).encode("utf-8"), supplied) for row in cursor.fetchall()):
+            self._log_why_chain("verify_email", [*decision_points, "code_valid:failed"])
+            return {"error": "code_expired"}
+        # Review finding 4525101305 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): COUNT FIRST, in one conditional
+        # write per code, and compare only a code whose count succeeded (one row changed). The count is committed
+        # before the compare, so concurrent requests on other connections can never compare more than 5 tries
+        # between them; the read above is only a pre-filter, the write decides.
         code_record = None
         for candidate in live:
-            if hmac.compare_digest(str(candidate[1]).encode("utf-8"), supplied):
-                code_record = candidate
-        if not code_record:
-            self._log_why_chain("verify_email", decision_points + ["code_valid:failed"])
-            if current and not live:
-                return {"error": "code_invalid"}
-            # Phase B.4 (af92d76): the right code past its expiry is code_expired; any other code is code_invalid.
             cursor.execute(
-                """SELECT code_hash FROM verification_codes
-                   WHERE user_id = ? AND type = 'email' AND expires_at <= ?""",
-                (user_id, self._now_iso())
+                """UPDATE verification_codes SET attempts = attempts + 1
+                   WHERE id = ? AND attempts < ? AND expires_at > ?""",
+                (candidate[0], self.email_code_max_attempts, now_iso)
             )
-            if any(hmac.compare_digest(str(row[0]).encode("utf-8"), supplied) for row in cursor.fetchall()):
-                return {"error": "code_expired"}
-            for row in live:
-                cursor.execute("UPDATE verification_codes SET attempts = attempts + 1 WHERE id = ?", (row[0],))
+            counted = cursor.rowcount == 1
             self.db.commit()
+            if counted and hmac.compare_digest(str(candidate[1]).encode("utf-8"), supplied):
+                code_record = candidate
+                break
+        if not code_record:
+            self._log_why_chain("verify_email", [*decision_points, "code_valid:failed"])
             return {"error": "code_invalid"}
         decision_points.append("code_valid")
-        now_iso = self._now_iso()
         cursor.execute("UPDATE users SET email_verified_at = ?, status = 'verified', updated_at = ? WHERE id = ?",
                        (now_iso, now_iso, user_id))
         cursor.execute("DELETE FROM verification_codes WHERE id = ?", (code_record[0],))
         self.db.commit()
+        # The why chain and the audit row are written only now, with no transaction open: their own commit can
+        # never commit part of this flow early (review finding 4525101305).
         self._log_why_chain("verify_email", decision_points)
         self._log_audit_log("email_verified", actor_id=user_id, resource_type="user", resource_id=user_id,
                            old_value={"email_verified_at": None, "status": "unverified"}, 
