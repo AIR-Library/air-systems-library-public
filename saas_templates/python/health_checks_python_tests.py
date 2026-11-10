@@ -139,10 +139,13 @@ def test_multiple_threads_see_same_store():
     def check_ok():
         return {"status": "pass", "observedValue": 100, "observedUnit": "ms"}
     
-    def register_from_thread():
-        register_check(f"comp-{threading.current_thread().ident}", "service", check_ok, critical=True, timeout_ms=1000)
+    # [2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP] Each thread gets its own index for the name. The
+    # name used to be the thread's ident, but Python reuses the ident of a finished thread (documented in
+    # threading.get_ident), so on 3.12 all five threads registered "comp-<same ident>" and one check remained.
+    def register_from_thread(index):
+        register_check(f"comp-{index}", "service", check_ok, critical=True, timeout_ms=1000)
     
-    threads = [threading.Thread(target=register_from_thread) for _ in range(5)]
+    threads = [threading.Thread(target=register_from_thread, args=(i,)) for i in range(5)]
     for t in threads:
         t.start()
     for t in threads:

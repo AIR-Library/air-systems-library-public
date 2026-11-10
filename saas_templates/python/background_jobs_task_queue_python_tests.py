@@ -3,6 +3,7 @@ import tempfile
 import os
 import time
 import json
+import threading
 from datetime import datetime, timedelta, timezone
 from background_jobs_task_queue_python import BackgroundJobSystem
 
@@ -18,6 +19,9 @@ class TestBackgroundJobSystem(unittest.TestCase):
         os.unlink(self.db_path)
 
     def test_enqueue_job_initial_status(self):
+        # [2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP] Stop the worker first: with it polling, it
+        # could claim the job between enqueue and the status read (a timing race), so "enqueued" was luck.
+        self.system.stop_worker()
         result = self.system.enqueue_job("send_bulk_email", {"template_key": "test"})
         self.assertTrue(result["success"])
         self.assertEqual(result["status"], "enqueued")
@@ -85,13 +89,18 @@ class TestBackgroundJobSystem(unittest.TestCase):
         else:
             self.fail("Job did not retry after first failure")
         
-        # Check backoff timing (approximately 2^1 = 2 seconds)
+        # Check backoff timing: the spec's backoff is 1s, 2s, 4s, ... so the first retry waits 2^0 = 1 second.
+        # [2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP] was 2.0, which contradicts TIER_2 spec system 4
+        # ("Exponential backoff (1s, 2s, 4s, 8s, ... up to max_retries)") and the passing Java suite.
         first_retry_time = datetime.fromisoformat(status["next_retry_at"].replace('Z', '+00:00'))
         enqueue_time = datetime.fromisoformat(status["created_at"].replace('Z', '+00:00'))
         backoff = (first_retry_time - enqueue_time).total_seconds()
-        self.assertAlmostEqual(backoff, 2.0, delta=0.5)
+        self.assertAlmostEqual(backoff, 1.0, delta=0.5)
         
-        # Second failure -> exceeds max_retries -> failed
+        # Second and third attempts fail (retries 1 and 2) -> retries exhausted -> failed.
+        # [2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP] max_retries=2 allows two retries after the
+        # first attempt (spec: "up to max_retries"; Java: retry_count 2 after three attempts), so the
+        # final error is from attempt 3; the old "Attempt 2 failed" meant only one retry was ever made.
         timeout = time.time() + 5
         while time.time() < timeout:
             status = self.system.get_job_status(job_id)
@@ -104,7 +113,8 @@ class TestBackgroundJobSystem(unittest.TestCase):
         self.assertEqual(status["retry_count"], 2)
         self.assertEqual(status["max_retries"], 2)
         self.assertIsNotNone(status["error"])
-        self.assertIn("Attempt 2 failed", status["error"])
+        self.assertIn("Attempt 3 failed", status["error"])
+        self.assertEqual(attempt_count, 3)
 
     def test_job_exceeds_max_retries_becomes_failed(self):
         def failing_handler(params, progress_callback):
@@ -129,6 +139,9 @@ class TestBackgroundJobSystem(unittest.TestCase):
         self.assertIsNotNone(status["error"])
 
     def test_user_can_cancel_enqueued_job(self):
+        # [2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP] Stop the worker so the job is certainly not
+        # started when we cancel; with it polling, the cancel raced the worker's claim.
+        self.system.stop_worker()
         result = self.system.enqueue_job("send_bulk_email", {})
         job_id = result["job_id"]
         
@@ -141,8 +154,11 @@ class TestBackgroundJobSystem(unittest.TestCase):
         self.assertIsNone(status["started_at"])
 
     def test_cannot_cancel_job_that_has_started(self):
+        # [2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP] The handler holds the job in "running" until
+        # the test releases it, instead of sleeping 0.5 s and hoping the poll lands inside that window.
+        release = threading.Event()
         def slow_handler(params, progress_callback):
-            time.sleep(0.5)  # Simulate work
+            release.wait(5)  # Simulate work that lasts until released
             return {"done": True}
         
         self.system.register_handler("test_slow", slow_handler)
@@ -167,13 +183,20 @@ class TestBackgroundJobSystem(unittest.TestCase):
         # Verify job still running/completed
         status = self.system.get_job_status(job_id)
         self.assertIn(status["status"], ["running", "completed"])
+        release.set()
 
     def test_progress_tracking_updates_in_real_time(self):
         progress_updates = []
+        # [2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP] Each step waits until the test has read it
+        # from the store (observed.set()), instead of sleeping 10 ms while the test polls every 50 ms, which
+        # skipped most steps (it saw ['30/100', '70/100'] and failed on '50/100'). Same assertions.
+        observed = threading.Event()
         def progress_handler(params, progress_callback):
             for i in range(0, 101, 10):
                 progress_callback(i, 100)
-                time.sleep(0.01)  # Small delay to allow updates
+                if not observed.wait(5):  # wait until the test has seen this step
+                    raise RuntimeError("test did not observe progress")
+                observed.clear()
             return {"completed": 100}
         
         self.system.register_handler("test_progress", progress_handler)
@@ -190,7 +213,8 @@ class TestBackgroundJobSystem(unittest.TestCase):
             if status["progress"] and status["progress"] != last_progress:
                 last_progress = status["progress"]
                 progress_updates.append(status["progress"])
-            time.sleep(0.05)
+                observed.set()
+            time.sleep(0.01)
         else:
             self.fail("Job did not complete")
         
@@ -236,6 +260,9 @@ class TestBackgroundJobSystem(unittest.TestCase):
             self.assertEqual(status["result"]["ran"], True)
 
     def test_bulk_job_processed_without_blocking_request(self):
+        # [2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP] Stop the worker so the stored job is still
+        # "enqueued" when we read it back (the worker could otherwise claim it first: a timing race).
+        self.system.stop_worker()
         # Test that enqueue returns quickly even with large params
         large_params = {"items": list(range(1000))}  # Simulate large payload
         
@@ -321,16 +348,12 @@ class TestBackgroundJobSystem(unittest.TestCase):
         else:
             self.fail("Job did not complete")
         
-        # Attempt to retry completed job
+        # Attempt to retry completed job: the spec retries failed jobs only.
+        # [2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP] removed stale comments that said the
+        # implementation allows retrying any job; it now refuses, as the spec and Java do.
         with self.assertRaises(ValueError) as cm:
             self.system.retry_job(job_id)
-        # Note: implementation doesn't check status in retry_job, but let's verify behavior
-        # Actually, looking at implementation: retry_job doesn't check status, it just creates new job
-        # So this test might not apply. Let's check what happens:
-        # It will create a new job with same params regardless of original status
-        # But spec says retry failed job, so we should test that it works on failed jobs only?
-        # However, implementation doesn't enforce this. We'll skip this test as implementation allows retrying any job.
-        pass
+        self.assertIn("only failed jobs can be retried", str(cm.exception))
 
 if __name__ == '__main__':
     unittest.main()

@@ -1,11 +1,19 @@
+// Tests for the billing template. Changed 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): they built
+// Stripe.net objects (Stripe.Subscription with long timestamps, Stripe.Invoice.AmountRefunded) that do not exist in
+// Stripe.net 44 and could not compile, and "simulated a valid signature" by blanking STRIPE_WEBHOOK_SECRET, i.e. by
+// switching verification off. They now fake IStripeService with local types and sign every webhook payload with a
+// test secret exactly as Stripe does, so signature verification is exercised, not bypassed. Same ten tests, same
+// assertions. Touches: in-memory databases only; no network.
 using System;
 using System.Collections.Generic;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 using System.Threading.Tasks;
 using BillingSubscriptions;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Moq;
-using Stripe;
 using Xunit;
 
 namespace BillingSubscriptionsTests
@@ -34,6 +42,38 @@ namespace BillingSubscriptionsTests
             return new Mock<IStripeService>();
         }
 
+        /// <summary>The webhook signing secret every test service uses (a test value, not a real secret).</summary>
+        private const string WebhookSecret = "whsec_test_secret";
+
+        /// <summary>Builds the service under test with the test webhook secret. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.</summary>
+        private BillingService NewService(BillingContext ctx, IStripeService stripe, ILogger<BillingService> logger) =>
+            new BillingService(ctx, stripe, logger, WebhookSecret);
+
+        /// <summary>
+        /// Signs a payload the way Stripe does: "t=&lt;unix&gt;,v1=hex(HMAC-SHA256(secret, t + "." + payload))".
+        /// 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Pure (reads the clock).
+        /// </summary>
+        private static string Sign(string payload, string secret = WebhookSecret)
+        {
+            var t = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
+            var sig = Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes($"{t}.{payload}"))).ToLowerInvariant();
+            return $"t={t},v1={sig}";
+        }
+
+        /// <summary>A Stripe event body ({id, type, data: {object}}) in Stripe's JSON field names. Pure.</summary>
+        private static string EventJson(string id, string type, object dataObject) =>
+            JsonSerializer.Serialize(new { id, type, data = new { @object = dataObject } });
+
+        /// <summary>An invoice.payment_succeeded data object. Pure.</summary>
+        private static object PaidInvoice(string id, string customer, long amountPaid) => new
+        {
+            id,
+            customer,
+            amount_paid = amountPaid,
+            status_transitions = new { paid_at = DateTimeOffset.UtcNow.ToUnixTimeSeconds() }
+        };
+
         [Fact]
         public async Task CreateSubscription_HappyPath()
         {
@@ -41,15 +81,15 @@ namespace BillingSubscriptionsTests
             var logger = GetLogger();
             var stripeMock = GetMockStripeService();
 
-            var stripeSub = new Stripe.Subscription
+            var stripeSub = new StripeSubscriptionInfo
             {
                 Id = "sub_123",
-                CurrentPeriodEnd = DateTimeOffset.UtcNow.AddMonths(1).ToUnixTimeSeconds()
+                CurrentPeriodEnd = DateTime.UtcNow.AddMonths(1)
             };
             stripeMock.Setup(s => s.CreateSubscriptionAsync("cust_1", It.IsAny<string>()))
                 .ReturnsAsync(stripeSub);
 
-            var service = new BillingService(ctx, stripeMock.Object, logger);
+            var service = NewService(ctx, stripeMock.Object, logger);
             var response = await service.CreateSubscriptionAsync("cust_1", "solo");
 
             Assert.True(response.Success);
@@ -71,7 +111,7 @@ namespace BillingSubscriptionsTests
             var logger = GetLogger();
             var stripeMock = GetMockStripeService();
 
-            var service = new BillingService(ctx, stripeMock.Object, logger);
+            var service = NewService(ctx, stripeMock.Object, logger);
             var response = await service.CreateSubscriptionAsync("cust_1", "invalid_tier");
 
             Assert.False(response.Success);
@@ -97,16 +137,16 @@ namespace BillingSubscriptionsTests
             ctx.Subscriptions.Add(sub);
             await ctx.SaveChangesAsync();
 
-            var stripeSub = new Stripe.Subscription
+            var stripeSub = new StripeSubscriptionInfo
             {
                 Id = "sub_123",
-                CurrentPeriodStart = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                LatestInvoice = new Stripe.Invoice { AmountRefunded = 0 }
+                CurrentPeriodStart = DateTime.UtcNow,
+                ProrationCredit = 0
             };
             stripeMock.Setup(s => s.UpdateSubscriptionAsync("sub_123", It.IsAny<string>()))
                 .ReturnsAsync(stripeSub);
 
-            var service = new BillingService(ctx, stripeMock.Object, logger);
+            var service = NewService(ctx, stripeMock.Object, logger);
             var response = await service.ChangePlanAsync("sub_123", "team");
 
             Assert.True(response.Success);
@@ -128,7 +168,7 @@ namespace BillingSubscriptionsTests
             var logger = GetLogger();
             var stripeMock = GetMockStripeService();
 
-            var stripeInvoice = new Stripe.Invoice
+            var stripeInvoice = new StripeInvoiceInfo
             {
                 Id = "in_123",
                 AmountPaid = 5000,
@@ -137,7 +177,7 @@ namespace BillingSubscriptionsTests
             stripeMock.Setup(s => s.RetrieveInvoiceAsync("in_123"))
                 .ReturnsAsync(stripeInvoice);
 
-            var service = new BillingService(ctx, stripeMock.Object, logger);
+            var service = NewService(ctx, stripeMock.Object, logger);
             var response = await service.QueueRefundAsync("in_123", 3000, "Customer request", "admin_user");
 
             Assert.True(response.Success);
@@ -159,7 +199,7 @@ namespace BillingSubscriptionsTests
             var logger = GetLogger();
             var stripeMock = GetMockStripeService();
 
-            var stripeInvoice = new Stripe.Invoice
+            var stripeInvoice = new StripeInvoiceInfo
             {
                 Id = "in_123",
                 AmountPaid = 2000,
@@ -168,7 +208,7 @@ namespace BillingSubscriptionsTests
             stripeMock.Setup(s => s.RetrieveInvoiceAsync("in_123"))
                 .ReturnsAsync(stripeInvoice);
 
-            var service = new BillingService(ctx, stripeMock.Object, logger);
+            var service = NewService(ctx, stripeMock.Object, logger);
             var response = await service.QueueRefundAsync("in_123", 3000, "Too much", "admin_user");
 
             Assert.False(response.Success);
@@ -182,28 +222,11 @@ namespace BillingSubscriptionsTests
             var logger = GetLogger();
             var stripeMock = GetMockStripeService();
 
-            var service = new BillingService(ctx, stripeMock.Object, logger);
+            var service = NewService(ctx, stripeMock.Object, logger);
 
-            var stripeEvent = new Event
-            {
-                Id = "evt_1",
-                Type = "invoice.payment_succeeded",
-                Data = new EventData
-                {
-                    Object = new Stripe.Invoice
-                    {
-                        Id = "in_123",
-                        CustomerId = "cust_1",
-                        AmountPaid = 5000,
-                        StatusTransitions = new InvoiceStatusTransitions { PaidAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds() }
-                    }
-                }
-            };
-            var json = JsonSerializer.Serialize(stripeEvent);
-            // Simulate valid signature by bypassing verification (set secret to empty)
-            Environment.SetEnvironmentVariable("STRIPE_WEBHOOK_SECRET", "");
+            var json = EventJson("evt_1", "invoice.payment_succeeded", PaidInvoice("in_123", "cust_1", 5000));
 
-            var response = await service.HandleStripeWebhookAsync(json, "dummy_signature");
+            var response = await service.HandleStripeWebhookAsync(json, Sign(json));
             Assert.True(response.Success);
             var webhookResp = Assert.IsType<WebhookResponse>(response.Data);
             Assert.True(webhookResp.Received);
@@ -220,32 +243,16 @@ namespace BillingSubscriptionsTests
             var logger = GetLogger();
             var stripeMock = GetMockStripeService();
 
-            var service = new BillingService(ctx, stripeMock.Object, logger);
+            var service = NewService(ctx, stripeMock.Object, logger);
 
-            var stripeEvent = new Event
-            {
-                Id = "evt_dup",
-                Type = "invoice.payment_succeeded",
-                Data = new EventData
-                {
-                    Object = new Stripe.Invoice
-                    {
-                        Id = "in_123",
-                        CustomerId = "cust_1",
-                        AmountPaid = 5000,
-                        StatusTransitions = new InvoiceStatusTransitions { PaidAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds() }
-                    }
-                }
-            };
-            var json = JsonSerializer.Serialize(stripeEvent);
-            Environment.SetEnvironmentVariable("STRIPE_WEBHOOK_SECRET", "");
+            var json = EventJson("evt_dup", "invoice.payment_succeeded", PaidInvoice("in_123", "cust_1", 5000));
 
             // First call
-            var first = await service.HandleStripeWebhookAsync(json, "sig");
+            var first = await service.HandleStripeWebhookAsync(json, Sign(json));
             Assert.True(first.Success);
 
             // Second call (duplicate)
-            var second = await service.HandleStripeWebhookAsync(json, "sig");
+            var second = await service.HandleStripeWebhookAsync(json, Sign(json));
             Assert.True(second.Success);
             var webhookResp = Assert.IsType<WebhookResponse>(second.Data);
             Assert.True(webhookResp.Received);
@@ -273,36 +280,17 @@ namespace BillingSubscriptionsTests
             });
             await ctx.SaveChangesAsync();
 
-            var service = new BillingService(ctx, stripeMock.Object, logger);
+            var service = NewService(ctx, stripeMock.Object, logger);
 
-            var stripeEvent = new Event
+            var json = EventJson("evt_upd", "customer.subscription.updated", new
             {
-                Id = "evt_upd",
-                Type = "customer.subscription.updated",
-                Data = new EventData
-                {
-                    Object = new Stripe.Subscription
-                    {
-                        Id = "sub_123",
-                        CustomerId = "cust_1",
-                        Status = "active",
-                        Items = new StripeList<SubscriptionItem>
-                        {
-                            Data = new List<SubscriptionItem>
-                            {
-                                new SubscriptionItem
-                                {
-                                    Price = new Price { LookupKey = "team" }
-                                }
-                            }
-                        }
-                    }
-                }
-            };
-            var json = JsonSerializer.Serialize(stripeEvent);
-            Environment.SetEnvironmentVariable("STRIPE_WEBHOOK_SECRET", "");
+                id = "sub_123",
+                customer = "cust_1",
+                status = "active",
+                items = new { data = new[] { new { price = new { lookup_key = "team" } } } }
+            });
 
-            var response = await service.HandleStripeWebhookAsync(json, "sig");
+            var response = await service.HandleStripeWebhookAsync(json, Sign(json));
             Assert.True(response.Success);
 
             var sub = await ctx.Subscriptions.FirstAsync(s => s.StripeSubscriptionId == "sub_123");
@@ -317,8 +305,7 @@ namespace BillingSubscriptionsTests
             var logger = GetLogger();
             var stripeMock = GetMockStripeService();
 
-            var service = new BillingService(ctx, stripeMock.Object, logger);
-            Environment.SetEnvironmentVariable("STRIPE_WEBHOOK_SECRET", "whsec_test");
+            var service = NewService(ctx, stripeMock.Object, logger);
 
             var response = await service.HandleStripeWebhookAsync("{}", "invalid_signature");
             Assert.False(response.Success);
@@ -332,32 +319,59 @@ namespace BillingSubscriptionsTests
             var logger = GetLogger();
             var stripeMock = GetMockStripeService();
 
-            var service = new BillingService(ctx, stripeMock.Object, logger);
-            Environment.SetEnvironmentVariable("STRIPE_WEBHOOK_SECRET", "");
+            var service = NewService(ctx, stripeMock.Object, logger);
 
-            var stripeEvent = new Event
-            {
-                Id = "evt_time",
-                Type = "invoice.payment_succeeded",
-                Data = new EventData
-                {
-                    Object = new Stripe.Invoice
-                    {
-                        Id = "in_123",
-                        CustomerId = "cust_1",
-                        AmountPaid = 1000,
-                        StatusTransitions = new InvoiceStatusTransitions { PaidAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds() }
-                    }
-                }
-            };
-            var json = JsonSerializer.Serialize(stripeEvent);
+            var json = EventJson("evt_time", "invoice.payment_succeeded", PaidInvoice("in_123", "cust_1", 1000));
 
             var start = DateTime.UtcNow;
-            var response = await service.HandleStripeWebhookAsync(json, "sig");
+            var response = await service.HandleStripeWebhookAsync(json, Sign(json));
             var elapsed = DateTime.UtcNow - start;
 
             Assert.True(response.Success);
             Assert.True(elapsed.TotalSeconds < 3, $"Elapsed {elapsed.TotalSeconds}s exceeds 3 seconds");
         }
-    }
+    
+        /// <summary>
+        /// A well-formed Stripe-Signature made with another secret, and a genuine one replayed after the 5-minute
+        /// tolerance, are both refused, and nothing is recorded. Added 2026-11-10 (session
+        /// session_012zDydZCZ4AChqhEZ4oVtaP) with the constant-time verifier.
+        /// </summary>
+        [Fact]
+        public async Task HandleWebhook_WrongSecretOrStaleTimestamp_Rejected()
+        {
+            var ctx = GetInMemoryContext();
+            var json = EventJson("evt_forged", "invoice.payment_succeeded", PaidInvoice("in_9", "cust_1", 5000));
+            var service = NewService(ctx, GetMockStripeService().Object, GetLogger());
+
+            var forged = await service.HandleStripeWebhookAsync(json, Sign(json, "whsec_someone_else"));
+            Assert.Equal("invalid_signature", forged.Error.Code);
+
+            var later = new BillingService(ctx, GetMockStripeService().Object, GetLogger(), WebhookSecret,
+                () => DateTimeOffset.UtcNow.AddMinutes(10));
+            var stale = await later.HandleStripeWebhookAsync(json, Sign(json));
+            Assert.Equal("invalid_signature", stale.Error.Code);
+
+            Assert.Empty(await ctx.Events.ToListAsync());
+            Assert.Empty(await ctx.Invoices.ToListAsync());
+        }
+
+        /// <summary>
+        /// Two refunds that each fit the invoice but together exceed it: the second is refused. Added 2026-11-10
+        /// (session session_012zDydZCZ4AChqhEZ4oVtaP) with the cumulative check.
+        /// </summary>
+        [Fact]
+        public async Task QueueRefund_CumulativeRefundsCannotExceedInvoice()
+        {
+            var ctx = GetInMemoryContext();
+            var stripeMock = GetMockStripeService();
+            stripeMock.Setup(s => s.RetrieveInvoiceAsync("in_123"))
+                .ReturnsAsync(new StripeInvoiceInfo { Id = "in_123", AmountPaid = 5000, Status = "paid" });
+            var service = NewService(ctx, stripeMock.Object, GetLogger());
+
+            Assert.True((await service.QueueRefundAsync("in_123", 3000, "first", "admin_user")).Success);
+            var second = await service.QueueRefundAsync("in_123", 3000, "second", "admin_user");
+            Assert.False(second.Success);
+            Assert.Equal("refund_exceeds_invoice", second.Error.Code);
+        }
+}
 }

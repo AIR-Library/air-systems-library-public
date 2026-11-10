@@ -1,3 +1,11 @@
+/**
+ * Quota & rate-limiting tests, one jest test per check.
+ * Why: this file was a hand-written runner (runAllTests) that the library's runner counted as 0 framework tests, and
+ * its month-rollover check read the real calendar month. Converted to jest 2026-11-10, session
+ * session_012zDydZCZ4AChqhEZ4oVtaP: every check and assertion is kept, each check is now its own test, and the
+ * rollover check pins the service clock to January 2024. Touches: process memory only.
+ */
+import { describe, test } from "@jest/globals";
 import {
   InMemoryQuotaService,
   getCurrentMonth,
@@ -223,7 +231,8 @@ async function testFeatureGateFail(): Promise<void> {
 }
 
 async function testMonthRollover(): Promise<void> {
-  const service = new InMemoryQuotaService();
+  // The usage is recorded "now"; the check reads it back as month 2024-01, so "now" must be in January 2024.
+  const service = new InMemoryQuotaService({ now: () => new Date(Date.UTC(2024, 0, 15, 12, 0, 0)) });
   const userId = "user11";
   const tier: Tier = "solo";
   const oldMonth = "2024-01";
@@ -276,26 +285,17 @@ async function testTierUpgrade(): Promise<void> {
   console.log("✓ tier upgrade → limits updated immediately");
 }
 
-async function runAllTests(): Promise<void> {
-  console.log("Running Quota & Rate Limiting Tests...\n");
-
-  await testApiQuotaPass();
-  await testApiQuotaFail();
-  await testStorageQuotaPass();
-  await testStorageQuotaFail();
-  await testRateLimitPerUserPass();
-  await testRateLimitPerUserFail();
-  await testRateLimitPerIpPass();
-  await testRateLimitPerIpFail();
-  await testFeatureGatePass();
-  await testFeatureGateFail();
-  await testMonthRollover();
-  await testTierUpgrade();
-
-  console.log("\nAll tests passed!");
-}
-
-runAllTests().catch((err) => {
-  console.error("Test failed:", err);
-  process.exit(1);
+describe("Quota & Rate Limiting", () => {
+  test("api_quota PASS → call succeeds, usage incremented", testApiQuotaPass);
+  test("api_quota FAIL → call rejected 429", testApiQuotaFail);
+  test("storage_quota PASS → file stored", testStorageQuotaPass);
+  test("storage_quota FAIL → upload rejected 413", testStorageQuotaFail);
+  test("rate_limit_per_user PASS → < 100/min allowed", testRateLimitPerUserPass);
+  test("rate_limit_per_user FAIL → 100+/min rejected 429", testRateLimitPerUserFail);
+  test("rate_limit_per_ip PASS → < 10/sec allowed", testRateLimitPerIpPass);
+  test("rate_limit_per_ip FAIL → 10+/sec rejected 429", testRateLimitPerIpFail);
+  test("feature_gate PASS → feature available in tier", testFeatureGatePass);
+  test("feature_gate FAIL → feature unavailable, 403 with upgrade hint", testFeatureGateFail);
+  test("month rollover → usage_metrics reset for new month", testMonthRollover);
+  test("tier upgrade → limits updated immediately", testTierUpgrade);
 });

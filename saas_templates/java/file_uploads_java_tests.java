@@ -89,10 +89,21 @@ class FileUploadServiceTest {
             service.download(userId, link.token()));
     }
 
+    /**
+     * A link whose signature part was altered is refused. Changed 2026-11-10, session
+     * session_012zDydZCZ4AChqhEZ4oVtaP: it replaced the token's last base64url character with "X", but that
+     * character also carries unused padding bits, so for several values (and always when it already was "X")
+     * the "tampered" token decoded to the same bytes and the download succeeded: a random failure (seen once in
+     * this session's runs). It now changes a character five from the end, which always alters the signature.
+     * Touches: the test's temporary database and storage.
+     */
     @Test void tamperedLinkRejected() throws Exception {
         FileUploadService.UploadResult result = service.upload(userId, orgId, "test.png", pngBytes(), "image/png");
         FileUploadService.DownloadLink link = service.createDownloadLink(userId, result.fileId(), 300);
-        String tampered = link.token().substring(0, link.token().length() - 1) + "X";
+        String token = link.token();
+        int i = token.length() - 5;
+        char replacement = token.charAt(i) == 'A' ? 'B' : 'A';
+        String tampered = token.substring(0, i) + replacement + token.substring(i + 1);
         assertThrows(FileUploadService.DownloadException.class, () ->
             service.download(userId, tampered));
     }

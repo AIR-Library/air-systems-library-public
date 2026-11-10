@@ -5,6 +5,7 @@ import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -18,9 +19,17 @@ import java.util.stream.Collectors;
  *  - Document unindexing (delete)
  *  - Batch reindexing (background job)
  *
- * Storage: In-memory inverted index backed by a ConcurrentHashMap.
+ * Storage: In-memory inverted index kept in a sorted map (token -> keys in insertion order),
+ * plus a forward index per document, so an update or delete touches only that document's tokens.
  * Tokenization: whitespace split, lowercase, stop-word removal.
- * Relevance: exact match > partial match > prefix match.
+ * Relevance: exact match > partial match > prefix match; ties break by insertion order.
+ * Multi-word queries: every text token must match (spec: "stripe integration" finds deployments with both words).
+ * Thread safety: every read and write of the index holds this object's monitor.
+ *
+ * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: the class did not compile (a second
+ * search(...) overload with the same signature that called itself), every index/update scanned the whole
+ * inverted index (the 1M-document test never finished), prefix search scanned every token, results with equal
+ * scores came back in hash order, and a reindex without a source wiped the index. Touches: memory only.
  */
 public class FullTextSearchIndexing implements AutoCloseable {
 
@@ -53,12 +62,20 @@ public class FullTextSearchIndexing implements AutoCloseable {
 
     // ─── Data Models ─────────────────────────────────────────────────────────
 
+    /**
+     * One indexed document. Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: gains the package-private seq (insertion order, for
+     * deterministic ties) and tokens (forward index) fields; its public constructor is unchanged.
+     */
     public static class Document {
         public String documentType;
         public String documentId;
         public String content;
         public Instant indexedAt;
         public Map<String, Object> metadata;
+        /** Insertion sequence, used to break relevance ties deterministically (set by indexDocument). */
+        long seq;
+        /** Distinct normalized tokens of content, the forward index used for removal and scoring. */
+        String[] tokens = new String[0];
 
         public Document(String documentType, String documentId, String content,
                         Instant indexedAt, Map<String, Object> metadata) {
@@ -132,14 +149,24 @@ public class FullTextSearchIndexing implements AutoCloseable {
 
     // ─── Internal Index Structures ───────────────────────────────────────────
 
-    /** Inverted index: token -> set of "type:id" keys */
-    private final Map<String, Set<String>> invertedIndex = new ConcurrentHashMap<>();
+    /** Inverted index: token -> "type:id" keys in insertion order. Sorted so prefix lookups are a range scan. */
+    private final TreeMap<String, Set<String>> invertedIndex = new TreeMap<>();
 
-    /** Document store: "type:id" -> Document */
-    private final Map<String, Document> documentStore = new ConcurrentHashMap<>();
+    /** Document store: "type:id" -> Document, in insertion order. */
+    private final Map<String, Document> documentStore = new LinkedHashMap<>();
 
-    /** Metadata index: field -> value -> set of "type:id" keys */
-    private final Map<String, Map<String, Set<String>>> metadataIndex = new ConcurrentHashMap<>();
+    /** Metadata index: field -> value -> "type:id" keys in insertion order. */
+    private final Map<String, Map<String, Set<String>>> metadataIndex = new HashMap<>();
+
+    /** Monotonic insertion counter for Document.seq. Guarded by this. */
+    private long nextSeq = 0;
+
+    /** Futures of submitted reindex jobs, so callers can wait for one deterministically. */
+    private final Map<String, Future<?>> jobFutures = new ConcurrentHashMap<>();
+
+    private static final Pattern LEADING_NON_ALNUM = Pattern.compile("^[^a-z0-9]+");
+    private static final Pattern TRAILING_NON_ALNUM = Pattern.compile("[^a-z0-9]+$");
+    private static final Pattern WHITESPACE = Pattern.compile("\\s+");
 
     private final Config config;
     private final ExecutorService reindexExecutor;
@@ -163,23 +190,39 @@ public class FullTextSearchIndexing implements AutoCloseable {
 
     // ─── Tokenization ────────────────────────────────────────────────────────
 
+    /**
+     * Splits text on whitespace, lowercases it, trims non-alphanumerics from each word's edges and drops stop words.
+     * Input: any text (null gives an empty list). Output: tokens in their order of appearance.
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: precompiled patterns (the 1M-document test).
+     * Touches: nothing (pure).
+     */
     private List<String> tokenize(String text) {
         if (text == null || text.isEmpty()) {
             return Collections.emptyList();
         }
         String lower = text.toLowerCase(Locale.ROOT);
-        String[] parts = lower.split("\\s+");
+        String[] parts = WHITESPACE.split(lower);
         List<String> tokens = new ArrayList<>();
         for (String part : parts) {
-            String trimmed = part.trim();
-            if (trimmed.isEmpty()) continue;
-            // Remove non-alphanumeric characters from edges
-            trimmed = trimmed.replaceAll("^[^a-z0-9]+", "").replaceAll("[^a-z0-9]+$", "");
+            String trimmed = normalizeWord(part);
             if (trimmed.isEmpty()) continue;
             if (config.stopWords.contains(trimmed)) continue;
             tokens.add(trimmed);
         }
         return tokens;
+    }
+
+    /**
+     * Normalizes one already-lowercased word the way indexed words are normalized: trims whitespace and
+     * non-alphanumerics from its edges. Input: a word. Output: the normalized word, possibly empty.
+     * Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP, so query words and indexed words match the
+     * same way ("stripe," finds "stripe"). Touches: nothing (pure).
+     */
+    private static String normalizeWord(String word) {
+        String trimmed = word.trim();
+        if (trimmed.isEmpty()) return trimmed;
+        trimmed = LEADING_NON_ALNUM.matcher(trimmed).replaceAll("");
+        return TRAILING_NON_ALNUM.matcher(trimmed).replaceAll("");
     }
 
     private String docKey(String documentType, String documentId) {
@@ -196,8 +239,12 @@ public class FullTextSearchIndexing implements AutoCloseable {
      * @param content      full searchable text
      * @param metadata     filterable fields
      * @return IndexResponse with success and indexedAt
+     *
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: removal of the old version now uses the
+     * document's own forward index instead of scanning every token (that made 1M inserts quadratic), and each
+     * document gets an insertion sequence for deterministic tie-breaking. Touches: memory only.
      */
-    public IndexResponse indexDocument(String documentType, String documentId,
+    public synchronized IndexResponse indexDocument(String documentType, String documentId,
                                        String content, Map<String, Object> metadata) {
         if (documentType == null || documentType.isEmpty()) {
             throw new IllegalArgumentException("document_type is required");
@@ -212,14 +259,16 @@ public class FullTextSearchIndexing implements AutoCloseable {
         // Remove old index entries if document exists
         removeIndexEntries(key);
 
-        // Store document
+        // Store document (remove first so a re-index moves it to the end of insertion order)
+        documentStore.remove(key);
         Document doc = new Document(documentType, documentId, content, now, metadata);
+        doc.seq = nextSeq++;
+        doc.tokens = new LinkedHashSet<>(tokenize(content)).toArray(new String[0]);
         documentStore.put(key, doc);
 
         // Build inverted index
-        List<String> tokens = tokenize(content);
-        for (String token : tokens) {
-            invertedIndex.computeIfAbsent(token, k -> ConcurrentHashMap.newKeySet()).add(key);
+        for (String token : doc.tokens) {
+            invertedIndex.computeIfAbsent(token, k -> new LinkedHashSet<>(2)).add(key);
         }
 
         // Build metadata index
@@ -230,8 +279,8 @@ public class FullTextSearchIndexing implements AutoCloseable {
                 if (value == null) continue;
                 String strValue = value.toString();
                 metadataIndex
-                        .computeIfAbsent(field, k -> new ConcurrentHashMap<>())
-                        .computeIfAbsent(strValue, k -> ConcurrentHashMap.newKeySet())
+                        .computeIfAbsent(field, k -> new HashMap<>())
+                        .computeIfAbsent(strValue, k -> new LinkedHashSet<>(2))
                         .add(key);
             }
         }
@@ -251,8 +300,13 @@ public class FullTextSearchIndexing implements AutoCloseable {
      * @param offset         pagination offset
      * @param facetFields    list of metadata fields to facet on
      * @return SearchResponse
+     *
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: every text token must match (exactly or
+     * as a prefix), as the spec's "stripe integration" example requires; prefix lookups are a range scan of the
+     * sorted index instead of a scan of every token; equal scores keep insertion order; facets count the
+     * documents actually returned by the query. Touches: memory only (reads the index).
      */
-    public SearchResponse search(String query, String documentType,
+    public synchronized SearchResponse search(String query, String documentType,
                                  Map<String, String> filters, int limit, int offset,
                                  List<String> facetFields) {
         if (limit <= 0) limit = config.defaultLimit;
@@ -270,27 +324,31 @@ public class FullTextSearchIndexing implements AutoCloseable {
         }
         allFilters.putAll(parts.filters);
 
-        // Determine candidate document keys
+        // Determine candidate document keys: every text token must match (exact or prefix)
         Set<String> candidates = null;
 
-        // If there are text tokens, use inverted index
         if (!parts.textTokens.isEmpty()) {
-            candidates = new HashSet<>();
             for (String token : parts.textTokens) {
-                Set<String> docs = invertedIndex.get(token);
-                if (docs != null) {
-                    candidates.addAll(docs);
+                Set<String> matches = new HashSet<>();
+                // Exact and prefix matches: the sorted range [token, token + U+FFFF)
+                for (Set<String> docs : invertedIndex.subMap(token, true, token + Character.MAX_VALUE, false).values()) {
+                    matches.addAll(docs);
                 }
-                // Also check prefix matches
-                for (Map.Entry<String, Set<String>> entry : invertedIndex.entrySet()) {
-                    if (entry.getKey().startsWith(token) && !entry.getKey().equals(token)) {
-                        candidates.addAll(entry.getValue());
-                    }
+                if (candidates == null) {
+                    candidates = matches;
+                } else {
+                    candidates.retainAll(matches);
                 }
+                if (candidates.isEmpty()) break;
             }
         }
 
-        // If no text tokens, all documents are candidates
+        if (candidates == null && parts.hadTextWords) {
+            // Only stop words were typed: they are not indexed, so nothing matches ("the" finds nothing)
+            candidates = new HashSet<>();
+        }
+
+        // If no text at all (empty query or filters only), all documents are candidates
         if (candidates == null) {
             candidates = new HashSet<>(documentStore.keySet());
         }
@@ -319,7 +377,7 @@ public class FullTextSearchIndexing implements AutoCloseable {
             candidates.retainAll(matching);
         }
 
-        // Score and sort
+        // Score and sort: relevance descending, then insertion order (deterministic ties)
         List<ScoredDoc> scored = new ArrayList<>();
         for (String key : candidates) {
             Document doc = documentStore.get(key);
@@ -330,7 +388,10 @@ public class FullTextSearchIndexing implements AutoCloseable {
             }
         }
 
-        scored.sort((a, b) -> Double.compare(b.score, a.score));
+        scored.sort((a, b) -> {
+            int c = Double.compare(b.score, a.score);
+            return c != 0 ? c : Long.compare(a.doc.seq, b.doc.seq);
+        });
 
         long total = scored.size();
 
@@ -344,7 +405,7 @@ public class FullTextSearchIndexing implements AutoCloseable {
                     sd.doc.documentId,
                     sd.doc.documentType,
                     sd.score,
-                    sd.doc.metadata
+                    new HashMap<>(sd.doc.metadata)
             ));
         }
 
@@ -353,30 +414,36 @@ public class FullTextSearchIndexing implements AutoCloseable {
         // Facets
         Map<String, Map<String, Long>> facets = null;
         if (facetFields != null && !facetFields.isEmpty()) {
-            facets = computeFacets(candidates, facetFields);
+            facets = computeFacets(scored, facetFields);
         }
 
         return new SearchResponse(results, total, hasMore, facets);
     }
 
-    // Convenience overloads
+    /**
+     * Convenience overload: search all types with the default limit. Output: SearchResponse.
+     * Touches: memory only. Documented 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (the duplicate
+     * six-argument overload that called itself forever was removed in this repair).
+     */
     public SearchResponse search(String query) {
         return search(query, null, null, config.defaultLimit, 0, null);
     }
 
+    /**
+     * Convenience overload: text query within one document type, paginated. Output: SearchResponse.
+     * Touches: memory only. Documented 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.
+     */
     public SearchResponse search(String query, String documentType, int limit, int offset) {
         return search(query, documentType, null, limit, offset, null);
     }
 
+    /**
+     * Convenience overload: text query plus metadata filters, paginated, no facets. Output: SearchResponse.
+     * Touches: memory only. Documented 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.
+     */
     public SearchResponse search(String query, String documentType,
                                  Map<String, String> filters, int limit, int offset) {
         return search(query, documentType, filters, limit, offset, null);
-    }
-
-    public SearchResponse search(String query, String documentType,
-                                 Map<String, String> filters, int limit, int offset,
-                                 List<String> facetFields) {
-        return search(query, documentType, filters, limit, offset, facetFields);
     }
 
     // ─── 3. Search with Filters (convenience) ────────────────────────────────
@@ -403,9 +470,12 @@ public class FullTextSearchIndexing implements AutoCloseable {
     // ─── 5. Unindex Document ─────────────────────────────────────────────────
 
     /**
-     * Remove a document from the index.
+     * Remove a document from the index. Removing an unknown document succeeds (idempotent delete).
+     * Input: document type and id. Output: DeleteResponse(success=true).
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: synchronized, and removal uses the forward
+     * index. Touches: memory only.
      */
-    public DeleteResponse unindexDocument(String documentType, String documentId) {
+    public synchronized DeleteResponse unindexDocument(String documentType, String documentId) {
         if (documentType == null || documentType.isEmpty()) {
             throw new IllegalArgumentException("document_type is required");
         }
@@ -427,13 +497,16 @@ public class FullTextSearchIndexing implements AutoCloseable {
      *
      * @param documentType specific type or null for all
      * @return ReindexResponse with job_id and status
+     *
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: the job's Future is kept so awaitJob can
+     * wait for it instead of callers sleeping and hoping. Touches: memory only, one background thread.
      */
     public ReindexResponse reindexAll(String documentType) {
         String jobId = "reindex-" + jobIdCounter.incrementAndGet();
         jobStatus.put(jobId, "enqueued");
 
         final String type = documentType;
-        reindexExecutor.submit(() -> {
+        Future<?> future = reindexExecutor.submit(() -> {
             try {
                 jobStatus.put(jobId, "running");
                 performReindex(type);
@@ -442,32 +515,68 @@ public class FullTextSearchIndexing implements AutoCloseable {
                 jobStatus.put(jobId, "failed");
             }
         });
+        jobFutures.put(jobId, future);
 
         return new ReindexResponse(true, jobId, "enqueued");
     }
 
     /**
-     * Synchronous reindex (for testing or immediate use).
+     * Waits until a reindex job has finished (completed or failed), up to timeoutMs.
+     * Input: job id from reindexAll, timeout in milliseconds. Output: true if the job finished in time,
+     * false if it is unknown, still running, or the wait was interrupted.
+     * Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP so tests and callers wait on the job itself
+     * rather than on a fixed sleep (a wall-clock race). Touches: memory only.
      */
-    public void performReindex(String documentType) {
-        // Clear existing index
-        invertedIndex.clear();
-        documentStore.clear();
-        metadataIndex.clear();
+    public boolean awaitJob(String jobId, long timeoutMs) {
+        Future<?> future = jobFutures.get(jobId);
+        if (future == null) return false;
+        try {
+            future.get(timeoutMs, TimeUnit.MILLISECONDS);
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        } catch (ExecutionException e) {
+            return true; // the job ended; its status says "failed"
+        } catch (TimeoutException e) {
+            return false;
+        }
+    }
 
-        // Rebuild from a snapshot of what would be the source of truth.
-        // In a real system, this would query the database.
-        // Here we rebuild from a provided source if available.
-        // For this implementation, we assume the caller has already
-        // re-indexed documents via indexDocument, or we rebuild from
-        // a registered source.
-        if (reindexSource != null) {
-            List<Document> docs = reindexSource.getDocumentType().equals("all")
-                    ? reindexSource.getAllDocuments()
-                    : reindexSource.getDocumentsByType(documentType);
-            for (Document doc : docs) {
-                indexDocument(doc.documentType, doc.documentId, doc.content, doc.metadata);
+    /**
+     * Synchronous reindex from the registered ReindexSource (the source of truth, e.g. the database).
+     * Input: a document type, or null for all types. Output: none; the index for that scope is rebuilt.
+     * With a type, only documents of that type are dropped and reloaded (getDocumentsByType); with null, the
+     * whole index is dropped and reloaded (getAllDocuments).
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: it cleared the whole index even for a
+     * one-type reindex, and with no source registered it wiped every document and rebuilt nothing. It now
+     * refuses (IllegalStateException, so the job is marked failed) and leaves the index untouched.
+     * Touches: memory only (reads the source).
+     */
+    public synchronized void performReindex(String documentType) {
+        if (reindexSource == null) {
+            throw new IllegalStateException("no reindex source registered; index left unchanged");
+        }
+        List<Document> docs = documentType == null
+                ? reindexSource.getAllDocuments()
+                : reindexSource.getDocumentsByType(documentType);
+
+        if (documentType == null) {
+            invertedIndex.clear();
+            documentStore.clear();
+            metadataIndex.clear();
+        } else {
+            for (String key : new ArrayList<>(documentStore.keySet())) {
+                if (key.startsWith(documentType + ":")) {
+                    removeIndexEntries(key);
+                    documentStore.remove(key);
+                }
             }
+        }
+
+        for (Document doc : docs) {
+            if (documentType != null && !documentType.equals(doc.documentType)) continue;
+            indexDocument(doc.documentType, doc.documentId, doc.content, doc.metadata);
         }
     }
 
@@ -481,7 +590,12 @@ public class FullTextSearchIndexing implements AutoCloseable {
 
     private ReindexSource reindexSource;
 
-    public void setReindexSource(ReindexSource source) {
+    /**
+     * Registers the source of truth used by reindex jobs. Input: a ReindexSource. Output: none.
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: synchronized with the jobs that read it.
+     * Touches: memory only.
+     */
+    public synchronized void setReindexSource(ReindexSource source) {
         this.reindexSource = source;
     }
 
@@ -490,8 +604,16 @@ public class FullTextSearchIndexing implements AutoCloseable {
     private static class QueryParts {
         List<String> textTokens = new ArrayList<>();
         Map<String, String> filters = new HashMap<>();
+        /** True when the query held free-text words, even if every one was a stop word. */
+        boolean hadTextWords = false;
     }
 
+    /**
+     * Splits a query into free-text tokens and field:value filters ("member tier:team").
+     * Input: raw query (may be null). Output: QueryParts.
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: text tokens are normalized like indexed
+     * words, and hadTextWords marks a stop-word-only query so it matches nothing. Touches: nothing (pure).
+     */
     private QueryParts parseQuery(String query) {
         QueryParts parts = new QueryParts();
         if (query == null || query.trim().isEmpty()) {
@@ -508,7 +630,8 @@ public class FullTextSearchIndexing implements AutoCloseable {
                     parts.filters.put(field, value);
                 }
             } else {
-                String lower = token.toLowerCase(Locale.ROOT);
+                String lower = normalizeWord(token.toLowerCase(Locale.ROOT));
+                if (!lower.isEmpty()) parts.hadTextWords = true;
                 if (!config.stopWords.contains(lower) && !lower.isEmpty()) {
                     parts.textTokens.add(lower);
                 }
@@ -531,46 +654,35 @@ public class FullTextSearchIndexing implements AutoCloseable {
         }
     }
 
+    /**
+     * Scores a document for the query: per token, exact word 3.0, word containing the token 2.0, word starting
+     * with it 1.0; averaged over tokens, with a 1.5x bonus when a multi-word query matches every word exactly.
+     * Input: document, query tokens. Output: score (0 when nothing matches; 1.0 for an empty query).
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: scores against the document's normalized
+     * tokens (the same words the index holds) instead of re-splitting raw content on every call.
+     * Touches: nothing (pure).
+     */
     private double computeRelevance(Document doc, List<String> queryTokens) {
         if (queryTokens == null || queryTokens.isEmpty()) {
             return 1.0; // No text query, all equal
         }
 
-        String contentLower = (doc.content != null ? doc.content : "").toLowerCase(Locale.ROOT);
         double totalScore = 0.0;
+        boolean allExact = true;
 
         for (String qt : queryTokens) {
             double tokenScore = 0.0;
-
-            // Exact match: token appears as a whole word in content
-            if (contentLower.contains(qt)) {
-                // Check if it's an exact word match
-                String[] words = contentLower.split("\\s+");
-                boolean exactWordMatch = false;
-                for (String w : words) {
-                    if (w.equals(qt)) {
-                        exactWordMatch = true;
-                        break;
-                    }
-                }
-                if (exactWordMatch) {
+            for (String w : doc.tokens) {
+                if (w.equals(qt)) {
                     tokenScore = 3.0; // exact match
-                } else if (contentLower.contains(qt)) {
-                    tokenScore = 2.0; // partial match (substring)
+                    break;
+                } else if (w.contains(qt)) {
+                    tokenScore = Math.max(tokenScore, 2.0); // partial match (substring)
+                } else if (w.startsWith(qt)) {
+                    tokenScore = Math.max(tokenScore, 1.0); // prefix match
                 }
             }
-
-            // Prefix match: any word starts with the query token
-            if (tokenScore == 0.0) {
-                String[] words = contentLower.split("\\s+");
-                for (String w : words) {
-                    if (w.startsWith(qt)) {
-                        tokenScore = 1.0; // prefix match
-                        break;
-                    }
-                }
-            }
-
+            if (tokenScore < 3.0) allExact = false;
             totalScore += tokenScore;
         }
 
@@ -579,21 +691,6 @@ public class FullTextSearchIndexing implements AutoCloseable {
         double normalized = totalScore / queryTokens.size();
 
         // Bonus: if all tokens matched exactly, boost
-        boolean allExact = true;
-        for (String qt : queryTokens) {
-            String[] words = contentLower.split("\\s+");
-            boolean found = false;
-            for (String w : words) {
-                if (w.equals(qt)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                allExact = false;
-                break;
-            }
-        }
         if (allExact && queryTokens.size() > 1) {
             normalized *= 1.5; // multi-word exact bonus
         }
@@ -603,15 +700,21 @@ public class FullTextSearchIndexing implements AutoCloseable {
 
     // ─── Facets ──────────────────────────────────────────────────────────────
 
-    private Map<String, Map<String, Long>> computeFacets(Set<String> candidateKeys,
+    /**
+     * Counts, per requested metadata field, how many matching documents hold each value; values sorted by count
+     * descending, then by value for a stable order. Input: the scored matches, field names. Output: field ->
+     * value -> count (an empty map for a field no match has).
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: counts the documents the query returned
+     * (not raw candidates) and orders ties deterministically. Touches: nothing (pure).
+     */
+    private Map<String, Map<String, Long>> computeFacets(List<ScoredDoc> matches,
                                                          List<String> facetFields) {
         Map<String, Map<String, Long>> facets = new LinkedHashMap<>();
 
         for (String field : facetFields) {
             Map<String, Long> counts = new LinkedHashMap<>();
-            for (String key : candidateKeys) {
-                Document doc = documentStore.get(key);
-                if (doc == null) continue;
+            for (ScoredDoc sd : matches) {
+                Document doc = sd.doc;
                 Object value = doc.metadata.get(field);
                 if (value != null) {
                     String strValue = value.toString();
@@ -620,7 +723,8 @@ public class FullTextSearchIndexing implements AutoCloseable {
             }
             // Sort by count descending
             Map<String, Long> sorted = counts.entrySet().stream()
-                    .sorted(Map.Entry.<String, Long>comparingByValue().reversed())
+                    .sorted(Map.Entry.<String, Long>comparingByValue().reversed()
+                            .thenComparing(Map.Entry.comparingByKey()))
                     .collect(Collectors.toMap(
                             Map.Entry::getKey,
                             Map.Entry::getValue,
@@ -635,42 +739,56 @@ public class FullTextSearchIndexing implements AutoCloseable {
 
     // ─── Internal: Remove Index Entries ──────────────────────────────────────
 
+    /**
+     * Removes one document's entries from the inverted and metadata indexes, using its forward index (its own
+     * tokens and metadata values), and drops postings that become empty. The document itself stays in
+     * documentStore; callers remove it. Input: "type:id" key (unknown keys are a no-op). Output: none.
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: it walked every token and every metadata
+     * value in the index on each call, so indexing N documents cost O(N^2) and the 1M-document test never ended.
+     * Touches: memory only. Caller holds this object's monitor.
+     */
     private void removeIndexEntries(String key) {
-        // Remove from inverted index
-        for (Iterator<Map.Entry<String, Set<String>>> it = invertedIndex.entrySet().iterator();
-             it.hasNext(); ) {
-            Map.Entry<String, Set<String>> entry = it.next();
-            entry.getValue().remove(key);
-            if (entry.getValue().isEmpty()) {
-                it.remove();
+        Document old = documentStore.get(key);
+        if (old == null) return;
+
+        for (String token : old.tokens) {
+            Set<String> postings = invertedIndex.get(token);
+            if (postings != null) {
+                postings.remove(key);
+                if (postings.isEmpty()) invertedIndex.remove(token);
             }
         }
 
-        // Remove from metadata index
-        for (Iterator<Map.Entry<String, Map<String, Set<String>>>> it = metadataIndex.entrySet().iterator();
-             it.hasNext(); ) {
-            Map.Entry<String, Map<String, Set<String>>> entry = it.next();
-            for (Iterator<Map.Entry<String, Set<String>>> vit = entry.getValue().entrySet().iterator();
-                 vit.hasNext(); ) {
-                Map.Entry<String, Set<String>> valueEntry = vit.next();
-                valueEntry.getValue().remove(key);
-                if (valueEntry.getValue().isEmpty()) {
-                    vit.remove();
-                }
+        for (Map.Entry<String, Object> entry : old.metadata.entrySet()) {
+            if (entry.getValue() == null) continue;
+            Map<String, Set<String>> fieldIndex = metadataIndex.get(entry.getKey());
+            if (fieldIndex == null) continue;
+            String strValue = entry.getValue().toString();
+            Set<String> postings = fieldIndex.get(strValue);
+            if (postings != null) {
+                postings.remove(key);
+                if (postings.isEmpty()) fieldIndex.remove(strValue);
             }
-            if (entry.getValue().isEmpty()) {
-                it.remove();
-            }
+            if (fieldIndex.isEmpty()) metadataIndex.remove(entry.getKey());
         }
     }
 
     // ─── Utility ─────────────────────────────────────────────────────────────
 
-    public int getDocumentCount() {
+    /**
+     * Number of indexed documents. Touches: memory only.
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: synchronized (the store is no longer a
+     * concurrent map).
+     */
+    public synchronized int getDocumentCount() {
         return documentStore.size();
     }
 
-    public int getDocumentCount(String documentType) {
+    /**
+     * Number of indexed documents of one type. Touches: memory only.
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: synchronized.
+     */
+    public synchronized int getDocumentCount(String documentType) {
         return (int) documentStore.keySet().stream()
                 .filter(k -> k.startsWith(documentType + ":"))
                 .count();

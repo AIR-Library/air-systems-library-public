@@ -6,6 +6,9 @@ import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMock
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.*;
 import org.springframework.test.web.servlet.*;
+// Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: RequestPostProcessor lives in the .request
+// sub-package; without this import the file could not compile against any implementation.
+import org.springframework.test.web.servlet.request.RequestPostProcessor;
 
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
@@ -13,7 +16,19 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.*;
 
-@SpringBootTest
+/*
+ * Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: the test deployment's configuration. The
+ * implementation no longer trusts a client-sent X-User-Id header, a hard-coded CSRF token, a hard-coded
+ * "can publish" flag or a live Stripe key unless the deployment says so; these properties say so for this test
+ * (identity header from the test's stand-in auth proxy, the CSRF token the requests send, the in-memory Stripe
+ * gateway, publishing enabled).
+ */
+@SpringBootTest(properties = {
+        "admin.auth.trusted-user-header=X-User-Id",
+        "admin.csrf.token=secure-token",
+        "admin.stripe.gateway=in-memory",
+        "admin.safety.can-publish=true"
+})
 @AutoConfigureMockMvc
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class AdminSystemTests {
@@ -22,6 +37,9 @@ class AdminSystemTests {
     @Autowired private UserRepository userRepo;
     @Autowired private CustomerRepository custRepo;
     @Autowired private DeploymentRepository depRepo;
+    @Autowired private InvoiceRepository invoiceRepo;
+    @Autowired private GovernanceActionRepository gaRepo;
+    @Autowired private AdminStripeGateway stripeGateway;
     @Autowired private ObjectMapper mapper;
 
     private User owner;
@@ -211,6 +229,7 @@ class AdminSystemTests {
                 .andExpect(jsonPath("$.name").value("Detail"));
     }
 
+    /** change_plan updates Stripe and returns old and new tier. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: asserts the (in-memory) Stripe call and old_tier. */
     @Test
     void testChangePlanStripeCalled() throws Exception {
         Customer c = new Customer();
@@ -227,17 +246,35 @@ class AdminSystemTests {
                 .content(mapper.writeValueAsString(payload))
                 .with(auth(owner)))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.new_tier").value("PRO"));
+                .andExpect(jsonPath("$.new_tier").value("PRO"))
+                .andExpect(jsonPath("$.old_tier").value("BASIC"));
+        // The Stripe subscription update was called (in-memory gateway, no network)
+        Assertions.assertTrue(((InMemoryAdminStripeGateway) stripeGateway).calls().contains("sub_123 PRO"));
     }
 
+    /** A refund against a paid invoice is queued. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: creates the customer and invoice it refunds. */
     @Test
     void testQueueRefundRecordCreated() throws Exception {
+        // Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: the spec checks that the invoice exists
+        // and succeeded; the test refunded invoice 1001 of customer 1, neither of which it created, so a correct
+        // implementation had to refuse it. It now creates the customer and a paid invoice first.
+        Customer c = new Customer();
+        c.setEmail("refund@example.com");
+        c.setName("Refund");
+        c.setTier("BASIC");
+        c.setSignupDate(java.time.LocalDate.now());
+        custRepo.save(c);
+        Invoice inv = new Invoice();
+        inv.setCustomerId(c.getId());
+        inv.setAmount(new java.math.BigDecimal("100.00"));
+        inv.setStatus("succeeded");
+        invoiceRepo.save(inv);
         Map<String, Object> payload = Map.of(
-                "invoice_id", 1001,
+                "invoice_id", inv.getId(),
                 "amount", 49.99,
                 "reason", "customer request"
         );
-        mockMvc.perform(post("/admin/customers/1/action")
+        mockMvc.perform(post("/admin/customers/" + c.getId() + "/action")
                 .header("X-Action", "queue_refund")
                 .contentType(MediaType.APPLICATION_JSON)
                 .content(mapper.writeValueAsString(payload))
@@ -269,6 +306,7 @@ class AdminSystemTests {
                 .andExpect(jsonPath("$.domain").value("example.com"));
     }
 
+    /** Publishing a ready draft makes it live. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: the draft has a theme and a verified domain (spec checks). */
     @Test
     void testPublishDeploymentDoubleGate() throws Exception {
         // create deployment first
@@ -277,6 +315,10 @@ class AdminSystemTests {
         d.setDomain("publish.com");
         d.setTier("BASIC");
         d.setStatus("draft");
+        // Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: the spec's publish check requires a
+        // verified domain and a theme; the draft now has both.
+        d.setThemeId(1L);
+        d.setDomainVerified(true);
         depRepo.save(d);
         Map<String, Object> payload = Map.of("deployment_id", d.getId());
         mockMvc.perform(post("/admin/deployments/action")
@@ -288,40 +330,53 @@ class AdminSystemTests {
                 .andExpect(jsonPath("$.status").value("live"));
     }
 
+    /** Approving executes the action. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: saves the action, uses its id, asserts the execution. */
     @Test
     void testGovernanceApprove() throws Exception {
         // create a pending governance action
+        // Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: the action was never saved and the request
+        // assumed id 1 existed; it is now saved and its real id used. It targets a user of its own, because
+        // approving executes the action and must not remove a user other tests rely on.
+        User target = new User(); target.setEmail("approve-target@example.com"); target.setName("Target"); target.setTier("USER");
+        userRepo.save(target);
         GovernanceAction ga = new GovernanceAction();
         ga.setActionType("delete_user");
         ga.setActorId(admin.getId());
-        ga.setTargetResourceId(regular.getId());
+        ga.setTargetResourceId(target.getId());
         ga.setReason("cleanup");
-        // save via repository (omitted injection for brevity)
-        // Assume saved and id = 1
-        mockMvc.perform(post("/admin/governance/actions/1/decide")
+        gaRepo.save(ga);
+        mockMvc.perform(post("/admin/governance/actions/" + ga.getId() + "/decide")
                 .header("X-Decide", "approve")
                 .with(auth(owner)))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("approved"));
+        // The original action was executed
+        Assertions.assertEquals("deleted", userRepo.findById(target.getId()).orElseThrow().getStatus());
     }
 
+    /** Rejecting records the reason and executes nothing. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: saves the action, uses its id. */
     @Test
     void testGovernanceReject() throws Exception {
         // create a pending governance action
+        // Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: saved, and its real id used (it assumed id 2).
+        User target = new User(); target.setEmail("reject-target@example.com"); target.setName("Target"); target.setTier("USER");
+        userRepo.save(target);
         GovernanceAction ga = new GovernanceAction();
         ga.setActionType("delete_user");
         ga.setActorId(admin.getId());
-        ga.setTargetResourceId(regular.getId());
+        ga.setTargetResourceId(target.getId());
         ga.setReason("cleanup");
-        // save via repository (omitted)
+        gaRepo.save(ga);
         Map<String, Object> payload = Map.of("reason", "not needed");
-        mockMvc.perform(post("/admin/governance/actions/2/decide")
+        mockMvc.perform(post("/admin/governance/actions/" + ga.getId() + "/decide")
                 .header("X-Decide", "reject")
                 .contentType(MediaType.APPLICATION_JSON)
                 .content(mapper.writeValueAsString(payload))
                 .with(auth(owner)))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("rejected"));
+        // Nothing was executed
+        Assertions.assertEquals("active", userRepo.findById(target.getId()).orElseThrow().getStatus());
     }
 
     @Test

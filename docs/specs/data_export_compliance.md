@@ -1,0 +1,119 @@
+# Data Export & Compliance (Gdpr/Ccpa)
+
+Reference contract for `saas_templates/<lang>/data_export_compliance_<lang>.<ext>` in all eight languages. Every
+language implements the same functions, error codes and return shapes, so the same input gives the
+same answer everywhere. Common rules for every system are in [README.md](README.md).
+
+## Required tests
+
+Each language's tests file has at least one test for every id below, and names the id in the test's
+name or in a comment on the line above it (for example `# EXPORT-01`), so a missing case is visible.
+
+| id | what it proves |
+|---|---|
+| `EXPORT-01` | Export: JSON and CSV formats both work |
+| `EXPORT-02` | Export: All data categories included (profile, activity, files, etc) |
+| `EXPORT-03` | Export: Email sent with download link |
+| `EXPORT-04` | Export: Signed URL works, expires after 7 days |
+| `EXPORT-05` | Deletion: 30-day grace period enforced |
+| `EXPORT-06` | Deletion: User can cancel within grace period |
+| `EXPORT-07` | Deletion: Cascade delete works (sessions, api_keys, etc deleted) |
+| `EXPORT-08` | Deletion: Audit log preserved (not deleted with user) |
+| `EXPORT-09` | Deletion: User confirmed via email token |
+| `EXPORT-10` | Admin: Can see all export/deletion requests |
+| `EXPORT-11` | Audit: All requests logged with why_chain support |
+
+## Contract
+
+```text
+PURPOSE:
+Export user data (profile, activity, files, preferences) as JSON/CSV.
+Delete user account with cascade (sessions, activity, files, preferences).
+Audit all requests and actions (legal requirement).
+
+SCHEMA:
+export_requests (id, user_id, requested_at, status: 'pending'|'completed'|'failed', format: 'json'|'csv', file_url, completed_at, expires_at)
+deletion_requests (id, user_id, requested_at, status: 'pending'|'approved'|'completed', reason, deleted_at)
+
+EXPORT DATA INCLUDES:
+- User profile (id, email, name, created_at, tier, status)
+- Sessions (list of all sessions, IPs, device info)
+- Activity (all actions user performed: logins, purchases, deployments, etc)
+- Files (list of files owned by user with sizes, not file contents)
+- Preferences (notification settings, theme, language, etc)
+- Transactions (all invoices, payments, refunds)
+- Audit trail (all mutations involving this user)
+
+ENDPOINTS:
+
+1. Request data export
+   POST /compliance/export
+   { format: 'json'|'csv' }
+   Response: { success: true, export_id: '...', status: 'pending', will_email_at: '2026-09-25T09:00:00Z' }
+
+   Behind scenes:
+   - Generate export file (JSON or CSV)
+   - Upload to S3
+   - Create signed URL (expires in 7 days)
+   - Send email with download link
+   - Log in audit_log: action='data_export_requested'
+
+2. Check export status
+   GET /compliance/exports/:export_id
+   Response: { export_id, status: 'pending'|'completed'|'failed', file_url: '...', expires_at, requested_at }
+
+3. Request account deletion
+   POST /compliance/delete
+   { reason: 'user_requested'|'gdpr_request'|'gdpr_right_to_be_forgotten'|'other' }
+   Response: { success: true, deletion_id: '...', status: 'pending', will_delete_at: '2026-10-02T00:00:00Z' }
+
+   Behind scenes:
+   - 30-day grace period so the user can cancel an account deletion they asked for. This is a product choice,
+     not a GDPR requirement: a statutory erasure request (reason gdpr_request or gdpr_right_to_be_forgotten)
+     must be completed without undue delay and within one month, so a deployment may shorten the period for
+     those. Clarified 2026-11-10 from review on PR 19.
+   - Schedule cascade delete: sessions, api_keys, preferences, export files and their request rows, etc.
+     The audit log is kept (EXPORT-08). Corrected 2026-11-10 from review on PR 19: this line listed audit_logs.
+   - Log in audit_log: action='deletion_requested', reason
+
+4. Approve/confirm deletion (user must confirm in email link)
+   POST /compliance/delete/:deletion_id/confirm
+   { confirmation_token: '...' }
+   Response: { success: true, deletion_scheduled_for: '2026-10-02T00:00:00Z' }
+
+5. Cancel deletion (within grace period)
+   DELETE /compliance/delete/:deletion_id
+   Response: { success: true, status: 'cancelled' }
+
+6. List export requests (admin only)
+   GET /admin/compliance/exports?user_id=123&status=completed
+   Response: { exports: [...], total: 5 }
+
+7. List deletion requests (admin only)
+   GET /admin/compliance/deletions?status=pending
+   Response: { deletions: [...], total: 2 }
+
+IMPLEMENTATION:
+- Export generation: Background job (async), not blocking request
+- Storage: S3, encrypted at rest
+- Signed URLs: 7-day expiry, download-only (no upload)
+- Grace period: 30 days before actual deletion (user can cancel via email link)
+- Cascade delete: Delete from all tables where user_id = X, except audit_log (keep for compliance)
+- Audit trail: Every export and deletion request logged
+- Email confirmation: User must confirm deletion via email link (phishing protection)
+- GDPR: Support right_to_be_forgotten, right_to_access, right_to_data_portability
+- CCPA: Support consumer opt-out, data access, deletion requests
+
+TESTS:
+- **EXPORT-01** Export: JSON and CSV formats both work
+- **EXPORT-02** Export: All data categories included (profile, activity, files, etc)
+- **EXPORT-03** Export: Email sent with download link
+- **EXPORT-04** Export: Signed URL works, expires after 7 days
+- **EXPORT-05** Deletion: 30-day grace period enforced
+- **EXPORT-06** Deletion: User can cancel within grace period
+- **EXPORT-07** Deletion: Cascade delete works (sessions, api_keys, etc deleted)
+- **EXPORT-08** Deletion: Audit log preserved (not deleted with user)
+- **EXPORT-09** Deletion: User confirmed via email token
+- **EXPORT-10** Admin: Can see all export/deletion requests
+- **EXPORT-11** Audit: All requests logged with why_chain support
+```

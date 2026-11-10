@@ -6,8 +6,23 @@ import {
   create_subscription,
   change_plan,
   queue_refund,
-  handle_stripe_webhook
+  handle_stripe_webhook,
+  set_clients,
+  verify_and_handle_stripe_webhook,
+  MARK_SUBSCRIPTION_PAST_DUE_SQL,
+  MARK_CUSTOMER_ACTIVE_SUBSCRIPTIONS_PAST_DUE_SQL
 } from './billing_subscriptions_typescript';
+
+/*
+ * Test changes 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP), each because the old line could not work:
+ * - The fakes were installed by assigning require(module)._stripe / ._dbPool. Under babel (this runner) that sets a
+ *   property the module never reads, and under native ES modules it throws, so the module kept the empty mocks that
+ *   initialize() built. They are now installed with set_clients().
+ * - Four assertions checked mockPool.query, but the module runs its SQL in a transaction on the client from
+ *   pool.connect() (BEGIN ... COMMIT), and the same tests give that client the replies; the pool-level mock is never
+ *   called. They now check that client's query mock, with the same SQL and parameters.
+ * - Added: the spec's "webhook signature invalid -> 403 invalid_signature" test, which this file did not have.
+ */
 
 // Mock Stripe
 jest.mock('stripe');
@@ -52,8 +67,7 @@ describe('Billing Subscriptions System', () => {
     initialize(process.env.STRIPE_SECRET_KEY, process.env.DATABASE_URL);
     
     // Replace internal stripe instance with mock
-    // @ts-ignore
-    require('./billing_subscriptions_typescript')._stripe = mockStripe as any;
+    set_clients({ stripe: mockStripe as any });
   });
 
   describe('create_subscription', () => {
@@ -84,8 +98,7 @@ describe('Billing Subscriptions System', () => {
           commit: jest.fn()
         })
       };
-      // @ts-ignore
-      require('./billing_subscriptions_typescript')._dbPool = mockPool as any;
+      set_clients({ pool: mockPool as any });
       
       mockPool.connect.mockResolvedValue({
         query: jest.fn().mockImplementation((text, params) => {
@@ -152,8 +165,7 @@ describe('Billing Subscriptions System', () => {
           commit: jest.fn()
         })
       };
-      // @ts-ignore
-      require('./billing_subscriptions_typescript')._dbPool = mockPool as any;
+      set_clients({ pool: mockPool as any });
       
       mockPool.connect.mockResolvedValue({
         query: jest.fn().mockImplementation((text, params) => {
@@ -204,8 +216,7 @@ describe('Billing Subscriptions System', () => {
           commit: jest.fn()
         })
       };
-      // @ts-ignore
-      require('./billing_subscriptions_typescript')._dbPool = mockPool as any;
+      set_clients({ pool: mockPool as any });
       
       const result = await change_plan('sub_999', 'price_team');
       expect(result).toEqual({ error: 'subscription_not_found', message: 'Subscription not found: sub_999' });
@@ -234,8 +245,7 @@ describe('Billing Subscriptions System', () => {
           commit: jest.fn()
         })
       };
-      // @ts-ignore
-      require('./billing_subscriptions_typescript')._dbPool = mockPool as any;
+      set_clients({ pool: mockPool as any });
       
       const result = await queue_refund('in_123', 500, 'Customer requested', 'admin');
       expect(result).toEqual({
@@ -245,7 +255,7 @@ describe('Billing Subscriptions System', () => {
         amount: 500,
         reason: 'Customer requested'
       });
-      expect(mockPool.query).toHaveBeenCalledWith(
+      expect((await mockPool.connect()).query).toHaveBeenCalledWith(
         `INSERT INTO refunds (invoice_id, amount, status, reason, created_by)
          VALUES ($1, $2, 'queued', $3, $4)
          RETURNING id`,
@@ -263,8 +273,7 @@ describe('Billing Subscriptions System', () => {
           commit: jest.fn()
         })
       };
-      // @ts-ignore
-      require('./billing_subscriptions_typescript')._dbPool = mockPool as any;
+      set_clients({ pool: mockPool as any });
       
       const result = await queue_refund('in_123', 500, 'Customer requested', 'admin');
       expect(result).toEqual({ error: 'refund_exceeds_invoice', message: 'Refund amount 500 exceeds invoice amount 300' });
@@ -280,8 +289,7 @@ describe('Billing Subscriptions System', () => {
           commit: jest.fn()
         })
       };
-      // @ts-ignore
-      require('./billing_subscriptions_typescript')._dbPool = mockPool as any;
+      set_clients({ pool: mockPool as any });
       
       const result = await queue_refund('in_123', 500, 'Customer requested', 'admin');
       expect(result).toEqual({ error: 'invoice_not_succeeded', message: 'Invoice status is open, expected succeeded' });
@@ -325,12 +333,11 @@ describe('Billing Subscriptions System', () => {
           commit: jest.fn()
         })
       };
-      // @ts-ignore
-      require('./billing_subscriptions_typescript')._dbPool = mockPool as any;
+      set_clients({ pool: mockPool as any });
       
       const result = await handle_stripe_webhook(mockEvent);
       expect(result).toEqual({ received: true });
-      expect(mockPool.query).toHaveBeenCalledWith(
+      expect((await mockPool.connect()).query).toHaveBeenCalledWith(
         `INSERT INTO invoices (stripe_invoice_id, customer_id, amount, status, paid_at)
          VALUES ($1, $2, $3, 'succeeded', NOW())
          ON CONFLICT (stripe_invoice_id) DO UPDATE SET
@@ -367,13 +374,12 @@ describe('Billing Subscriptions System', () => {
           commit: jest.fn()
         })
       };
-      // @ts-ignore
-      require('./billing_subscriptions_typescript')._dbPool = mockPool as any;
+      set_clients({ pool: mockPool as any });
       
       const result = await handle_stripe_webhook(mockEvent);
       expect(result).toEqual({ received: true });
       // Should not process the event again
-      expect(mockPool.query).not.toHaveBeenCalledWith(
+      expect((await mockPool.connect()).query).not.toHaveBeenCalledWith(
         expect.stringContaining('INSERT INTO invoices'),
         expect.any(Array)
       );
@@ -427,12 +433,11 @@ describe('Billing Subscriptions System', () => {
           commit: jest.fn()
         })
       };
-      // @ts-ignore
-      require('./billing_subscriptions_typescript')._dbPool = mockPool as any;
+      set_clients({ pool: mockPool as any });
       
       const result = await handle_stripe_webhook(mockEvent);
       expect(result).toEqual({ received: true });
-      expect(mockPool.query).toHaveBeenCalledWith(
+      expect((await mockPool.connect()).query).toHaveBeenCalledWith(
         `UPDATE subscriptions SET 
          tier = $1, 
          status = $2, 
@@ -464,11 +469,102 @@ describe('Billing Subscriptions System', () => {
           commit: jest.fn()
         })
       };
-      // @ts-ignore
-      require('./billing_subscriptions_typescript')._dbPool = mockPool as any;
+      set_clients({ pool: mockPool as any });
       
       const result = await handle_stripe_webhook(mockEvent);
       expect(result).toEqual({ error: 'webhook_processing_error', message: 'DB error' });
+    });
+
+    /**
+     * A client whose subscriptions table lives in memory: it applies the two past_due statements the way Postgres
+     * would (the row filter is read from the statement: by subscription id or by customer, and only 'active' rows),
+     * and answers everything else with an empty result. In: the starting rows. Out: { client, rows }.
+     * Why 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): CodeRabbit review on PR 19, payment_failed marked
+     * every subscription of the customer past_due, cancelled ones included. Touches: memory only.
+     */
+    const subscriptionsClient = (rows: Array<{ stripe_subscription_id: string; customer_id: string; status: string }>) => {
+      const client = {
+        query: jest.fn().mockImplementation((text: string, params: any[] = []) => {
+          if (text.includes('SELECT id FROM events WHERE stripe_event_id = $1')) {
+            return Promise.resolve({ rows: [], rowCount: 0 });
+          }
+          if (/^\s*UPDATE subscriptions SET status = 'past_due'/.test(text)) {
+            const bySubscription = /WHERE stripe_subscription_id = \$1/.test(text);
+            const byCustomer = /WHERE customer_id = \$1/.test(text);
+            const activeOnly = /AND status = 'active'/.test(text);
+            const notPastDueOnly = /AND status <> 'past_due'/.test(text);
+            let rowCount = 0;
+            for (const row of rows) {
+              const keyMatches = bySubscription ? row.stripe_subscription_id === params[0]
+                : byCustomer ? row.customer_id === params[0] : false;
+              const statusMatches = activeOnly ? row.status === 'active' : notPastDueOnly ? row.status !== 'past_due' : true;
+              if (keyMatches && statusMatches) { row.status = 'past_due'; rowCount++; }
+            }
+            return Promise.resolve({ rows: [], rowCount });
+          }
+          return Promise.resolve({ rows: [], rowCount: 0 });
+        }),
+        release: jest.fn(),
+      };
+      return { client, rows };
+    };
+
+    it('payment_failed marks only the invoice\'s subscription past_due; cancelled and other active ones untouched', async () => {
+      const { client, rows } = subscriptionsClient([
+        { stripe_subscription_id: 'sub_failed', customer_id: 'cus_123', status: 'active' },
+        { stripe_subscription_id: 'sub_other', customer_id: 'cus_123', status: 'active' },
+        { stripe_subscription_id: 'sub_old', customer_id: 'cus_123', status: 'cancelled' },
+      ]);
+      set_clients({ pool: { query: jest.fn(), connect: jest.fn().mockResolvedValue(client) } as any });
+
+      const result = await handle_stripe_webhook({
+        id: 'evt_failed_1', type: 'invoice.payment_failed',
+        data: { object: { id: 'in_failed', customer: 'cus_123', subscription: 'sub_failed' } },
+      } as any);
+
+      expect(result).toEqual({ received: true });
+      expect(client.query).toHaveBeenCalledWith(MARK_SUBSCRIPTION_PAST_DUE_SQL, ['sub_failed']);
+      expect(rows.map((r) => [r.stripe_subscription_id, r.status])).toEqual([
+        ['sub_failed', 'past_due'],
+        ['sub_other', 'active'],
+        ['sub_old', 'cancelled'],
+      ]);
+    });
+
+    it('payment_failed with no subscription on the invoice marks only active rows; cancelled stays cancelled', async () => {
+      const { client, rows } = subscriptionsClient([
+        { stripe_subscription_id: 'sub_live', customer_id: 'cus_123', status: 'active' },
+        { stripe_subscription_id: 'sub_old', customer_id: 'cus_123', status: 'cancelled' },
+        { stripe_subscription_id: 'sub_else', customer_id: 'cus_999', status: 'active' },
+      ]);
+      set_clients({ pool: { query: jest.fn(), connect: jest.fn().mockResolvedValue(client) } as any });
+
+      const result = await handle_stripe_webhook({
+        id: 'evt_failed_2', type: 'invoice.payment_failed',
+        data: { object: { id: 'in_oneoff', customer: 'cus_123', subscription: null } },
+      } as any);
+
+      expect(result).toEqual({ received: true });
+      expect(client.query).toHaveBeenCalledWith(MARK_CUSTOMER_ACTIVE_SUBSCRIPTIONS_PAST_DUE_SQL, ['cus_123']);
+      expect(rows.map((r) => [r.stripe_subscription_id, r.status])).toEqual([
+        ['sub_live', 'past_due'],
+        ['sub_old', 'cancelled'],
+        ['sub_else', 'active'],
+      ]);
+    });
+
+    it('should reject a webhook whose signature is invalid (403 invalid_signature)', async () => {
+      const mockPool = { query: jest.fn(), connect: jest.fn() };
+      set_clients({ pool: mockPool as any });
+      mockStripe.webhooks.constructEvent.mockImplementation(() => {
+        throw new Error('No signatures found matching the expected signature for payload');
+      });
+
+      const result = await verify_and_handle_stripe_webhook('{"id":"evt_forged"}', 't=1,v1=bad', 'whsec_test');
+      expect(result).toEqual({ error: 'invalid_signature', message: 'Webhook signature verification failed', code: 403 });
+      expect(mockStripe.webhooks.constructEvent).toHaveBeenCalledWith('{"id":"evt_forged"}', 't=1,v1=bad', 'whsec_test');
+      // Nothing is written for an unverified event.
+      expect(mockPool.connect).not.toHaveBeenCalled();
     });
   });
 });

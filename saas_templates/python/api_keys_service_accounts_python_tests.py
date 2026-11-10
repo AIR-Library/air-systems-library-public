@@ -5,6 +5,7 @@ from unittest.mock import patch, MagicMock
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 import redis
 import fakeredis
 
@@ -17,14 +18,17 @@ os.environ["REDIS_URL"] = "redis://localhost:6379/1"
 from api_keys_service_accounts_python import (
     app, Base, get_db, get_redis, ApiKey, ApiKeyUsage,
     generate_api_key, hash_key, verify_key, validate_api_key,
-    log_api_key_usage
+    log_api_key_usage, get_current_user, CurrentUser, scope_for_request
 )
 
-# Override dependencies for testing
+# [2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP] One in-memory database shared by the app and the
+# test code (StaticPool keeps the single connection). The old override built a NEW empty in-memory database
+# on every call, so a key created through the API could never be found again by the next request or by the
+# test's own session ("total 0 vs 2"): no implementation could pass. Tables are reset before each test.
+TEST_ENGINE = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=TEST_ENGINE)
+
 def override_get_db():
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
-    TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    Base.metadata.create_all(bind=engine)
     db = TestingSessionLocal()
     try:
         yield db
@@ -36,6 +40,9 @@ def override_get_redis():
 
 app.dependency_overrides[get_db] = override_get_db
 app.dependency_overrides[get_redis] = override_get_redis
+# [2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP] The management routes now act for the authenticated
+# user instead of a hard-coded user 1. The tests act as TEST_USER_ID (an admin, for the audit test).
+app.dependency_overrides[get_current_user] = lambda: CurrentUser(id=1, is_admin=True)
 
 client = TestClient(app)
 
@@ -45,6 +52,13 @@ TEST_NAME = "Test Integration"
 TEST_SCOPES = ["read:deployments", "write:webhooks"]
 TEST_EXPIRES_AT = datetime.utcnow() + timedelta(days=365)
 TEST_RATE_LIMIT = 5
+
+@pytest.fixture(autouse=True)
+def fresh_tables():
+    """Give every test empty tables (2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP)."""
+    Base.metadata.drop_all(bind=TEST_ENGINE)
+    Base.metadata.create_all(bind=TEST_ENGINE)
+    yield
 
 @pytest.fixture
 def db_session():
@@ -271,10 +285,13 @@ def test_rotate_new_key_works_old_stops_after_grace():
     assert validated_key is not None
     assert validated_key.id != api_key_id  # New key ID
     
-    # Simulate grace period expiration by updating the old key's created_at
+    # Simulate grace period expiration by moving the old key's grace period end into the past
     # (In reality, we'd wait, but we can manipulate the DB for test)
+    # [2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP] was "created_at = revoked - 25h": that only worked
+    # with an implementation that overwrote the key's creation date at rotation to track the grace period.
+    assert grace_ends_at - old_revoked_at == timedelta(hours=24)
     api_key = db.query(ApiKey).filter(ApiKey.id == api_key_id).first()
-    api_key.created_at = old_revoked_at - timedelta(hours=25)  # Make it look expired
+    api_key.grace_period_ends_at = grace_ends_at - timedelta(hours=25)  # as if rotated 25 hours ago
     db.commit()
     
     # After grace period, old key should fail
@@ -345,7 +362,9 @@ def test_usage_stats_requests_counted_per_endpoint():
         # Validate key (simulates middleware)
         validated_key = validate_api_key(
             key=plaintext_key,
-            required_scope=f"{method.lower()}:{endpoint.split('/')[1]}" if endpoint.startswith("/") else None,
+            # [2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP] was f"{method.lower()}:..." ("get:deployments"),
+            # which is not a scope (the spec's are read:/write:), so the key must have been refused with 403.
+            required_scope=scope_for_request(method, endpoint),
             db=db,
             redis_client=redis_client
         )
@@ -409,6 +428,48 @@ def test_admin_audit_all_keys_visible():
     assert response.status_code == 200
     data = response.json()
     assert data["total"] == 1
+
+def test_management_routes_require_login_and_admin():
+    """Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: no identity -> 401; non-admin -> 403 on the
+    audit list; another user's key -> 404 (the template used to give every caller user 1 and the admin list)."""
+    created = client.post("/api-keys", json={"name": "Mine", "scopes": ["read:users"]}).json()
+    try:
+        del app.dependency_overrides[get_current_user]
+        # Each call is made before its assert, so the requests still happen under `python -O` (code scanning, PR 19).
+        anonymous = client.get("/api-keys")
+        assert anonymous.status_code == 401
+        app.dependency_overrides[get_current_user] = lambda: CurrentUser(id=2, is_admin=False)
+        audit_list = client.get("/admin/api-keys")
+        assert audit_list.status_code == 403
+        delete_other = client.delete(f"/api-keys/{created['api_key_id']}")
+        assert delete_other.status_code == 404
+        own_keys = client.get("/api-keys").json()["keys"]
+        assert own_keys == []
+    finally:
+        app.dependency_overrides[get_current_user] = lambda: CurrentUser(id=1, is_admin=True)
+    listed = client.get("/api-keys").json()["keys"]
+    assert len(listed) == 1 and listed[0]["is_active"] is True
+    assert "key" not in listed[0] and "key_secret_hash" not in listed[0]
+
+def test_bearer_request_succeeds_and_is_logged():
+    """Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: spec endpoint 5 over HTTP, with
+    Authorization: Bearer; a missing scope is 403 and both calls land in the usage stats."""
+    shared_redis = fakeredis.FakeRedis()
+    app.dependency_overrides[get_redis] = lambda: shared_redis
+    try:
+        ok = client.post("/api-keys", json={"name": "Reader", "scopes": ["read:deployments"]}).json()
+        resp = client.get("/api/deployments", headers={"Authorization": f"Bearer {ok['key']}"})
+        assert resp.status_code == 200
+        assert resp.json()["api_key_id"] == ok["api_key_id"]
+        no_key = client.get("/api/deployments")
+        assert no_key.status_code == 401
+        other = client.post("/api-keys", json={"name": "Users only", "scopes": ["read:users"]}).json()
+        wrong_scope = client.get("/api/deployments", headers={"Authorization": f"Bearer {other['key']}"})
+        assert wrong_scope.status_code == 403
+        stats = client.get(f"/api-keys/{other['api_key_id']}/usage").json()
+        assert stats["errors"] == {"403": 1}
+    finally:
+        app.dependency_overrides[get_redis] = override_get_redis
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

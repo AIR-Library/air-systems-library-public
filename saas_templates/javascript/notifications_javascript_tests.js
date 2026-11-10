@@ -101,7 +101,9 @@ async function run() {
   });
 
   await test('Quiet hours: skip if in range', async () => {
-    const svc = makeService();
+    // Fixed clock at 12:00 local time (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): with the real clock this test
+    // failed during the one minute a day, 23:59, that lies outside 00:00-23:59.
+    const svc = makeService({ nowFn: () => new Date(2024, 0, 1, 12, 0) });
     svc.updatePreferences(11, {
       quiet_hours_start: '00:00',
       quiet_hours_end: '23:59',
@@ -198,6 +200,32 @@ async function run() {
     assert.strictEqual(res.status, 'sent');
     const log = svc.logs.get(res.message_id);
     assert.strictEqual(log.channel, 'sms');
+  });
+
+  // Added 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): naming a channel must never override the user turning it off
+  // (an earlier repair that did so was rejected), and a user without saved preferences gets the SMS they were sent.
+  await test('User preferences honored: explicitly requested channel the user turned off is skipped', async () => {
+    let smsCalls = 0;
+    const svc = makeService({ smsSender: async () => { smsCalls += 1; } });
+    svc.updatePreferences(67, { channels_enabled: { sms: false } });
+    const res = await svc.send({ user_id: 67, template_key: 'trial_starting', channel: 'sms', vars: { trial_days: 7 } });
+    assert.strictEqual(res.status, 'skipped');
+    assert.strictEqual(svc.logs.get(res.message_id).error, 'channel_disabled');
+    assert.strictEqual(smsCalls, 0);
+  });
+
+  await test('Unsubscribe link: only a token signed by the service unsubscribes', async () => {
+    let mail = null;
+    const svc = makeService({ emailSender: async (m) => { mail = m; } });
+    const router = createRouter(svc);
+    await svc.send({ user_id: 77, template_key: 'welcome_email', channel: 'email', vars: { app_name: 'Acme' } });
+    const forged = await router.handle('GET', '/unsubscribe', { query: { user_id: '78', channel: 'email', token: 'x' } });
+    assert.strictEqual(forged.status, 403);
+    assert.strictEqual(svc.isUnsubscribed(78, 'email'), false);
+    const query = Object.fromEntries(new URL(mail.unsubscribeUrl).searchParams);
+    const out = await router.handle('GET', '/unsubscribe', { query });
+    assert.strictEqual(out.status, 200);
+    assert.strictEqual(svc.isUnsubscribed(77, 'email'), true);
   });
 
   await test('Router: POST /notifications/send returns spec shape', async () => {

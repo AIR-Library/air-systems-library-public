@@ -3,34 +3,33 @@ package api_keys
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"testing"
 	"time"
 
-	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
-	_ "github.com/lib/pq" // PostgreSQL driver
 )
 
-// TestAPIKeyService tests the API key service.
-func TestAPIKeyService(t *testing.T) {
-	// Setup test database and redis
-	db, err := sql.Open("postgres", "host=localhost port=5432 user=postgres password=postgres dbname=test sslmode=disable")
+// newTestService returns a service on a fresh in-memory SQLite database with an in-memory rate
+// limiter and a clock frozen at the current instant, so hourly windows cannot roll over mid-test.
+// Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: the tests needed a live PostgreSQL and
+// Redis on localhost (no network in library tests). Touches: an in-memory database only.
+func newTestService(t *testing.T) *Service {
+	t.Helper()
+	db, err := sql.Open("sqlite", ":memory:")
 	require.NoError(t, err)
-	defer db.Close()
-
-	// Run DDL
+	db.SetMaxOpenConns(1) // every new connection to :memory: would be a separate, empty database
+	t.Cleanup(func() { db.Close() })
 	_, err = db.Exec(APIKeysDDL)
 	require.NoError(t, err)
+	s := NewService(db, NewMemoryRateLimiter(), "test")
+	frozen := time.Now()
+	s.SetClock(func() time.Time { return frozen })
+	return s
+}
 
-	// Setup test redis
-	rdb := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
-	})
-	defer rdb.Close()
-
-	// Create service
-	s := NewService(db, rdb, "test")
+// TestAPIKeyService tests the API key service: the spec's nine checks as subtests.
+func TestAPIKeyService(t *testing.T) {
+	s := newTestService(t)
 	ctx := context.Background()
 
 	t.Run("Create key with scopes", func(t *testing.T) {
@@ -43,9 +42,8 @@ func TestAPIKeyService(t *testing.T) {
 		require.NoError(t, err)
 		require.NotEmpty(t, res.APIKeyID)
 		require.NotEmpty(t, res.Key)
-		require.Equal(t, "Test Key", res.Name) // Note: Name not in response? Fix: Actually, CreateAPIKeyResponse doesn't have Name. This is a bug in the test.
-		// We'll adjust: The CreateAPIKeyResponse does not return name. We'll check via list.
-		// Instead, we'll validate the key works.
+		require.Equal(t, "Test Key", res.Name)
+		// The key works for an endpoint its scopes cover.
 		apiKey, err := s.ValidateAPIKey(ctx, res.Key, "/deployments", "GET")
 		require.NoError(t, err)
 		require.NotNil(t, apiKey)
@@ -167,11 +165,11 @@ func TestAPIKeyService(t *testing.T) {
 	})
 
 	t.Run("Expired key: after expires_at, request returns 401", func(t *testing.T) {
-		past := time.Now().Add(-1 * time.Hour)
+		past := time.Now().Add(-1 * time.Hour).Format(time.RFC3339)
 		req := CreateAPIKeyRequest{
 			Name:     "Expired Test",
 			Scopes:   []string{"read:users"},
-			ExpiresAt: &past.Format(time.RFC3339), // Already expired
+			ExpiresAt: &past, // Already expired
 			RateLimit: 1000,
 		}
 		createRes, err := s.CreateAPIKey(ctx, 7, req)
@@ -211,6 +209,8 @@ func TestAPIKeyService(t *testing.T) {
 	})
 
 	t.Run("Admin audit: all keys visible to admin", func(t *testing.T) {
+		// A fresh store: the counts below are exact, and earlier subtests created keys of their own.
+		s := newTestService(t)
 		// Create keys for two users
 		req1 := CreateAPIKeyRequest{Name: "User1 Key", Scopes: []string{"read:users"}, RateLimit: 1000}
 		req2 := CreateAPIKeyRequest{Name: "User2 Key", Scopes: []string{"read:deployments"}, RateLimit: 1000}
@@ -224,6 +224,8 @@ func TestAPIKeyService(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, adminRes.Keys, 2)
 		require.Equal(t, int64(2), adminRes.Total)
+		require.ElementsMatch(t, []string{res1.APIKeyID, res2.APIKeyID},
+			[]string{adminRes.Keys[0].APIKeyID, adminRes.Keys[1].APIKeyID})
 
 		// Admin list by user_id
 		adminRes2, err := s.ListAPIKeysForAdmin(ctx, &[]int64{10}[0], "")

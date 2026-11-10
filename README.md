@@ -4,51 +4,57 @@ Reference implementations of common SaaS building blocks (authentication, billin
 rate limiting, ...), each written to a shared contract in **eight languages**: C#, Go, Java,
 JavaScript, PHP, Python, Rust and TypeScript.
 
-The code was machine-generated and is **unfinished**: many suites do not pass
-yet. This repository is where that gets fixed in the open. Treat everything here as a starting point,
-not production code.
+The code was first machine-generated, then repaired and reviewed suite by suite: every suite in every language
+now passes its tests in CI. It is reference code to learn from and adapt. Review it before you use it in
+production, and wire in your own authentication, secrets and providers where the templates use fakes or
+interfaces.
 
 ## Layout
 
     saas_templates/<lang>/<system>_<lang>.<ext>          implementation
     saas_templates/<lang>/<system>_<lang>_tests.<ext>    its tests
-    docs/                                                reference spec for the auth / admin / trial-abuse systems
+    docs/specs/<system>.md                               each system's contract and its required tests
     tools/run_suites.py                                  one test runner for every language
-    ci/baseline.json                                     suites known to fail today
+    tools/readme_status.py                               writes the status table below from ci/baseline.json
+    ci/baseline.json                                     suites known to fail today (empty when all pass)
 
 18 systems x 8 languages = 144 suites.
 
 ## Status
 
-Last checked 2026-11-05 by CI with `tools/run_suites.py`. Legend: ✅ passes, ❌ fails.
-Suites that fail today are listed in `ci/baseline.json`. A missing file or a file that does not parse fails
-CI even for a suite on that list.
+Legend: ✅ passes, ❌ fails. The table is generated from `ci/baseline.json` by `tools/readme_status.py`, and CI
+fails when it is out of date. CI fails any suite that does not pass unless it is listed in `ci/baseline.json`; a
+missing file or a file that does not parse fails CI even for a suite on that list.
+
+<!-- status:start -->
+144 of 144 suites pass.
 
 | system | csharp | go | java | javascript | php | python | rust | typescript |
 |---|---|---|---|---|---|---|---|---|
-| admin_system | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ |
-| api_keys_service_accounts | ❌ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
-| audit_logging | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ❌ |
-| auth_system | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
-| background_jobs_task_queue | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| billing_subscriptions | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ |
-| data_export_compliance | ❌ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ |
-| feature_flags | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ |
-| file_uploads | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ✅ |
-| full_text_search_indexing | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ |
-| health_checks | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
-| idempotency_keys | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
-| notifications | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ |
-| organizations_teams | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
-| permissions_rbac | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
-| quotas_rate_limiting | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
-| trial_abuse_prevention | ❌ | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ |
-| webhooks | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
-| **passing** | **7/18** | **12/18** | **10/18** | **11/18** | **13/18** | **13/18** | **3/18** | **10/18** |
+| admin_system | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| api_keys_service_accounts | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| audit_logging | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| auth_system | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| background_jobs_task_queue | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| billing_subscriptions | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| data_export_compliance | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| feature_flags | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| file_uploads | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| full_text_search_indexing | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| health_checks | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| idempotency_keys | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| notifications | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| organizations_teams | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| permissions_rbac | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| quotas_rate_limiting | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| trial_abuse_prevention | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| webhooks | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **passing** | **18/18** | **18/18** | **18/18** | **18/18** | **18/18** | **18/18** | **18/18** | **18/18** |
+<!-- status:end -->
 
-CI's per-suite table (in each job's summary) is the live version of this; this table is refreshed by
-hand and can lag. Some failures depend on the toolchain version: the Python suites were written
-against Python 3.14, where annotations are evaluated lazily, and fail with a `NameError` on 3.11/3.12.
+Each CI job's summary also shows its language's per-suite table with test counts. CI runs Python 3.12, Node 22,
+JDK 21, PHP 8.3, .NET 8 and stable Go and Rust. Each system's contract and the tests it requires are in
+[docs/specs/](docs/specs/README.md).
 
 ## Running tests
 
@@ -60,18 +66,17 @@ The runner installs each language's packages into `.deps/` on first use. See
 
 ## How to help
 
-Every ❌ above is a good first issue:
+Every suite passes today, so help now means making the templates better:
 
-1. Pick one system in one language, run its suite, read the failure.
-2. Fix the implementation (or the test, if the test is wrong; say why in the PR). Never weaken a test
-   just to get green.
+1. Read a system's spec in [docs/specs/](docs/specs/README.md) and compare a language's behaviour with it. All
+   eight languages must give the same answer for the same input; a difference is a bug.
+2. Fix it with a test that fails before your change. Never weaken a test to get green; if a test is wrong,
+   say why in the PR.
 3. Open one pull request per system and language, with `git commit -s` sign-off.
-4. If the suite now passes, delete its line from `ci/baseline.json`.
 
-CI fails on **regressions** (a suite that does not pass and is not in `ci/baseline.json`, or any suite with a
-missing file or a file that does not parse, listed or not), so
-`main` stays green while the known failures are worked down. New systems and new languages are welcome:
-open a "New system or feature" issue first so the contract is agreed across languages.
+CI fails when any suite does not pass (a suite listed in `ci/baseline.json` is excused, and the list is empty), when
+a file is missing or does not parse, or when this README's table is out of date. New systems and new languages are
+welcome: open a "New system or feature" issue first so the contract is agreed across languages.
 
 ## License
 

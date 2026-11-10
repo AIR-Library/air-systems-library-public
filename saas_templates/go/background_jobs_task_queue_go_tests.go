@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -19,8 +21,7 @@ func TestEnqueueJob(t *testing.T) {
 	router := gin.Default()
 	
 	js := &JobService{
-		db:    setupTestDB(t),
-		redis: setupTestRedis(t),
+		db: setupTestDB(t),
 	}
 	router.POST("/jobs/enqueue", js.EnqueueJob)
 
@@ -56,8 +57,7 @@ func TestGetJobStatus(t *testing.T) {
 	router := gin.Default()
 	
 	js := &JobService{
-		db:    setupTestDB(t),
-		redis: setupTestRedis(t),
+		db: setupTestDB(t),
 	}
 	router.GET("/jobs/:job_id", js.GetJobStatus)
 
@@ -81,8 +81,7 @@ func TestListJobs(t *testing.T) {
 	router := gin.Default()
 	
 	js := &JobService{
-		db:    setupTestDB(t),
-		redis: setupTestRedis(t),
+		db: setupTestDB(t),
 	}
 	router.GET("/jobs", js.ListJobs)
 
@@ -106,8 +105,7 @@ func TestCancelJob(t *testing.T) {
 	router := gin.Default()
 	
 	js := &JobService{
-		db:    setupTestDB(t),
-		redis: setupTestRedis(t),
+		db: setupTestDB(t),
 	}
 	router.DELETE("/jobs/:job_id", js.CancelJob)
 
@@ -130,12 +128,14 @@ func TestRetryJob(t *testing.T) {
 	router := gin.Default()
 	
 	js := &JobService{
-		db:    setupTestDB(t),
-		redis: setupTestRedis(t),
+		db: setupTestDB(t),
 	}
 	router.POST("/jobs/:job_id/retry", js.RetryJob)
 
 	jobID := createTestJob(t, js.db, "send_bulk_email")
+	// Only a failed job can be retried (spec: "Retry failed job"; the Java reference answers 409 otherwise).
+	_, err := js.db.Exec("UPDATE jobs SET status = ? WHERE id = ?", "failed", jobID)
+	require.NoError(t, err)
 	
 	reqRecorder := httptest.NewRecorder()
 	reqTest := httptest.NewRequest("POST", fmt.Sprintf("/jobs/%s/retry", jobID), nil)
@@ -155,8 +155,7 @@ func TestGetJobResults(t *testing.T) {
 	router := gin.Default()
 	
 	js := &JobService{
-		db:    setupTestDB(t),
-		redis: setupTestRedis(t),
+		db: setupTestDB(t),
 	}
 	router.GET("/jobs/:job_id/results", js.GetJobResults)
 
@@ -175,78 +174,40 @@ func TestGetJobResults(t *testing.T) {
 
 func TestWorkerProcessesJob(t *testing.T) {
 	js := &JobService{
-		db:    setupTestDB(t),
-		redis: setupTestRedis(t),
+		db: setupTestDB(t),
 	}
 
 	jobID := createTestJob(t, js.db, "send_bulk_email")
-	js.redis.LPush(context.Background(), "job_queue", jobID)
-	
-	time.Sleep(100 * time.Millisecond)
+	// One worker step, run synchronously: the worker picks the enqueued job up and marks it running.
+	claimed, _, err := js.ClaimNextJob(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, jobID, claimed.ID)
 	
 	job, err := js.getJob(jobID)
 	require.NoError(t, err)
 	assert.Equal(t, "running", job.Status)
 }
 
+// setupTestDB returns a fresh in-memory SQLite database with the template's schema.
+// Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: it needed a live PostgreSQL on
+// localhost (and a live Redis via setupTestRedis, now removed: the jobs table is the queue).
 func setupTestDB(t *testing.T) *sql.DB {
-	db, err := sql.Open("postgres", "user=postgres dbname=test password=postgres host=localhost sslmode=disable")
+	db, err := OpenDB(":memory:")
 	require.NoError(t, err)
-	
-	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS jobs (
-			id VARCHAR(36) PRIMARY KEY,
-			task_type VARCHAR(255) NOT NULL,
-			params JSONB,
-			status VARCHAR(50) NOT NULL,
-			created_at TIMESTAMP WITH TIME ZONE NOT NULL,
-			started_at TIMESTAMP WITH TIME ZONE,
-			completed_at TIMESTAMP WITH TIME ZONE,
-			progress VARCHAR(50),
-			result JSONB,
-			error TEXT,
-			retry_count INTEGER NOT NULL DEFAULT 0,
-			max_retries INTEGER NOT NULL DEFAULT 3,
-			next_retry_at TIMESTAMP WITH TIME ZONE,
-			scheduled_at TIMESTAMP WITH TIME ZONE
-		);
-	`)
-	require.NoError(t, err)
-	
-	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS job_runs (
-			id VARCHAR(36) PRIMARY KEY,
-			job_id VARCHAR(36) NOT NULL,
-			status VARCHAR(50) NOT NULL,
-			started_at TIMESTAMP WITH TIME ZONE NOT NULL,
-			completed TIMESTAMP WITH TIME ZONE,
-			result TEXT,
-			FOREIGN KEY (job_id) REFERENCES jobs(id)
-		);
-	`)
-	require.NoError(t, err)
-	
+	t.Cleanup(func() { db.Close() })
 	return db
 }
 
-func setupTestRedis(t *testing.T) *redis.Client {
-	rdb := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
-	})
-	
-	rdb.FlushDB(context.Background())
-	return rdb
-}
-
 func createTestJob(t *testing.T, db *sql.DB, taskType string) string {
-	jobID := uuid.New().String()
+	jobID := newUUID()
 	params, _ := json.Marshal(map[string]interface{}{
 		"template_key": "test",
 	})
 	
 	_, err := db.Exec(
-		"INSERT INTO jobs (id, task_type, params, status, created_at) VALUES ($1, $2, $3, $4, $5)",
-		jobID, taskType, params, "enqueued", time.Now(),
+		"INSERT INTO jobs (id, task_type, params, status, created_at) VALUES (?, ?, ?, ?, ?)",
+		jobID, taskType, string(params), "enqueued", time.Now().UTC(),
 	)
 	require.NoError(t, err)
 	

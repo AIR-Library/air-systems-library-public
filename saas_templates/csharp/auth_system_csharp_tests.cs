@@ -1,9 +1,15 @@
+// Tests for the auth template. Changed 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): `BCrypt.HashPassword`
+// resolved to the BCrypt namespace (compile error) and is BCrypt.Net.BCrypt.HashPassword; a loop variable named
+// `result` clashed with the outer `result` (compile error) and is `signup`; the OAuth tests passed a state ("state123")
+// that nothing had issued, which a correct callback must refuse (spec gate state_valid), and now obtain one from
+// CreateOAuthStateAsync; VerifyEmail_HappyPath re-read the user through the context that still tracked the old
+// instance and now reads through a fresh one. Three tests were added for verify_access_token and the login lock.
+// Touches: EF InMemory databases and an in-memory cache only.
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using AuthSystem;
-using BCrypt.Net;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Caching.Memory;
 using Moq;
@@ -47,7 +53,7 @@ namespace AuthSystemTests
         public async Task Signup_DuplicateEmail_ReturnsError()
         {
             using var db = CreateDb();
-            db.Users.Add(new User { Email = "test@example.com", PasswordHash = BCrypt.HashPassword("password"), Status = "verified" });
+            db.Users.Add(new User { Email = "test@example.com", PasswordHash = BCrypt.Net.BCrypt.HashPassword("password"), Status = "verified" });
             await db.SaveChangesAsync();
 
             var service = CreateService();
@@ -70,9 +76,9 @@ namespace AuthSystemTests
             var service = CreateService();
             for (int i = 0; i < 5; i++)
             {
-                var result = await service.SignupAsync($"user{i}@example.com", "ThisIsAVeryLongPassword123!", "Test User");
+                var signup = await service.SignupAsync($"user{i}@example.com", "ThisIsAVeryLongPassword123!", "Test User");
                 if (i < 4)
-                    Assert.Equal("pending_verification", ((dynamic)result).status);
+                    Assert.Equal("pending_verification", ((dynamic)signup).status);
             }
 
             var result = await service.SignupAsync("blocked@example.com", "ThisIsAVeryLongPassword123!", "Test User");
@@ -83,7 +89,7 @@ namespace AuthSystemTests
         public async Task VerifyEmail_HappyPath_VerifiesUser()
         {
             using var db = CreateDb();
-            var user = new User { Email = "test@example.com", PasswordHash = BCrypt.HashPassword("password"), Status = "unverified" };
+            var user = new User { Email = "test@example.com", PasswordHash = BCrypt.Net.BCrypt.HashPassword("password"), Status = "unverified" };
             db.Users.Add(user);
             await db.SaveChangesAsync();
 
@@ -103,7 +109,10 @@ namespace AuthSystemTests
             Assert.Equal("verified", ((dynamic)result).status);
             Assert.Equal(user.Id, ((dynamic)result).user_id);
 
-            var updatedUser = await db.Users.FindAsync(user.Id);
+            // Read through a fresh context: `db` still tracks the pre-verification instance, so FindAsync on it
+            // would return that stale object without querying (2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP).
+            using var freshDb = CreateDb();
+            var updatedUser = await freshDb.Users.FindAsync(user.Id);
             Assert.NotNull(updatedUser.EmailVerifiedAt);
         }
 
@@ -111,7 +120,7 @@ namespace AuthSystemTests
         public async Task VerifyEmail_ExpiredCode_ReturnsError()
         {
             using var db = CreateDb();
-            var user = new User { Email = "test@example.com", PasswordHash = BCrypt.HashPassword("password"), Status = "unverified" };
+            var user = new User { Email = "test@example.com", PasswordHash = BCrypt.Net.BCrypt.HashPassword("password"), Status = "unverified" };
             db.Users.Add(user);
             await db.SaveChangesAsync();
 
@@ -135,7 +144,7 @@ namespace AuthSystemTests
         public async Task Login_NoMFA_ReturnsToken()
         {
             using var db = CreateDb();
-            var user = new User { Email = "test@example.com", PasswordHash = BCrypt.HashPassword("ThisIsAVeryLongPassword123!"), Status = "verified" };
+            var user = new User { Email = "test@example.com", PasswordHash = BCrypt.Net.BCrypt.HashPassword("ThisIsAVeryLongPassword123!"), Status = "verified" };
             db.Users.Add(user);
             await db.SaveChangesAsync();
 
@@ -153,7 +162,7 @@ namespace AuthSystemTests
             var user = new User
             {
                 Email = "test@example.com",
-                PasswordHash = BCrypt.HashPassword("ThisIsAVeryLongPassword123!"),
+                PasswordHash = BCrypt.Net.BCrypt.HashPassword("ThisIsAVeryLongPassword123!"),
                 Status = "verified",
                 MfaEnabled = true,
                 MfaSecret = "JBSWY3DPEHPK3PXP" // Base32 for "HELLOWORLD"
@@ -171,7 +180,7 @@ namespace AuthSystemTests
         public async Task Login_InvalidPassword_ReturnsError()
         {
             using var db = CreateDb();
-            var user = new User { Email = "test@example.com", PasswordHash = BCrypt.HashPassword("ThisIsAVeryLongPassword123!"), Status = "verified" };
+            var user = new User { Email = "test@example.com", PasswordHash = BCrypt.Net.BCrypt.HashPassword("ThisIsAVeryLongPassword123!"), Status = "verified" };
             db.Users.Add(user);
             await db.SaveChangesAsync();
 
@@ -187,7 +196,8 @@ namespace AuthSystemTests
             _oauthProviderMock.Setup(o => o.IsEmailVerifiedAsync("google", "code")).ReturnsAsync(true);
 
             var service = CreateService();
-            var result = await service.OAuthCallbackAsync("google", "code", "state123");
+            var state = await service.CreateOAuthStateAsync();
+            var result = await service.OAuthCallbackAsync("google", "code", state);
             Assert.Equal("authenticated", ((dynamic)result).status);
             Assert.Equal("newuser@example.com", ((dynamic)result).user.email);
             Assert.Equal("verified", ((dynamic)result).user.status.ToString());
@@ -202,7 +212,7 @@ namespace AuthSystemTests
         public async Task OAuthCallback_ExistingUser_LinksProvider()
         {
             using var db = CreateDb();
-            var user = new User { Email = "existing@example.com", PasswordHash = BCrypt.HashPassword("password"), Status = "verified" };
+            var user = new User { Email = "existing@example.com", PasswordHash = BCrypt.Net.BCrypt.HashPassword("password"), Status = "verified" };
             db.Users.Add(user);
             await db.SaveChangesAsync();
 
@@ -210,7 +220,8 @@ namespace AuthSystemTests
             _oauthProviderMock.Setup(o => o.IsEmailVerifiedAsync("google", "code")).ReturnsAsync(true);
 
             var service = CreateService();
-            var result = await service.OAuthCallbackAsync("google", "code", "state123");
+            var state = await service.CreateOAuthStateAsync();
+            var result = await service.OAuthCallbackAsync("google", "code", state);
             Assert.Equal("authenticated", ((dynamic)result).status);
             Assert.Equal(user.Id, ((dynamic)result).user.id);
         }
@@ -222,7 +233,7 @@ namespace AuthSystemTests
             var user = new User
             {
                 Email = "test@example.com",
-                PasswordHash = BCrypt.HashPassword("ThisIsAVeryLongPassword123!"),
+                PasswordHash = BCrypt.Net.BCrypt.HashPassword("ThisIsAVeryLongPassword123!"),
                 Status = "verified",
                 MfaEnabled = true,
                 MfaSecret = "JBSWY3DPEHPK3PXP"
@@ -257,7 +268,7 @@ namespace AuthSystemTests
             var user = new User
             {
                 Email = "test@example.com",
-                PasswordHash = BCrypt.HashPassword("ThisIsAVeryLongPassword123!"),
+                PasswordHash = BCrypt.Net.BCrypt.HashPassword("ThisIsAVeryLongPassword123!"),
                 Status = "verified",
                 MfaEnabled = true,
                 MfaSecret = "JBSWY3DPEHPK3PXP"
@@ -285,7 +296,7 @@ namespace AuthSystemTests
         public async Task TokenRefresh_HappyPath_IssuesNewToken()
         {
             using var db = CreateDb();
-            var user = new User { Email = "test@example.com", PasswordHash = BCrypt.HashPassword("password"), Status = "verified", Tier = "premium" };
+            var user = new User { Email = "test@example.com", PasswordHash = BCrypt.Net.BCrypt.HashPassword("password"), Status = "verified", Tier = "premium" };
             db.Users.Add(user);
             await db.SaveChangesAsync();
 
@@ -311,7 +322,7 @@ namespace AuthSystemTests
         public async Task TokenRefresh_BannedUser_ReturnsError()
         {
             using var db = CreateDb();
-            var user = new User { Email = "test@example.com", PasswordHash = BCrypt.HashPassword("password"), Status = "banned" };
+            var user = new User { Email = "test@example.com", PasswordHash = BCrypt.Net.BCrypt.HashPassword("password"), Status = "banned" };
             db.Users.Add(user);
             await db.SaveChangesAsync();
 
@@ -331,5 +342,69 @@ namespace AuthSystemTests
             var result = await service.TokenRefreshAsync(refreshToken);
             Assert.Equal("user_banned", ((dynamic)result).error);
         }
-    }
+    
+        /// <summary>
+        /// Flow 7 (verify_access_token) happy path: a token from login verifies and names the same user. Added
+        /// 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP) with the flow itself. Touches: the in-memory database.
+        /// </summary>
+        [Fact]
+        public async Task VerifyAccessToken_ValidToken_ReturnsUser()
+        {
+            using var db = CreateDb();
+            var user = new User { Email = "test@example.com", PasswordHash = BCrypt.Net.BCrypt.HashPassword("ThisIsAVeryLongPassword123!"), Status = "verified" };
+            db.Users.Add(user);
+            await db.SaveChangesAsync();
+
+            var service = CreateService();
+            var login = await service.LoginAsync("test@example.com", "ThisIsAVeryLongPassword123!", "device1", "127.0.0.1");
+            var result = await service.VerifyAccessTokenAsync((string)((dynamic)login).token);
+            Assert.Equal("ok", ((dynamic)result).status);
+            Assert.Equal(user.Id, ((dynamic)result).user.id);
+        }
+
+        /// <summary>
+        /// Flow 7 rejects an unsigned ("alg":"none") token and a token signed with another key (RFC 8725 3.1: the
+        /// header's algorithm is never trusted). Added 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP).
+        /// </summary>
+        [Fact]
+        public async Task VerifyAccessToken_ForgedOrUnsigned_ReturnsInvalidToken()
+        {
+            using var db = CreateDb();
+            var user = new User { Email = "test@example.com", PasswordHash = BCrypt.Net.BCrypt.HashPassword("ThisIsAVeryLongPassword123!"), Status = "verified" };
+            db.Users.Add(user);
+            await db.SaveChangesAsync();
+
+            static string B64(string json) => Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(json)).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+            var exp = DateTimeOffset.UtcNow.AddMinutes(10).ToUnixTimeSeconds();
+            var payload = B64($"{{\"user_id\":\"{user.Id}\",\"tier\":\"free\",\"exp\":{exp}}}");
+            var unsigned = B64("{\"alg\":\"none\",\"typ\":\"JWT\"}") + "." + payload + ".";
+
+            var otherKeyService = new AuthService(CreateDb(), _emailSenderMock.Object, _oauthProviderMock.Object, _cache, "a_completely_different_secret_key_that_is_also_long_enough");
+            var login = await otherKeyService.LoginAsync("test@example.com", "ThisIsAVeryLongPassword123!", "device1", "127.0.0.1");
+            var forged = (string)((dynamic)login).token;
+
+            var service = CreateService();
+            Assert.Equal("invalid_token", ((dynamic)await service.VerifyAccessTokenAsync(unsigned)).error);
+            Assert.Equal("invalid_token", ((dynamic)await service.VerifyAccessTokenAsync(forged)).error);
+        }
+
+        /// <summary>
+        /// Login locks an ip+email pair after 5 failed attempts in 15 minutes (spec rate_limit gate), even when the 6th
+        /// attempt has the right password. Added 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): failures were
+        /// counted but never checked.
+        /// </summary>
+        [Fact]
+        public async Task Login_FiveFailures_LocksFurtherAttempts()
+        {
+            using var db = CreateDb();
+            db.Users.Add(new User { Email = "test@example.com", PasswordHash = BCrypt.Net.BCrypt.HashPassword("ThisIsAVeryLongPassword123!"), Status = "verified" });
+            await db.SaveChangesAsync();
+
+            var service = CreateService();
+            for (int i = 0; i < 5; i++)
+                Assert.Equal("invalid_credentials", ((dynamic)await service.LoginAsync("test@example.com", "WrongPassword", "device1", "10.0.0.1")).error);
+            var locked = await service.LoginAsync("test@example.com", "ThisIsAVeryLongPassword123!", "device1", "10.0.0.1");
+            Assert.Equal("too_many_attempts", ((dynamic)locked).error);
+        }
+}
 }

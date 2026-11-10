@@ -65,6 +65,7 @@ namespace SaaSLibrary.ApiKeys
             };
         }
 
+        /// <summary>Lists one user's API keys (never the secrets or hashes). Input: the user id. Output: name, scopes, dates, rate limit, active flag per key. Changed 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): scopes deserialised with explicit options (CS0854). Touches: api_keys (read).</summary>
         public async Task<ListApiKeysResponse> ListApiKeysAsync(Guid userId)
         {
             var keys = await _dbContext.ApiKeys
@@ -73,7 +74,10 @@ namespace SaaSLibrary.ApiKeys
                 {
                     ApiKeyId = k.Id.ToString(),
                     Name = k.Name,
-                    Scopes = JsonSerializer.Deserialize<List<string>>(k.ScopesJson)!,
+                    // Options passed explicitly: an expression tree may not use optional arguments (CS0854, the
+                    // compile error this suite hit on .NET SDK 8.0.133; 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP).
+                    // EF Core runs this final projection on the client.
+                    Scopes = JsonSerializer.Deserialize<List<string>>(k.ScopesJson, (JsonSerializerOptions?)null)!,
                     CreatedAt = k.CreatedAt,
                     LastUsedAt = k.LastUsedAt,
                     RateLimit = k.RateLimit,
@@ -276,6 +280,7 @@ namespace SaaSLibrary.ApiKeys
             };
         }
 
+        /// <summary>Admin list of API keys, optionally by user and "active"/"inactive" status (never the secrets or hashes). Changed 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): scopes deserialised with explicit options (CS0854). Touches: api_keys (read).</summary>
         public async Task<AdminListApiKeysResponse> AdminListApiKeysAsync(Guid? userId, string status)
         {
             var query = _dbContext.ApiKeys.AsQueryable();
@@ -294,7 +299,10 @@ namespace SaaSLibrary.ApiKeys
                 {
                     ApiKeyId = k.Id.ToString(),
                     Name = k.Name,
-                    Scopes = JsonSerializer.Deserialize<List<string>>(k.ScopesJson)!,
+                    // Options passed explicitly: an expression tree may not use optional arguments (CS0854, the
+                    // compile error this suite hit on .NET SDK 8.0.133; 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP).
+                    // EF Core runs this final projection on the client.
+                    Scopes = JsonSerializer.Deserialize<List<string>>(k.ScopesJson, (JsonSerializerOptions?)null)!,
                     CreatedAt = k.CreatedAt,
                     LastUsedAt = k.LastUsedAt,
                     RateLimit = k.RateLimit,

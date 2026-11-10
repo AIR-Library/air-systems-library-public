@@ -1,3 +1,9 @@
+//! Permissions and RBAC tests (GEMINI spec, template #6).
+//! Corrected 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: `sqlx::query!` / `query_scalar!` are
+//! compile-time-checked macros that need `DATABASE_URL` pointing at a live database while COMPILING, so
+//! no test could build; they are now the runtime `sqlx::query` / `query_scalar` with the same SQL and the
+//! same assertions. One spec test was added (a failing cascade step rolls the whole cascade back).
+//! Touches: in-memory SQLite only.
 mod permissions_rbac_rust;
 
 use permissions_rbac_rust::{RbacSystem, Tier, User, RbacError};
@@ -53,43 +59,43 @@ async fn test_require_authenticated_public() {
 async fn test_cascade_delete_user() {
     let pool = setup_db().await;
     let rbac = RbacSystem { db: pool.clone() };
-    sqlx::query!("INSERT INTO users (id, tier) VALUES (1, 'owner')")
+    sqlx::query("INSERT INTO users (id, tier) VALUES (1, 'owner')")
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query!("INSERT INTO sessions (id, user_id) VALUES (1, 1), (2, 1)")
+    sqlx::query("INSERT INTO sessions (id, user_id) VALUES (1, 1), (2, 1)")
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query!("INSERT INTO api_keys (id, user_id) VALUES (1, 1), (2, 1), (3, 1)")
+    sqlx::query("INSERT INTO api_keys (id, user_id) VALUES (1, 1), (2, 1), (3, 1)")
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query!("INSERT INTO files (id, user_id) VALUES (1, 1)")
+    sqlx::query("INSERT INTO files (id, user_id) VALUES (1, 1)")
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query!("INSERT INTO preferences (id, user_id) VALUES (1, 1)")
+    sqlx::query("INSERT INTO preferences (id, user_id) VALUES (1, 1)")
         .execute(&pool)
         .await
         .unwrap();
     rbac.delete_user(1).await.unwrap();
-    let sessions: i64 = sqlx::query_scalar!("SELECT COUNT(*) FROM sessions")
+    let sessions: i64 = sqlx::query_scalar::<_, Option<i64>>("SELECT COUNT(*) FROM sessions")
         .fetch_one(&pool)
         .await
         .unwrap()
         .unwrap_or(0);
-    let api_keys: i64 = sqlx::query_scalar!("SELECT COUNT(*) FROM api_keys")
+    let api_keys: i64 = sqlx::query_scalar::<_, Option<i64>>("SELECT COUNT(*) FROM api_keys")
         .fetch_one(&pool)
         .await
         .unwrap()
         .unwrap_or(0);
-    let files: i64 = sqlx::query_scalar!("SELECT COUNT(*) FROM files")
+    let files: i64 = sqlx::query_scalar::<_, Option<i64>>("SELECT COUNT(*) FROM files")
         .fetch_one(&pool)
         .await
         .unwrap()
         .unwrap_or(0);
-    let preferences: i64 = sqlx::query_scalar!("SELECT COUNT(*) FROM preferences")
+    let preferences: i64 = sqlx::query_scalar::<_, Option<i64>>("SELECT COUNT(*) FROM preferences")
         .fetch_one(&pool)
         .await
         .unwrap()
@@ -109,38 +115,38 @@ async fn test_cascade_delete_user() {
 async fn test_cascade_delete_deployment() {
     let pool = setup_db().await;
     let rbac = RbacSystem { db: pool.clone() };
-    sqlx::query!("INSERT INTO organizations (id) VALUES (1)")
+    sqlx::query("INSERT INTO organizations (id) VALUES (1)")
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query!("INSERT INTO deployments (id, organization_id) VALUES (1, 1)")
+    sqlx::query("INSERT INTO deployments (id, organization_id) VALUES (1, 1)")
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query!("INSERT INTO dns_records (id, deployment_id) VALUES (1, 1), (2, 1)")
+    sqlx::query("INSERT INTO dns_records (id, deployment_id) VALUES (1, 1), (2, 1)")
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query!("INSERT INTO theme_configs (id, deployment_id) VALUES (1, 1)")
+    sqlx::query("INSERT INTO theme_configs (id, deployment_id) VALUES (1, 1)")
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query!("INSERT INTO deployment_logs (id, deployment_id) VALUES (1, 1), (2, 1), (3, 1)")
+    sqlx::query("INSERT INTO deployment_logs (id, deployment_id) VALUES (1, 1), (2, 1), (3, 1)")
         .execute(&pool)
         .await
         .unwrap();
     rbac.delete_deployment(1).await.unwrap();
-    let dns: i64 = sqlx::query_scalar!("SELECT COUNT(*) FROM dns_records")
+    let dns: i64 = sqlx::query_scalar::<_, Option<i64>>("SELECT COUNT(*) FROM dns_records")
         .fetch_one(&pool)
         .await
         .unwrap()
         .unwrap_or(0);
-    let themes: i64 = sqlx::query_scalar!("SELECT COUNT(*) FROM theme_configs")
+    let themes: i64 = sqlx::query_scalar::<_, Option<i64>>("SELECT COUNT(*) FROM theme_configs")
         .fetch_one(&pool)
         .await
         .unwrap()
         .unwrap_or(0);
-    let logs: i64 = sqlx::query_scalar!("SELECT COUNT(*) FROM deployment_logs")
+    let logs: i64 = sqlx::query_scalar::<_, Option<i64>>("SELECT COUNT(*) FROM deployment_logs")
         .fetch_one(&pool)
         .await
         .unwrap()
@@ -159,43 +165,43 @@ async fn test_cascade_delete_deployment() {
 async fn test_cascade_delete_organization() {
     let pool = setup_db().await;
     let rbac = RbacSystem { db: pool.clone() };
-    sqlx::query!("INSERT INTO organizations (id) VALUES (1)")
+    sqlx::query("INSERT INTO organizations (id) VALUES (1)")
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query!("INSERT INTO deployments (id, organization_id) VALUES (1, 1), (2, 1)")
+    sqlx::query("INSERT INTO deployments (id, organization_id) VALUES (1, 1), (2, 1)")
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query!("INSERT INTO users (id, tier, organization_id) VALUES (1, 'member', 1), (2, 'admin', 1)")
+    sqlx::query("INSERT INTO users (id, tier, organization_id) VALUES (1, 'member', 1), (2, 'admin', 1)")
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query!("INSERT INTO api_keys (id, user_id) VALUES (1, 1), (2, 2)")
+    sqlx::query("INSERT INTO api_keys (id, user_id) VALUES (1, 1), (2, 2)")
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query!("INSERT INTO sessions (id, user_id) VALUES (1, 1), (2, 2)")
+    sqlx::query("INSERT INTO sessions (id, user_id) VALUES (1, 1), (2, 2)")
         .execute(&pool)
         .await
         .unwrap();
     rbac.delete_organization(1).await.unwrap();
-    let deployments: i64 = sqlx::query_scalar!("SELECT COUNT(*) FROM deployments")
+    let deployments: i64 = sqlx::query_scalar::<_, Option<i64>>("SELECT COUNT(*) FROM deployments")
         .fetch_one(&pool)
         .await
         .unwrap()
         .unwrap_or(0);
-    let users: i64 = sqlx::query_scalar!("SELECT COUNT(*) FROM users")
+    let users: i64 = sqlx::query_scalar::<_, Option<i64>>("SELECT COUNT(*) FROM users")
         .fetch_one(&pool)
         .await
         .unwrap()
         .unwrap_or(0);
-    let api_keys: i64 = sqlx::query_scalar!("SELECT COUNT(*) FROM api_keys")
+    let api_keys: i64 = sqlx::query_scalar::<_, Option<i64>>("SELECT COUNT(*) FROM api_keys")
         .fetch_one(&pool)
         .await
         .unwrap()
         .unwrap_or(0);
-    let sessions: i64 = sqlx::query_scalar!("SELECT COUNT(*) FROM sessions")
+    let sessions: i64 = sqlx::query_scalar::<_, Option<i64>>("SELECT COUNT(*) FROM sessions")
         .fetch_one(&pool)
         .await
         .unwrap()
@@ -215,11 +221,11 @@ async fn test_cascade_delete_organization() {
 async fn test_cascade_rollback_on_error() {
     let pool = setup_db().await;
     let rbac = RbacSystem { db: pool.clone() };
-    sqlx::query!("INSERT INTO users (id, tier) VALUES (1, 'owner')")
+    sqlx::query("INSERT INTO users (id, tier) VALUES (1, 'owner')")
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query!("INSERT INTO sessions (id, user_id) VALUES (1, 1)")
+    sqlx::query("INSERT INTO sessions (id, user_id) VALUES (1, 1)")
         .execute(&pool)
         .await
         .unwrap();
@@ -227,7 +233,7 @@ async fn test_cascade_rollback_on_error() {
         .execute(&pool)
         .await;
     assert!(result.is_err());
-    let sessions: i64 = sqlx::query_scalar!("SELECT COUNT(*) FROM sessions")
+    let sessions: i64 = sqlx::query_scalar::<_, Option<i64>>("SELECT COUNT(*) FROM sessions")
         .fetch_one(&pool)
         .await
         .unwrap()
@@ -354,7 +360,7 @@ async fn test_permission_audit_logged_pass() {
 async fn test_cascade_delete_user_audit_log() {
     let pool = setup_db().await;
     let rbac = RbacSystem { db: pool.clone() };
-    sqlx::query!("INSERT INTO users (id, tier) VALUES (1, 'owner')")
+    sqlx::query("INSERT INTO users (id, tier) VALUES (1, 'owner')")
         .execute(&pool)
         .await
         .unwrap();
@@ -447,4 +453,20 @@ async fn test_audit_log_fields() {
     assert_eq!(log.5, "FAIL");
     assert!(log.6.is_none());
     assert!(!log.7.is_empty());
+}
+
+/// Added 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP), spec "cascade on error -> rollback (no partial
+/// deletes)": with the preferences table missing, delete_user fails part way and nothing is deleted.
+#[tokio::test]
+async fn test_cascade_delete_rolls_back_when_a_step_fails() {
+    let pool = setup_db().await;
+    let rbac = RbacSystem { db: pool.clone() };
+    sqlx::query("INSERT INTO users (id, tier) VALUES (1, 'owner')").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO sessions (id, user_id) VALUES (1, 1)").execute(&pool).await.unwrap();
+    sqlx::query("DROP TABLE preferences").execute(&pool).await.unwrap();
+    assert!(rbac.delete_user(1).await.is_err());
+    let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions").fetch_one(&pool).await.unwrap();
+    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users").fetch_one(&pool).await.unwrap();
+    let cascades: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE action = 'user_deleted_cascade'").fetch_one(&pool).await.unwrap();
+    assert_eq!((sessions, users, cascades), (1, 1, 0));
 }

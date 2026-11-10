@@ -17,8 +17,8 @@ jest.mock('pg', () => {
 jest.mock('ioredis', () => {
   const g = globalThis as any;
   g.__mockRedis = g.__mockRedis ?? {
-    setex: jest.fn(), lpush: jest.fn(), lrange: jest.fn(), lrem: jest.fn(), keys: jest.fn(), del: jest.fn(),
-    pipeline: jest.fn(),
+    setex: jest.fn(), set: jest.fn(), lpush: jest.fn(), lrange: jest.fn(), lrem: jest.fn(), keys: jest.fn(),
+    del: jest.fn(), pipeline: jest.fn(),
   };
   return { __esModule: true, default: jest.fn(() => g.__mockRedis) };
 });
@@ -108,15 +108,18 @@ describe('Background Job Manager', () => {
       };
       
       mockDb.query.mockResolvedValue({ rows: [mockJob] });
-      mockRedis.setex.mockResolvedValue('OK');
+      mockRedis.set.mockResolvedValue('OK');
       
       await jobManager.enqueueJob('send_bulk_email', { template_key: 'trial_ending_soon' }, scheduledAt);
       
-      expect(mockRedis.setex).toHaveBeenCalledWith(
+      // Corrected 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): the worker reads this key as the run time in epoch
+      // milliseconds, so that is what must be stored (no TTL). The old assertion expected setex(key, seconds, jobId),
+      // which the worker parses as a time that is never due, so the scheduled job never ran.
+      expect(mockRedis.set).toHaveBeenCalledWith(
         'job:scheduled:test-uuid-123',
-        expect.any(Number),
-        'test-uuid-123'
+        String(scheduledAt.getTime())
       );
+      expect(mockRedis.lpush).not.toHaveBeenCalledWith('job:queue', 'test-uuid-123');
     });
   });
   
@@ -435,6 +438,68 @@ describe('Background Job Manager', () => {
         ['test-uuid-123']
       );
     });
+
+    /**
+     * A job that is gone or no longer 'enqueued' must end its transaction (ROLLBACK) before the client goes back to
+     * the pool, and must not be run. In: a fake client. Out: assertions only.
+     * Why 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): CodeRabbit review on PR 19 (early returns left the
+     * row-locking transaction open). Touches: memory only.
+     */
+    it.each([
+      ['the job does not exist', []],
+      ['the job is no longer enqueued', [{ id: 'test-uuid-123', task_type: 'send_bulk_email', params: {},
+        status: JobStatus.RUNNING, retry_count: 0, max_retries: 3, next_retry_at: null, scheduled_at: null }]],
+    ])('should roll back and release when %s', async (_label: string, rows: any[]) => {
+      const mockClient = {
+        query: jest.fn()
+          .mockResolvedValueOnce({ rows: [] })   // BEGIN
+          .mockResolvedValueOnce({ rows })       // SELECT ... FOR UPDATE
+          .mockResolvedValue({ rows: [] }),
+        release: jest.fn(),
+      };
+      mockDb.connect.mockResolvedValue(mockClient as any);
+
+      await jobManager.processJob('test-uuid-123');
+
+      const statements = mockClient.query.mock.calls.map((call: any[]) => call[0]);
+      expect(statements).toEqual(['BEGIN', 'SELECT * FROM jobs WHERE id = $1 FOR UPDATE', 'ROLLBACK']);
+      expect(mockClient.release).toHaveBeenCalledTimes(1);
+      expect(mockDb.query).not.toHaveBeenCalled();
+    });
+
+    /**
+     * A retry whose next_retry_at is still in the future is not run: the transaction is rolled back, no job_run is
+     * written, the task does not execute, and the job is put back on the delayed path for its next_retry_at.
+     * In: a fake client. Out: assertions only.
+     * Why 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): CodeRabbit review on PR 19 (retries ignored the
+     * backoff). Touches: memory only.
+     */
+    it('should not execute a job whose next_retry_at is in the future', async () => {
+      const nextRetryAt = new Date(Date.now() + 60000);
+      const mockJob = {
+        id: 'test-uuid-123', task_type: 'send_bulk_email', params: { template_key: 'trial_ending_soon' },
+        status: JobStatus.ENQUEUED, created_at: new Date(), started_at: null, completed_at: null, progress: null,
+        result: null, error: 'boom', retry_count: 1, max_retries: 3, next_retry_at: nextRetryAt, scheduled_at: null
+      };
+      const mockClient = {
+        query: jest.fn()
+          .mockResolvedValueOnce({ rows: [] })        // BEGIN
+          .mockResolvedValueOnce({ rows: [mockJob] }) // SELECT ... FOR UPDATE
+          .mockResolvedValue({ rows: [] }),
+        release: jest.fn(),
+      };
+      mockDb.connect.mockResolvedValue(mockClient as any);
+
+      await jobManager.processJob('test-uuid-123');
+
+      const statements = mockClient.query.mock.calls.map((call: any[]) => call[0]);
+      expect(statements).toEqual(['BEGIN', 'SELECT * FROM jobs WHERE id = $1 FOR UPDATE', 'ROLLBACK']);
+      expect(statements.some((sql: string) => sql.includes('INSERT INTO job_runs'))).toBe(false);
+      expect(mockDb.query).not.toHaveBeenCalled();
+      expect(mockRedis.lpush).not.toHaveBeenCalled();
+      expect(mockRedis.set).toHaveBeenCalledWith('job:scheduled:test-uuid-123', String(nextRetryAt.getTime()));
+      expect(mockClient.release).toHaveBeenCalledTimes(1);
+    });
   });
   
   describe('handleJobError', () => {
@@ -473,6 +538,38 @@ describe('Background Job Manager', () => {
         expect.stringContaining('UPDATE jobs SET'),
         expect.any(Array)
       );
+    });
+
+    /**
+     * A retry goes through the delayed path at its backoff time (1 s for the first retry), not straight onto
+     * job:queue. In: a fake client. Out: assertions only.
+     * Why 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): CodeRabbit review on PR 19 (the documented 1 s, 2 s,
+     * 4 s backoff never happened). Touches: memory only.
+     */
+    it('should schedule the retry after its backoff instead of queueing it now', async () => {
+      const mockJob = {
+        id: 'test-uuid-123', task_type: 'send_bulk_email', params: {}, status: JobStatus.RUNNING,
+        retry_count: 0, max_retries: 3, next_retry_at: null, scheduled_at: null
+      };
+      const mockClient = {
+        query: jest.fn()
+          .mockResolvedValueOnce({ rows: [] })        // BEGIN
+          .mockResolvedValueOnce({ rows: [mockJob] }) // SELECT ... FOR UPDATE
+          .mockResolvedValue({ rows: [] }),
+        release: jest.fn(),
+      };
+      mockDb.connect.mockResolvedValue(mockClient as any);
+      const before = Date.now();
+
+      await jobManager.handleJobError('test-uuid-123', new Error('Test error'));
+
+      expect(mockRedis.lpush).not.toHaveBeenCalled();
+      expect(mockRedis.set).toHaveBeenCalledTimes(1);
+      const [key, runAt] = mockRedis.set.mock.calls[0];
+      expect(key).toBe('job:scheduled:test-uuid-123');
+      expect(Number(runAt)).toBeGreaterThanOrEqual(before + 1000);
+      const update = mockClient.query.mock.calls.find((call: any[]) => String(call[0]).startsWith('UPDATE jobs SET'));
+      expect((update[1][3] as Date).getTime()).toBe(Number(runAt));
     });
     
     it('should mark job as failed after max retries exceeded', async () => {
@@ -787,11 +884,17 @@ describe('Background Job Manager', () => {
         .mockResolvedValueOnce({ rows: [] })
         .mockResolvedValueOnce({ rows: [] })
         .mockResolvedValueOnce({ rows: [] });
+      // Syncing means asking Stripe for each invoice; Stripe is faked here so the test makes no network call
+      // (2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: the task used to re-read its own table instead).
+      const retrieveInvoice = jest.fn(async (id: string) => ({ id, status: 'paid', amount_paid: 1000, amount_due: 0 }));
+      jobManager.setStripeInvoiceGateway({ retrieveInvoice });
       
       const result = await jobManager.executeJob(mockJob);
       
       expect(result).toHaveProperty('invoices_processed', 2);
       expect(result).toHaveProperty('total_invoices', 2);
+      expect(retrieveInvoice).toHaveBeenCalledWith('invoice-1');
+      expect(retrieveInvoice).toHaveBeenCalledWith('invoice-2');
     });
     
     it('should execute generate_deployment_archive task', async () => {

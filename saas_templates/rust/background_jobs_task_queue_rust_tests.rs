@@ -1,3 +1,4 @@
+//! Background jobs tests (TIER 2 spec, system 4). Touches: in-memory SQLite and a worker thread.
 use super::*;
 use chrono::{Duration as ChronoDuration, Utc};
 use r2d2_sqlite::SqliteConnectionManager;
@@ -5,9 +6,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::time::{sleep, timeout};
 
+/// Corrected 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): the pool is limited to ONE connection.
+/// Each connection of a `:memory:` manager opens its own empty database, so with r2d2's default of 10
+/// connections the worker and the test could read different databases (the jobs table existed on one
+/// connection only). Touches: memory only.
 fn init_pool() -> DbPool {
     let manager = SqliteConnectionManager::memory();
-    let pool = r2d2::Pool::new(manager).expect("Failed to create pool");
+    let pool = r2d2::Pool::builder().max_size(1).build(manager).expect("Failed to create pool");
     pool
 }
 

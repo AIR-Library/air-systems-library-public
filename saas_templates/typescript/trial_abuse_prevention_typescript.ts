@@ -4,6 +4,10 @@ import { createHash } from 'crypto';
 // ---------- Types ----------
 type Decision = 'PASS' | 'CHALLENGE' | 'FAIL';
 
+/**
+ * What a gate returns: its decision and the numbers it decided on. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: paymentDelay may be null
+ * and the chargeback gate reports its total in count. Touches: nothing.
+ */
 interface GateResult {
   decision: Decision;
   priorCount?: number;
@@ -11,7 +15,7 @@ interface GateResult {
   matchingUsers?: number;
   deviceHash?: string;
   trialDuration?: number;
-  paymentDelay?: number;
+  paymentDelay?: number | null;
 }
 
 interface User {
@@ -205,70 +209,126 @@ export function check_device_fingerprint(device: {
   return { decision, matchingUsers, deviceHash };
 }
 
+/**
+ * Reads a date stored by SQLite or by this module. SQLite's CURRENT_TIMESTAMP / datetime('now') give
+ * "YYYY-MM-DD HH:MM:SS" in UTC with no zone marker, which `new Date()` would read as local time; this reads it as UTC.
+ * In: the stored text (or null). Out: a Date, or null when nothing is stored.
+ * Why: the timing gate must not depend on the machine's time zone (repair of trial_payment_timing, 2026-11-10,
+ * session session_012zDydZCZ4AChqhEZ4oVtaP). Touches: nothing.
+ */
+function parseDbDate(value: string | null | undefined): Date | null {
+  if (value === null || value === undefined) return null;
+  const text = String(value);
+  const isoLike = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?$/.test(text) ? text.replace(' ', 'T') + 'Z' : text;
+  const d = new Date(isoLike);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Gate 5, TRIAL_PAYMENT_TIMING (spec GEMINI_DISPATCH_MASTER_SPEC, trial abuse #5), run when a payment method is added.
+ * In: the user id and the trial length in days. Out: { decision, trialDuration (days since the trial started),
+ * paymentDelay (days from trial start to the payment, or null) }.
+ * Rules, counted from the ledger's trial_started_at (the first ledger row for the user):
+ * - a payment already on file within trial_days + 5 days, or a new payment while days_elapsed < trial_days + 5: PASS;
+ * - the trial has ended, no payment was ever added, and the user is coming back 90+ days after the trial started: FAIL
+ *   (the API answers 403 trial_ended_no_payment_cannot_retry);
+ * - a payment made after the trial ended and more than trial_days + 30 days in: CHALLENGE (flag late_payment_entry);
+ * - anything else: PASS.
+ * Why: the gate measured from the ledger row's created_at (the insert time, always "now") instead of
+ * trial_started_at, and tested the CHALLENGE window before the 90-day FAIL, so an abandoned 100-day-old trial passed
+ * (failing test "trial_payment_timing FAIL", repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP).
+ * Touches: reads trial_abuse_ledger, writes one gate_decisions row.
+ */
 export function check_trial_payment_timing(userId: number, trialDays: number = 14): GateResult {
-  const userRow = db.prepare(`SELECT created_at FROM trial_abuse_ledger WHERE user_id = ? ORDER BY id ASC LIMIT 1`).get(userId);
-  if (!userRow) {
-    // No trial info; treat as PASS
+  const ledgerRow = db.prepare(
+    `SELECT trial_started_at FROM trial_abuse_ledger WHERE user_id = ? ORDER BY id ASC LIMIT 1`
+  ).get(userId) as { trial_started_at: string } | undefined;
+  const trialStart = ledgerRow ? parseDbDate(ledgerRow.trial_started_at) : null;
+  if (!trialStart) {
+    // No trial on record for this user: there is no trial to time, so the gate has nothing to object to.
     why_chain({
       user_id: userId,
       gate_name: 'trial_payment_timing',
       decision: 'PASS',
-      rule_inputs: {},
-      rule_outputs: {}
+      rule_inputs: { trial_started_at: null },
+      rule_outputs: { decision: 'PASS', reason: 'no_trial_on_record' }
     });
     return { decision: 'PASS' };
   }
 
-  const trialStart = new Date(userRow.created_at);
   const now = new Date();
-  const daysElapsed = Math.floor((now.getTime() - trialStart.getTime()) / (1000 * 60 * 60 * 24));
+  const daysElapsed = Math.floor((now.getTime() - trialStart.getTime()) / DAY_MS);
 
   const paymentRow = db.prepare(`
     SELECT payment_added_date FROM trial_abuse_ledger
     WHERE user_id = ? AND payment_added_date IS NOT NULL
-    ORDER BY id DESC LIMIT 1
-  `).get(userId);
-  const paymentAddedDate = paymentRow ? new Date(paymentRow.payment_added_date) : null;
+    ORDER BY id ASC LIMIT 1
+  `).get(userId) as { payment_added_date: string } | undefined;
+  const priorPayment = paymentRow ? parseDbDate(paymentRow.payment_added_date) : null;
 
-  let decision: Decision = 'PASS';
-  if (paymentAddedDate) {
-    // payment already added; PASS
+  // The payment being judged: the one already on file, else the one being added now.
+  const paymentDate = priorPayment ?? now;
+  const paymentDelay = Math.floor((paymentDate.getTime() - trialStart.getTime()) / DAY_MS);
+  const trialEnded = daysElapsed >= trialDays;
+
+  let decision: Decision;
+  if (!priorPayment && trialEnded && daysElapsed >= 90) {
+    decision = 'FAIL';
+  } else if (paymentDelay < trialDays + 5) {
     decision = 'PASS';
+  } else if (paymentDelay > trialDays + 30 && paymentDate.getTime() > trialStart.getTime() + trialDays * DAY_MS) {
+    decision = 'CHALLENGE';
   } else {
-    if (daysElapsed < trialDays + 5) {
-      decision = 'PASS';
-    } else if (daysElapsed > trialDays + 30) {
-      decision = 'CHALLENGE';
-    } else {
-      // trial ended without payment and trying to re-add after 90+ days (simplified)
-      if (daysElapsed >= 90) decision = 'FAIL';
-      else decision = 'PASS';
-    }
+    decision = 'PASS';
   }
 
   why_chain({
     user_id: userId,
     gate_name: 'trial_payment_timing',
     decision,
-    rule_inputs: { trialStart, now, daysElapsed, paymentAddedDate },
-    rule_outputs: { decision }
+    rule_inputs: { trial_started_at: trialStart.toISOString(), days_elapsed: daysElapsed, trial_days: trialDays,
+      payment_added_date: priorPayment ? priorPayment.toISOString() : null },
+    rule_outputs: { decision, trial_duration: daysElapsed, payment_delay: paymentDelay }
   });
 
-  return { decision, trialDuration: daysElapsed };
+  return { decision, trialDuration: daysElapsed, paymentDelay };
 }
 
-export function check_chargeback_history(stripeCustomerId: string, userId: number): GateResult {
-  const chargebackRow = db.prepare(`
-    SELECT COUNT(*) as cnt FROM stripe_events
-    WHERE customer = ? AND type LIKE '%chargeback%'
-  `).get(stripeCustomerId);
-  const chargebackCount = chargebackRow.cnt as number;
+/**
+ * Says whether a table exists in this database. In: a table name. Out: true or false.
+ * Why: stripe_events and refunds belong to the billing system (its Stripe webhook writes them), not to this module;
+ * a deployment without billing has no chargeback records yet, which is not an error (failing test
+ * "chargeback_history PASS", SqliteError no such table, repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP).
+ * Touches: reads sqlite_master.
+ */
+function tableExists(name: string): boolean {
+  return db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(name) !== undefined;
+}
 
-  const refundRow = db.prepare(`
-    SELECT COUNT(*) as cnt FROM refunds
-    WHERE user_id = ? AND status = 'chargebacked'
-  `).get(userId);
-  const refundCount = refundRow.cnt as number;
+/**
+ * Gate 6, CHARGEBACK_HISTORY (spec trial abuse #6): counts Stripe chargeback events for the customer plus the user's
+ * charged-back refunds. In: the Stripe customer id and the user id. Out: { decision, count } where 0 = PASS,
+ * 1 = CHALLENGE, 2+ = FAIL (403 chargeback_history_requires_prepayment).
+ * Why: it queried stripe_events and refunds unconditionally and threw when the billing tables were not installed; a
+ * table that is not there now counts as no records (repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP).
+ * Touches: reads stripe_events and refunds when present, writes one gate_decisions row.
+ */
+export function check_chargeback_history(stripeCustomerId: string, userId: number): GateResult {
+  const chargebackCount = tableExists('stripe_events')
+    ? (db.prepare(`
+        SELECT COUNT(*) as cnt FROM stripe_events
+        WHERE customer = ? AND type LIKE '%chargeback%'
+      `).get(stripeCustomerId) as { cnt: number }).cnt
+    : 0;
+
+  const refundCount = tableExists('refunds')
+    ? (db.prepare(`
+        SELECT COUNT(*) as cnt FROM refunds
+        WHERE user_id = ? AND status = 'chargebacked'
+      `).get(userId) as { cnt: number }).cnt
+    : 0;
 
   const totalChargebacks = chargebackCount + refundCount;
 
@@ -285,7 +345,7 @@ export function check_chargeback_history(stripeCustomerId: string, userId: numbe
     rule_outputs: { decision }
   });
 
-  return { decision, chargebacks: totalChargebacks };
+  return { decision, count: totalChargebacks };
 }
 
 // ---------- Core Flows ----------

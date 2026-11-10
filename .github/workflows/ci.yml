@@ -20,6 +20,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] The README's status table is written from ci/baseline.json by
+  # tools/readme_status.py; this job fails when someone changes the baseline without regenerating the table, so the
+  # table on main can never lag behind CI again (it showed 79 of 144 while CI passed 92). Touches: reads files only.
+  readme:
+    name: readme
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with: {python-version: "3.12"}
+      - name: README status table matches ci/baseline.json
+        run: python tools/readme_status.py
+      # The tools' own regression tests: a declared system with no files is still a suite (MISSING), and the README
+      # table keeps it as failing (CodeRabbit, PR 19).
+      - name: Tool tests
+        run: python -m unittest tools/test_tools.py -v
+
   suites:
     name: ${{ matrix.lang }}
     runs-on: ubuntu-24.04

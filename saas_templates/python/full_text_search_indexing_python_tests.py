@@ -137,6 +137,19 @@ class TestIndexAndSearch(unittest.TestCase):
         self.assertEqual(res["total"], 1)
         self.assertEqual(res["results"][0]["document_id"], "1")
 
+    def test_all_query_words_must_match(self):
+        """Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: spec example "stripe integration ->
+        find deployments with both words"; exact words outrank partial ones; ties newest first."""
+        self.engine.index_document("deployment", 1, "stripe integration", {})
+        self.engine.index_document("deployment", 2, "stripe only", {})
+        self.engine.index_document("deployment", 3, "stripes integrations", {})
+        self.engine.index_document("deployment", 4, "stripe integration again", {})
+        res = self.engine.search(q="stripe integration", document_type="deployment")
+        self.assertEqual(res["total"], 3)
+        self.assertEqual([r["document_id"] for r in res["results"]], ["4", "1", "3"])
+        self.assertEqual(res["results"][0]["relevance"], 1.0)
+        self.assertLess(res["results"][2]["relevance"], 1.0)
+
     def test_no_match_returns_empty(self):
         self.engine.index_document("user", 1, "alice", {"tier": "team"})
         res = self.engine.search(q="zzzznotfound")
@@ -196,11 +209,10 @@ class TestPerformance(unittest.TestCase):
 class TestEndpointHandlers(unittest.TestCase):
     def setUp(self):
         # Reset the shared engine for isolation.
-        global _default_engine
-        from full_text_search_indexing_python import _default_engine as eng
-        eng._docs.clear()
-        eng._index.clear()
-        eng._jobs.clear()
+        # [2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP] was eng._docs/_index/_jobs.clear(): private
+        # attributes of the old engine, which had to be restructured to search 1M documents in under 200 ms.
+        # SearchEngine.clear() is the public way to reset it (same effect: no documents, index or jobs).
+        get_engine().clear()
 
     def test_handle_index_and_search(self):
         handle_index({

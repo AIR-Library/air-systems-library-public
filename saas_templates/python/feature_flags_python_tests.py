@@ -2,6 +2,10 @@ import json
 import sys
 import threading
 import time
+# [2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP] FailingStore below annotates with Optional, List and
+# AuditEntry, which were never imported: collection died with NameError on every Python version (annotations
+# on a def are evaluated when the def runs). Test change only: the imports; no test or assertion changed.
+from typing import List, Optional
 from feature_flags_python import (
     FeatureFlagClient,
     InMemoryFlagStore,
@@ -29,6 +33,7 @@ from feature_flags_python import (
     AUDIT_ACTION_CREATE,
     AUDIT_ACTION_UPDATE,
     FlagStore,
+    AuditEntry,
 )
 
 T0 = 1767225600

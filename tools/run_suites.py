@@ -274,6 +274,10 @@ JAVA_DEPS = [
     ("org.mockito", "mockito-junit-jupiter", "5.14.2"),
     ("com.fasterxml.jackson.core", "jackson-databind", "2.18.1"),
     ("com.google.code.gson", "gson", "2.11.0"), ("com.stripe", "stripe-java", "28.1.0"),
+    # [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] json-path (from spring-boot-starter-test) pulls slf4j-api 1.7.36,
+    # which wins over the 2.x that logback 1.4 needs, and Spring Boot then stops with "LoggerFactory is not a Logback
+    # LoggerContext" (java admin_system). Naming 2.0.11 directly makes Maven pick it.
+    ("org.slf4j", "slf4j-api", "2.0.11"),
     ("com.auth0", "java-jwt", "4.4.0"), ("org.mindrot", "jbcrypt", "0.4"),
     ("com.h2database", "h2", "2.3.232"),
     ("org.springframework.boot", "spring-boot-starter-web", "3.2.2"),
@@ -283,7 +287,16 @@ JAVA_DEPS = [
 
 
 def setup_java() -> Path:
+    """Downloads JAVA_DEPS into .deps/java/lib once. Out: that folder.
+
+    [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] The folder is fetched again when JAVA_DEPS changes (a stamp file holds
+    the list it was built from), so a checkout that already had jars picks up a new pin such as slf4j-api (CodeRabbit,
+    PR 19). Touches: network (Maven Central), files under .deps/java."""
     d = DEPS / "java"
+    wanted = "\n".join(f"{g}:{a}:{v}" for g, a, v in JAVA_DEPS)
+    stamp = d / "deps.txt"
+    if list((d / "lib").glob("*.jar")) and (not stamp.is_file() or stamp.read_text() != wanted):
+        shutil.rmtree(d / "lib", ignore_errors=True)
     if not list((d / "lib").glob("*.jar")):
         d.mkdir(parents=True, exist_ok=True)
         deps = "\n".join(f"<dependency><groupId>{g}</groupId><artifactId>{a}</artifactId>"
@@ -292,6 +305,7 @@ def setup_java() -> Path:
         rc, out = sh(["mvn", "-q", "-B", "dependency:copy-dependencies", "-DoutputDirectory=lib"], d, 1500)
         if rc != 0:
             raise RuntimeError("mvn dependency:copy-dependencies failed:\n" + tail(out, [], 30))
+        stamp.write_text(wanted)
     return d
 
 
@@ -590,12 +604,25 @@ def parse_failures(lang: str, files: list[Path], ctx: Path) -> dict[str, str]:
 
 
 # ----------------------------------------------------------------------------------- reporting
+def declared_systems() -> set[str]:
+    """The systems the library declares: one row per system in docs/specs/README.md's table. Out: names ({} when
+    there is no spec index). [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Touches: reads one file."""
+    index = TEMPLATES.parent / "docs" / "specs" / "README.md"
+    if not index.is_file():
+        return set()
+    return set(re.findall(r"^\|\s*([a-z0-9_]+)\s*\|\s*\[[a-z0-9_]+\.md\]", index.read_text(encoding="utf-8"), re.M))
+
+
 def systems_for(lang: str) -> list[str]:
-    """Every system with an implementation or a tests file. In: a language. Out: sorted names.
-    Both kinds count, so a tests file whose implementation is gone shows as MISSING too (2026-11-05, session f3daac6e)."""
+    """Every system with an implementation or a tests file, plus every declared system. In: a language. Out: sorted names.
+    Both kinds count, so a tests file whose implementation is gone shows as MISSING too (2026-11-05, session f3daac6e).
+    [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Declared systems (docs/specs/README.md) count too, so a system whose
+    files are all gone from a language is reported MISSING (never excused) instead of silently not run (CodeRabbit,
+    PR 19)."""
     ext = EXT[lang]
     names = {p.name[: -len(f"_{lang}.{ext}")] for p in (TEMPLATES / lang).glob(f"*_{lang}.{ext}")}
     names |= {p.name[: -len(f"_{lang}_tests.{ext}")] for p in (TEMPLATES / lang).glob(f"*_{lang}_tests.{ext}")}
+    names |= declared_systems()
     return sorted(names)
 
 
@@ -615,7 +642,8 @@ def render_summary(lang: str, res: dict, baseline: set[str], regress: list[str],
         out += ["**Regressions (not passing, and either not in the baseline or MISSING/BROKEN, which it cannot "
                 "excuse):** " + ", ".join(regress), ""]
     if fixed:
-        out += ["**Newly passing (remove from `ci/baseline.json`):** " + ", ".join(fixed), ""]
+        out += ["**Newly passing: remove from `ci/baseline.json` (the run fails until they are removed):** "
+                + ", ".join(fixed), ""]
     return "\n".join(out)
 
 
@@ -701,6 +729,14 @@ def main() -> int:
         p.write_text(json.dumps({"known_failing": sorted(keep)}, indent=2) + "\n")
     print(f"\n{a.lang}: {sum(r['status'] == 'PASS' for r in res.values())}/{len(res)} pass; "
           f"regressions={len(regress)}; newly passing={len(fixed)}")
+    # [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] A suite that passes while it is still listed in the baseline fails
+    # the run too (unless the baseline is being rewritten), so its stale entry is removed in the same pull request and
+    # the README table (tools/readme_status.py, which reads the baseline) never shows a passing suite as failing
+    # (CodeRabbit, PR 19). Only a full run can tell, so this applies when --baseline is given.
+    if fixed and a.baseline and not a.update_baseline:
+        print("STALE BASELINE: these suites pass; remove them from " + a.baseline + ": "
+              + ", ".join(key(a.lang, s) for s in fixed))
+        return 1
     return 1 if regress else 0
 
 

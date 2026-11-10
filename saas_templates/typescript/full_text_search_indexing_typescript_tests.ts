@@ -1,12 +1,17 @@
+/**
+ * Full-text search & indexing tests, one jest test per check, run in order against one shared service.
+ * Why: this file was a hand-written runner (runTests) that the library's runner counted as 0 framework tests.
+ * Converted to jest 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: every check, message and budget is kept
+ * (100 ms real-time, 200 ms search over 1,000,000 documents); each numbered block is now its own test.
+ * Touches: process memory only.
+ */
+import { describe, test } from '@jest/globals';
 import { FullTextSearchService, tokenize, parseQuery } from './full_text_search_indexing_typescript';
 
-async function runTests() {
+describe("Full-Text Search & Indexing", () => {
   const searchService = new FullTextSearchService();
 
-  console.log("Starting Full-Text Search & Indexing Tests...");
-
-  // Test 1: Index user, search finds it
-  {
+  test("Test 1: Index user, search finds it", async () => {
     searchService.clear();
     const indexRes = await searchService.indexDocument({
       document_type: 'user',
@@ -29,10 +34,9 @@ async function runTests() {
       throw new Error(`Test 1 Failed: Expected 1 result with ID 123, got total ${searchRes.total}`);
     }
     console.log("✓ Test 1 Passed: Index user, search finds it");
-  }
+  });
 
-  // Test 2: Index deployment, query works
-  {
+  test("Test 2: Index deployment, query works", async () => {
     await searchService.indexDocument({
       document_type: 'deployment',
       document_id: 'dep-999',
@@ -48,20 +52,18 @@ async function runTests() {
       throw new Error(`Test 2 Failed: Expected deployment dep-999, got total ${searchRes.total}`);
     }
     console.log("✓ Test 2 Passed: Index deployment, query works");
-  }
+  });
 
-  // Test 3: Partial match: "stri" finds "stripe"
-  {
+  test("Test 3: Partial match: 'stri' finds 'stripe'", async () => {
     const searchRes = await searchService.search({ q: 'stri' });
     const found = searchRes.results.some(r => r.document_id === 'dep-999');
     if (!found) {
       throw new Error("Test 3 Failed: Partial match 'stri' did not find 'stripe' deployment");
     }
     console.log("✓ Test 3 Passed: Partial match: 'stri' finds 'stripe'");
-  }
+  });
 
-  // Test 4: Filters: tier:team returns only team tier
-  {
+  test("Test 4: Filters: tier:team returns only team tier", async () => {
     await searchService.indexDocument({
       document_type: 'user',
       document_id: 124,
@@ -79,10 +81,9 @@ async function runTests() {
       throw new Error(`Test 4 Failed: Expected only team tier user (123), got total ${searchRes.total}`);
     }
     console.log("✓ Test 4 Passed: Filters: tier:team returns only team tier");
-  }
+  });
 
-  // Test 5: Facets: shows count per status
-  {
+  test("Test 5: Facets: shows count per status", async () => {
     await searchService.indexDocument({
       document_type: 'deployment',
       document_id: 'dep-100',
@@ -111,20 +112,18 @@ async function runTests() {
       throw new Error(`Test 5 Failed: Incorrect tier facet counts: ${JSON.stringify(tierFacets)}`);
     }
     console.log("✓ Test 5 Passed: Facets: shows count per status");
-  }
+  });
 
-  // Test 6: Unindex: document no longer found after delete
-  {
+  test("Test 6: Unindex: document no longer found after delete", async () => {
     await searchService.unindexDocument('deployment', 'dep-101');
     const searchRes = await searchService.search({ q: 'archived' });
     if (searchRes.total !== 0) {
       throw new Error("Test 6 Failed: Unindexed document was still found in search");
     }
     console.log("✓ Test 6 Passed: Unindex: document no longer found after delete");
-  }
+  });
 
-  // Test 7: Real-time: index updated within 100ms of create
-  {
+  test("Test 7: Real-time: index updated within 100ms of create", async () => {
     const startTime = Date.now();
     await searchService.indexDocument({
       document_type: 'user',
@@ -142,10 +141,9 @@ async function runTests() {
       throw new Error(`Test 7 Failed: Indexing and searching took too long: ${duration}ms`);
     }
     console.log(`✓ Test 7 Passed: Real-time: index updated within 100ms of create (${duration}ms)`);
-  }
+  });
 
-  // Test 8: Performance: 1M documents, search returns <200ms
-  {
+  test("Test 8: Performance: 1M documents, search returns <200ms", async () => {
     searchService.clear();
     console.log("Generating 1,000,000 lightweight documents for performance test...");
     
@@ -183,10 +181,9 @@ async function runTests() {
       throw new Error("Test 8 Failed: Search returned 0 results, expected matches");
     }
     console.log(`✓ Test 8 Passed: Performance: 1M documents, search returns <200ms (${searchDuration}ms)`);
-  }
+  });
 
-  // Test 9: Relevance: exact match ranks higher than partial
-  {
+  test("Test 9: Relevance: exact match ranks higher than partial", async () => {
     searchService.clear();
     await searchService.indexDocument({
       document_type: 'deployment',
@@ -209,12 +206,5 @@ async function runTests() {
       throw new Error("Test 9 Failed: Exact match relevance score should be strictly greater than partial match");
     }
     console.log("✓ Test 9 Passed: Relevance: exact match ranks higher than partial");
-  }
-
-  console.log("All Full-Text Search & Indexing Tests Passed Successfully!");
-}
-
-runTests().catch(err => {
-  console.error("Test Suite Failed:", err);
-  process.exit(1);
+  });
 });
