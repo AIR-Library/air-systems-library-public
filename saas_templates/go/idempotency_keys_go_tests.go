@@ -1,11 +1,17 @@
 package idempotencykeys
 
 import (
+	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
+
+	_ "modernc.org/sqlite"
 )
 
+// IDEM-01
 func TestFirstCallRunsOperationOnce(t *testing.T) {
 	store := NewInMemoryStore()
 	svc, _ := NewIdempotencyService(store, IdempotencyOptions{})
@@ -26,6 +32,7 @@ func TestFirstCallRunsOperationOnce(t *testing.T) {
 	}
 }
 
+// IDEM-02
 func TestIdenticalRetryReplaysStoredResponse(t *testing.T) {
 	store := NewInMemoryStore()
 	svc, _ := NewIdempotencyService(store, IdempotencyOptions{})
@@ -44,6 +51,7 @@ func TestIdenticalRetryReplaysStoredResponse(t *testing.T) {
 	}
 }
 
+// IDEM-03
 func TestSameKeyDifferentBodyIs422(t *testing.T) {
 	store := NewInMemoryStore()
 	svc, _ := NewIdempotencyService(store, IdempotencyOptions{})
@@ -65,6 +73,7 @@ func TestSameKeyDifferentBodyIs422(t *testing.T) {
 	}
 }
 
+// IDEM-04
 func TestSameKeyWhileInProgressIs409(t *testing.T) {
 	store := NewInMemoryStore()
 	svc, _ := NewIdempotencyService(store, IdempotencyOptions{})
@@ -92,6 +101,7 @@ func TestSameKeyWhileInProgressIs409(t *testing.T) {
 	}
 }
 
+// IDEM-05
 func TestRequiredMethodWithoutKeyIs400(t *testing.T) {
 	store := NewInMemoryStore()
 	svc, _ := NewIdempotencyService(store, IdempotencyOptions{})
@@ -119,6 +129,7 @@ func TestRequiredMethodWithoutKeyIs400(t *testing.T) {
 	}
 }
 
+// IDEM-06
 func TestSameKeyInTwoScopesRunsTwice(t *testing.T) {
 	store := NewInMemoryStore()
 	svc, _ := NewIdempotencyService(store, IdempotencyOptions{})
@@ -140,6 +151,7 @@ func TestSameKeyInTwoScopesRunsTwice(t *testing.T) {
 	}
 }
 
+// IDEM-07
 func TestExpiredKeyRunsOperationAgain(t *testing.T) {
 	now := int64(1700000000)
 	store := NewInMemoryStore()
@@ -160,13 +172,34 @@ func TestExpiredKeyRunsOperationAgain(t *testing.T) {
 	if count != 2 {
 		t.Fatalf("expected count 2, got %d", count)
 	}
+
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (IDEM-07, amended): an in_progress record past
+	// expires_at (a process killed mid-operation) is uncertain: 409 outcome_unknown, and it does not run.
+	claimed, _ := store.TryClaim(IdempotencyRecord{Scope: "client-a", IdemKey: "key-crashed", RequestFingerprint: ComputeFingerprint("POST", "/charges", `{"amount":100}`),
+		Status: "in_progress", CreatedAt: now - 90000, ExpiresAt: now - 3600}, now-90000)
+	if !claimed {
+		t.Fatal("could not plant the crashed in_progress record")
+	}
+	resp, _ = svc.Handle("client-a", "key-crashed", "POST", "/charges", `{"amount":100}`, op)
+	if resp.Status != 409 || !strings.Contains(resp.Body, "outcome_unknown") || resp.ContentType != "application/problem+json" {
+		t.Fatalf("stale in_progress: expected 409 outcome_unknown, got %+v", resp)
+	}
+	if count != 2 {
+		t.Fatalf("a stale in_progress key must not run the operation; count %d", count)
+	}
+	if n, _ := svc.PurgeExpired(); n != 0 {
+		t.Fatalf("purge must keep the stale in_progress record (and the unexpired completed one); purged %d", n)
+	}
 }
 
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the amended IDEM-08 frees the key only for a
+// DEFINITE failure, an error wrapping ErrOperationFailed; a plain error now leaves it uncertain (IDEM-10).
+// IDEM-08
 func TestRaisingOperationFreesTheKey(t *testing.T) {
 	store := NewInMemoryStore()
 	svc, _ := NewIdempotencyService(store, IdempotencyOptions{})
 	count := 0
-	boom := errors.New("boom")
+	boom := fmt.Errorf("card declined: %w", ErrOperationFailed)
 	op := func() (OperationResult, error) {
 		count++
 		return OperationResult{}, boom
@@ -193,6 +226,7 @@ func TestRaisingOperationFreesTheKey(t *testing.T) {
 	}
 }
 
+// IDEM-09
 func TestErrorResponsesAreProblemJson(t *testing.T) {
 	store := NewInMemoryStore()
 	svc, _ := NewIdempotencyService(store, IdempotencyOptions{})
@@ -326,4 +360,176 @@ func itoa(n int) string {
 		buf[pos] = '-'
 	}
 	return string(buf[pos:])
+}
+// TestOtherErrorLeavesKeyUncertain proves IDEM-10: an error that is not ErrOperationFailed (a timeout
+// after the provider may have charged) leaves the key 'uncertain'; a retry gets 409 outcome_unknown and
+// does not run; ListUncertain lists it; after Release a retry runs, and a second Release returns false.
+// A panic is treated the same way. Written 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
+// IDEM-10
+func TestOtherErrorLeavesKeyUncertain(t *testing.T) {
+	store := NewInMemoryStore()
+	svc, _ := NewIdempotencyService(store, IdempotencyOptions{})
+	count := 0
+	timeout := errors.New("provider timeout")
+	failing := func() (OperationResult, error) {
+		count++
+		return OperationResult{}, timeout
+	}
+	working := func() (OperationResult, error) {
+		count++
+		return OperationResult{Status: 201, Body: `{"n":2}`}, nil
+	}
+	if _, err := svc.Handle("client-a", "key-1", "POST", "/charges", `{"amount":100}`, failing); !errors.Is(err, timeout) {
+		t.Fatalf("the operation's error must be re-raised, got %v", err)
+	}
+	resp, _ := svc.Handle("client-a", "key-1", "POST", "/charges", `{"amount":100}`, working)
+	if resp.Status != 409 || resp.ContentType != "application/problem+json" ||
+		resp.Body != `{"type":"https://developer.example.com/problems/outcome_unknown","title":"Outcome unknown","detail":"The first request with this Idempotency-Key ended without a known outcome; it will not be run again until it is reconciled."}` {
+		t.Fatalf("expected 409 outcome_unknown, got %+v", resp)
+	}
+	if count != 1 {
+		t.Fatalf("an uncertain key must not run the operation again; count %d", count)
+	}
+	// A different body on the same key is still 422 (the fingerprint check comes first).
+	if r, _ := svc.Handle("client-a", "key-1", "POST", "/charges", `{"amount":999}`, working); r.Status != 422 {
+		t.Fatalf("different body on an uncertain key: expected 422, got %+v", r)
+	}
+	list, _ := svc.ListUncertain(10)
+	if len(list) != 1 || list[0].Scope != "client-a" || list[0].IdemKey != "key-1" {
+		t.Fatalf("ListUncertain: %+v", list)
+	}
+	if n, _ := svc.PurgeExpired(); n != 0 {
+		t.Fatalf("purge must keep an uncertain record")
+	}
+	if ok, _ := svc.Release("client-a", "key-1"); !ok {
+		t.Fatal("Release on an uncertain key should return true")
+	}
+	if ok, _ := svc.Release("client-a", "key-1"); ok {
+		t.Fatal("a second Release should return false")
+	}
+	resp, _ = svc.Handle("client-a", "key-1", "POST", "/charges", `{"amount":100}`, working)
+	if resp.Status != 201 || count != 2 {
+		t.Fatalf("after Release the retry should run: %+v count %d", resp, count)
+	}
+	if ok, _ := svc.Release("client-a", "key-1"); ok {
+		t.Fatal("Release on a completed key should return false")
+	}
+
+	// A panic is an unknown outcome too.
+	func() {
+		defer func() { _ = recover() }()
+		_, _ = svc.Handle("client-a", "key-panic", "POST", "/charges", `{}`, func() (OperationResult, error) {
+			count++
+			panic("crash after the provider call")
+		})
+	}()
+	if r, _ := svc.Handle("client-a", "key-panic", "POST", "/charges", `{}`, working); r.Status != 409 || !strings.Contains(r.Body, "outcome_unknown") {
+		t.Fatalf("after a panic: expected 409 outcome_unknown, got %+v", r)
+	}
+}
+
+// TestResolveStoresOutcome proves IDEM-11: Resolve on an uncertain key stores the response; a retry
+// returns it without running; a second Resolve or Release returns false; the resolved record expires
+// 24 h after the resolve. Written 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
+// IDEM-11
+func TestResolveStoresOutcome(t *testing.T) {
+	now := int64(1_700_000_000)
+	store := NewInMemoryStore()
+	svc, _ := NewIdempotencyService(store, IdempotencyOptions{Clock: func() int64 { return now }})
+	count := 0
+	_, _ = svc.Handle("client-a", "key-1", "POST", "/charges", `{"amount":100}`, func() (OperationResult, error) {
+		count++
+		return OperationResult{}, errors.New("connection reset")
+	})
+	if ok, _ := svc.Resolve("client-b", "key-1", 201, `{"charge":"ch_1"}`); ok {
+		t.Fatal("Resolve under another scope must not touch client-a's key")
+	}
+	now += 3600
+	if ok, err := svc.Resolve("client-a", "key-1", 201, `{"charge":"ch_1"}`); !ok || err != nil {
+		t.Fatalf("Resolve on an uncertain key: %v %v", ok, err)
+	}
+	resp, _ := svc.Handle("client-a", "key-1", "POST", "/charges", `{"amount":100}`, func() (OperationResult, error) {
+		count++
+		return OperationResult{Status: 201, Body: `{"charge":"ch_2"}`}, nil
+	})
+	if resp.Status != 201 || resp.Body != `{"charge":"ch_1"}` || resp.ContentType != "application/json" || count != 1 {
+		t.Fatalf("retry after Resolve: %+v count %d", resp, count)
+	}
+	if ok, _ := svc.Resolve("client-a", "key-1", 201, `{"charge":"ch_3"}`); ok {
+		t.Fatal("a second Resolve should return false")
+	}
+	if ok, _ := svc.Release("client-a", "key-1"); ok {
+		t.Fatal("Release on a resolved key should return false")
+	}
+	rec, _ := store.Get("client-a", "key-1")
+	if rec.ExpiresAt != now+86400 {
+		t.Fatalf("resolved record should expire 24h after the resolve: %d", rec.ExpiresAt-now)
+	}
+}
+
+// TestReleaseAndResolveAreSingleConditionalWrites proves that of many concurrent Release (or Resolve)
+// calls on one uncertain key exactly one returns true, on the in-memory and the SQL store, and that the
+// SQL store follows IDEM-07/10/11 too. Written 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+// Touches: memory and an in-memory SQLite database.
+func TestReleaseAndResolveAreSingleConditionalWrites(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	sqlStore := NewSqlStore(db)
+	if err := sqlStore.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	for name, store := range map[string]Store{"memory": NewInMemoryStore(), "sql": sqlStore} {
+		now := int64(1_700_000_000)
+		svc, _ := NewIdempotencyService(store, IdempotencyOptions{Clock: func() int64 { return now }})
+		count := 0
+		fail := func() (OperationResult, error) { count++; return OperationResult{}, errors.New("timeout") }
+		ok := func() (OperationResult, error) { count++; return OperationResult{Status: 200, Body: `{"ok":true}`}, nil }
+		for _, key := range []string{"k-release", "k-resolve"} {
+			_, _ = svc.Handle("s", key, "POST", "/p", "b", fail)
+		}
+		if r, _ := svc.Handle("s", "k-release", "POST", "/p", "b", ok); r.Status != 409 || count != 2 {
+			t.Fatalf("%s: uncertain retry: %+v count %d", name, r, count)
+		}
+		var wins int
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		for i := 0; i < 8; i++ {
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				if won, _ := svc.Release("s", "k-release"); won {
+					mu.Lock()
+					wins++
+					mu.Unlock()
+				}
+			}()
+			go func(i int) {
+				defer wg.Done()
+				if won, _ := svc.Resolve("s", "k-resolve", 200, fmt.Sprintf(`{"i":%d}`, i)); won {
+					mu.Lock()
+					wins += 100
+					mu.Unlock()
+				}
+			}(i)
+		}
+		wg.Wait()
+		if wins != 101 {
+			t.Fatalf("%s: expected exactly one Release and one Resolve to win, got %d", name, wins)
+		}
+		if r, _ := svc.Handle("s", "k-release", "POST", "/p", "b", ok); r.Status != 200 || count != 3 {
+			t.Fatalf("%s: retry after Release: %+v count %d", name, r, count)
+		}
+		if r, _ := svc.Handle("s", "k-resolve", "POST", "/p", "b", ok); r.Status != 200 || count != 3 {
+			t.Fatalf("%s: retry after Resolve must replay, not run: %+v count %d", name, r, count)
+		}
+		// Expiry applies to completed records only: a day later the completed key runs again.
+		now += 86400 + 1
+		if r, _ := svc.Handle("s", "k-release", "POST", "/p", "b", ok); r.Status != 200 || count != 4 {
+			t.Fatalf("%s: expired completed key should run again: %+v count %d", name, r, count)
+		}
+	}
 }

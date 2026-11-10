@@ -8,12 +8,22 @@
 // tests), handlers read JSON or form bodies, roles come from the users table instead of a
 // client-supplied header, the CSRF token is random per process and compared in constant time, and the
 // publish safety flag is server-side. Touches: SQLite database, network (Stripe API, production only).
+//
+// Phase B, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: change_plan follows billing change_plan (ADMIN-12,
+// amended): the handler retrieves the subscription's items, refuses anything but exactly one (409
+// subscription_item_ambiguous) before any update, and updates {id: current_item_id, price} with
+// proration_behavior create_prorations; queue_refund checks the invoice (it assumed it existed and had
+// succeeded); approving a governance action executes it in the same transaction (it only marked it
+// approved); create and reset_password really send the invite / reset email through the injectable
+// Mail, with a single-use token stored as its SHA-256; every mutation writes its audit row in the same
+// transaction as the change.
 package admin
 
 import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
@@ -60,17 +70,33 @@ func newCSRFToken() string {
 // X-Can-Publish header. Touches: nothing (in-memory flag).
 var SafetyFlags = struct{ CanPublish bool }{CanPublish: os.Getenv("ADMIN_DISABLE_PUBLISH") != "true"}
 
-// PlanChanger moves a customer's billing subscription to the price of a tier.
-// Input: subscription id and the new tier. Output: an error if the provider refused or is unreachable.
-// Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP so Stripe sits behind an interface
-// (the old code imported a stripe-go package that does not exist). Touches: money (the provider).
+// PlanChanger is the part of the billing provider change_plan needs: the price for a tier, the item ids
+// of a subscription (stripe.subscriptions.retrieve) and an update of ONE item's price
+// (stripe.subscriptions.update with {items: [{id, price}], proration_behavior: 'create_prorations'}).
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-12, amended): it was a single ChangePlan call
+// that hid the item handling, so a test could not see that the existing item id was sent, and a
+// subscription with several items had its first item silently repriced. Touches: money (the provider).
 type PlanChanger interface {
-	ChangePlan(ctx context.Context, subscriptionID, tier string) error
+	PriceID(tier string) (string, error)
+	SubscriptionItems(ctx context.Context, subscriptionID string) ([]string, error)
+	UpdateSubscriptionItem(ctx context.Context, subscriptionID, itemID, priceID string) error
 }
 
 // Billing is the PlanChanger the change_plan action calls. It defaults to Stripe configured from
 // STRIPE_SECRET_KEY and STRIPE_PRICE_<TIER> environment variables; tests replace it with a fake.
 var Billing PlanChanger = NewStripePlanChangerFromEnv()
+
+// Mailer sends the admin system's emails: the invite of a created user and a password-reset link. Each
+// carries a single-use token whose SHA-256 alone is stored. Added 2026-11-10,
+// session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-01, ADMIN-04: both emails were "omitted"). Touches: network.
+type Mailer interface {
+	SendInvite(email, token string) error
+	SendPasswordReset(email, token string) error
+}
+
+// Mail is the Mailer the user actions use. Nil (the default) makes create and reset_password answer
+// 503 mail_unavailable rather than claim an email was sent. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+var Mail Mailer
 
 // StripePlanChanger calls the Stripe REST API with the standard library (no SDK dependency).
 // Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: network (api.stripe.com), money.
@@ -101,6 +127,9 @@ func NewStripePlanChangerFromEnv() *StripePlanChanger {
 // or decode failure (the Stripe error body is included, the key never is).
 // Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: network (Stripe API).
 func (s *StripePlanChanger) stripeDo(ctx context.Context, method, path string, form url.Values, out interface{}) error {
+	if s.SecretKey == "" {
+		return errors.New("stripe is not configured (STRIPE_SECRET_KEY unset)")
+	}
 	var body io.Reader
 	if form != nil {
 		body = strings.NewReader(form.Encode())
@@ -125,19 +154,19 @@ func (s *StripePlanChanger) stripeDo(ctx context.Context, method, path string, f
 	return json.Unmarshal(raw, out)
 }
 
-// ChangePlan swaps the subscription's first item to the tier's price (spec:
-// stripe.subscriptions.update(id, {items: [{price: price_id[new_tier]}]})). Reusing the item id
-// replaces the price instead of adding a second item. Added 2026-11-10, session
-// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: network (Stripe API), money.
-func (s *StripePlanChanger) ChangePlan(ctx context.Context, subscriptionID, tier string) error {
-	if s.SecretKey == "" {
-		return errors.New("stripe is not configured (STRIPE_SECRET_KEY unset)")
-	}
+// PriceID returns the configured Stripe price for a tier. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+// Touches: nothing.
+func (s *StripePlanChanger) PriceID(tier string) (string, error) {
 	price, ok := s.PriceIDs[tier]
 	if !ok {
-		return fmt.Errorf("no Stripe price configured for tier %q (STRIPE_PRICE_%s)", tier, strings.ToUpper(tier))
+		return "", fmt.Errorf("no Stripe price configured for tier %q (STRIPE_PRICE_%s)", tier, strings.ToUpper(tier))
 	}
-	path := "/v1/subscriptions/" + url.PathEscape(subscriptionID)
+	return price, nil
+}
+
+// SubscriptionItems calls stripe.subscriptions.retrieve and returns the item ids.
+// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-12). Touches: network (Stripe API).
+func (s *StripePlanChanger) SubscriptionItems(ctx context.Context, subscriptionID string) ([]string, error) {
 	var sub struct {
 		Items struct {
 			Data []struct {
@@ -145,20 +174,36 @@ func (s *StripePlanChanger) ChangePlan(ctx context.Context, subscriptionID, tier
 			} `json:"data"`
 		} `json:"items"`
 	}
-	if err := s.stripeDo(ctx, http.MethodGet, path, nil, &sub); err != nil {
-		return err
+	if err := s.stripeDo(ctx, http.MethodGet, "/v1/subscriptions/"+url.PathEscape(subscriptionID), nil, &sub); err != nil {
+		return nil, err
 	}
-	if len(sub.Items.Data) == 0 {
-		return errors.New("stripe subscription has no items")
+	ids := make([]string, 0, len(sub.Items.Data))
+	for _, it := range sub.Items.Data {
+		ids = append(ids, it.ID)
 	}
+	return ids, nil
+}
+
+// UpdateSubscriptionItem calls stripe.subscriptions.update(id, {items: [{id: itemID, price: priceID}],
+// proration_behavior: 'create_prorations'}): the existing item gets the new price, no second item is added.
+// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-12). Touches: network (Stripe API), money.
+func (s *StripePlanChanger) UpdateSubscriptionItem(ctx context.Context, subscriptionID, itemID, priceID string) error {
 	form := url.Values{}
-	form.Set("items[0][id]", sub.Items.Data[0].ID)
-	form.Set("items[0][price]", price)
+	form.Set("items[0][id]", itemID)
+	form.Set("items[0][price]", priceID)
 	form.Set("proration_behavior", "create_prorations")
 	var updated struct {
 		ID string `json:"id"`
 	}
-	return s.stripeDo(ctx, http.MethodPost, path, form, &updated)
+	return s.stripeDo(ctx, http.MethodPost, "/v1/subscriptions/"+url.PathEscape(subscriptionID), form, &updated)
+}
+
+// newToken returns a 32-byte random token (hex) and its SHA-256 (hex), which is all that is stored.
+// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: OS random source.
+func newToken() (raw, hash string) {
+	raw = newCSRFToken()
+	h := sha256.Sum256([]byte(raw))
+	return raw, hex.EncodeToString(h[:])
 }
 
 // readParams returns the request parameters from a JSON object body (Content-Type
@@ -276,7 +321,32 @@ func migrate() error {
 			status TEXT NOT NULL DEFAULT 'pending',
 			approved_by INTEGER,
 			approved_at DATETIME,
-			rejection_reason TEXT
+			rejection_reason TEXT,
+			params TEXT,
+			execution_result TEXT
+		);`,
+		// invoices and user_tokens added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: queue_refund checks the
+		// invoice (ADMIN-13), and invite / reset tokens are stored as SHA-256 (ADMIN-01, ADMIN-04).
+		`CREATE TABLE IF NOT EXISTS invoices (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			customer_id INTEGER NOT NULL,
+			amount INTEGER NOT NULL,
+			status TEXT NOT NULL,
+			FOREIGN KEY(customer_id) REFERENCES customers(id)
+		);`,
+		`CREATE TABLE IF NOT EXISTS deployment_configs (
+			deployment_id INTEGER PRIMARY KEY,
+			theme_id INTEGER NOT NULL,
+			settings TEXT NOT NULL DEFAULT '{}',
+			created_at DATETIME NOT NULL,
+			FOREIGN KEY(deployment_id) REFERENCES deployments(id)
+		);`,
+		`CREATE TABLE IF NOT EXISTS user_tokens (
+			token_hash TEXT PRIMARY KEY,
+			user_id INTEGER NOT NULL,
+			purpose TEXT NOT NULL,
+			expires_at DATETIME NOT NULL,
+			used_at DATETIME
 		);`,
 		`CREATE TABLE IF NOT EXISTS audit_log (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -404,6 +474,11 @@ func auditLogWriteWith(ex sqlExecer, actorID int64, action, resourceType string,
 }
 
 // ---------- Handlers ----------
+
+// handleUserAction is POST /admin/users/action (owner, CSRF): create (sends the invite), reset_password
+// (sends the reset link), change_role, suspend. Each change and its audit row are one transaction; the
+// actor id comes from the authenticated context, never the body. Changed 2026-11-10,
+// session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-01/04: emails really sent; transactions). Touches: SQLite, Mail.
 func handleUserAction(w http.ResponseWriter, r *http.Request) {
 	actorID := r.Context().Value(ctxUserIDKey).(int64)
 
@@ -418,9 +493,13 @@ func handleUserAction(w http.ResponseWriter, r *http.Request) {
 		email := form.Get("email")
 		name := form.Get("name")
 		tier := form.Get("tier")
-		// form.Get("notify") would trigger an invite email; this template has no mailer, so the
-		// host app sends the invite after a successful create.
-
+		// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-01): the invite is sent through Mail with a
+		// single-use 7-day token; the user, the token hash and the audit row are one transaction, rolled
+		// back if the email cannot be sent.
+		if Mail == nil {
+			writeJSON(w, http.StatusServiceUnavailable, jsonResponse{"error": "mail_unavailable", "message": "No mailer is configured"})
+			return
+		}
 		if !validateEmail(email) || !validateName(name) || !validateRole(tier) {
 			writeJSON(w, http.StatusBadRequest, jsonResponse{"error": "validation_failed", "message": "Invalid input"})
 			return
@@ -436,18 +515,38 @@ func handleUserAction(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusConflict, jsonResponse{"error": "email_exists", "message": "Email already in use"})
 			return
 		}
-		// create
-		res, err := db.Exec(`INSERT INTO users (email, name, role, status, created_at) VALUES (?,?,?,?,?)`,
+		tx, err := db.Begin()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": "database error"})
+			return
+		}
+		defer tx.Rollback()
+		res, err := tx.Exec(`INSERT INTO users (email, name, role, status, created_at) VALUES (?,?,?,?,?)`,
 			email, name, tier, "active", time.Now().UTC())
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": err.Error()})
+			writeJSON(w, http.StatusConflict, jsonResponse{"error": "email_exists", "message": "Email already in use"})
 			return
 		}
 		userID, _ := res.LastInsertId()
-		// audit before commit (already committed due to Exec, but spec wants before commit; using transaction would be ideal)
-		_ = auditLogWrite(actorID, "user_created", "user", sql.NullInt64{Int64: userID, Valid: true},
-			sql.NullString{}, sql.NullString{String: email + "|" + tier, Valid: true}, sql.NullString{})
-		// simulate invite email omitted
+		invite, inviteHash := newToken()
+		if _, err := tx.Exec(`INSERT INTO user_tokens (token_hash, user_id, purpose, expires_at) VALUES (?,?,?,?)`,
+			inviteHash, userID, "invite", time.Now().UTC().Add(7*24*time.Hour)); err != nil {
+			writeJSON(w, http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": "database error"})
+			return
+		}
+		if err := auditLogWriteWith(tx, actorID, "user_created", "user", sql.NullInt64{Int64: userID, Valid: true},
+			sql.NullString{}, sql.NullString{String: email + "|" + tier, Valid: true}, sql.NullString{}); err != nil {
+			writeJSON(w, http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": "database error"})
+			return
+		}
+		if err := Mail.SendInvite(email, invite); err != nil {
+			writeJSON(w, http.StatusBadGateway, jsonResponse{"error": "mail_failed", "message": "The invite email could not be sent"})
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			writeJSON(w, http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": "database error"})
+			return
+		}
 		writeJSON(w, http.StatusOK, jsonResponse{
 			"success":    true,
 			"user_id":    userID,
@@ -462,8 +561,8 @@ func handleUserAction(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, jsonResponse{"error": "cannot_reset_own_password", "message": "Cannot reset own password"})
 			return
 		}
-		var role string
-		err := db.QueryRow(`SELECT role FROM users WHERE id = ?`, uid).Scan(&role)
+		var role, targetEmail string
+		err := db.QueryRow(`SELECT role, email FROM users WHERE id = ?`, uid).Scan(&role, &targetEmail)
 		if err != nil {
 			writeJSON(w, http.StatusNotFound, jsonResponse{"error": "user_not_found", "message": "User not found"})
 			return
@@ -480,9 +579,37 @@ func handleUserAction(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		// generate token & email (omitted)
-		_ = auditLogWrite(actorID, "password_reset_initiated", "user", sql.NullInt64{Int64: uid, Valid: true},
-			sql.NullString{}, sql.NullString{}, sql.NullString{})
+		// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-04): a single-use 1-hour token (only its hash is
+		// stored) is emailed through Mail; token and audit row commit only if the email was sent.
+		if Mail == nil {
+			writeJSON(w, http.StatusServiceUnavailable, jsonResponse{"error": "mail_unavailable", "message": "No mailer is configured"})
+			return
+		}
+		tx, err := db.Begin()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": "database error"})
+			return
+		}
+		defer tx.Rollback()
+		reset, resetHash := newToken()
+		if _, err := tx.Exec(`INSERT INTO user_tokens (token_hash, user_id, purpose, expires_at) VALUES (?,?,?,?)`,
+			resetHash, uid, "password_reset", time.Now().UTC().Add(time.Hour)); err != nil {
+			writeJSON(w, http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": "database error"})
+			return
+		}
+		if err := auditLogWriteWith(tx, actorID, "password_reset_initiated", "user", sql.NullInt64{Int64: uid, Valid: true},
+			sql.NullString{}, sql.NullString{}, sql.NullString{}); err != nil {
+			writeJSON(w, http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": "database error"})
+			return
+		}
+		if err := Mail.SendPasswordReset(targetEmail, reset); err != nil {
+			writeJSON(w, http.StatusBadGateway, jsonResponse{"error": "mail_failed", "message": "The reset email could not be sent"})
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			writeJSON(w, http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": "database error"})
+			return
+		}
 		writeJSON(w, http.StatusOK, jsonResponse{"success": true, "status": "reset_email_sent"})
 	case "change_role":
 		userIDStr := form.Get("user_id")
@@ -513,13 +640,17 @@ func handleUserAction(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		_, err = db.Exec(`UPDATE users SET role = ? WHERE id = ?`, newTier, uid)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": err.Error()})
+		// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the change and its audit row are one transaction.
+		if err := inTx(func(tx *sql.Tx) error {
+			if _, err := tx.Exec(`UPDATE users SET role = ? WHERE id = ?`, newTier, uid); err != nil {
+				return err
+			}
+			return auditLogWriteWith(tx, actorID, "role_changed", "user", sql.NullInt64{Int64: uid, Valid: true},
+				sql.NullString{String: oldTier, Valid: true}, sql.NullString{String: newTier, Valid: true}, sql.NullString{})
+		}); err != nil {
+			writeJSON(w, http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": "database error"})
 			return
 		}
-		_ = auditLogWrite(actorID, "role_changed", "user", sql.NullInt64{Int64: uid, Valid: true},
-			sql.NullString{String: oldTier, Valid: true}, sql.NullString{String: newTier, Valid: true}, sql.NullString{})
 		writeJSON(w, http.StatusOK, jsonResponse{
 			"success": true, "user_id": uid, "old_tier": oldTier, "new_tier": newTier,
 		})
@@ -548,13 +679,17 @@ func handleUserAction(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		_, err = db.Exec(`UPDATE users SET status='suspended' WHERE id=?`, uid)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": err.Error()})
+		// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the change and its audit row are one transaction.
+		if err := inTx(func(tx *sql.Tx) error {
+			if _, err := tx.Exec(`UPDATE users SET status='suspended' WHERE id=?`, uid); err != nil {
+				return err
+			}
+			return auditLogWriteWith(tx, actorID, "user_suspended", "user", sql.NullInt64{Int64: uid, Valid: true},
+				sql.NullString{}, sql.NullString{}, sql.NullString{String: reason, Valid: true})
+		}); err != nil {
+			writeJSON(w, http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": "database error"})
 			return
 		}
-		_ = auditLogWrite(actorID, "user_suspended", "user", sql.NullInt64{Int64: uid, Valid: true},
-			sql.NullString{}, sql.NullString{}, sql.NullString{String: reason, Valid: true})
 		writeJSON(w, http.StatusOK, jsonResponse{
 			"success": true, "user_id": uid, "suspended": true,
 		})
@@ -632,6 +767,33 @@ func handleCustomerDetail(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// inTx runs fn in one transaction and commits only if fn succeeds. Added 2026-11-10,
+// session_012zDydZCZ4AChqhEZ4oVtaP (spec: "Every mutation: audit_log write before commit"). Touches: SQLite.
+func inTx(fn func(tx *sql.Tx) error) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// handleCustomerAction is POST /admin/customers/{customer_id}/action (owner, CSRF).
+//
+// change_plan (ADMIN-12, amended 2026-11-10): unknown tier -> 400 invalid_tier; unknown customer -> 404;
+// no subscription -> 400 no_subscription; the subscription's items are retrieved and anything but exactly
+// one item -> 409 subscription_item_ambiguous, both before any update; then the provider updates
+// {id: current_item_id, price} with create_prorations, and the tier and its audit row are written in one
+// transaction. Output {success, customer_id, old_tier, new_tier, effective_date}.
+// queue_refund (ADMIN-13): the invoice must exist and belong to this customer (404 invoice_not_found), be
+// 'succeeded' (400 invalid_invoice_status), the amount positive (400 invalid_amount) and, with refunds
+// already queued or executed, not above the invoice (400 refund_exceeds_invoice); the refund row
+// (status 'queued') and its audit row are one transaction. Output {success, refund_id, status, amount}.
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: change_plan hid the item handling in the provider
+// and queue_refund assumed the invoice existed and had succeeded. Touches: SQLite, the billing provider (money).
 func handleCustomerAction(w http.ResponseWriter, r *http.Request) {
 	actorID := r.Context().Value(ctxUserIDKey).(int64)
 	parts := strings.Split(r.URL.Path, "/")
@@ -645,8 +807,10 @@ func handleCustomerAction(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, jsonResponse{"error": "bad_form", "message": "Invalid form"})
 		return
 	}
-	action := form.Get("action")
-	switch action {
+	dbError := func() {
+		writeJSON(w, http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": "database error"})
+	}
+	switch form.Get("action") {
 	case "change_plan":
 		newTier := form.Get("new_tier")
 		if !validateRole(newTier) {
@@ -664,18 +828,34 @@ func handleCustomerAction(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, jsonResponse{"error": "no_subscription", "message": "Customer has no subscription"})
 			return
 		}
-		// Billing provider update (Stripe in production, a fake in tests) before the local record.
-		if err = Billing.ChangePlan(r.Context(), stripeSubID.String, newTier); err != nil {
+		price, err := Billing.PriceID(newTier)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, jsonResponse{"error": "price_not_configured", "message": "No price is configured for that tier"})
+			return
+		}
+		items, err := Billing.SubscriptionItems(r.Context(), stripeSubID.String)
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, jsonResponse{"error": "stripe_error", "message": "Billing provider could not read the subscription"})
+			return
+		}
+		if len(items) != 1 {
+			writeJSON(w, http.StatusConflict, jsonResponse{"error": "subscription_item_ambiguous", "message": "The subscription does not have exactly one item"})
+			return
+		}
+		if err := Billing.UpdateSubscriptionItem(r.Context(), stripeSubID.String, items[0], price); err != nil {
 			writeJSON(w, http.StatusBadGateway, jsonResponse{"error": "stripe_error", "message": "Billing provider rejected the plan change"})
 			return
 		}
-		_, err = db.Exec(`UPDATE customers SET tier=? WHERE id=?`, newTier, cid)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": err.Error()})
+		if err := inTx(func(tx *sql.Tx) error {
+			if _, err := tx.Exec(`UPDATE customers SET tier=? WHERE id=?`, newTier, cid); err != nil {
+				return err
+			}
+			return auditLogWriteWith(tx, actorID, "plan_changed", "customer", sql.NullInt64{Int64: cid, Valid: true},
+				sql.NullString{String: oldTier, Valid: true}, sql.NullString{String: newTier, Valid: true}, sql.NullString{})
+		}); err != nil {
+			dbError()
 			return
 		}
-		_ = auditLogWrite(actorID, "plan_changed", "customer", sql.NullInt64{Int64: cid, Valid: true},
-			sql.NullString{String: oldTier, Valid: true}, sql.NullString{String: newTier, Valid: true}, sql.NullString{})
 		writeJSON(w, http.StatusOK, jsonResponse{
 			"success":        true,
 			"customer_id":    cid,
@@ -684,21 +864,60 @@ func handleCustomerAction(w http.ResponseWriter, r *http.Request) {
 			"effective_date": time.Now().UTC(),
 		})
 	case "queue_refund":
-		invoiceIDStr := form.Get("invoice_id")
-		amountStr := form.Get("amount")
-		reason := form.Get("reason")
-		invoiceID, _ := strconv.ParseInt(invoiceIDStr, 10, 64)
-		amount, _ := strconv.Atoi(amountStr)
-		// verify invoice exists and succeeded (omitted, assume ok)
-		res, err := db.Exec(`INSERT INTO refunds (invoice_id, amount, reason, status, created_by, created_at)
-			VALUES (?,?,?,?,?,?)`, invoiceID, amount, reason, "queued", actorID, time.Now().UTC())
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": err.Error()})
+		reason := strings.TrimSpace(form.Get("reason"))
+		invoiceID, errID := strconv.ParseInt(form.Get("invoice_id"), 10, 64)
+		amount, errAmt := strconv.ParseInt(form.Get("amount"), 10, 64)
+		if errID != nil || reason == "" {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"error": "missing_fields", "message": "invoice_id, amount and reason are required"})
 			return
 		}
-		refundID, _ := res.LastInsertId()
-		_ = auditLogWrite(actorID, "refund_queued", "refund", sql.NullInt64{Int64: refundID, Valid: true},
-			sql.NullString{}, sql.NullString{}, sql.NullString{String: reason, Valid: true})
+		if errAmt != nil || amount <= 0 {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"error": "invalid_amount", "message": "amount must be a positive integer"})
+			return
+		}
+		var refundID int64
+		var status int
+		var body jsonResponse
+		err := inTx(func(tx *sql.Tx) error {
+			var invAmount int64
+			var invStatus string
+			if err := tx.QueryRow(`SELECT amount, status FROM invoices WHERE id=? AND customer_id=?`, invoiceID, cid).Scan(&invAmount, &invStatus); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					status, body = http.StatusNotFound, jsonResponse{"error": "invoice_not_found", "message": "Invoice not found"}
+					return errDone
+				}
+				return err
+			}
+			if invStatus != "succeeded" {
+				status, body = http.StatusBadRequest, jsonResponse{"error": "invalid_invoice_status", "message": "Only a succeeded invoice can be refunded"}
+				return errDone
+			}
+			var refunded int64
+			if err := tx.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM refunds WHERE invoice_id=? AND status IN ('queued','executed')`, invoiceID).Scan(&refunded); err != nil {
+				return err
+			}
+			if refunded+amount > invAmount {
+				status, body = http.StatusBadRequest, jsonResponse{"error": "refund_exceeds_invoice", "message": "Refunds would exceed the invoice amount"}
+				return errDone
+			}
+			res, err := tx.Exec(`INSERT INTO refunds (invoice_id, amount, reason, status, created_by, created_at) VALUES (?,?,?,?,?,?)`,
+				invoiceID, amount, reason, "queued", actorID, time.Now().UTC())
+			if err != nil {
+				return err
+			}
+			refundID, _ = res.LastInsertId()
+			return auditLogWriteWith(tx, actorID, "refund_queued", "refund", sql.NullInt64{Int64: refundID, Valid: true},
+				sql.NullString{}, sql.NullString{String: fmt.Sprintf(`{"invoice_id":%d,"amount":%d}`, invoiceID, amount), Valid: true},
+				sql.NullString{String: reason, Valid: true})
+		})
+		if errors.Is(err, errDone) {
+			writeJSON(w, status, body)
+			return
+		}
+		if err != nil {
+			dbError()
+			return
+		}
 		writeJSON(w, http.StatusOK, jsonResponse{
 			"success":   true,
 			"refund_id": refundID,
@@ -709,6 +928,9 @@ func handleCustomerAction(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, jsonResponse{"error": "unknown_action", "message": "Unsupported action"})
 	}
 }
+
+// errDone stops an inTx function early with an answer already chosen (the transaction rolls back).
+var errDone = errors.New("answered")
 
 // Deployments
 func handleDeploymentsList(w http.ResponseWriter, r *http.Request) {
@@ -739,6 +961,9 @@ func handleDeploymentsList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, list)
 }
 
+// handleDeploymentAction is POST /admin/deployments/action (owner, CSRF): create, publish (double gate:
+// owner + server-side SafetyFlags.CanPublish; only from 'draft'), suspend, retire. Each change and its audit
+// row are one transaction. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite.
 func handleDeploymentAction(w http.ResponseWriter, r *http.Request) {
 	actorID := r.Context().Value(ctxUserIDKey).(int64)
 	form, err := readParams(r)
@@ -768,15 +993,27 @@ func handleDeploymentAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// theme existence omitted (assume exists)
-		res, err := db.Exec(`INSERT INTO deployments (customer_id, domain, tier, theme_id, status) VALUES (?,?,?,?,?)`,
-			custID, domain, tier, themeID, "draft")
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": err.Error()})
+		// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the record and its audit row are one transaction.
+		var depID int64
+		if err := inTx(func(tx *sql.Tx) error {
+			res, err := tx.Exec(`INSERT INTO deployments (customer_id, domain, tier, theme_id, status) VALUES (?,?,?,?,?)`,
+				custID, domain, tier, themeID, "draft")
+			if err != nil {
+				return err
+			}
+			depID, _ = res.LastInsertId()
+			// "init config" (ADMIN-14): the deployment's configuration row, added 2026-11-10,
+			// session_012zDydZCZ4AChqhEZ4oVtaP (nothing was initialised).
+			if _, err := tx.Exec(`INSERT INTO deployment_configs (deployment_id, theme_id, settings, created_at) VALUES (?,?,?,?)`,
+				depID, themeID, `{"tier":"`+tier+`"}`, time.Now().UTC()); err != nil {
+				return err
+			}
+			return auditLogWriteWith(tx, actorID, "deployment_created", "deployment", sql.NullInt64{Int64: depID, Valid: true},
+				sql.NullString{}, sql.NullString{String: domain + "|" + tier, Valid: true}, sql.NullString{})
+		}); err != nil {
+			writeJSON(w, http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": "database error"})
 			return
 		}
-		depID, _ := res.LastInsertId()
-		_ = auditLogWrite(actorID, "deployment_created", "deployment", sql.NullInt64{Int64: depID, Valid: true},
-			sql.NullString{}, sql.NullString{String: domain + "|" + tier, Valid: true}, sql.NullString{})
 		writeJSON(w, http.StatusOK, jsonResponse{
 			"success":       true,
 			"deployment_id": depID,
@@ -802,13 +1039,28 @@ func handleDeploymentAction(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, jsonResponse{"error": "invalid_state", "message": "Cannot publish"})
 			return
 		}
-		_, err = db.Exec(`UPDATE deployments SET status='live', published_at=? WHERE id=?`, time.Now().UTC(), depID)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": err.Error()})
+		// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: conditional on status='draft', with its audit row, in one
+		// transaction, so two concurrent publishes cannot both succeed.
+		published := false
+		if err := inTx(func(tx *sql.Tx) error {
+			res, err := tx.Exec(`UPDATE deployments SET status='live', published_at=? WHERE id=? AND status='draft'`, time.Now().UTC(), depID)
+			if err != nil {
+				return err
+			}
+			if n, _ := res.RowsAffected(); n != 1 {
+				return nil
+			}
+			published = true
+			return auditLogWriteWith(tx, actorID, "deployment_published", "deployment", sql.NullInt64{Int64: depID, Valid: true},
+				sql.NullString{}, sql.NullString{}, sql.NullString{})
+		}); err != nil {
+			writeJSON(w, http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": "database error"})
 			return
 		}
-		_ = auditLogWrite(actorID, "deployment_published", "deployment", sql.NullInt64{Int64: depID, Valid: true},
-			sql.NullString{}, sql.NullString{}, sql.NullString{})
+		if !published {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"error": "invalid_state", "message": "Cannot publish"})
+			return
+		}
 		writeJSON(w, http.StatusOK, jsonResponse{
 			"success":       true,
 			"deployment_id": depID,
@@ -819,13 +1071,28 @@ func handleDeploymentAction(w http.ResponseWriter, r *http.Request) {
 		depIDStr := form.Get("deployment_id")
 		reason := form.Get("reason")
 		depID, _ := strconv.ParseInt(depIDStr, 10, 64)
-		_, err := db.Exec(`UPDATE deployments SET status='suspended', suspend_reason=? WHERE id=?`, reason, depID)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": err.Error()})
+		// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: an unknown deployment is 404 (it answered success), and
+		// the change and its audit row are one transaction.
+		found := false
+		if err := inTx(func(tx *sql.Tx) error {
+			res, err := tx.Exec(`UPDATE deployments SET status='suspended', suspend_reason=? WHERE id=?`, reason, depID)
+			if err != nil {
+				return err
+			}
+			if n, _ := res.RowsAffected(); n != 1 {
+				return nil
+			}
+			found = true
+			return auditLogWriteWith(tx, actorID, "deployment_suspended", "deployment", sql.NullInt64{Int64: depID, Valid: true},
+				sql.NullString{}, sql.NullString{}, sql.NullString{String: reason, Valid: true})
+		}); err != nil {
+			writeJSON(w, http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": "database error"})
 			return
 		}
-		_ = auditLogWrite(actorID, "deployment_suspended", "deployment", sql.NullInt64{Int64: depID, Valid: true},
-			sql.NullString{}, sql.NullString{}, sql.NullString{String: reason, Valid: true})
+		if !found {
+			writeJSON(w, http.StatusNotFound, jsonResponse{"error": "not_found", "message": "Deployment not found"})
+			return
+		}
 		writeJSON(w, http.StatusOK, jsonResponse{
 			"success":       true,
 			"deployment_id": depID,
@@ -834,13 +1101,27 @@ func handleDeploymentAction(w http.ResponseWriter, r *http.Request) {
 	case "retire":
 		depIDStr := form.Get("deployment_id")
 		depID, _ := strconv.ParseInt(depIDStr, 10, 64)
-		_, err := db.Exec(`UPDATE deployments SET status='archived', archived_at=? WHERE id=?`, time.Now().UTC(), depID)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": err.Error()})
+		// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: 404 for an unknown deployment; one transaction.
+		found := false
+		if err := inTx(func(tx *sql.Tx) error {
+			res, err := tx.Exec(`UPDATE deployments SET status='archived', archived_at=? WHERE id=?`, time.Now().UTC(), depID)
+			if err != nil {
+				return err
+			}
+			if n, _ := res.RowsAffected(); n != 1 {
+				return nil
+			}
+			found = true
+			return auditLogWriteWith(tx, actorID, "deployment_archived", "deployment", sql.NullInt64{Int64: depID, Valid: true},
+				sql.NullString{}, sql.NullString{}, sql.NullString{})
+		}); err != nil {
+			writeJSON(w, http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": "database error"})
 			return
 		}
-		_ = auditLogWrite(actorID, "deployment_archived", "deployment", sql.NullInt64{Int64: depID, Valid: true},
-			sql.NullString{}, sql.NullString{}, sql.NullString{})
+		if !found {
+			writeJSON(w, http.StatusNotFound, jsonResponse{"error": "not_found", "message": "Deployment not found"})
+			return
+		}
 		writeJSON(w, http.StatusOK, jsonResponse{
 			"success":       true,
 			"deployment_id": depID,
@@ -943,7 +1224,8 @@ func handleGovernanceDecide(w http.ResponseWriter, r *http.Request) {
 
 // decideAction applies one governance decision in a single transaction: the status change (approve:
 // status='approved', approved_by, approved_at; reject: status='rejected', rejection_reason), the
-// action's execution (in this template, approving only marks it approved), and its audit row
+// action's execution (executeAction; added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: approving used to
+// only mark it approved), and its audit row
 // (action_approved / action_rejected). The UPDATE carries AND status='pending' and its RowsAffected is
 // checked, so when another request has already decided the action nothing is changed, no audit row is
 // written, and the answer is 409 action_not_pending.
@@ -992,14 +1274,97 @@ func decideAction(actorID, actionID int64, decide, reason string) (int, jsonResp
 	if n == 0 {
 		return http.StatusConflict, jsonResponse{"error": "action_not_pending", "message": "Action already decided"}
 	}
+	var result sql.NullString
+	if decide == "approve" {
+		// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-16): approving executes the original action in
+		// this transaction; if it cannot run, nothing is approved.
+		out, status, body := executeAction(tx, actorID, actionID)
+		if body != nil {
+			return status, body
+		}
+		result = sql.NullString{String: out, Valid: true}
+		if _, err := tx.Exec(`UPDATE actions SET execution_result=? WHERE id=?`, out, actionID); err != nil {
+			return dbError(err)
+		}
+	}
 	if err := auditLogWriteWith(tx, actorID, auditName, "action", sql.NullInt64{Int64: actionID, Valid: true},
-		sql.NullString{}, sql.NullString{}, auditWhy); err != nil {
+		sql.NullString{}, result, auditWhy); err != nil {
 		return dbError(err)
 	}
 	if err := tx.Commit(); err != nil {
 		return dbError(err)
 	}
 	return http.StatusOK, jsonResponse{"success": true, "action_id": actionID, "status": newStatus}
+}
+
+// executeAction runs an approved governance action inside tx and returns its execution result as JSON.
+// Supported action types: "change_role" (params {"new_tier"}) and "suspend_user" (params {"reason"}) on
+// the target user, with the same checks as the direct actions (the last active owner is never demoted or
+// suspended). Any other type, a missing target or bad params answers with an error status and body (the
+// caller rolls back, so the action stays pending). Out: (result JSON, 0, nil) or (_, status, body).
+// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-16: "execute the original action"; approval
+// used to only mark it approved). Touches: SQLite users and audit_log (inside tx).
+func executeAction(tx *sql.Tx, actorID, actionID int64) (string, int, jsonResponse) {
+	var actionType string
+	var target sql.NullInt64
+	var params sql.NullString
+	if err := tx.QueryRow(`SELECT action_type, target_resource_id, params FROM actions WHERE id=?`, actionID).Scan(&actionType, &target, &params); err != nil {
+		return "", http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": "database error"}
+	}
+	p := map[string]string{}
+	if params.Valid && params.String != "" {
+		if err := json.Unmarshal([]byte(params.String), &p); err != nil {
+			return "", http.StatusUnprocessableEntity, jsonResponse{"error": "invalid_action_params", "message": "Action params are not valid JSON"}
+		}
+	}
+	if actionType != "change_role" && actionType != "suspend_user" {
+		return "", http.StatusUnprocessableEntity, jsonResponse{"error": "unsupported_action_type", "message": "No executor for action type " + actionType}
+	}
+	var role, status string
+	if !target.Valid || tx.QueryRow(`SELECT role, status FROM users WHERE id=?`, target.Int64).Scan(&role, &status) != nil {
+		return "", http.StatusUnprocessableEntity, jsonResponse{"error": "target_not_found", "message": "The action's target user does not exist"}
+	}
+	lastOwner := false
+	if role == "owner" {
+		var others int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM users WHERE role='owner' AND status='active' AND id != ?`, target.Int64).Scan(&others); err != nil {
+			return "", http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": "database error"}
+		}
+		lastOwner = others == 0
+	}
+	uid := sql.NullInt64{Int64: target.Int64, Valid: true}
+	switch actionType {
+	case "change_role":
+		newTier := p["new_tier"]
+		if !validateRole(newTier) {
+			return "", http.StatusUnprocessableEntity, jsonResponse{"error": "invalid_action_params", "message": "change_role needs a valid new_tier"}
+		}
+		if lastOwner && newTier != "owner" {
+			return "", http.StatusBadRequest, jsonResponse{"error": "cannot_demote_last_owner", "message": "Cannot demote last active owner"}
+		}
+		if _, err := tx.Exec(`UPDATE users SET role=? WHERE id=?`, newTier, target.Int64); err != nil {
+			return "", http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": "database error"}
+		}
+		if err := auditLogWriteWith(tx, actorID, "role_changed", "user", uid, sql.NullString{String: role, Valid: true},
+			sql.NullString{String: newTier, Valid: true}, sql.NullString{}); err != nil {
+			return "", http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": "database error"}
+		}
+		out, _ := json.Marshal(map[string]string{"old_tier": role, "new_tier": newTier})
+		return string(out), 0, nil
+	default: // suspend_user
+		if lastOwner {
+			return "", http.StatusBadRequest, jsonResponse{"error": "cannot_suspend_last_owner", "message": "Cannot suspend last active owner"}
+		}
+		if _, err := tx.Exec(`UPDATE users SET status='suspended' WHERE id=?`, target.Int64); err != nil {
+			return "", http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": "database error"}
+		}
+		if err := auditLogWriteWith(tx, actorID, "user_suspended", "user", uid, sql.NullString{}, sql.NullString{},
+			sql.NullString{String: p["reason"], Valid: p["reason"] != ""}); err != nil {
+			return "", http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": "database error"}
+		}
+		out, _ := json.Marshal(map[string]interface{}{"user_id": target.Int64, "suspended": true})
+		return string(out), 0, nil
+	}
 }
 
 func handleAuditLogSearch(w http.ResponseWriter, r *http.Request) {

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -21,23 +22,40 @@ func setupServer() *httptest.Server {
 	return httptest.NewServer(mux)
 }
 
+// postJSON posts payload and returns the response with its body already read and the connection
+// released. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: bodies were never closed, so the
+// 10,000 posts of TestPerformance each kept a connection open and ran out of file descriptors.
 func postJSON(t *testing.T, url string, payload interface{}) *http.Response {
 	body, _ := json.Marshal(payload)
 	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("POST error: %v", err)
 	}
-	return resp
+	return buffered(t, resp)
 }
 
+// getJSON is postJSON for GET. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (same reason).
 func getJSON(t *testing.T, url string) *http.Response {
 	resp, err := http.Get(url)
 	if err != nil {
 		t.Fatalf("GET error: %v", err)
 	}
+	return buffered(t, resp)
+}
+
+// buffered reads and closes resp.Body and replaces it with an in-memory copy.
+// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the test HTTP connection.
+func buffered(t *testing.T, resp *http.Response) *http.Response {
+	data, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(data))
 	return resp
 }
 
+// SEARCH-01
 func TestIndexAndSearchUser(t *testing.T) {
 	server := setupServer()
 	defer server.Close()
@@ -79,6 +97,7 @@ func TestIndexAndSearchUser(t *testing.T) {
 	}
 }
 
+// SEARCH-02
 func TestIndexDeploymentAndSearch(t *testing.T) {
 	server := setupServer()
 	defer server.Close()
@@ -107,6 +126,7 @@ func TestIndexDeploymentAndSearch(t *testing.T) {
 	}
 }
 
+// SEARCH-03
 func TestPartialMatch(t *testing.T) {
 	server := setupServer()
 	defer server.Close()
@@ -129,8 +149,18 @@ func TestPartialMatch(t *testing.T) {
 	if sr.Total != 1 {
 		t.Fatalf("expected total 1, got %d", sr.Total)
 	}
+
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (SEARCH-03, amended): a term matches a word equal to it
+	// or starting with it, never one merely containing it.
+	resp = getJSON(t, server.URL+"/search?q=ripe&document_type=deployment")
+	sr = SearchResponse{}
+	json.NewDecoder(resp.Body).Decode(&sr)
+	if sr.Total != 0 {
+		t.Fatalf(`"ripe" must not find "stripe"; got total %d`, sr.Total)
+	}
 }
 
+// SEARCH-04
 func TestFilters(t *testing.T) {
 	server := setupServer()
 	defer server.Close()
@@ -168,6 +198,7 @@ func TestFilters(t *testing.T) {
 	}
 }
 
+// SEARCH-05
 func TestFacets(t *testing.T) {
 	server := setupServer()
 	defer server.Close()
@@ -218,6 +249,7 @@ func TestFacets(t *testing.T) {
 	}
 }
 
+// SEARCH-06
 func TestUnindex(t *testing.T) {
 	server := setupServer()
 	defer server.Close()
@@ -258,6 +290,7 @@ func TestUnindex(t *testing.T) {
 	}
 }
 
+// SEARCH-07
 func TestRealTimeIndexing(t *testing.T) {
 	server := setupServer()
 	defer server.Close()
@@ -288,41 +321,68 @@ func TestRealTimeIndexing(t *testing.T) {
 	}
 }
 
+// TestRelevanceOrdering proves SEARCH-09 (amended): an exact word match ranks above a prefix match, and
+// equal scores keep insertion order (not document id order).
+// Rewritten 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the old documents ("exact match" and "examine
+// match") did not both match the query, so the ordering was never tested.
+// SEARCH-09
 func TestRelevanceOrdering(t *testing.T) {
 	server := setupServer()
 	defer server.Close()
 
-	docExact := Document{
-		DocumentType: "user",
-		DocumentID:   800,
-		Content:      "exact match",
-		Metadata: map[string]interface{}{
-			"tier":   "solo",
-			"status": "active",
-		},
+	meta := map[string]interface{}{"tier": "solo", "status": "active"}
+	for _, d := range []Document{
+		{DocumentType: "user", DocumentID: 900, Content: "stripes and more", Metadata: meta}, // prefix, indexed first
+		{DocumentType: "user", DocumentID: 801, Content: "stripe billing", Metadata: meta},   // exact
+		{DocumentType: "user", DocumentID: 500, Content: "stripe again", Metadata: meta},     // exact, indexed after 801
+	} {
+		postJSON(t, server.URL+"/search/index", d)
 	}
-	docPartial := Document{
-		DocumentType: "user",
-		DocumentID:   801,
-		Content:      "examine match",
-		Metadata: map[string]interface{}{
-			"tier":   "solo",
-			"status": "active",
-		},
-	}
-	postJSON(t, server.URL+"/search/index", docExact)
-	postJSON(t, server.URL+"/search/index", docPartial)
 
-	searchURL := server.URL + "/search?q=exact&document_type=user"
-	resp := getJSON(t, searchURL)
+	resp := getJSON(t, server.URL+"/search?q=stripe&document_type=user")
 	var sr SearchResponse
 	json.NewDecoder(resp.Body).Decode(&sr)
-	if sr.Total != 1 {
-		t.Fatalf("expected total 1, got %d", sr.Total)
+	if sr.Total != 3 {
+		t.Fatalf("expected total 3, got %d", sr.Total)
 	}
-	if sr.Results[0].DocumentID != 800 {
-		t.Fatalf("expected exact match first, got %d", sr.Results[0].DocumentID)
+	got := []int{sr.Results[0].DocumentID, sr.Results[1].DocumentID, sr.Results[2].DocumentID}
+	if got[0] != 801 || got[1] != 500 || got[2] != 900 {
+		t.Fatalf("expected exact matches in insertion order then the prefix match [801 500 900], got %v", got)
 	}
+	if sr.Results[0].Relevance <= sr.Results[2].Relevance {
+		t.Fatalf("exact relevance %v should exceed prefix relevance %v", sr.Results[0].Relevance, sr.Results[2].Relevance)
+	}
+}
+
+// TestOneMillionDocumentsUnder200ms proves SEARCH-08: with 1,000,000 documents indexed, a search returns
+// in under 200 ms (the contract budget). It calls the index directly, as the other languages do, so the
+// time measured is the search, not 1M HTTP requests. Written 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP:
+// the Go suite only indexed 10,000. Touches: process memory (about a few hundred MB).
+// SEARCH-08
+func TestOneMillionDocumentsUnder200ms(t *testing.T) {
+	idx := newIndex()
+	meta := map[string]interface{}{"tier": "team", "status": "active"} // shared: every document has the same metadata
+	for i := 0; i < 1_000_000; i++ {
+		idx.IndexDocument(Document{
+			DocumentType: "deployment",
+			DocumentID:   i,
+			Content:      "document " + strconv.Itoa(i) + " stripe integration deployment active",
+			Metadata:     meta,
+		})
+	}
+	start := time.Now()
+	results, total, _, _, err := idx.Search("stripe", "deployment", 20, 0, nil, nil)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed >= 200*time.Millisecond {
+		t.Fatalf("search over 1M documents took %v, budget 200ms", elapsed)
+	}
+	if total != 1_000_000 || len(results) != 20 || results[0].DocumentID != 0 || results[19].DocumentID != 19 {
+		t.Fatalf("expected all 1M in insertion order, got total %d, first %v", total, results[:1])
+	}
+	t.Logf("1M-document search: %v", elapsed)
 }
 
 func TestPerformance(t *testing.T) {

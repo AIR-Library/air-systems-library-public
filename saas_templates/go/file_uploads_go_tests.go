@@ -23,6 +23,7 @@ func setupTest(t *testing.T) (*FileUploads, *InMemoryStore, string) {
 	return fu, store, tmpDir
 }
 
+// UPLOAD-01
 func TestExeRejected(t *testing.T) {
 	fu, store, _ := setupTest(t)
 	store.AddOrgMember("org1", "user1")
@@ -40,6 +41,7 @@ func TestExeRejected(t *testing.T) {
 	}
 }
 
+// UPLOAD-02
 func TestRealPNGAcceptedGeneratedName(t *testing.T) {
 	fu, store, tmpDir := setupTest(t)
 	store.AddOrgMember("org1", "user1")
@@ -71,6 +73,7 @@ func TestRealPNGAcceptedGeneratedName(t *testing.T) {
 	}
 }
 
+// UPLOAD-03
 func TestPathTraversalStoredSafely(t *testing.T) {
 	fu, store, tmpDir := setupTest(t)
 	store.AddOrgMember("org1", "user1")
@@ -96,6 +99,7 @@ func TestPathTraversalStoredSafely(t *testing.T) {
 	}
 }
 
+// UPLOAD-04
 func TestFileOverSizeLimitRejected(t *testing.T) {
 	fu, store, _ := setupTest(t)
 	store.AddOrgMember("org1", "user1")
@@ -111,6 +115,7 @@ func TestFileOverSizeLimitRejected(t *testing.T) {
 	}
 }
 
+// UPLOAD-05
 func TestNonMemberCannotUploadOrDownload(t *testing.T) {
 	fu, store, _ := setupTest(t)
 	store.AddOrgMember("org1", "user1")
@@ -137,12 +142,20 @@ func TestNonMemberCannotUploadOrDownload(t *testing.T) {
 		t.Fatalf("member create link failed: %v", err)
 	}
 
-	_, err = fu.Download(token)
+	_, err = fu.Download("user1", token)
 	if err != nil {
 		t.Fatalf("member download failed: %v", err)
 	}
+
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: download(user, token) re-checks the caller (spec
+	// UPLOAD-05); a non-member holding a valid link is refused.
+	_, err = fu.Download("user2", token)
+	if err != ErrUnauthorized {
+		t.Errorf("non-member download with a valid link should fail: %v", err)
+	}
 }
 
+// UPLOAD-06
 func TestExpiredAndTamperedLinkRejected(t *testing.T) {
 	fu, store, _ := setupTest(t)
 	store.AddOrgMember("org1", "user1")
@@ -153,13 +166,20 @@ func TestExpiredAndTamperedLinkRejected(t *testing.T) {
 		t.Fatalf("upload failed: %v", err)
 	}
 
-	token, err := fu.CreateDownloadLink("user1", fileID, 1)
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: an injectable clock replaces the 2 s sleep (spec
+	// README: time comes from an injectable clock); the link is 1 s old past its 300 s expiry.
+	now := time.Unix(1_700_000_000, 0)
+	fu.config.Now = func() time.Time { return now }
+	token, err := fu.CreateDownloadLink("user1", fileID, 300)
 	if err != nil {
 		t.Fatalf("create link failed: %v", err)
 	}
+	if _, err = fu.Download("user1", token); err != nil {
+		t.Fatalf("link inside its lifetime should work: %v", err)
+	}
 
-	time.Sleep(2 * time.Second)
-	_, err = fu.Download(token)
+	now = now.Add(301 * time.Second)
+	_, err = fu.Download("user1", token)
 	if err != ErrTokenExpired {
 		t.Errorf("expected ErrTokenExpired, got %v", err)
 	}
@@ -170,12 +190,13 @@ func TestExpiredAndTamperedLinkRejected(t *testing.T) {
 	}
 
 	tampered := token2[:len(token2)-1] + "X"
-	_, err = fu.Download(tampered)
+	_, err = fu.Download("user1", tampered)
 	if err != ErrInvalidToken {
 		t.Errorf("expected ErrInvalidToken for tampered link, got %v", err)
 	}
 }
 
+// UPLOAD-07
 func TestAfterDeleteFileCannotLinkOrDownload(t *testing.T) {
 	fu, store, _ := setupTest(t)
 	store.AddOrgMember("org1", "user1")
@@ -204,7 +225,7 @@ func TestAfterDeleteFileCannotLinkOrDownload(t *testing.T) {
 	}
 
 	// Download with pre-delete token should fail with ErrFileNotFound
-	_, err = fu.Download(token)
+	_, err = fu.Download("user1", token)
 	if err != ErrFileNotFound {
 		t.Errorf("expected ErrFileNotFound on download after delete, got %v", err)
 	}
@@ -354,17 +375,17 @@ func TestDeleteByNonOwnerFails(t *testing.T) {
 func TestMalformedTokenHandledGracefully(t *testing.T) {
 	fu, _, _ := setupTest(t)
 
-	_, err := fu.Download("not-base64!@#")
+	_, err := fu.Download("user1", "not-base64!@#")
 	if err != ErrInvalidToken {
 		t.Errorf("expected ErrInvalidToken for bad base64, got %v", err)
 	}
 
-	_, err = fu.Download("dGhpcyBpcyBub3QgYSB2YWxpZCB0b2tlbg==")
+	_, err = fu.Download("user1", "dGhpcyBpcyBub3QgYSB2YWxpZCB0b2tlbg==")
 	if err != ErrInvalidToken {
 		t.Errorf("expected ErrInvalidToken for wrong parts, got %v", err)
 	}
 
-	_, err = fu.Download("ZmlsZTEuMTIzLmludmFsaWQ=")
+	_, err = fu.Download("user1", "ZmlsZTEuMTIzLmludmFsaWQ=")
 	if err != ErrInvalidToken {
 		t.Errorf("expected ErrInvalidToken for bad sig, got %v", err)
 	}
@@ -386,7 +407,7 @@ func TestDownloadRechecksOrgMembership(t *testing.T) {
 		t.Fatalf("create link failed: %v", err)
 	}
 
-	_, err = fu.Download(token)
+	_, err = fu.Download("user1", token)
 	if err != nil {
 		t.Fatalf("owner download failed: %v", err)
 	}
@@ -395,8 +416,28 @@ func TestDownloadRechecksOrgMembership(t *testing.T) {
 	store2.AddOrgMember("org1", "user1")
 	fu2 := NewFileUploads(fu.config, store2)
 
-	_, err = fu2.Download(token)
+	_, err = fu2.Download("user1", token)
 	if err != ErrFileNotFound {
 		t.Errorf("expected ErrFileNotFound when file not in store, got %v", err)
+	}
+}
+// TestFullSignaturesRequired proves the spec's FULL magic-byte signatures: a 4-byte PNG prefix, "GIF8"
+// without "7a"/"9a", and "%PDF" without "-" are rejected. Why: file_uploads spec (amended 2026-09-26);
+// Go checked 4-byte prefixes. Written 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: a temp dir.
+func TestFullSignaturesRequired(t *testing.T) {
+	fu, store, _ := setupTest(t)
+	store.AddOrgMember("org1", "user1")
+	cases := map[string][]byte{
+		"a.png": {0x89, 0x50, 0x4E, 0x47, 0x00, 0x00, 0x00, 0x00},
+		"a.gif": []byte("GIF8xx"),
+		"a.pdf": []byte("%PDF1.4"),
+	}
+	for name, data := range cases {
+		if _, err := fu.Upload("user1", "org1", name, data, "application/octet-stream"); err != ErrInvalidMagicBytes {
+			t.Errorf("%s with a partial signature: want ErrInvalidMagicBytes, got %v", name, err)
+		}
+	}
+	if _, err := fu.Upload("user1", "org1", "a.gif", []byte("GIF87a"), "image/gif"); err != nil {
+		t.Errorf("GIF87a should be accepted: %v", err)
 	}
 }

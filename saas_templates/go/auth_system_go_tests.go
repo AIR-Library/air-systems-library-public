@@ -2,15 +2,57 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/pquerna/otp/totp"
 )
 
+// fakeMailer records verification emails instead of sending them (no network in tests).
+// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-01 "email sent").
+type fakeMailer struct{ sent map[string]string } // email -> code
+
+// SendVerificationEmail records the code for the address.
+func (f *fakeMailer) SendVerificationEmail(_ context.Context, email, code string) error {
+	f.sent[email] = code
+	return nil
+}
+
+// fakeOAuth answers ExchangeCode from a fixed table of code -> identity (no network in tests).
+// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-10/11).
+type fakeOAuth struct{ ids map[string]OAuthIdentity }
+
+// ExchangeCode returns the identity for a known code, else an error.
+func (f *fakeOAuth) ExchangeCode(_ context.Context, _ string, code string) (OAuthIdentity, error) {
+	id, ok := f.ids[code]
+	if !ok {
+		return OAuthIdentity{}, errors.New("unknown code")
+	}
+	return id, nil
+}
+
+// newTestAuth builds an AuthSystem with the fake mailer and OAuth provider.
+// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: NewAuthSystem alone has no email sender, and
+// signup refuses rather than pretend to send. Touches: in-memory SQLite.
+func newTestAuth(t *testing.T) (*AuthSystem, error) {
+	t.Helper()
+	return NewAuthSystemWithOptions(Options{
+		Email: &fakeMailer{sent: map[string]string{}},
+		OAuth: &fakeOAuth{ids: map[string]OAuthIdentity{
+			"code-new":      {ProviderUserID: "g-1", Email: "newuser@example.com", EmailVerified: true},
+			"code-ivy":      {ProviderUserID: "gh-7", Email: "ivy@example.com", EmailVerified: true},
+			"code-unverified": {ProviderUserID: "g-2", Email: "x@example.com", EmailVerified: false},
+		}},
+	})
+}
+
+// AUTH-01
 func TestSignupHappyPath(t *testing.T) {
-	as, err := NewAuthSystem()
+	as, err := newTestAuth(t)
 	if err != nil {
 		t.Fatalf("NewAuthSystem failed: %v", err)
 	}
@@ -21,10 +63,23 @@ func TestSignupHappyPath(t *testing.T) {
 	if !ok || !success || resp["status"] != "pending_verification" {
 		t.Fatalf("unexpected response: %v", resp)
 	}
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: AUTH-01 also says "user created, email sent".
+	userID, err := as.getUserIDByEmail(ctx, "alice@example.com")
+	if err != nil {
+		t.Fatalf("user not created: %v", err)
+	}
+	code, err := as.getLatestVerificationCode(ctx, userID, "email")
+	if err != nil {
+		t.Fatalf("no verification code: %v", err)
+	}
+	if sent := as.email.(*fakeMailer).sent["alice@example.com"]; sent == "" || sent != code {
+		t.Fatalf("verification email not sent with the stored code: sent %q, stored %q", sent, code)
+	}
 }
 
+// AUTH-02
 func TestSignupDuplicateEmail(t *testing.T) {
-	as, err := NewAuthSystem()
+	as, err := newTestAuth(t)
 	if err != nil {
 		t.Fatalf("NewAuthSystem failed: %v", err)
 	}
@@ -37,21 +92,42 @@ func TestSignupDuplicateEmail(t *testing.T) {
 	}
 }
 
+// AUTH-03
 func TestSignupWeakPassword(t *testing.T) {
-	as, err := NewAuthSystem()
+	as, err := newTestAuth(t)
 	if err != nil {
 		t.Fatalf("NewAuthSystem failed: %v", err)
 	}
 	ctx := context.Background()
 	ip := "192.0.2.3"
-	resp := as.Signup(ctx, "carol@example.com", "short", "Carol", ip)
-	if resp["error"] != "password_too_weak" {
-		t.Fatalf("expected weak password error, got %v", resp)
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the amended AUTH-03 answers
+	// {error: "password_rejected", reason} (password_too_weak is gone); checks run too_short, too_long,
+	// blocklisted and the first failure wins, so "password123" is too_short, not blocklisted.
+	cases := []struct{ pw, name, reason string }{
+		{"short", "Carol", "too_short"},
+		{"password123", "Carol", "too_short"},
+		{strings.Repeat("a", 65), "Carol", "too_long"},
+		{"Carol Danvers Marvel", "Carol Danvers Marvel", "blocklisted"},
+		{"carol@example.com", "Carol", "blocklisted"},
+	}
+	for _, c := range cases {
+		resp := as.Signup(ctx, "carol@example.com", c.pw, c.name, ip)
+		if resp["error"] != "password_rejected" || resp["reason"] != c.reason {
+			t.Fatalf("%q: expected password_rejected/%s, got %v", c.pw, c.reason, resp)
+		}
+	}
+	if _, err := as.getUserIDByEmail(ctx, "carol@example.com"); err == nil {
+		t.Fatalf("a rejected password must not create the user")
+	}
+	// 15 characters with an empty name is accepted (an empty name used to blocklist everything).
+	if resp := as.Signup(ctx, "carol@example.com", "correct horse b", "", "192.0.2.33"); resp["success"] != true {
+		t.Fatalf("a 15-character password should be accepted: %v", resp)
 	}
 }
 
+// AUTH-04
 func TestSignupIPRateLimit(t *testing.T) {
-	as, err := NewAuthSystem()
+	as, err := newTestAuth(t)
 	if err != nil {
 		t.Fatalf("NewAuthSystem failed: %v", err)
 	}
@@ -66,8 +142,9 @@ func TestSignupIPRateLimit(t *testing.T) {
 	}
 }
 
+// AUTH-05
 func TestVerifyEmailHappyPath(t *testing.T) {
-	as, err := NewAuthSystem()
+	as, err := newTestAuth(t)
 	if err != nil {
 		t.Fatalf("NewAuthSystem failed: %v", err)
 	}
@@ -95,8 +172,9 @@ func TestVerifyEmailHappyPath(t *testing.T) {
 	}
 }
 
+// AUTH-06
 func TestVerifyEmailExpiredCode(t *testing.T) {
-	as, err := NewAuthSystem()
+	as, err := newTestAuth(t)
 	if err != nil {
 		t.Fatalf("NewAuthSystem failed: %v", err)
 	}
@@ -132,8 +210,9 @@ func TestVerifyEmailExpiredCode(t *testing.T) {
 	}
 }
 
+// AUTH-07
 func TestLoginHappyPathNoMFA(t *testing.T) {
-	as, err := NewAuthSystem()
+	as, err := newTestAuth(t)
 	if err != nil {
 		t.Fatalf("NewAuthSystem failed: %v", err)
 	}
@@ -162,8 +241,9 @@ func TestLoginHappyPathNoMFA(t *testing.T) {
 	}
 }
 
+// AUTH-08
 func TestLoginWithMFAEnabled(t *testing.T) {
-	as, err := NewAuthSystem()
+	as, err := newTestAuth(t)
 	if err != nil {
 		t.Fatalf("NewAuthSystem failed: %v", err)
 	}
@@ -199,8 +279,9 @@ func TestLoginWithMFAEnabled(t *testing.T) {
 	}
 }
 
+// AUTH-09
 func TestLoginInvalidPassword(t *testing.T) {
-	as, err := NewAuthSystem()
+	as, err := newTestAuth(t)
 	if err != nil {
 		t.Fatalf("NewAuthSystem failed: %v", err)
 	}
@@ -229,20 +310,52 @@ func TestLoginInvalidPassword(t *testing.T) {
 	}
 }
 
+// AUTH-10
 func TestOAuthCallbackNewUser(t *testing.T) {
-	as, err := NewAuthSystem()
+	as, err := newTestAuth(t)
 	if err != nil {
 		t.Fatalf("NewAuthSystem failed: %v", err)
 	}
 	ctx := context.Background()
-	resp := as.OAuthCallback(ctx, "google", "newuser@example.com", "validstate")
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the callback now needs a state from StartOAuth and
+	// gets the email from the provider exchange, not from the code (which used to BE the email).
+	state, err := as.StartOAuth(ctx, "google")
+	if err != nil {
+		t.Fatalf("StartOAuth: %v", err)
+	}
+	resp := as.OAuthCallback(ctx, "google", "code-new", state)
 	if resp["status"] != "authenticated" {
 		t.Fatalf("expected authenticated, got %v", resp)
 	}
+	userID, err := as.getUserIDByEmail(ctx, "newuser@example.com")
+	if err != nil {
+		t.Fatalf("user not created: %v", err)
+	}
+	var linked int64
+	if err := as.db.QueryRow(`SELECT user_id FROM oauth_accounts WHERE provider='google' AND provider_user_id='g-1'`).Scan(&linked); err != nil || linked != userID {
+		t.Fatalf("oauth not linked to the new user: %d (%v)", linked, err)
+	}
+	// The state is single use, a made-up state fails, and an unverified provider email is refused.
+	if r := as.OAuthCallback(ctx, "google", "code-new", state); r["error"] != "invalid_state" {
+		t.Fatalf("reused state: expected invalid_state, got %v", r)
+	}
+	if r := as.OAuthCallback(ctx, "google", "code-new", "validstate"); r["error"] != "invalid_state" {
+		t.Fatalf("unknown state: expected invalid_state, got %v", r)
+	}
+	state2, _ := as.StartOAuth(ctx, "google")
+	if r := as.OAuthCallback(ctx, "google", "code-unverified", state2); r["error"] != "email_not_verified" {
+		t.Fatalf("unverified email: expected email_not_verified, got %v", r)
+	}
+	// A code that names an email directly is not an identity.
+	state3, _ := as.StartOAuth(ctx, "google")
+	if r := as.OAuthCallback(ctx, "google", "victim@example.com", state3); r["error"] != "oauth_exchange_failed" {
+		t.Fatalf("raw email as code: expected oauth_exchange_failed, got %v", r)
+	}
 }
 
+// AUTH-11
 func TestOAuthCallbackExistingUser(t *testing.T) {
-	as, err := NewAuthSystem()
+	as, err := newTestAuth(t)
 	if err != nil {
 		t.Fatalf("NewAuthSystem failed: %v", err)
 	}
@@ -265,14 +378,32 @@ func TestOAuthCallbackExistingUser(t *testing.T) {
 	}
 	_ = as.VerifyEmail(ctx, "ivy@example.com", code)
 
-	resp = as.OAuthCallback(ctx, "github", "ivy@example.com", "validstate")
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: state from StartOAuth, identity from the provider.
+	state, err := as.StartOAuth(ctx, "github")
+	if err != nil {
+		t.Fatalf("StartOAuth: %v", err)
+	}
+	resp = as.OAuthCallback(ctx, "github", "code-ivy", state)
 	if resp["status"] != "authenticated" {
 		t.Fatalf("expected authenticated, got %v", resp)
 	}
+	if got := resp["user"].(map[string]interface{})["id"]; got != userID {
+		t.Fatalf("expected the existing user %d, got %v", userID, got)
+	}
+	var linked int64
+	if err := as.db.QueryRow(`SELECT user_id FROM oauth_accounts WHERE provider='github' AND provider_user_id='gh-7'`).Scan(&linked); err != nil || linked != userID {
+		t.Fatalf("oauth not linked to the existing account: %d (%v)", linked, err)
+	}
+	var users int
+	_ = as.db.QueryRow(`SELECT COUNT(*) FROM users WHERE email='ivy@example.com'`).Scan(&users)
+	if users != 1 {
+		t.Fatalf("expected one account for ivy, got %d", users)
+	}
 }
 
+// AUTH-12
 func TestMFAChallengeHappyPath(t *testing.T) {
-	as, err := NewAuthSystem()
+	as, err := newTestAuth(t)
 	if err != nil {
 		t.Fatalf("NewAuthSystem failed: %v", err)
 	}
@@ -307,10 +438,11 @@ func TestMFAChallengeHappyPath(t *testing.T) {
 		t.Fatalf("no challenge_id in login response: %v", loginResp)
 	}
 
-	// fetch generated MFA code
-	mfaCode, err := as.getLatestVerificationCode(ctx, userID, "mfa")
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the code is the user's current TOTP (as from an
+	// authenticator app); the challenge no longer stores a code for the test to read back.
+	mfaCode, err := totp.GenerateCode("BASE32SECRET", time.Now())
 	if err != nil {
-		t.Fatalf("getLatestVerificationCode for MFA failed: %v", err)
+		t.Fatalf("GenerateCode: %v", err)
 	}
 
 	resp = as.MFAChallenge(ctx, challengeID, mfaCode)
@@ -319,8 +451,9 @@ func TestMFAChallengeHappyPath(t *testing.T) {
 	}
 }
 
+// AUTH-13
 func TestMFAChallengeWrongCode(t *testing.T) {
-	as, err := NewAuthSystem()
+	as, err := newTestAuth(t)
 	if err != nil {
 		t.Fatalf("NewAuthSystem failed: %v", err)
 	}
@@ -360,8 +493,9 @@ func TestMFAChallengeWrongCode(t *testing.T) {
 	}
 }
 
+// AUTH-14
 func TestTokenRefreshHappyPath(t *testing.T) {
-	as, err := NewAuthSystem()
+	as, err := newTestAuth(t)
 	if err != nil {
 		t.Fatalf("NewAuthSystem failed: %v", err)
 	}
@@ -404,8 +538,9 @@ func TestTokenRefreshHappyPath(t *testing.T) {
 	}
 }
 
+// AUTH-15
 func TestTokenRefreshBannedUser(t *testing.T) {
-	as, err := NewAuthSystem()
+	as, err := newTestAuth(t)
 	if err != nil {
 		t.Fatalf("NewAuthSystem failed: %v", err)
 	}
@@ -455,7 +590,7 @@ func TestTokenRefreshBannedUser(t *testing.T) {
 }
 
 func TestVerifyAccessTokenValid(t *testing.T) {
-	as, err := NewAuthSystem()
+	as, err := newTestAuth(t)
 	if err != nil {
 		t.Fatalf("NewAuthSystem failed: %v", err)
 	}
@@ -494,13 +629,13 @@ func TestVerifyAccessTokenValid(t *testing.T) {
 }
 
 func TestVerifyAccessTokenExpired(t *testing.T) {
-	as, err := NewAuthSystem()
+	as, err := newTestAuth(t)
 	if err != nil {
 		t.Fatalf("NewAuthSystem failed: %v", err)
 	}
 	ctx := context.Background()
 	// Create an expired token manually
-	expiredToken := createExpiredToken(1, "free")
+	expiredToken := createExpiredToken(as, 1, "free")
 	resp := as.VerifyAccessToken(ctx, expiredToken)
 	if resp["error"] != "token_expired" {
 		t.Fatalf("expected token_expired, got %v", resp)
@@ -508,7 +643,7 @@ func TestVerifyAccessTokenExpired(t *testing.T) {
 }
 
 func TestVerifyAccessTokenBannedUser(t *testing.T) {
-	as, err := NewAuthSystem()
+	as, err := newTestAuth(t)
 	if err != nil {
 		t.Fatalf("NewAuthSystem failed: %v", err)
 	}
@@ -550,7 +685,7 @@ func TestVerifyAccessTokenBannedUser(t *testing.T) {
 }
 
 func TestVerifyAccessTokenInvalidSignature(t *testing.T) {
-	as, err := NewAuthSystem()
+	as, err := newTestAuth(t)
 	if err != nil {
 		t.Fatalf("NewAuthSystem failed: %v", err)
 	}
@@ -563,8 +698,9 @@ func TestVerifyAccessTokenInvalidSignature(t *testing.T) {
 	}
 }
 
-// Helper to create an expired token for testing
-func createExpiredToken(userID int64, tier string) string {
+// createExpiredToken signs an expired token with the system's own secret.
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the secret is per instance now, not a constant.
+func createExpiredToken(as *AuthSystem, userID int64, tier string) string {
 	claims := jwt.MapClaims{
 		"user_id": userID,
 		"tier":    tier,
@@ -572,7 +708,7 @@ func createExpiredToken(userID int64, tier string) string {
 		"iat":     time.Now().Add(-2*time.Hour).Unix(),
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	s, _ := token.SignedString([]byte(jwtSecret))
+	s, _ := token.SignedString(as.jwtSecret)
 	return s
 }
 
@@ -587,4 +723,70 @@ func createTokenWithSecret(userID int64, tier, secret string) string {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	s, _ := token.SignedString([]byte(secret))
 	return s
+}
+
+// TestMFAChallengeBoundToItsUser proves a challenge only accepts its own user's TOTP: user B's valid
+// code against user A's challenge is invalid_code, and A's challenge then still works once.
+// Why: MFAChallenge ignored challenge_id and took the newest MFA row of any user (found 2026-11-10,
+// session_012zDydZCZ4AChqhEZ4oVtaP). Touches: in-memory SQLite.
+func TestMFAChallengeBoundToItsUser(t *testing.T) {
+	fixed := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC) // a fixed clock: the two codes below differ at it
+	as, err := NewAuthSystemWithOptions(Options{Email: &fakeMailer{sent: map[string]string{}}, Now: func() time.Time { return fixed }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	login := func(email, secret, ip string) string {
+		if r := as.Signup(ctx, email, "StrongPassword!12345", "", ip); r["success"] != true {
+			t.Fatalf("signup %s: %v", email, r)
+		}
+		_ = as.VerifyEmail(ctx, email, as.email.(*fakeMailer).sent[email])
+		if _, err := as.db.ExecContext(ctx, `UPDATE users SET mfa_enabled = 1, mfa_secret = ? WHERE email = ?`, secret, email); err != nil {
+			t.Fatal(err)
+		}
+		r := as.Login(ctx, email, "StrongPassword!12345", "d", ip)
+		id, ok := r["challenge_id"].(string)
+		if !ok {
+			t.Fatalf("no challenge for %s: %v", email, r)
+		}
+		return id
+	}
+	challengeA := login("a@example.com", "JBSWY3DPEHPK3PXP", "198.51.100.1")
+	_ = login("b@example.com", "KRSXG5CTMVRXEZLU", "198.51.100.2")
+	codeB, _ := totp.GenerateCode("KRSXG5CTMVRXEZLU", fixed)
+	codeA, _ := totp.GenerateCode("JBSWY3DPEHPK3PXP", fixed)
+	if codeA == codeB {
+		t.Fatalf("pick secrets whose codes differ at the fixed time")
+	}
+	if r := as.MFAChallenge(ctx, challengeA, codeB); r["error"] != "invalid_code" {
+		t.Fatalf("B's code on A's challenge: expected invalid_code, got %v", r)
+	}
+	if r := as.MFAChallenge(ctx, challengeA, codeA); r["status"] != "authenticated" {
+		t.Fatalf("A's code on A's challenge: expected authenticated, got %v", r)
+	}
+	if r := as.MFAChallenge(ctx, challengeA, codeA); r["error"] != "invalid_code" {
+		t.Fatalf("a used challenge: expected invalid_code, got %v", r)
+	}
+}
+
+// TestLoginFailureLimitEnforced proves the 5-failures-per-15-minutes limit per ip+email: the sixth
+// attempt is refused even with the right password. Why: failures were counted but never checked
+// (found 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). Touches: in-memory SQLite.
+func TestLoginFailureLimitEnforced(t *testing.T) {
+	as, err := newTestAuth(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	ip := "198.51.100.9"
+	_ = as.Signup(ctx, "p@example.com", "StrongPassword!12345", "P", ip)
+	_ = as.VerifyEmail(ctx, "p@example.com", as.email.(*fakeMailer).sent["p@example.com"])
+	for i := 0; i < 5; i++ {
+		if r := as.Login(ctx, "p@example.com", "wrong password here", "d", ip); r["error"] != "invalid_credentials" {
+			t.Fatalf("attempt %d: %v", i, r)
+		}
+	}
+	if r := as.Login(ctx, "p@example.com", "StrongPassword!12345", "d", ip); r["error"] != "too_many_login_attempts" {
+		t.Fatalf("expected too_many_login_attempts, got %v", r)
+	}
 }

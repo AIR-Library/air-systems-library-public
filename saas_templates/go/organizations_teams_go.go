@@ -380,6 +380,11 @@ func (o *OrganizationsTeams) CreateOrg(user User, name string) (Org, error) {
 }
 
 // Invite invites a user to join an organization by email.
+//
+// In: the verified actor, the org id, the invitee's email and role. Out: the raw token (returned once;
+// only its SHA-256 hash is stored), or "not found" / "forbidden" / "invalid role".
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: only an owner may invite with role owner (spec
+// "Least privilege"). Touches: the invitations store; crypto/rand.
 func (o *OrganizationsTeams) Invite(actor User, orgID, email string, role Role) (string, error) {
 	// Check if actor is a member of the org
 	membership, err := o.store.GetMembership(orgID, actor.ID)
@@ -393,6 +398,11 @@ func (o *OrganizationsTeams) Invite(actor User, orgID, email string, role Role) 
 	// Validate role
 	if role != RoleOwner && role != RoleAdmin && role != RoleMember {
 		return "", errors.New("invalid role")
+	}
+	// Only an owner may grant the owner role (spec "Least privilege", amended 2026-09-26; fixed in Go
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: an admin could invite a second owner).
+	if role == RoleOwner && membership.Role != RoleOwner {
+		return "", errors.New("forbidden")
 	}
 	// Generate token
 	rawToken, tokenHash := generateToken()
@@ -453,25 +463,33 @@ func (o *OrganizationsTeams) AcceptInvitation(user User, rawToken string) (Membe
 	return membership, nil
 }
 
-// ChangeRole changes the role of a member in an organization.
+// ChangeRole changes the role of an existing member of an organization.
+//
+// In: the verified actor, the org id, the target user id and the new role. Out: nil, or an error
+// "not found" (actor or target not a member), "forbidden" (a member acting, an admin touching an owner,
+// or a non-owner granting owner), "invalid role", or "cannot demote the last owner".
+// Why: organizations_teams spec "Least privilege": an admin manages members but cannot demote or change
+// the owner, and only an owner grants the owner role. Before 2026-11-10 only owners could change roles
+// at all. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the memberships store.
 func (o *OrganizationsTeams) ChangeRole(actor User, orgID, userID string, role Role) error {
-	// Check if actor is a member of the org
 	actorMembership, err := o.store.GetMembership(orgID, actor.ID)
 	if err != nil {
 		return errors.New("not found")
 	}
-	// Check if actor has permission to change roles (owner only)
-	if actorMembership.Role != RoleOwner {
+	if actorMembership.Role != RoleOwner && actorMembership.Role != RoleAdmin {
 		return errors.New("forbidden")
 	}
-	// Check if target user is a member
 	targetMembership, err := o.store.GetMembership(orgID, userID)
 	if err != nil {
 		return errors.New("not found")
 	}
-	// Check if target is the owner
-	if targetMembership.Role == RoleOwner {
-		// Check if this would leave the org with no owners
+	if role != RoleOwner && role != RoleAdmin && role != RoleMember {
+		return errors.New("invalid role")
+	}
+	if actorMembership.Role != RoleOwner && (targetMembership.Role == RoleOwner || role == RoleOwner) {
+		return errors.New("forbidden")
+	}
+	if targetMembership.Role == RoleOwner && role != RoleOwner {
 		ownerCount, err := o.store.CountOwners(orgID)
 		if err != nil {
 			return err
@@ -480,32 +498,33 @@ func (o *OrganizationsTeams) ChangeRole(actor User, orgID, userID string, role R
 			return errors.New("cannot demote the last owner")
 		}
 	}
-	// Validate role
-	if role != RoleOwner && role != RoleAdmin && role != RoleMember {
-		return errors.New("invalid role")
-	}
 	return o.store.UpdateMembershipRole(orgID, userID, role)
 }
 
-// RemoveMember removes a member from an organization.
+// RemoveMember removes an existing member from an organization.
+//
+// In: the verified actor, the org id and the target user id. Out: nil, or "not found" (actor or target
+// not a member), "forbidden" (a member acting, or an admin removing an owner), or "cannot remove the
+// last owner".
+// Why: organizations_teams spec "Least privilege" (ORG-03): an admin manages members but cannot remove
+// the owner. Before 2026-11-10 only owners could remove anyone. Changed 2026-11-10,
+// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the memberships store.
 func (o *OrganizationsTeams) RemoveMember(actor User, orgID, userID string) error {
-	// Check if actor is a member of the org
 	actorMembership, err := o.store.GetMembership(orgID, actor.ID)
 	if err != nil {
 		return errors.New("not found")
 	}
-	// Check if actor has permission to remove members (owner only)
-	if actorMembership.Role != RoleOwner {
+	if actorMembership.Role != RoleOwner && actorMembership.Role != RoleAdmin {
 		return errors.New("forbidden")
 	}
-	// Check if target user is a member
 	targetMembership, err := o.store.GetMembership(orgID, userID)
 	if err != nil {
 		return errors.New("not found")
 	}
-	// Check if target is the owner
 	if targetMembership.Role == RoleOwner {
-		// Check if this would leave the org with no owners
+		if actorMembership.Role != RoleOwner {
+			return errors.New("forbidden")
+		}
 		ownerCount, err := o.store.CountOwners(orgID)
 		if err != nil {
 			return err

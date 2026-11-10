@@ -35,6 +35,9 @@ func (e *RBACError) Error() string {
 }
 
 // ---------- Audit ----------
+// AuditEntry is one audit_log row. TargetID and DeletedItems (added 2026-11-10,
+// session_012zDydZCZ4AChqhEZ4oVtaP) carry the org id and the counts the org cascade logs
+// (spec RBAC-06: deleted_items={deployments, api_keys, invitations, memberships}).
 type AuditEntry struct {
 	Action       string
 	UserID       string
@@ -43,6 +46,8 @@ type AuditEntry struct {
 	UserTier     Tier
 	Decision     string // "PASS" or "FAIL"
 	Timestamp    time.Time
+	TargetID     string
+	DeletedItems map[string]int
 }
 
 var (
@@ -182,7 +187,20 @@ func RequireAuthenticated(user *User, endpoint string) error {
 
 // ---------- In‑memory data store ----------
 type Session struct{ ID, UserID string }
-type APIKey struct{ ID, UserID string }
+
+// APIKey is an API key row. OrgID "" is a personal key, which belongs to its user and survives an
+// org deletion (spec RBAC-06). OrgID added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+type APIKey struct{ ID, UserID, OrgID string }
+
+// Membership is one (org_id, user_id, role) row as in organizations_teams.md; role is owner, admin or
+// member. Invitation is a pending invitation to an org. Both added 2026-11-10,
+// session_012zDydZCZ4AChqhEZ4oVtaP: the org cascade gates on the caller's membership role and deletes
+// the org's memberships and invitations, never user accounts (RBAC-06).
+type Membership struct {
+	OrgID, UserID string
+	Role          Tier
+}
+type Invitation struct{ ID, OrgID, Email string }
 type File struct{ ID, OwnerID string }
 type Preference struct{ ID, UserID string }
 
@@ -214,6 +232,10 @@ var (
 	deploymentLogs   = make(map[string]*DeploymentLog)
 	orgsMu           sync.RWMutex
 	organizations    = make(map[string]*Organization)
+	membershipsMu    sync.RWMutex
+	memberships      = make(map[string]*Membership) // key: membershipKey(org_id, user_id)
+	invitationsMu    sync.RWMutex
+	invitations      = make(map[string]*Invitation)
 
 	// For testing error injection in cascade operations
 	cascadeInjectError bool
@@ -231,6 +253,8 @@ type backupState struct {
 	themeConfigs   map[string]*ThemeConfig
 	deploymentLogs map[string]*DeploymentLog
 	organizations  map[string]*Organization
+	memberships    map[string]*Membership
+	invitations    map[string]*Invitation
 }
 
 func takeBackup() backupState {
@@ -244,7 +268,11 @@ func takeBackup() backupState {
 	themeConfigsMu.RLock()
 	deploymentLogsMu.RLock()
 	orgsMu.RLock()
+	membershipsMu.RLock()
+	invitationsMu.RLock()
 	defer func() {
+		membershipsMu.RUnlock()
+		invitationsMu.RUnlock()
 		usersMu.RUnlock()
 		sessionsMu.RUnlock()
 		apiKeysMu.RUnlock()
@@ -269,6 +297,8 @@ func takeBackup() backupState {
 		themeConfigs:   make(map[string]*ThemeConfig, len(themeConfigs)),
 		deploymentLogs: make(map[string]*DeploymentLog, len(deploymentLogs)),
 		organizations:  make(map[string]*Organization, len(organizations)),
+		memberships:    make(map[string]*Membership, len(memberships)),
+		invitations:    make(map[string]*Invitation, len(invitations)),
 	}
 	for k, v := range users { b.users[k] = v }
 	for k, v := range sessions { b.sessions[k] = v }
@@ -280,6 +310,8 @@ func takeBackup() backupState {
 	for k, v := range themeConfigs { b.themeConfigs[k] = v }
 	for k, v := range deploymentLogs { b.deploymentLogs[k] = v }
 	for k, v := range organizations { b.organizations[k] = v }
+	for k, v := range memberships { b.memberships[k] = v }
+	for k, v := range invitations { b.invitations[k] = v }
 	return b
 }
 
@@ -294,7 +326,11 @@ func restoreBackup(b backupState) {
 	themeConfigsMu.Lock()
 	deploymentLogsMu.Lock()
 	orgsMu.Lock()
+	membershipsMu.Lock()
+	invitationsMu.Lock()
 	defer func() {
+		membershipsMu.Unlock()
+		invitationsMu.Unlock()
 		usersMu.Unlock()
 		sessionsMu.Unlock()
 		apiKeysMu.Unlock()
@@ -317,6 +353,8 @@ func restoreBackup(b backupState) {
 	themeConfigs = b.themeConfigs
 	deploymentLogs = b.deploymentLogs
 	organizations = b.organizations
+	memberships = b.memberships
+	invitations = b.invitations
 }
 
 // ---------- Cascade delete implementations ----------
@@ -451,73 +489,133 @@ func DeleteDeployment(deploymentID string) error {
 	return nil
 }
 
-func DeleteOrganization(orgID string) error {
+// membershipKey is the map key of a membership row (org_id, user_id).
+// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+func membershipKey(orgID, userID string) string { return orgID + "\x00" + userID }
+
+// AddMembership stores a membership row (org_id, user_id, role). In: the org, the user and the role
+// (owner, admin or member). Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
+func AddMembership(orgID, userID string, role Tier) {
+	membershipsMu.Lock()
+	defer membershipsMu.Unlock()
+	memberships[membershipKey(orgID, userID)] = &Membership{OrgID: orgID, UserID: userID, Role: role}
+}
+
+// GetMembership returns the membership row of (org_id, user_id), if any.
+// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory (read).
+func GetMembership(orgID, userID string) (*Membership, bool) {
+	membershipsMu.RLock()
+	defer membershipsMu.RUnlock()
+	m, ok := memberships[membershipKey(orgID, userID)]
+	return m, ok
+}
+
+// GetInvitation returns an invitation by id, if any.
+// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory (read).
+func GetInvitation(id string) (*Invitation, bool) {
+	invitationsMu.RLock()
+	defer invitationsMu.RUnlock()
+	i, ok := invitations[id]
+	return i, ok
+}
+
+// DeleteOrganization deletes an organization and everything that belongs to it, all or nothing.
+//
+// In: the verified caller and the org id. Out: nil, or *RBACError 401 authentication_required (no
+// caller), 404 not_found (the org does not exist, or the caller's membership row for it is not
+// 'owner': a global admin or owner tier is not enough), or the simulated cascade error (rolled back).
+// Deletes: the org's deployments, each with the deployment cascade (DNS records, theme configs,
+// deployment logs); API keys whose OrgID is this org; all its invitations and membership rows; the org.
+// Keeps: every user account, session and personal API key (OrgID ""), and every membership of
+// another org, because a user may belong to several orgs. Logs org_deleted_cascade with
+// deleted_items {deployments, api_keys, invitations, memberships}.
+// Why: spec RBAC-06 (amended 2026-11-10 after review on PR 19). The old Go code took no caller and
+// deleted every user whose id began with "<org id>-" together with their sessions and keys.
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory store, the audit log.
+func DeleteOrganization(caller *User, orgID string) error {
+	if caller == nil {
+		return &RBACError{Code: 401, Message: "authentication_required"}
+	}
+	m, isMember := GetMembership(orgID, caller.ID)
+	_, orgExists := GetOrganization(orgID)
+	if !orgExists || !isMember || m.Role != TierOwner {
+		logAudit(AuditEntry{Action: "permission_check", UserID: caller.ID, Endpoint: "DeleteOrganization",
+			RequiredTier: TierOwner, UserTier: caller.Tier, Decision: "FAIL", Timestamp: time.Now(), TargetID: orgID})
+		return &RBACError{Code: 404, Message: "not_found"}
+	}
+
 	backup := takeBackup()
 	defer func() {
 		if r := recover(); r != nil {
 			restoreBackup(backup)
+			panic(r)
 		}
 	}()
+	counts := map[string]int{"deployments": 0, "api_keys": 0, "invitations": 0, "memberships": 0}
 
-	// Delete organization
 	orgsMu.Lock()
-	if _, ok := organizations[orgID]; !ok {
-		orgsMu.Unlock()
-		restoreBackup(backup)
-		return errors.New("organization not found")
-	}
 	delete(organizations, orgID)
 	orgsMu.Unlock()
 
-	// Delete deployments belonging to org
 	deploymentsMu.Lock()
-	var depIDs []string
+	depIDs := map[string]bool{}
 	for id, d := range deployments {
 		if d.OrgID == orgID {
-			depIDs = append(depIDs, id)
+			depIDs[id] = true
+			delete(deployments, id)
 		}
-	}
-	for _, id := range depIDs {
-		delete(deployments, id)
 	}
 	deploymentsMu.Unlock()
+	counts["deployments"] = len(depIDs)
 
-	// Delete users belonging to org (for simplicity assume user IDs start with orgID-)
-	usersMu.Lock()
-	var userIDs []string
-	for id, u := range users {
-		if u != nil && len(u.ID) >= len(orgID)+1 && u.ID[:len(orgID)+1] == orgID+"-" {
-			userIDs = append(userIDs, id)
+	dnsRecordsMu.Lock()
+	for id, r := range dnsRecords {
+		if depIDs[r.DeploymentID] {
+			delete(dnsRecords, id)
 		}
 	}
-	for _, id := range userIDs {
-		delete(users, id)
+	dnsRecordsMu.Unlock()
+	themeConfigsMu.Lock()
+	for id, c := range themeConfigs {
+		if depIDs[c.DeploymentID] {
+			delete(themeConfigs, id)
+		}
 	}
-	usersMu.Unlock()
+	themeConfigsMu.Unlock()
+	deploymentLogsMu.Lock()
+	for id, l := range deploymentLogs {
+		if depIDs[l.DeploymentID] {
+			delete(deploymentLogs, id)
+		}
+	}
+	deploymentLogsMu.Unlock()
 
-	// Delete API keys belonging to those users
 	apiKeysMu.Lock()
 	for kid, k := range apiKeys {
-		for _, uid := range userIDs {
-			if k.UserID == uid {
-				delete(apiKeys, kid)
-				break
-			}
+		if k.OrgID != "" && k.OrgID == orgID {
+			delete(apiKeys, kid)
+			counts["api_keys"]++
 		}
 	}
 	apiKeysMu.Unlock()
 
-	// Delete sessions belonging to those users
-	sessionsMu.Lock()
-	for sid, s := range sessions {
-		for _, uid := range userIDs {
-			if s.UserID == uid {
-				delete(sessions, sid)
-				break
-			}
+	invitationsMu.Lock()
+	for id, inv := range invitations {
+		if inv.OrgID == orgID {
+			delete(invitations, id)
+			counts["invitations"]++
 		}
 	}
-	sessionsMu.Unlock()
+	invitationsMu.Unlock()
+
+	membershipsMu.Lock()
+	for k, mem := range memberships {
+		if mem.OrgID == orgID {
+			delete(memberships, k)
+			counts["memberships"]++
+		}
+	}
+	membershipsMu.Unlock()
 
 	if cascadeInjectError {
 		restoreBackup(backup)
@@ -525,11 +623,13 @@ func DeleteOrganization(orgID string) error {
 	}
 
 	logAudit(AuditEntry{
-		Action:    "org_deleted_cascade",
-		UserID:    "", // system action
-		Endpoint:  "DeleteOrganization",
-		Decision:  "PASS",
-		Timestamp: time.Now(),
+		Action:       "org_deleted_cascade",
+		UserID:       caller.ID,
+		Endpoint:     "DeleteOrganization",
+		Decision:     "PASS",
+		Timestamp:    time.Now(),
+		TargetID:     orgID,
+		DeletedItems: counts,
 	})
 	return nil
 }
@@ -546,7 +646,11 @@ func ResetAllData() {
 	themeConfigsMu.Lock()
 	deploymentLogsMu.Lock()
 	orgsMu.Lock()
+	membershipsMu.Lock()
+	invitationsMu.Lock()
 	defer func() {
+		membershipsMu.Unlock()
+		invitationsMu.Unlock()
 		usersMu.Unlock()
 		sessionsMu.Unlock()
 		apiKeysMu.Unlock()
@@ -569,6 +673,8 @@ func ResetAllData() {
 	themeConfigs = make(map[string]*ThemeConfig)
 	deploymentLogs = make(map[string]*DeploymentLog)
 	organizations = make(map[string]*Organization)
+	memberships = make(map[string]*Membership)
+	invitations = make(map[string]*Invitation)
 
 	auditMu.Lock()
 	auditLog = nil
