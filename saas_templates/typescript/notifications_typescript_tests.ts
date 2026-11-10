@@ -366,4 +366,38 @@ describe('NotificationService', () => {
       await svc.close();
     }
   });
+
+  /**
+   * NOTIF-10: the preference routes take the user from the VERIFIED caller, never from the path. User 8101 reads
+   * and changes their own preferences; user 8102 (and an anonymous request) asking for 8101's gets 404 for GET and
+   * PUT, and 8101's preferences are unchanged; a body cannot smuggle another user_id or an unknown key (400).
+   * In: the shared service. Out: assertions only. Why: review follow-up 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (the preference endpoints took
+   * user_id from the route). Touches: in-memory SQLite.
+   */
+  // NOTIF-10
+  test('Preference routes: a caller cannot read or change another user\'s preferences', async () => {
+    const owner = { id: 8101 };
+    const other = { id: 8102 };
+    const mine = await service.handleGetPreferences(owner, '8101');
+    expect(mine.http_status).toBe(200);
+    expect(mine.body).toMatchObject({ user_id: 8101, channels_enabled: { email: true, sms: false, in_app: true } });
+
+    const notFound = { http_status: 404, body: { success: false, error: 'not_found' } };
+    expect(await service.handleGetPreferences(other, '8101')).toEqual(notFound);
+    expect(await service.handleGetPreferences(null, '8101')).toEqual(notFound);
+    expect(await service.handleUpdatePreferences(other, '8101', { channels_enabled: { email: false }, do_not_disturb: true })).toEqual(notFound);
+    expect(await service.handleUpdatePreferences(null, '8101', { do_not_disturb: true })).toEqual(notFound);
+    expect(await service.getPreferences(8101)).toMatchObject({ do_not_disturb: false, channels_enabled: { email: true } });
+
+    const bad = { http_status: 400, body: { success: false, error: 'invalid_preferences' } };
+    expect(await service.handleUpdatePreferences(owner, '8101', { user_id: 8102, do_not_disturb: true })).toEqual(bad);
+    expect(await service.handleUpdatePreferences(owner, '8101', { channels_enabled: { fax: true } })).toEqual(bad);
+    expect(await service.handleUpdatePreferences(owner, '8101', { quiet_hours_start: '25:00' })).toEqual(bad);
+    expect((await service.getPreferences(8102)).do_not_disturb).toBe(false);
+
+    expect(await service.handleUpdatePreferences(owner, '8101', { do_not_disturb: true, channels_enabled: { sms: true } }))
+      .toEqual({ http_status: 200, body: { success: true } });
+    expect(await service.getPreferences(8101)).toMatchObject({ do_not_disturb: true, channels_enabled: { email: true, sms: true, in_app: true } });
+    expect((await service.getPreferences(8102)).do_not_disturb).toBe(false);
+  });
 });

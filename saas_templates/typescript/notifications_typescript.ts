@@ -87,6 +87,11 @@ export interface NotificationServiceOptions {
   baseUrl?: string;
 }
 
+/** The verified caller of a preference route, as the auth layer provides it. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+export interface PreferencesCaller {
+  id: string | number;
+}
+
 /** The channels a link or preference may name. */
 const CHANNELS: readonly NotificationChannel[] = ['email', 'sms', 'in_app'];
 
@@ -388,6 +393,12 @@ export class NotificationService {
     return row;
   }
 
+  /**
+   * Internal (service-side) preference update for a user id the SYSTEM already trusts, such as a verified
+   * unsubscribe token. Never wire it to a client route with a user id from the path, query or body: the routes are
+   * handleGetPreferences / handleUpdatePreferences, which check the verified caller.
+   * In: user id and the fields to change. Out: { success: true }. Documented 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: user_notification_preferences.
+   */
   async updateUserPreferences(user_id: number, prefs: Partial<UserPreferences>): Promise<{ success: boolean }> {
     const current = await this.getUserPreferences(user_id);
     const updated: UserPreferences = {
@@ -864,7 +875,75 @@ export class NotificationService {
     return await this.db.get<NotificationLog>(`SELECT * FROM notification_logs WHERE id = ?`, message_id);
   }
 
+  /**
+   * Internal (service-side) read of a user's preferences, created with the defaults on first use. Not a client
+   * route: clients go through handleGetPreferences. Documented 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: user_notification_preferences.
+   */
   async getPreferences(user_id: number): Promise<UserPreferences> {
     return await this.getUserPreferences(user_id);
+  }
+
+  /**
+   * Whether the verified caller is the user named in the route. In: the caller from the auth layer (or null) and the
+   * path's user id. Out: true only for the same user. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+   */
+  private isSelf(caller: PreferencesCaller | null | undefined, pathUserId: string | number): boolean {
+    return caller != null && caller.id !== null && caller.id !== undefined && String(pathUserId) !== ''
+      && String(caller.id) === String(pathUserId);
+  }
+
+  /**
+   * Route GET /users/:user_id/notification-preferences. The caller is the VERIFIED user the auth layer put on the
+   * request, never the id in the path: anyone else (or no caller) gets 404 not_found, so a user cannot read another
+   * user's preferences or learn that they exist.
+   * In: the caller and the path's user_id. Out: { http_status, body } (200 with the preferences, or 404).
+   * Why: review follow-up 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the preference endpoints took user_id from the route alone (the JavaScript build
+   * now checks the verified caller the same way). Touches: user_notification_preferences (read; defaults on first use).
+   */
+  async handleGetPreferences(caller: PreferencesCaller | null | undefined, pathUserId: string | number): Promise<UnsubscribeResponse> {
+    if (!this.isSelf(caller, pathUserId)) return { http_status: 404, body: { success: false, error: 'not_found' } };
+    return { http_status: 200, body: { ...(await this.getUserPreferences(Number(caller!.id))) } };
+  }
+
+  /**
+   * Route PUT /users/:user_id/notification-preferences. Same caller rule as handleGetPreferences (404 for anyone but
+   * the user themself, checked before the body is read). Only do_not_disturb (boolean), quiet_hours_start /
+   * quiet_hours_end ("HH:mm" or null) and channels_enabled ({email|sms|in_app: boolean}) may change; any other key or
+   * value is 400 invalid_preferences and changes nothing (a body cannot name a different user_id).
+   * In: the caller, the path's user_id and the JSON body. Out: { http_status, body }.
+   * Why: review follow-up 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: user_notification_preferences.
+   */
+  async handleUpdatePreferences(
+    caller: PreferencesCaller | null | undefined,
+    pathUserId: string | number,
+    body: unknown
+  ): Promise<UnsubscribeResponse> {
+    if (!this.isSelf(caller, pathUserId)) return { http_status: 404, body: { success: false, error: 'not_found' } };
+    const bad: UnsubscribeResponse = { http_status: 400, body: { success: false, error: 'invalid_preferences' } };
+    if (body === null || typeof body !== 'object' || Array.isArray(body)) return bad;
+    const input = body as Record<string, unknown>;
+    const update: Partial<UserPreferences> = {};
+    const isTime = (v: unknown) => v === null || (typeof v === 'string' && this.parseMinutes(v) !== null);
+    for (const [key, value] of Object.entries(input)) {
+      if (key === 'do_not_disturb') {
+        if (typeof value !== 'boolean') return bad;
+        update.do_not_disturb = value;
+      } else if (key === 'quiet_hours_start' || key === 'quiet_hours_end') {
+        if (!isTime(value)) return bad;
+        update[key] = value as string | null;
+      } else if (key === 'channels_enabled') {
+        if (value === null || typeof value !== 'object' || Array.isArray(value)) return bad;
+        const channels: UserPreferences['channels_enabled'] = {};
+        for (const [ch, on] of Object.entries(value as Record<string, unknown>)) {
+          if (!(CHANNELS as readonly string[]).includes(ch) || typeof on !== 'boolean') return bad;
+          channels[ch as NotificationChannel] = on;
+        }
+        update.channels_enabled = channels;
+      } else {
+        return bad;
+      }
+    }
+    await this.updateUserPreferences(Number(caller!.id), update);
+    return { http_status: 200, body: { success: true } };
   }
 }
