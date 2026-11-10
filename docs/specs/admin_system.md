@@ -45,9 +45,11 @@ TIERS: two different things share the word.
   Amended 2026-11-10 (Phase B.2).
 
 LAST OWNER (ADMIN-07): an owner cannot change their own role, and ADMIN-19 refuses a suspended owner, so a
-  direct change_role can only reach the last active owner through a governance-approved action. ADMIN-07 is
-  proven there: approving a change_role that would demote the last active owner fails with 400
-  {error: "cannot_demote_last_owner"} and leaves the action pending. Amended 2026-11-10 (Phase B.3).
+  direct change_role never reaches the last active owner; only a governance-approved change_role can. ADMIN-07
+  is proven there: approving a change_role that would demote the last active owner fails with 400
+  {error: "cannot_demote_last_owner"} and leaves the action pending. A governance change_role whose target is
+  the approver is refused with 400 {error: "cannot_change_own_role"}, checked after the last-owner check, and
+  the action stays pending. Amended 2026-11-10 (Phase B.3; approver rule added after review on PR 22).
 
 DOMAINS:
 
@@ -163,7 +165,7 @@ DOMAINS:
       Return: [{timestamp, actor_id, action, resource_type, resource_id, old_value, new_value, reason}, ...]
 
 IMPLEMENTATION REQUIREMENTS:
-  - Every POST: verify_csrf() first
+  - Every POST: refuse a suspended caller (ADMIN-19), then verify_csrf()
   - Every mutation: require_owner() gate (except reads: require_admin_or_owner())
   - Every mutation: audit_log write before commit
   - Validation: email format, name length, role in allowed_roles

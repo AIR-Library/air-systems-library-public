@@ -143,6 +143,7 @@ def setup_python() -> Path:
     if not py.exists():
         (DEPS / "python").mkdir(parents=True, exist_ok=True)
         subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
+        stamp.unlink(missing_ok=True)   # a new venv is empty, whatever the stamp says (CodeRabbit, PR 22)
     if not stamp.is_file() or stamp.read_text() != wanted:
         subprocess.run([str(py), "-m", "pip", "install", "-q", *PY_REQ], check=True)
         stamp.write_text(wanted)
