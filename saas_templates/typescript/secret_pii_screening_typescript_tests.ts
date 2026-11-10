@@ -398,6 +398,8 @@ test('SCREEN-13 secrets behind JSON escapes are refused in both modes; escape me
 
 /**
  * SCREEN-14: bad mode, bad categories and too-large text refused before any scan; hostile inputs under 2 s.
+ * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the spec's new hostile input "token=$" * 28571 (200,000
+ * characters, quadratic for a value scan that is not table-driven) is in the list, so its speed is proven.
  * In: the spec's vectors and fakes. Out: assertions only. Why: SCREEN-14 (Phase D wave 1, owner request
  * 2026-11-10). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
  */
@@ -416,6 +418,8 @@ test('SCREEN-14 bad mode, bad categories and too-large text refused before any s
   const hostile = [
     'a.'.repeat(100000), ('-----BEGIN ' + 'PRIVATE KEY-----').repeat(7400), '1234-'.repeat(40000), 'eyJ'.repeat(66666),
     'xeyJ-'.repeat(40000), 'xsk-'.repeat(50000), 'password' + ' '.repeat(199990), 'token=[REDACTED:'.repeat(12500),
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: added when the spec listed it (detector 13 was quadratic on it).
+    'token=$'.repeat(28571),
     'a://b:'.repeat(33000), 'ab:'.repeat(66000), '1.1.'.repeat(50000), '\\n'.repeat(100000), B + '\n'.repeat(199969),
     B + ('\n' + 'A'.repeat(64)).repeat(3000),
   ];
