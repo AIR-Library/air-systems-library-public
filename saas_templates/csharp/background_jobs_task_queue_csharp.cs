@@ -6,6 +6,8 @@
 // running, and claiming/cancelling a job was not atomic. Jobs are now claimed and cancelled with one conditional
 // UPDATE each, every attempt is recorded in job_runs, and webhook delivery goes through IWebhookSender, whose HTTP
 // implementation refuses non-HTTPS and internal targets before any network call.
+// 2026-11-10 (same session, CodeRabbit review on PR 19): a job interrupted by host shutdown goes back to enqueued
+// without using a retry, and the webhook sender never follows redirects (a 3xx is a failed attempt).
 // Touches: the jobs database (jobs, job_runs), outbound HTTPS for webhook_retry (production sender only).
 #nullable enable
 using System;
@@ -158,7 +160,8 @@ namespace BackgroundJobs
     /// Data access for jobs. Every status change is one conditional UPDATE (spec: "Status changes are atomic"), so two
     /// workers cannot both claim a job and a cancel cannot race a start. Changed 2026-11-10 (session
     /// session_012zDydZCZ4AChqhEZ4oVtaP): ClaimAsync, RecordFailureAsync and run records added; cancel made atomic.
-    /// Touches: jobs, job_runs.
+    /// RequeueInterruptedAsync added the same day (CodeRabbit review on PR 19): a job interrupted by shutdown goes back
+    /// to enqueued without using a retry. Touches: jobs, job_runs.
     /// </summary>
     public interface IJobRepository
     {
@@ -171,6 +174,7 @@ namespace BackgroundJobs
         Task<bool> ClaimAsync(Guid jobId, DateTime now);
         Task MarkCompletedAsync(Guid jobId, object result);
         Task<JobStatus> RecordFailureAsync(Guid jobId, string error, DateTime now);
+        Task<bool> RequeueInterruptedAsync(Guid jobId, DateTime now);
     }
 
     /// <summary>EF Core implementation of <see cref="IJobRepository"/>. Touches: jobs, job_runs.</summary>
@@ -310,6 +314,32 @@ namespace BackgroundJobs
             return job.Status;
         }
 
+        /// <summary>Error text written on a job_runs row closed because the worker stopped mid-attempt.</summary>
+        public const string InterruptedError = "interrupted: the worker stopped during this attempt; the job was re-enqueued without using a retry";
+
+        /// <summary>
+        /// Puts a job that was running when the host stopped back in the queue: one conditional UPDATE (only while it is
+        /// still running) sets status enqueued, clears started_at, progress and next_retry_at so the next worker picks it
+        /// up at once, and leaves retry_count unchanged (a shutdown is not a failed attempt). The open job_runs row is
+        /// closed as cancelled with <see cref="InterruptedError"/>. Every database call uses CancellationToken.None,
+        /// because the caller's token is already cancelled when this runs. Inputs: the job id and the time to record.
+        /// Output: true when the job was re-enqueued. Why: CodeRabbit review on PR 19, a job interrupted by shutdown
+        /// stayed "running" forever (the worker only picks enqueued jobs) with its run left open. Added 2026-11-10,
+        /// session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: jobs, job_runs.
+        /// </summary>
+        public async Task<bool> RequeueInterruptedAsync(Guid jobId, DateTime now)
+        {
+            var requeued = await _db.Jobs
+                .Where(j => j.Id == jobId && j.Status == JobStatus.Running)
+                .ExecuteUpdateAsync(u => u
+                    .SetProperty(j => j.Status, JobStatus.Enqueued)
+                    .SetProperty(j => j.StartedAt, (DateTime?)null)
+                    .SetProperty(j => j.Progress, (string?)null)
+                    .SetProperty(j => j.NextRetryAt, (DateTime?)null), CancellationToken.None);
+            await CloseRunAsync(jobId, JobStatus.Cancelled, null, InterruptedError, now);
+            return requeued == 1;
+        }
+
         /// <summary>Closes the job's open job_runs row with an outcome. Touches: job_runs.</summary>
         private async Task CloseRunAsync(Guid jobId, JobStatus status, string? resultJson, string? error, DateTime now)
         {
@@ -346,22 +376,70 @@ namespace BackgroundJobs
     /// server at itself or its network (SSRF). A non-2xx answer throws, which makes the job retry. Added 2026-11-10
     /// (session session_012zDydZCZ4AChqhEZ4oVtaP). Touches: outbound HTTPS. Note: host names are not resolved here;
     /// deployments should also restrict egress at the network layer, because DNS can point a public name inward.
+    /// Redirects are never followed (CodeRabbit review on PR 19, 2026-11-10, same session): the check above only sees
+    /// the first URL, so a public https host answering 302 to an internal address would otherwise bypass it. The
+    /// sender builds its own HttpClient, turns AllowAutoRedirect off on the handler it is given (through any
+    /// DelegatingHandler chain), and treats a 3xx answer as a failed attempt. There is deliberately no constructor that
+    /// takes a ready-made HttpClient, whose redirect setting could not be checked.
     /// </summary>
     public class HttpWebhookSender : IWebhookSender
     {
         private static readonly string[] ReservedSuffixes = { ".localhost", ".local", ".internal", ".invalid", ".test", ".example" };
+        /// <summary>Time limit of one delivery attempt when none is given.</summary>
+        public static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(10);
         private readonly HttpClient _http;
 
-        public HttpWebhookSender(HttpClient http) => _http = http;
+        /// <summary>
+        /// Production sender: a SocketsHttpHandler with redirects off and a <see cref="DefaultTimeout"/> per attempt.
+        /// Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit review on PR 19), replacing the
+        /// HttpClient constructor. Touches: nothing until a send.
+        /// </summary>
+        public HttpWebhookSender() : this(new SocketsHttpHandler { AllowAutoRedirect = false }, DefaultTimeout) { }
 
-        /// <summary>Validates the target (see the class summary), then POSTs the JSON payload. Throws on refusal or a non-2xx answer. Touches: network.</summary>
+        /// <summary>
+        /// Sender over a given handler (a custom transport, or a stub in tests). Inputs: the handler, which must not
+        /// have sent a request yet, and the per-attempt timeout. It switches AllowAutoRedirect off on the innermost
+        /// SocketsHttpHandler or HttpClientHandler, so no handler passed here can follow a redirect on its own. Added
+        /// 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit review on PR 19). Touches: the handler's
+        /// settings.
+        /// </summary>
+        public HttpWebhookSender(HttpMessageHandler handler, TimeSpan timeout)
+        {
+            DisableRedirects(handler ?? throw new ArgumentNullException(nameof(handler)));
+            _http = new HttpClient(handler) { Timeout = timeout };
+        }
+
+        /// <summary>
+        /// Validates the target (see the class summary), then POSTs the JSON payload. Throws on refusal, on a 3xx
+        /// answer (redirects are not followed, so an internal Location is never reached) and on any other non-2xx
+        /// answer. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit review on PR 19: 3xx is a
+        /// failure). Touches: network.
+        /// </summary>
         public async Task SendAsync(string url, string payloadJson, CancellationToken ct)
         {
             var target = ValidateTarget(url);
             using var content = new StringContent(payloadJson ?? "{}", Encoding.UTF8, "application/json");
             using var response = await _http.PostAsync(target, content, ct);
+            var code = (int)response.StatusCode;
+            if (code >= 300 && code < 400)
+                throw new HttpRequestException($"Webhook endpoint answered a redirect ({code}); redirects are not followed");
             if (!response.IsSuccessStatusCode)
-                throw new HttpRequestException($"Webhook endpoint answered {(int)response.StatusCode}");
+                throw new HttpRequestException($"Webhook endpoint answered {code}");
+        }
+
+        /// <summary>
+        /// Walks a DelegatingHandler chain to its innermost handler and turns AllowAutoRedirect off when it is a
+        /// SocketsHttpHandler or HttpClientHandler (other handlers do not follow redirects by themselves; SendAsync also
+        /// refuses any 3xx). Input: the handler. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit
+        /// review on PR 19). Touches: the handler's settings.
+        /// </summary>
+        private static void DisableRedirects(HttpMessageHandler handler)
+        {
+            var current = handler;
+            while (current is DelegatingHandler delegating && delegating.InnerHandler != null)
+                current = delegating.InnerHandler;
+            if (current is SocketsHttpHandler sockets) sockets.AllowAutoRedirect = false;
+            else if (current is HttpClientHandler client) client.AllowAutoRedirect = false;
         }
 
         /// <summary>Returns the parsed URL when it is an allowed webhook target; throws ArgumentException otherwise. Pure.</summary>
@@ -574,8 +652,14 @@ namespace BackgroundJobs
             }
         }
 
-        /// <summary>Runs one poll: up to 5 due jobs, oldest first. Touches: jobs, job_runs.</summary>
-        private async Task ProcessPendingJobs(CancellationToken ct)
+        /// <summary>
+        /// Runs one poll: up to 5 due jobs, oldest first. Input: the host's stopping token. Output: none; throws
+        /// OperationCanceledException when the host stops, after re-enqueueing the job that was running (see
+        /// <see cref="IJobRepository.RequeueInterruptedAsync"/>). Internal (was private) so a test can run one poll
+        /// deterministically. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit review on PR 19).
+        /// Touches: jobs, job_runs, and whatever the handlers touch.
+        /// </summary>
+        internal async Task ProcessPendingJobs(CancellationToken ct)
         {
             List<Guid> due;
             using (var scope = _sp.CreateScope())
@@ -610,6 +694,16 @@ namespace BackgroundJobs
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
+                    // The host is stopping: hand the job back to the queue (no retry used) before giving up, or it would
+                    // stay "running" forever. CodeRabbit review on PR 19; 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.
+                    try
+                    {
+                        await repo.RequeueInterruptedAsync(job.Id, DateTime.UtcNow);
+                    }
+                    catch (Exception requeueError)
+                    {
+                        _logger.LogError(requeueError, "Job {JobId} was interrupted and could not be re-enqueued", job.Id);
+                    }
                     throw;
                 }
                 catch (Exception ex)
@@ -635,13 +729,18 @@ namespace BackgroundJobs
         /// <summary>Most retries a job may ask for.</summary>
         public const int MaxRetriesLimit = 10;
 
-        /// <summary>Registers the database (SQLite file jobs.db), repository, handlers, webhook sender and worker. Touches: nothing until resolved.</summary>
+        /// <summary>
+        /// Registers the database (SQLite file jobs.db), repository, handlers, webhook sender and worker. The webhook
+        /// sender is built with redirects off (a 3xx is a failed attempt), so a public host cannot redirect a delivery
+        /// past the SSRF check to an internal address; changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP
+        /// (CodeRabbit review on PR 19). Touches: nothing until resolved.
+        /// </summary>
         public void ConfigureServices(IServiceCollection services)
         {
             services.AddDbContext<JobsDbContext>(opt => opt.UseSqlite("Data Source=jobs.db"));
             services.AddScoped<IJobRepository, JobRepository>();
             services.AddSingleton<JobDispatcher>();
-            services.AddSingleton<IWebhookSender>(_ => new HttpWebhookSender(new HttpClient { Timeout = TimeSpan.FromSeconds(10) }));
+            services.AddSingleton<IWebhookSender>(_ => new HttpWebhookSender(new SocketsHttpHandler { AllowAutoRedirect = false }, HttpWebhookSender.DefaultTimeout));
             services.AddTransient<SendBulkEmailHandler>();
             services.AddTransient<WebhookRetryHandler>();
             services.AddTransient<ExportGenerateHandler>();

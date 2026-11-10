@@ -1,14 +1,18 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Net;
+using System.Net.Http;
 using System.Net.Http.Json;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using BackgroundJobs;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
 public class BackgroundJobsTests : IClassFixture<WebApplicationFactory<BackgroundJobs.Program>>
@@ -217,5 +221,122 @@ public class BackgroundJobsTests : IClassFixture<WebApplicationFactory<Backgroun
         Assert.Equal(JobStatus.Enqueued, newStatus);
         Assert.NotEqual(jobId, newJobId);
         await GetJobStatusAsync(newJobId); // the new job exists and is readable
+    }
+}
+/// <summary>
+/// Deterministic tests of the worker and the webhook sender without a web host. Added 2026-11-10, session
+/// session_012zDydZCZ4AChqhEZ4oVtaP, for the CodeRabbit review on PR 19: (1) a job interrupted by host shutdown must go
+/// back to enqueued without using a retry, with its run closed; (2) the webhook sender must never follow a redirect.
+/// Touches: a private in-memory SQLite database and in-process stub HTTP handlers; no network, no sleeps.
+/// </summary>
+public class JobWorkerShutdownAndRedirectTests
+{
+    /// <summary>A webhook sender that simulates the host stopping mid-delivery: it cancels the worker's token, then
+    /// throws as a cancelled HTTP call would. Touches: the given token source.</summary>
+    private sealed class StopHostDuringSend : IWebhookSender
+    {
+        private readonly CancellationTokenSource _stop;
+        public StopHostDuringSend(CancellationTokenSource stop) => _stop = stop;
+
+        public Task SendAsync(string url, string payloadJson, CancellationToken ct)
+        {
+            _stop.Cancel();
+            ct.ThrowIfCancellationRequested();
+            return Task.CompletedTask;
+        }
+    }
+
+    /// <summary>A terminal handler that answers every request with one fixed response and counts the requests. Pure.</summary>
+    private sealed class FixedAnswerHandler : HttpMessageHandler
+    {
+        private readonly HttpStatusCode _status;
+        private readonly string _location;
+        public int Requests;
+
+        public FixedAnswerHandler(HttpStatusCode status, string location = null)
+        {
+            _status = status;
+            _location = location;
+        }
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref Requests);
+            var response = new HttpResponseMessage(_status) { RequestMessage = request };
+            if (_location != null) response.Headers.Location = new Uri(_location);
+            return Task.FromResult(response);
+        }
+    }
+
+    /// <summary>A pass-through DelegatingHandler, to prove the sender reaches the innermost handler. Pure.</summary>
+    private sealed class PassThroughHandler : DelegatingHandler { }
+
+    [Fact]
+    public async Task Job_Interrupted_By_Shutdown_Is_Requeued_Without_Using_A_Retry()
+    {
+        var connectionString = $"DataSource=file:jobs_shutdown_{Guid.NewGuid():N}?mode=memory&cache=shared";
+        using var keepAlive = new SqliteConnection(connectionString);
+        keepAlive.Open();
+        using var stop = new CancellationTokenSource();
+
+        var services = new ServiceCollection();
+        services.AddDbContext<JobsDbContext>(o => o.UseSqlite(connectionString));
+        services.AddScoped<IJobRepository, JobRepository>();
+        services.AddSingleton<JobDispatcher>();
+        services.AddSingleton<IWebhookSender>(new StopHostDuringSend(stop));
+        services.AddTransient<WebhookRetryHandler>();
+        using var provider = services.BuildServiceProvider();
+
+        Guid jobId;
+        using (var scope = provider.CreateScope())
+        {
+            scope.ServiceProvider.GetRequiredService<JobsDbContext>().Database.EnsureCreated();
+            var job = await scope.ServiceProvider.GetRequiredService<IJobRepository>()
+                .EnqueueAsync("webhook_retry", new { url = "https://hooks.example.com/deliver" }, null, 3);
+            jobId = job.Id;
+        }
+
+        var processor = new JobProcessor(provider, NullLogger<JobProcessor>.Instance);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => processor.ProcessPendingJobs(stop.Token));
+
+        using (var scope = provider.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<JobsDbContext>();
+            var job = await db.Jobs.AsNoTracking().SingleAsync(j => j.Id == jobId);
+            Assert.Equal(JobStatus.Enqueued, job.Status);   // not stuck in Running
+            Assert.Equal(0, job.RetryCount);                 // a shutdown is not a failed attempt
+            Assert.Null(job.NextRetryAt);                    // due again at once
+            Assert.Null(job.StartedAt);
+
+            var run = Assert.Single(await db.JobRuns.AsNoTracking().Where(r => r.JobId == jobId).ToListAsync());
+            Assert.NotNull(run.CompletedAt);                 // the attempt's run is closed, not left open
+            Assert.Equal(JobStatus.Cancelled, run.Status);
+            Assert.Equal(JobRepository.InterruptedError, run.Error);
+        }
+    }
+
+    [Fact]
+    public async Task Webhook_Redirect_Is_A_Failed_Attempt_And_Is_Not_Followed()
+    {
+        var handler = new FixedAnswerHandler(HttpStatusCode.Found, "https://127.0.0.1/admin");
+        var sender = new HttpWebhookSender(handler, TimeSpan.FromSeconds(5));
+
+        var error = await Assert.ThrowsAsync<HttpRequestException>(
+            () => sender.SendAsync("https://hooks.example.com/deliver", "{}", CancellationToken.None));
+        Assert.Contains("redirect", error.Message);
+        Assert.Equal(1, handler.Requests); // only the validated public URL was requested
+    }
+
+    [Fact]
+    public void Webhook_Sender_Turns_Off_Automatic_Redirects_On_The_Innermost_Handler()
+    {
+        var sockets = new SocketsHttpHandler();
+        Assert.True(sockets.AllowAutoRedirect); // the .NET default this guards against
+        _ = new HttpWebhookSender(new PassThroughHandler { InnerHandler = sockets }, TimeSpan.FromSeconds(5));
+        Assert.False(sockets.AllowAutoRedirect);
+
+        var classic = new HttpClientHandler();
+        _ = new HttpWebhookSender(classic, TimeSpan.FromSeconds(5));
+        Assert.False(classic.AllowAutoRedirect);
     }
 }

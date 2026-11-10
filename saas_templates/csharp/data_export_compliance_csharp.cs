@@ -15,6 +15,9 @@
 // stored as SHA-256 and compared in constant time; downloads are HMAC-signed URLs checked in constant time with an
 // expiry; user data, file storage and email sit behind IUserDataStore, IExportStorage and IComplianceMailer, with
 // in-memory development implementations so a fresh copy runs and its tests make no network calls.
+// 2026-11-10 (same session, CodeRabbit review on PR 19): a completed deletion also deletes the user's export files and
+// export_requests rows first (a failed cleanup leaves the deletion approved, to be retried), and a download link is
+// refused once its export request or file is gone, so a deleted user's unexpired link no longer works.
 // Touches: the compliance database; the user data store (reads, and deletes on a completed deletion); export storage;
 // email (through IComplianceMailer: network in production).
 #nullable enable
@@ -274,12 +277,21 @@ namespace ComplianceModule
     /// <summary>
     /// Where export files live and how download links are made. Production: S3 with server-side encryption and a
     /// presigned GET URL limited to 7 days (download only). Added 2026-11-10 (session
-    /// session_012zDydZCZ4AChqhEZ4oVtaP). Touches: file storage.
+    /// session_012zDydZCZ4AChqhEZ4oVtaP). DeleteAsync added the same day (CodeRabbit review on PR 19) so an account
+    /// deletion removes the user's export files. Touches: file storage.
     /// </summary>
     public interface IExportStorage
     {
         Task PutAsync(string key, byte[] content, string contentType, CancellationToken ct);
         Task<(byte[] Content, string ContentType)?> GetAsync(string key, CancellationToken ct);
+
+        /// <summary>
+        /// Deletes the file stored under the key; a key that holds nothing is not an error (idempotent, so a retried
+        /// deletion can run it again). Throws when the storage cannot delete it, which keeps the account deletion
+        /// retryable. Production (S3): DeleteObject, after which the object's presigned URLs answer 404. Added
+        /// 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit review on PR 19). Touches: file storage.
+        /// </summary>
+        Task DeleteAsync(string key, CancellationToken ct);
         string CreateDownloadUrl(string key, DateTimeOffset expiresAt);
         bool VerifyDownload(string key, long expiresUnix, string? signature, DateTimeOffset now);
     }
@@ -316,6 +328,17 @@ namespace ComplianceModule
         /// <summary>Implements the interface member of the same name; see the class summary. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.</summary>
         public Task<(byte[] Content, string ContentType)?> GetAsync(string key, CancellationToken ct) =>
             Task.FromResult(_files.TryGetValue(key, out var f) ? ((byte[], string)?)f : null);
+
+        /// <summary>
+        /// Removes the file under the key from memory; a missing key is a no-op. Input: the storage key. Added
+        /// 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit review on PR 19: a deleted user's export
+        /// stayed downloadable). Touches: process memory.
+        /// </summary>
+        public Task DeleteAsync(string key, CancellationToken ct)
+        {
+            _files.TryRemove(key, out _);
+            return Task.CompletedTask;
+        }
 
         /// <summary>Implements the interface member of the same name; see the class summary. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.</summary>
         public string CreateDownloadUrl(string key, DateTimeOffset expiresAt)
@@ -588,6 +611,7 @@ namespace ComplianceModule
     /// Builds pending exports and runs due deletions. Exports: collect the user's data, write JSON or CSV, store it,
     /// make a 7-day download link, email it, mark completed (or failed). Deletions: approved requests whose 30-day
     /// grace period has passed are cascaded through <see cref="IUserDataStore.DeleteUserAsync"/>; audit_logs are kept.
+    /// Since 2026-11-10 (CodeRabbit review on PR 19) the user's export files and export_requests rows go first.
     /// Called by <see cref="ComplianceWorker"/> and directly by tests. Added 2026-11-10 (session
     /// session_012zDydZCZ4AChqhEZ4oVtaP). Touches: the compliance database, the user data store, storage, the mailer.
     /// </summary>
@@ -622,7 +646,7 @@ namespace ComplianceModule
                     var (bytes, contentType) = export.Format == "csv"
                         ? (Encoding.UTF8.GetBytes(ToCsv(data)), "text/csv")
                         : (Encoding.UTF8.GetBytes(data.ToString(Formatting.Indented)), "application/json");
-                    var key = $"exports/{export.UserId}/{export.Id}.{export.Format}";
+                    var key = StorageKeyFor(export);
                     await _storage.PutAsync(key, bytes, contentType, ct);
                     var completedAt = DateTime.UtcNow;
                     var expiresAt = completedAt.Add(LinkLifetime);
@@ -648,13 +672,42 @@ namespace ComplianceModule
             return pending.Count;
         }
 
-        /// <summary>Runs every approved deletion whose grace period has ended at <paramref name="now"/>. Output: how many ran. Touches: see the class summary.</summary>
+        /// <summary>
+        /// The storage key of an export's file: "exports/{user}/{export id}.{format}". Derived, not read from
+        /// StorageKey, because an export that failed after its file was stored (for example at the email step) has no
+        /// StorageKey but does have a file. Input: the export request. Output: the key. Added 2026-11-10, session
+        /// session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit review on PR 19). Pure.
+        /// </summary>
+        public static string StorageKeyFor(ExportRequest export) => $"exports/{export.UserId}/{export.Id}.{export.Format}";
+
+        /// <summary>
+        /// Runs every approved deletion whose grace period has ended at <paramref name="now"/>. For each: first the
+        /// user's export files are deleted from storage and their export_requests rows removed (so no signed link can
+        /// download them any more); if that cleanup fails the deletion stays approved, audited as
+        /// deletion_export_cleanup_failed, and the next pass retries it. Then the user's data is cascaded through
+        /// <see cref="IUserDataStore.DeleteUserAsync"/> and the deletion marked completed. audit_logs are kept
+        /// (EXPORT-08). Input: the time to judge the grace period by. Output: how many due deletions were attempted.
+        /// Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit review on PR 19: export files and
+        /// rows survived the deletion). Touches: deletion_requests, export_requests, audit_logs, export storage, the
+        /// user data store.
+        /// </summary>
         public async Task<int> ProcessDueDeletionsAsync(DateTime now, CancellationToken ct)
         {
             var due = await _db.DeletionRequests.Where(d => d.Status == "approved" && d.ScheduledFor <= now)
                 .OrderBy(d => d.ScheduledFor).ThenBy(d => d.Sequence).ToListAsync(ct);
             foreach (var deletion in due)
             {
+                try
+                {
+                    await DeleteExportsOfAsync(deletion.UserId, ct);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogError("Deletion {DeletionId}: export cleanup failed, will retry: {Error}", deletion.Id, ex.GetType().Name);
+                    Audit.Add(_db, deletion.UserId, null, "deletion_export_cleanup_failed", new { deletion_id = deletion.Id, error = ex.GetType().Name });
+                    await _db.SaveChangesAsync(ct);
+                    continue; // still "approved": the next pass retries it
+                }
                 try
                 {
                     await _users.DeleteUserAsync(deletion.UserId, ct);
@@ -671,6 +724,25 @@ namespace ComplianceModule
                 await _db.SaveChangesAsync(ct);
             }
             return due.Count;
+        }
+
+        /// <summary>
+        /// Deletes every export file of the user from storage, then stages the removal of their export_requests rows
+        /// (saved with the deletion's outcome). Storage deletes are idempotent, so a retry after a partial failure is
+        /// safe; rows are removed only once every file is gone. Input: the user id. Throws when storage fails. Added
+        /// 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit review on PR 19). Touches: export storage,
+        /// export_requests.
+        /// </summary>
+        private async Task DeleteExportsOfAsync(Guid userId, CancellationToken ct)
+        {
+            var exports = await _db.ExportRequests.Where(e => e.UserId == userId).ToListAsync(ct);
+            foreach (var export in exports)
+            {
+                await _storage.DeleteAsync(StorageKeyFor(export), ct);
+                if (!string.IsNullOrEmpty(export.StorageKey) && export.StorageKey != StorageKeyFor(export))
+                    await _storage.DeleteAsync(export.StorageKey, ct);
+            }
+            _db.ExportRequests.RemoveRange(exports);
         }
 
         /// <summary>
@@ -863,7 +935,7 @@ namespace ComplianceModule
             });
         }
 
-        /// <summary>Creates the schema if missing, adds authentication/authorisation and maps the endpoints. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database.</summary>
+        /// <summary>Creates the schema if missing, adds authentication/authorisation and maps the endpoints. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP; the download now also requires the completed export request and its file to exist (CodeRabbit review on PR 19). Touches: the database, export storage.</summary>
         public void Configure(WebApplication app)
         {
             using (var scope = app.Services.CreateScope())
@@ -893,10 +965,15 @@ namespace ComplianceModule
             app.MapGet("/admin/compliance/deletions", async (string? status, ComplianceService svc, CancellationToken ct) =>
                 Results.Json(await svc.ListDeletionsAsync(status, ct))).RequireAuthorization("admin");
 
-            // The signed link is the credential (it is emailed to the owner), so this endpoint needs no session.
-            app.MapGet("/compliance/downloads/{**key}", async (string key, long expires, string? signature, IExportStorage storage, CancellationToken ct) =>
+            // The signed link is the credential (it is emailed to the owner), so this endpoint needs no session. A valid
+            // signature is not enough: the completed export request must still exist and so must its file, so a link of a
+            // deleted account (whose exports were removed) answers 404. Changed 2026-11-10, session
+            // session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit review on PR 19). Touches: export_requests (read), export storage.
+            app.MapGet("/compliance/downloads/{**key}", async (string key, long expires, string? signature, IExportStorage storage, ComplianceDbContext db, CancellationToken ct) =>
             {
                 if (!storage.VerifyDownload(key, expires, signature, DateTimeOffset.UtcNow)) return Results.StatusCode(403);
+                var requestExists = await db.ExportRequests.AsNoTracking().AnyAsync(e => e.StorageKey == key && e.Status == "completed", ct);
+                if (!requestExists) return Results.NotFound();
                 var file = await storage.GetAsync(key, ct);
                 return file == null ? Results.NotFound() : Results.File(file.Value.Content, file.Value.ContentType);
             });

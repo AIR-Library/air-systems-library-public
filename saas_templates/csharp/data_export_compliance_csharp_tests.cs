@@ -27,6 +27,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.IdentityModel.Tokens;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -397,6 +398,100 @@ namespace ComplianceModule.Tests
             Assert.Equal(HttpStatusCode.Forbidden, (await anonymous.GetAsync(tampered)).StatusCode);
             var expired = System.Text.RegularExpressions.Regex.Replace(status.FileUrl, "expires=\\d+", "expires=1");
             Assert.Equal(HttpStatusCode.Forbidden, (await anonymous.GetAsync(expired)).StatusCode);
+        }
+
+        /// <summary>
+        /// EXPORT-07 / EXPORT-08: after the grace period the deletion removes the user's export files and export
+        /// requests, so the export link that worked before is refused (404) and storage no longer holds the file; the
+        /// audit log survives. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit review on PR 19:
+        /// a deleted user's unexpired signed link still downloaded the export). Touches: the in-process test server.
+        /// </summary>
+        [Fact]
+        public async Task DeletedUsersExportLinkIsRefusedAndFileIsGone()
+        {
+            var export = await PostAs<ExportResponse>(_client, "/compliance/export", new ExportRequestDto { Format = "json" });
+            using (var scope = _factory.Services.CreateScope())
+                await scope.ServiceProvider.GetRequiredService<ExportProcessor>().ProcessPendingExportsAsync(CancellationToken.None);
+            var status = JsonConvert.DeserializeObject<ExportStatusResponse>(await (await _client.GetAsync($"/compliance/exports/{export.ExportId}")).Content.ReadAsStringAsync());
+            Assert.Equal("completed", status.Status);
+            var anonymous = _factory.CreateClient();
+            Assert.Equal(HttpStatusCode.OK, (await anonymous.GetAsync(status.FileUrl)).StatusCode); // the link works before
+
+            await ConfirmDeletionAsync();
+            using (var scope = _factory.Services.CreateScope())
+                await scope.ServiceProvider.GetRequiredService<ExportProcessor>().ProcessDueDeletionsAsync(DateTime.UtcNow.AddDays(31), CancellationToken.None);
+
+            Assert.Equal(HttpStatusCode.NotFound, (await anonymous.GetAsync(status.FileUrl)).StatusCode); // same, unexpired link
+            var key = $"exports/{_userId}/{export.ExportId}.json";
+            Assert.Null(await _factory.Services.GetRequiredService<IExportStorage>().GetAsync(key, CancellationToken.None));
+            using (var scope = _factory.Services.CreateScope())
+            {
+                var db = scope.ServiceProvider.GetRequiredService<ComplianceDbContext>();
+                Assert.False(await db.ExportRequests.AnyAsync(e => e.UserId == _userId));
+                Assert.Equal("completed", (await db.DeletionRequests.SingleAsync(d => d.UserId == _userId)).Status);
+                var actions = await db.AuditLogs.Where(a => a.UserId == _userId).Select(a => a.Action).ToListAsync();
+                Assert.Contains("data_export_requested", actions);
+                Assert.Contains("data_export_completed", actions);
+                Assert.Contains("deletion_completed", actions);
+            }
+        }
+
+        /// <summary>
+        /// When the export files cannot be deleted, the account deletion is not marked completed: it stays approved
+        /// (the user's data untouched) and the next pass, with working storage, completes it. Added 2026-11-10, session
+        /// session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit review on PR 19). Touches: the in-process test server.
+        /// </summary>
+        [Fact]
+        public async Task DeletionStaysRetryableWhenExportCleanupFails()
+        {
+            await PostAs<ExportResponse>(_client, "/compliance/export", new ExportRequestDto { Format = "csv" });
+            await ConfirmDeletionAsync();
+            var store = _factory.Services.GetRequiredService<InMemoryUserDataStore>();
+            var later = DateTime.UtcNow.AddDays(31);
+
+            using (var scope = _factory.Services.CreateScope())
+            {
+                var sp = scope.ServiceProvider;
+                var broken = new ExportProcessor(sp.GetRequiredService<ComplianceDbContext>(), sp.GetRequiredService<IUserDataStore>(),
+                    new StorageThatCannotDelete(sp.GetRequiredService<IExportStorage>()), sp.GetRequiredService<IComplianceMailer>(),
+                    NullLogger<ExportProcessor>.Instance);
+                await broken.ProcessDueDeletionsAsync(later, CancellationToken.None);
+                var db = sp.GetRequiredService<ComplianceDbContext>();
+                Assert.Equal("approved", (await db.DeletionRequests.AsNoTracking().SingleAsync(d => d.UserId == _userId)).Status);
+                Assert.True(await db.ExportRequests.AnyAsync(e => e.UserId == _userId));
+                Assert.Contains("deletion_export_cleanup_failed", await db.AuditLogs.Where(a => a.UserId == _userId).Select(a => a.Action).ToListAsync());
+            }
+            Assert.True(store.Exists(_userId));
+
+            using (var scope = _factory.Services.CreateScope())
+            {
+                await scope.ServiceProvider.GetRequiredService<ExportProcessor>().ProcessDueDeletionsAsync(later, CancellationToken.None);
+                var db = scope.ServiceProvider.GetRequiredService<ComplianceDbContext>();
+                Assert.Equal("completed", (await db.DeletionRequests.AsNoTracking().SingleAsync(d => d.UserId == _userId)).Status);
+                Assert.False(await db.ExportRequests.AnyAsync(e => e.UserId == _userId));
+            }
+            Assert.False(store.Exists(_userId));
+        }
+
+        /// <summary>Export storage whose delete always fails; everything else goes to the real storage. Test double.</summary>
+        private sealed class StorageThatCannotDelete : IExportStorage
+        {
+            private readonly IExportStorage _inner;
+            public StorageThatCannotDelete(IExportStorage inner) => _inner = inner;
+            public Task PutAsync(string key, byte[] content, string contentType, CancellationToken ct) => _inner.PutAsync(key, content, contentType, ct);
+            public Task<(byte[] Content, string ContentType)?> GetAsync(string key, CancellationToken ct) => _inner.GetAsync(key, ct);
+            public Task DeleteAsync(string key, CancellationToken ct) => throw new System.IO.IOException("storage unavailable");
+            public string CreateDownloadUrl(string key, DateTimeOffset expiresAt) => _inner.CreateDownloadUrl(key, expiresAt);
+            public bool VerifyDownload(string key, long expiresUnix, string signature, DateTimeOffset now) => _inner.VerifyDownload(key, expiresUnix, signature, now);
+        }
+
+        /// <summary>Requests this test user's deletion and confirms it with the emailed token. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.</summary>
+        private async Task ConfirmDeletionAsync()
+        {
+            var deletion = await PostAs<DeletionResponse>(_client, "/compliance/delete", new DeletionRequestDto { Reason = "gdpr_request" });
+            var token = _factory.Services.GetRequiredService<DevelopmentComplianceMailer>().Sent.Last(m => m.DeletionId == Guid.Parse(deletion.DeletionId)).Secret;
+            var confirm = await PostAs<DeletionConfirmationResponse>(_client, $"/compliance/delete/{deletion.DeletionId}/confirm", new ConfirmDeletionDto { ConfirmationToken = token });
+            Assert.True(confirm.Success);
         }
 
         /// <summary>POSTs a JSON body, requires success and reads the answer. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.</summary>
