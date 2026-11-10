@@ -64,6 +64,11 @@ audit_subjects (subject_ref, user_id UNIQUE, created_at)
   rows in ONE transaction, so a concurrent erase_subject() or apply_retention() leaves no orphan row. With that,
   the two may run in either order.
 
+Refusals by log(), each 400 with this error code: actor_type not 'user', 'service' or 'api_key' ->
+invalid_actor_type; actor_type 'user' without actor_id -> actor_required; actor_type 'service' without
+actor_service -> actor_service_required; and the codes below. erase_subject() and apply_retention() return
+erased_rows = the number of audit_personal rows they deleted. Amended 2026-11-10 (Phase B.2: one answer in every language).
+
 Which user is an entry's data subject:
 - resource_type 'user': the resource_id. A different subject_user_id is refused: 400 subject_mismatch.
 - every other resource_type: log() REQUIRES subject_user_id, either a user id or the literal 'none' for a

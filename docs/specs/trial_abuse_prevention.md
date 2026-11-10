@@ -80,6 +80,8 @@ name or in a comment on the line above it (for example `# TRIAL-01`), so a missi
      days_after_trial = floor((now - trial_end) / 1 day)   -- negative while the trial is running; floor
                         rounds toward negative infinity (Math.floor, Math.floorDiv, div_euclid), not truncation
      earlier_payment = the ledger already has a payment_added_date for this user
+     A user with no users row gets FAIL {error: "user_not_found"} (fail closed). A user with no ledger row is
+     judged from users.created_at with no earlier payment. Amended 2026-11-10 (Phase B.2: one answer in every language).
      Decision: PASS if days_after_trial < 5
               FAIL if days_after_trial >= 90 AND NOT earlier_payment
               CHALLENGE otherwise (5 to 89 days after the trial, or 90+ days with an earlier payment)

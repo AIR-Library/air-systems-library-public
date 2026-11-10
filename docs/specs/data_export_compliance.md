@@ -25,6 +25,7 @@ name or in a comment on the line above it (for example `# EXPORT-01`), so a miss
 | `EXPORT-12` | Deletion: a gdpr_request or gdpr_right_to_be_forgotten request is not held for 30 days (will_delete_at = requested_at) |
 | `EXPORT-13` | Deletion cascade order: the user's rows are deleted, 'user_deleted_cascade' is logged, then the audit eraser's erase_subject(user_id) is called last, and nothing is logged for the user after it; deletion_requests.user_id is NULL once completed |
 | `EXPORT-14` | Deletion confirmation: nothing is deleted before confirm; a wrong, reused or expired (over 24h) token is refused; another user's deletion request is 404 for confirm and cancel |
+| `EXPORT-15` | confirm with a wrong, reused or expired token → the same 400 invalid_confirmation_token; confirm or cancel of a cancelled or completed request → 409 deletion_not_pending |
 
 ## Contract
 
@@ -79,7 +80,10 @@ ENDPOINTS:
      PR 19; amended the same day so every language does the same.
    - Nothing is deleted until the request is confirmed (step 4). The confirmation token is 32 random bytes,
      stored only as its SHA-256, single-use, valid 24 hours, bound to its deletion_id, and compared in
-     constant time. Confirm and cancel act only on the caller's own request; anyone else's is 404.
+     constant time. Confirm and cancel act only on the caller's own request; anyone else's is 404
+     {error: "not_found"}. A wrong, reused or expired token gets one answer, 400
+     {error: "invalid_confirmation_token"}, so the reply never says which. A request that is no longer
+     pending (cancelled or completed) gets 409 {error: "deletion_not_pending"}. Amended 2026-11-10 (Phase B.2: one answer in every language).
    - Schedule cascade delete: sessions, api_keys, preferences, export files and their request rows, etc.
      The audit log is kept (EXPORT-08). Corrected 2026-11-10 from review on PR 19: this line listed audit_logs.
    - Log in audit_log: action='deletion_requested', reason
@@ -135,4 +139,5 @@ TESTS:
 - **EXPORT-12** Deletion: a gdpr_request or gdpr_right_to_be_forgotten request is not held for 30 days (will_delete_at = requested_at)
 - **EXPORT-13** Deletion cascade order: the user's rows are deleted, 'user_deleted_cascade' is logged, then the audit eraser's erase_subject(user_id) is called last, and nothing is logged for the user after it; deletion_requests.user_id is NULL once completed
 - **EXPORT-14** Deletion confirmation: nothing is deleted before confirm; a wrong, reused or expired (over 24h) token is refused; another user's deletion request is 404 for confirm and cancel
+- **EXPORT-15** confirm with a wrong, reused or expired token → the same 400 invalid_confirmation_token; confirm or cancel of a cancelled or completed request → 409 deletion_not_pending
 ```
