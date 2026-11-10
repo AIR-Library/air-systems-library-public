@@ -154,7 +154,16 @@ namespace SaaS.Search
         };
 
         // Background job queue (simplified)
-        private readonly ConcurrentQueue<Func<Task>> _jobQueue = new ConcurrentQueue<Func<Task>>();
+        private readonly ConcurrentQueue<(string Id, Func<Task> Run)> _jobQueue = new ConcurrentQueue<(string Id, Func<Task> Run)>();
+        private readonly ConcurrentDictionary<string, string> _failedJobs = new ConcurrentDictionary<string, string>();
+
+        /// <summary>
+        /// Reindex jobs that failed, by job id, with the error message. A failed job leaves the previous terms in place
+        /// and the worker carries on, so this is where the failure is visible. Added 2026-11-10,
+        /// session_012zDydZCZ4AChqhEZ4oVtaP: the worker used a bare catch that dropped the error (code scanning, PR 19).
+        /// Touches: process memory (read).
+        /// </summary>
+        public IReadOnlyDictionary<string, string> FailedJobs => _failedJobs;
         private readonly CancellationTokenSource _cts = new CancellationTokenSource();
 
         /// <summary>Creates an empty index and starts the in-process reindex worker. Touches: process memory.</summary>
@@ -396,7 +405,7 @@ namespace SaaS.Search
         {
             var documentType = request?.DocumentType;
             var jobId = Guid.NewGuid().ToString();
-            _jobQueue.Enqueue(() =>
+            _jobQueue.Enqueue((jobId, () =>
             {
                 lock (_gate)
                 {
@@ -410,7 +419,7 @@ namespace SaaS.Search
                     }
                 }
                 return Task.CompletedTask;
-            });
+            }));
 
             return Task.FromResult(new ReindexResponse
             {
@@ -422,7 +431,8 @@ namespace SaaS.Search
 
         /// <summary>
         /// Runs enqueued reindex jobs one at a time until the service is disposed of with the process. A failing job
-        /// is skipped so the worker keeps running. Touches: process memory.
+        /// is recorded in <see cref="FailedJobs"/> and the worker keeps running (2026-11-10,
+        /// session_012zDydZCZ4AChqhEZ4oVtaP: it was a bare catch that dropped the error). Touches: process memory.
         /// </summary>
         private async Task ProcessJobsAsync()
         {
@@ -430,8 +440,12 @@ namespace SaaS.Search
             {
                 if (_jobQueue.TryDequeue(out var job))
                 {
-                    try { await job(); }
-                    catch { /* a failed reindex leaves the previous terms in place */ }
+                    try { await job.Run(); }
+                    catch (Exception ex)
+                    {
+                        // A failed reindex leaves the previous terms in place; the worker must keep serving later jobs.
+                        _failedJobs[job.Id] = ex.Message;
+                    }
                 }
                 else
                 {
