@@ -133,6 +133,9 @@ describe('NotificationService', () => {
 
   test('Retry: failed email retries and eventually succeeds', async () => {
     const sendMailMock = mockEmailTransport.sendMail as jest.Mock;
+    // The transport mock is shared by the whole file, so its call count already includes the earlier tests' 1,000+
+    // sends; count only this test's attempts (2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP).
+    sendMailMock.mockClear();
     sendMailMock.mockRejectedValueOnce(new Error('SMTP error'));
     sendMailMock.mockRejectedValueOnce(new Error('SMTP error'));
     sendMailMock.mockResolvedValueOnce({});

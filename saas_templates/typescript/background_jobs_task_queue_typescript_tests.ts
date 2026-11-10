@@ -787,11 +787,17 @@ describe('Background Job Manager', () => {
         .mockResolvedValueOnce({ rows: [] })
         .mockResolvedValueOnce({ rows: [] })
         .mockResolvedValueOnce({ rows: [] });
+      // Syncing means asking Stripe for each invoice; Stripe is faked here so the test makes no network call
+      // (2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: the task used to re-read its own table instead).
+      const retrieveInvoice = jest.fn(async (id: string) => ({ id, status: 'paid', amount_paid: 1000, amount_due: 0 }));
+      jobManager.setStripeInvoiceGateway({ retrieveInvoice });
       
       const result = await jobManager.executeJob(mockJob);
       
       expect(result).toHaveProperty('invoices_processed', 2);
       expect(result).toHaveProperty('total_invoices', 2);
+      expect(retrieveInvoice).toHaveBeenCalledWith('invoice-1');
+      expect(retrieveInvoice).toHaveBeenCalledWith('invoice-2');
     });
     
     it('should execute generate_deployment_archive task', async () => {

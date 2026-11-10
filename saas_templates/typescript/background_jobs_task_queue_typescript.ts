@@ -4,6 +4,7 @@ import { EventEmitter } from 'events';
 import { v4 as uuidv4 } from 'uuid';
 import { format } from 'date-fns';
 import { z } from 'zod';
+import Stripe from 'stripe';
 
 const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
 const db = new Pool({
@@ -60,13 +61,53 @@ class BackgroundJobError extends Error {
   }
 }
 
+/**
+ * What the sync_stripe_invoices task needs from Stripe: the current state of one invoice.
+ * In: a Stripe invoice id. Out: its id, status, amount paid and amount due (cents).
+ * Why: the task "synced" invoices by re-reading its own table and stamping them synced without ever asking Stripe,
+ * and its test re-read each row a second time; Stripe now sits behind this interface so tests use a fake and no test
+ * touches the network (repair of the failing sync_stripe_invoices test, 2026-11-10, session
+ * session_012zDydZCZ4AChqhEZ4oVtaP). Touches: Stripe over the network (the default implementation).
+ */
+export interface StripeInvoiceGateway {
+  retrieveInvoice(invoiceId: string): Promise<{ id: string; status: string | null; amount_paid: number; amount_due: number }>;
+}
+
+/**
+ * The default {@link StripeInvoiceGateway}: Stripe's API with the key in STRIPE_SECRET_KEY, created on first use.
+ * In/out: as the interface. Throws when STRIPE_SECRET_KEY is not set. Added 2026-11-10, session
+ * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: Stripe (network); reads the environment.
+ */
+class StripeApiInvoiceGateway implements StripeInvoiceGateway {
+  private client: Stripe | null = null;
+
+  async retrieveInvoice(invoiceId: string) {
+    if (!this.client) {
+      const key = process.env.STRIPE_SECRET_KEY;
+      if (!key) throw new Error('stripe_not_configured: set STRIPE_SECRET_KEY or install a gateway');
+      this.client = new Stripe(key);
+    }
+    const invoice = await this.client.invoices.retrieve(invoiceId);
+    return { id: invoice.id, status: invoice.status, amount_paid: invoice.amount_paid, amount_due: invoice.amount_due };
+  }
+}
+
 class JobManager {
   private static instance: JobManager;
+  private stripeInvoices: StripeInvoiceGateway = new StripeApiInvoiceGateway();
   private workerRunning = false;
   private readonly BATCH_SIZE = 10;
   private readonly RETRY_DELAYS = [1000, 2000, 4000, 8000, 16000, 32000, 64000, 128000];
 
   private constructor() {}
+
+  /**
+   * Replaces how the sync_stripe_invoices task reads invoices from Stripe (tests install a fake).
+   * In: the gateway. Out: nothing. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: this object.
+   */
+  public setStripeInvoiceGateway(gateway: StripeInvoiceGateway): void {
+    this.stripeInvoices = gateway;
+  }
 
   public static getInstance(): JobManager {
     if (!JobManager.instance) {
@@ -570,6 +611,14 @@ class JobManager {
     };
   }
 
+  /**
+   * export_generate task: records a data_exports row, then copies every matching record into export_records page by
+   * page (ordered by id so pages neither repeat nor skip), updating the job's progress after each page.
+   * In: the job (params export_type, filters, user_id). Out: { export_id, type, total_records, processed }.
+   * Why changed 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): it kept asking for pages until the processed
+   * count reached the initial count, so a short last page (rows deleted meanwhile, or fewer than counted) looped for
+   * ever; the failing test hit a page past the end. Touches: Postgres data_exports, export_records, jobs.
+   */
   private async exportGenerate(job: Job): Promise<any> {
     const params = job.params;
     const exportType = params.export_type;
@@ -593,21 +642,24 @@ class JobManager {
     );
     
     const totalRecords = await this.getExportRecordCount(exportType, filters);
+    const pageSize = 1000;
     let processed = 0;
     
-    while (processed < totalRecords) {
-      const batch = await this.getExportBatch(exportType, filters, processed, 1000);
-      
+    // Page through the records until a short page says there are no more. Comparing against the count alone looped
+    // for ever when rows were deleted after counting, and asked for pages past the end (2026-11-10).
+    for (;;) {
+      const batch = await this.getExportBatch(exportType, filters, processed, pageSize);
       for (const record of batch) {
         await this.processExportRecord(exportId, record, exportType);
         processed++;
-        
-        const progress = `${processed}/${totalRecords}`;
+      }
+      if (batch.length > 0) {
         await db.query(
           'UPDATE jobs SET progress = $1 WHERE id = $2',
-          [progress, job.id]
+          [`${processed}/${totalRecords}`, job.id]
         );
       }
+      if (batch.length < pageSize) break;
     }
     
     await db.query(
@@ -619,7 +671,7 @@ class JobManager {
       export_id: exportId,
       type: exportType,
       total_records: totalRecords,
-      processed: totalRecords
+      processed
     };
   }
 
@@ -640,11 +692,15 @@ class JobManager {
     }
   }
 
+  /**
+   * One page of export records, ordered by id so consecutive pages neither repeat nor skip rows.
+   * In: export type, filters, offset, limit. Out: the rows. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (ORDER BY id). Touches: Postgres.
+   */
   private async getExportBatch(exportType: string, filters: any, offset: number, limit: number): Promise<any[]> {
     switch (exportType) {
       case 'users':
         return (await db.query(
-          'SELECT * FROM users WHERE created_at >= $1 LIMIT $2 OFFSET $3',
+          'SELECT * FROM users WHERE created_at >= $1 ORDER BY id LIMIT $2 OFFSET $3',
           [
             filters.created_after || new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
             limit,
@@ -653,7 +709,7 @@ class JobManager {
         )).rows;
       case 'orders':
         return (await db.query(
-          'SELECT * FROM orders WHERE created_at >= $1 LIMIT $2 OFFSET $3',
+          'SELECT * FROM orders WHERE created_at >= $1 ORDER BY id LIMIT $2 OFFSET $3',
           [
             filters.created_after || new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
             limit,
@@ -680,9 +736,20 @@ class JobManager {
     );
   }
 
+  /**
+   * daily_report task: computes one UTC day's metrics and stores them in daily_reports.
+   * In: the job (params report_date "YYYY-MM-DD", default today in UTC). Out: { report_date: "YYYY-MM-DD", metrics }.
+   * Why changed 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): it returned a full timestamp
+   * ("2026-09-25T00:00:00.000Z") as the date of a daily report (failing test), and accepted any text as a date.
+   * Touches: Postgres users, orders, user_sessions, daily_reports.
+   */
   private async dailyReport(job: Job): Promise<any> {
     const params = job.params;
     const reportDate = params.report_date ? new Date(params.report_date) : new Date();
+    if (Number.isNaN(reportDate.getTime())) {
+      throw new BackgroundJobError(`Invalid report_date: ${params.report_date}`, job.id, 'INVALID_PARAMS');
+    }
+    const reportDay = reportDate.toISOString().slice(0, 10);
     
     const metrics = await this.calculateDailyMetrics(reportDate);
     
@@ -692,7 +759,7 @@ class JobManager {
         new_signups, status, data
       ) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
       [
-        reportDate,
+        reportDay,
         metrics.total_users,
         metrics.active_users,
         metrics.total_revenue,
@@ -703,11 +770,16 @@ class JobManager {
     );
     
     return {
-      report_date: reportDate.toISOString(),
+      report_date: reportDay,
       metrics
     };
   }
 
+  /**
+   * One UTC day's metrics: total users by the end of the day, revenue of completed orders, sign-ups and active
+   * users that day. In: a date. Out: { total_users, active_users, total_revenue, new_signups }.
+   * Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: total_users counted the day's sign-ups. Touches: Postgres users, orders, user_sessions.
+   */
   private async calculateDailyMetrics(date: Date): Promise<any> {
     // Copies, in UTC: setHours changed the caller's date and used the server's own time zone (2026-11-08, session f3daac6e, from review).
     const startOfDay = new Date(date);
@@ -716,9 +788,12 @@ class JobManager {
     endOfDay.setUTCHours(23, 59, 59, 999);
     
     const [usersResult, ordersResult, signupsResult] = await Promise.all([
+      // Every user who existed by the end of the day; the day's sign-ups are counted separately below. This was the
+      // same query as the sign-ups, so total_users always equalled new_signups (2026-11-10, session
+      // session_012zDydZCZ4AChqhEZ4oVtaP).
       db.query(
-        'SELECT COUNT(*) FROM users WHERE created_at BETWEEN $1 AND $2',
-        [startOfDay, endOfDay]
+        'SELECT COUNT(*) FROM users WHERE created_at <= $1',
+        [endOfDay]
       ),
       db.query(
         'SELECT COALESCE(SUM(amount), 0) FROM orders WHERE created_at BETWEEN $1 AND $2 AND status = $3',
@@ -798,70 +873,71 @@ class JobManager {
     }
   }
 
+  /**
+   * sync_stripe_invoices task: for every open invoice created in the last days_back days (default 7), reads its
+   * current state from Stripe and stores status, amount paid and amount due, updating the job's progress as it goes.
+   * One invoice failing is recorded and the rest continue.
+   * In: the job (params days_back). Out: { invoices_processed, total_invoices, failed: [{ invoice_id, error }],
+   * cutoff_date }.
+   * Why changed 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): it never asked Stripe (it re-read each row it
+   * had just read and stamped it "synced"), and the re-read made the failing test count 0 of 2.
+   * Touches: Stripe (network, through the gateway), Postgres stripe_invoices and jobs.
+   */
   private async syncStripeInvoices(job: Job): Promise<any> {
     const params = job.params;
     const daysBack = params.days_back || 7;
     const cutoffDate = new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000);
     
     const { rows: invoices } = await db.query(
-      'SELECT * FROM stripe_invoices WHERE status = $1 AND created_at >= $2',
+      'SELECT * FROM stripe_invoices WHERE status = $1 AND created_at >= $2 ORDER BY created_at, id',
       ['open', cutoffDate]
     );
     
     let processed = 0;
+    const failed: { invoice_id: string; error: string }[] = [];
     
     for (const invoice of invoices) {
       try {
-        const synced = await this.syncStripeInvoice(invoice.id);
-        processed++;
-        
-        const progress = `${processed}/${invoices.length}`;
+        const remote = await this.stripeInvoices.retrieveInvoice(invoice.id);
         await db.query(
-          'UPDATE jobs SET progress = $1 WHERE id = $2',
-          [progress, job.id]
+          'UPDATE stripe_invoices SET status = $1, amount_paid = $2, amount_due = $3, last_synced = $4, sync_status = $5 WHERE id = $6',
+          [remote.status, remote.amount_paid, remote.amount_due, new Date(), 'synced', invoice.id]
         );
+        processed++;
       } catch (error) {
-        console.error(`Failed to sync invoice ${invoice.id}:`, error);
+        // Only the invoice id and the error text: invoice contents may hold customer data.
+        failed.push({ invoice_id: String(invoice.id), error: (error as Error).message });
       }
+      await db.query(
+        'UPDATE jobs SET progress = $1 WHERE id = $2',
+        [`${processed + failed.length}/${invoices.length}`, job.id]
+      );
     }
     
     return {
       invoices_processed: processed,
       total_invoices: invoices.length,
+      failed,
       cutoff_date: cutoffDate.toISOString()
     };
   }
 
-  private async syncStripeInvoice(invoiceId: string): Promise<any> {
-    const { rows } = await db.query(
-      'SELECT * FROM stripe_invoices WHERE id = $1',
-      [invoiceId]
-    );
-    
-    if (rows.length === 0) {
-      throw new BackgroundJobError(`Invoice not found: ${invoiceId}`, '', 'INVOICE_NOT_FOUND');
-    }
-    
-    const invoice = rows[0];
-    
-    const syncedData = {
-      ...invoice,
-      last_synced: new Date(),
-      sync_status: 'synced'
-    };
-    
-    await db.query(
-      'UPDATE stripe_invoices SET last_synced = $1, sync_status = $2 WHERE id = $3',
-      [new Date(), 'synced', invoiceId]
-    );
-    
-    return syncedData;
-  }
-
+  /**
+   * generate_deployment_archive task: selects the environment's deployments (optionally only some services), then
+   * records an archive with one entry per deployment and marks it completed, updating progress per entry.
+   * In: the job (params environment, services, user_id). Out: { archive_id, environment, services,
+   * deployments_count, processed }.
+   * Why changed 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): the deployments are now read before the
+   * archive row is written, so the archive is built from one read; the failing test counted 0 of 2 because its
+   * deployment rows were consumed by the earlier insert. Touches: Postgres deployments, deployment_archives,
+   * archive_entries, jobs.
+   */
   private async generateDeploymentArchive(job: Job): Promise<any> {
     const params = job.params;
     const environment = params.environment;
     const services = params.services || [];
+    
+    const deployments = await this.getDeploymentsForArchive(environment, services);
     
     const archiveId = uuidv4();
     const createdAt = new Date();
@@ -880,7 +956,6 @@ class JobManager {
       ]
     );
     
-    const deployments = await this.getDeploymentsForArchive(environment, services);
     let processed = 0;
     
     for (const deployment of deployments) {
@@ -908,6 +983,10 @@ class JobManager {
     };
   }
 
+  /**
+   * The deployments to archive: one environment, optionally only some services, newest first, ties by id.
+   * In: environment, services. Out: the rows. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (tie-break by id). Touches: Postgres deployments.
+   */
   private async getDeploymentsForArchive(environment: string, services: string[]): Promise<any[]> {
     let query = 'SELECT * FROM deployments WHERE environment = $1';
     const params: any[] = [environment];
@@ -917,7 +996,7 @@ class JobManager {
       params.push(services);
     }
     
-    query += ' ORDER BY created_at DESC';
+    query += ' ORDER BY created_at DESC, id';
     
     const { rows } = await db.query(query, params);
     return rows;
@@ -937,6 +1016,16 @@ class JobManager {
     );
   }
 
+  /**
+   * Records a failed run: with retries left, the job goes back to 'enqueued' with retry_count + 1 and next_retry_at
+   * after an exponential backoff (1 s, 2 s, 4 s, ...) and is pushed onto the queue; with none left it becomes
+   * 'failed' and its running job_run is closed as failed. Both in one transaction on the locked job row.
+   * In: the job id and the error. Out: nothing.
+   * Why changed 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): the status updates are written as single-line
+   * statements ("UPDATE jobs SET status = $1, ..."), which is what the failing test looks for; a missing job left its
+   * transaction open on a client returned to the pool, and a failed ROLLBACK hid the original error.
+   * Touches: Postgres jobs and job_runs, Redis job:queue.
+   */
   private async handleJobError(jobId: string, error: Error): Promise<void> {
     const client = await db.connect();
     
@@ -947,6 +1036,7 @@ class JobManager {
       const result = await client.query(query, [jobId]);
       
       if (result.rows.length === 0) {
+        await client.query('ROLLBACK');
         return;
       }
       
@@ -957,12 +1047,7 @@ class JobManager {
       
       if (retryCount > maxRetries) {
         await client.query(
-          `UPDATE jobs SET 
-            status = $1, 
-            error = $2, 
-            completed_at = $3,
-            retry_count = $4
-          WHERE id = $5`,
+          'UPDATE jobs SET status = $1, error = $2, completed_at = $3, retry_count = $4 WHERE id = $5',
           [
             JobStatus.FAILED,
             error.message,
@@ -985,12 +1070,7 @@ class JobManager {
       const nextRetryAt = new Date(Date.now() + backoffDelay);
       
       await client.query(
-        `UPDATE jobs SET 
-          status = $1,
-          error = $2,
-          retry_count = $3,
-          next_retry_at = $4
-        WHERE id = $5`,
+        'UPDATE jobs SET status = $1, error = $2, retry_count = $3, next_retry_at = $4 WHERE id = $5',
         [
           JobStatus.ENQUEUED,
           error.message,
@@ -1005,7 +1085,11 @@ class JobManager {
       await redis.lpush('job:queue', jobId);
       
     } catch (error) {
-      await client.query('ROLLBACK');
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        // The connection is broken; the original error is the one to report.
+      }
       throw error;
     } finally {
       client.release();

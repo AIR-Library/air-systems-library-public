@@ -1,27 +1,30 @@
-import { ApiKeyService, Scope } from './api_keys_service_accounts_typescript';
-import Redis from 'ioredis';
+import { ApiKeyService, Scope, InMemoryRateLimitStore } from './api_keys_service_accounts_typescript';
 import { jest } from '@jest/globals';
+
+/*
+ * Test changes 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP):
+ * - The suite opened two real Redis connections to localhost:6379 (`new Redis()` and init's options) and spied on
+ *   only incr/expire; with no Redis server ioredis waited for ever and the runner killed the suite at 300 s. The
+ *   service now takes a rate-limit store, and the tests use the in-memory one: no network.
+ * - The service runs on a fixed clock (10:30 UTC on 2026-06-15), so the hourly rate-limit window cannot roll over in
+ *   the middle of the 1,001-request test and the usage-stats range ('2026-01-01'..'2026-12-31') does not depend on
+ *   the year the suite runs in. The expired-key test takes "a minute ago" from that clock instead of Date.now().
+ */
+const FIXED_NOW = new Date('2026-06-15T10:30:00.000Z');
 
 describe('API Key Service', () => {
   let service: ApiKeyService;
-  let redisMock: Redis.Redis;
 
   beforeAll(async () => {
-    redisMock = new Redis();
-    jest.spyOn(redisMock, 'incr').mockImplementation(async (key: string) => {
-      const val = await redisMock.get(key);
-      const num = val ? parseInt(val, 10) : 0;
-      await redisMock.set(key, (num + 1).toString());
-      return num + 1;
-    });
-    jest.spyOn(redisMock, 'expire').mockImplementation(async () => 0);
     service = new ApiKeyService();
-    await service.init(':memory:', { host: '127.0.0.1', port: 6379 });
-    service.redis = redisMock;
+    await service.init(':memory:', {
+      rateLimitStore: new InMemoryRateLimitStore(() => FIXED_NOW.getTime()),
+      now: () => FIXED_NOW,
+    });
   });
 
   afterAll(async () => {
-    await redisMock.quit();
+    await service.close();
   });
 
   const userId = 'user-123';
@@ -119,12 +122,34 @@ describe('API Key Service', () => {
     await service.validateApiKey(newKey, '/deployments', 'GET', 'read:deployments');
   });
 
+  test('Rotate: old key expires by itself when the 24 h grace period ends', async () => {
+    // Added 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): the test above ends the grace period by hand; this
+    // one moves a clock past it.
+    let now = FIXED_NOW.getTime();
+    const clocked = new ApiKeyService();
+    await clocked.init(':memory:', { rateLimitStore: new InMemoryRateLimitStore(() => now), now: () => new Date(now) });
+    try {
+      const { api_key_id, key: oldKey } = await clocked.createApiKey({ user_id: userId, name: 'Grace Test', scopes });
+      const rotation = await clocked.rotateApiKey(api_key_id);
+      now += 23 * 60 * 60 * 1000;
+      await clocked.validateApiKey(oldKey, '/deployments', 'GET', 'read:deployments');
+      now += 2 * 60 * 60 * 1000;
+      await expect(
+        clocked.validateApiKey(oldKey, '/deployments', 'GET', 'read:deployments')
+      ).rejects.toMatchObject({ status: 401 });
+      await clocked.validateApiKey(rotation.new_key, '/deployments', 'GET', 'read:deployments');
+      await expect(clocked.rotateApiKey(api_key_id)).rejects.toMatchObject({ status: 409 });
+    } finally {
+      await clocked.close();
+    }
+  });
+
   test('Expired key: after expires_at, request returns 401', async () => {
     const { key } = await service.createApiKey({
       user_id: userId,
       name: 'Expire Test',
       scopes,
-      expires_at: new Date(Date.now() - 1000 * 60).toISOString().split('T')[0],
+      expires_at: new Date(FIXED_NOW.getTime() - 1000 * 60).toISOString().split('T')[0],
     });
     await expect(
       service.validateApiKey(key, '/deployments', 'GET', 'read:deployments')

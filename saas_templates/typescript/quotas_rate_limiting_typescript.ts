@@ -114,39 +114,87 @@ export const UPGRADE_URLS: Record<Tier, string> = {
   enterprise: "https://example.com/upgrade/enterprise",
 };
 
-export function getCurrentMonth(): string {
-  const now = new Date();
-  const year = now.getFullYear();
-  const month = String(now.getMonth() + 1).padStart(2, "0");
+/**
+ * The billing month of a moment, as "YYYY-MM" in UTC. In: the moment (default: now). Out: e.g. "2024-01".
+ * Why: it read the machine's local month, so the same instant fell in different months on different servers, and it
+ * could not be asked about any moment but the present, so month rollover could not be tested (repair of the failing
+ * check "Old month metrics should exist", 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP). Touches: nothing.
+ */
+export function getCurrentMonth(now: Date = new Date()): string {
+  const year = now.getUTCFullYear();
+  const month = String(now.getUTCMonth() + 1).padStart(2, "0");
   return `${year}-${month}`;
 }
 
-export function getResetDate(): string {
-  const now = new Date();
-  const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
-  return nextMonth.toISOString();
+/**
+ * When the monthly quota resets: midnight UTC on the first day of the next month, as an ISO string.
+ * In: the moment (default: now). Out: e.g. "2024-02-01T00:00:00.000Z".
+ * Why: it used local time, unlike the UTC month key above (2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP).
+ * Touches: nothing.
+ */
+export function getResetDate(now: Date = new Date()): string {
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1)).toISOString();
 }
 
+/**
+ * Options for {@link InMemoryQuotaService}. `now` is the clock the service reads for the billing month and the
+ * rate-limit windows (default: the system clock); tests and replays pass a fixed clock.
+ * Why: a quota service whose month cannot be pinned cannot be tested across a month rollover (2026-11-10, session
+ * session_012zDydZCZ4AChqhEZ4oVtaP). Touches: nothing.
+ */
+export interface QuotaServiceOptions {
+  now?: () => Date;
+}
+
+/**
+ * In-memory quota and rate-limit service (spec GEMINI_DISPATCH_MASTER_SPEC, quotas): monthly API-call and storage
+ * quotas per tier, per-user (100/min) and per-IP (10/s) rate limits, tier feature gates and month rollover.
+ * In: an optional clock ({@link QuotaServiceOptions}). Out: the {@link QuotaService} methods.
+ * Why: changed 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP) so every date it uses comes from one injectable
+ * clock; before, month rollover depended on the real calendar month. Touches: process memory only.
+ */
 export class InMemoryQuotaService implements QuotaService {
+  private readonly now: () => Date;
   private usageMetrics: Map<string, UsageMetricsRow> = new Map();
   private apiCalls: ApiCallRow[] = [];
   private users: Map<string, User> = new Map();
   private whyChain: WhyChainEntry[] = [];
   private callIdCounter: number = 0;
 
+  /**
+   * In: options; `now` overrides the clock. Out: a new empty service. Why/date/touches: see the class block.
+   */
+  constructor(options: QuotaServiceOptions = {}) {
+    this.now = options.now ?? (() => new Date());
+  }
+
+  /** The billing month by this service's clock. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing. */
+  private month(): string {
+    return getCurrentMonth(this.now());
+  }
+
   private getKey(userId: string, month: string): string {
     return `${userId}:${month}`;
   }
 
+  /**
+   * Appends one gate decision to the why-chain, stamped by the service clock. In: the entry. Out: nothing.
+   * Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (service clock). Touches: memory.
+   */
   private logWhyChain(entry: Omit<WhyChainEntry, "timestamp">): void {
     this.whyChain.push({
       ...entry,
-      timestamp: new Date().toISOString(),
+      timestamp: this.now().toISOString(),
     });
   }
 
+  /**
+   * Monthly API-call quota for a tier: passes while this call stays within the limit, else quota_exceeded with
+   * current, limit and reset_date (first of next month, UTC). In: user id, tier. Out: { pass, error? }.
+   * Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: month and reset date from the service clock. Touches: memory.
+   */
   async checkApiCallQuota(userId: string, tier: Tier): Promise<QuotaCheckResult> {
-    const month = getCurrentMonth();
+    const month = this.month();
     const key = this.getKey(userId, month);
     const currentUsage = this.usageMetrics.get(key)?.call_count ?? 0;
     const limit = API_CALL_LIMITS[tier];
@@ -173,13 +221,17 @@ export class InMemoryQuotaService implements QuotaService {
         error: "quota_exceeded",
         current: currentUsage,
         limit,
-        reset_date: getResetDate(),
+        reset_date: getResetDate(this.now()),
       },
     };
   }
 
+  /**
+   * Storage quota for a tier: passes while current + incoming bytes fit, else storage_quota_exceeded.
+   * In: user id, tier, incoming size. Out: { pass, error? }. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (service clock). Touches: memory.
+   */
   async checkStorageQuota(userId: string, tier: Tier, incomingFileSize: number): Promise<QuotaCheckResult> {
-    const month = getCurrentMonth();
+    const month = this.month();
     const key = this.getKey(userId, month);
     const currentStorage = this.usageMetrics.get(key)?.storage_bytes ?? 0;
     const limit = STORAGE_LIMITS[tier];
@@ -210,8 +262,12 @@ export class InMemoryQuotaService implements QuotaService {
     };
   }
 
+  /**
+   * Per-user limit: fewer than RATE_LIMIT_PER_USER calls in the last 60 s pass, else rate_limit_exceeded
+   * (reset_seconds 60). In: user id. Out: { pass, error? }. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (service clock). Touches: memory.
+   */
   async checkRateLimitPerUser(userId: string): Promise<RateLimitResult> {
-    const now = Date.now();
+    const now = this.now().getTime();
     const oneMinuteAgo = now - 60000;
     const count = this.apiCalls.filter(
       (call) => call.user_id === userId && new Date(call.timestamp).getTime() > oneMinuteAgo
@@ -230,8 +286,12 @@ export class InMemoryQuotaService implements QuotaService {
     };
   }
 
+  /**
+   * Per-IP limit: fewer than RATE_LIMIT_PER_IP calls in the last second pass, else ip_rate_limit_exceeded
+   * (reset_seconds 1). In: IP. Out: { pass, error? }. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (service clock). Touches: memory.
+   */
   async checkRateLimitPerIp(ip: string): Promise<RateLimitResult> {
-    const now = Date.now();
+    const now = this.now().getTime();
     const oneSecondAgo = now - 1000;
     const count = this.apiCalls.filter(
       (call) => call.ip === ip && new Date(call.timestamp).getTime() > oneSecondAgo
@@ -281,47 +341,59 @@ export class InMemoryQuotaService implements QuotaService {
     };
   }
 
+  /**
+   * Counts one API call in the current month's usage row. In: user id, tier. Out: nothing.
+   * Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (service clock). Touches: memory.
+   */
   async incrementUsage(userId: string, tier: Tier): Promise<void> {
-    const month = getCurrentMonth();
+    const month = this.month();
     const key = this.getKey(userId, month);
     const existing = this.usageMetrics.get(key);
 
     if (existing) {
       existing.call_count += 1;
-      existing.updated_at = new Date().toISOString();
+      existing.updated_at = this.now().toISOString();
     } else {
       this.usageMetrics.set(key, {
         user_id: userId,
         month,
         call_count: 1,
         storage_bytes: 0,
-        updated_at: new Date().toISOString(),
+        updated_at: this.now().toISOString(),
       });
     }
   }
 
+  /**
+   * Adds stored bytes to the current month's usage row. In: user id, bytes. Out: nothing.
+   * Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (service clock). Touches: memory.
+   */
   async addStorage(userId: string, bytes: number): Promise<void> {
-    const month = getCurrentMonth();
+    const month = this.month();
     const key = this.getKey(userId, month);
     const existing = this.usageMetrics.get(key);
 
     if (existing) {
       existing.storage_bytes += bytes;
-      existing.updated_at = new Date().toISOString();
+      existing.updated_at = this.now().toISOString();
     } else {
       this.usageMetrics.set(key, {
         user_id: userId,
         month,
         call_count: 0,
         storage_bytes: bytes,
-        updated_at: new Date().toISOString(),
+        updated_at: this.now().toISOString(),
       });
     }
   }
 
+  /**
+   * Logs one API call for the rate limits. In: the call without id. Out: nothing.
+   * Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (service clock in the id seed). Touches: memory.
+   */
   async recordApiCall(call: Omit<ApiCallRow, "id">): Promise<void> {
     this.callIdCounter += 1;
-    const id = createHash("md5").update(`${this.callIdCounter}-${Date.now()}`).digest("hex");
+    const id = createHash("md5").update(`${this.callIdCounter}-${this.now().getTime()}`).digest("hex");
     this.apiCalls.push({
       id,
       ...call,
@@ -344,7 +416,7 @@ export class InMemoryQuotaService implements QuotaService {
         month: newMonth,
         call_count: 0,
         storage_bytes: oldMetrics.storage_bytes,
-        updated_at: new Date().toISOString(),
+        updated_at: this.now().toISOString(),
       });
       this.usageMetrics.delete(oldKey);
     }

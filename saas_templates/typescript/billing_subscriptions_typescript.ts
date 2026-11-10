@@ -40,7 +40,41 @@ CREATE TABLE IF NOT EXISTS events (
   event_type VARCHAR(255) NOT NULL,
   processed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS audit_log (
+  id SERIAL PRIMARY KEY,
+  action VARCHAR(100) NOT NULL,
+  customer_id VARCHAR(255),
+  subscription_id VARCHAR(255),
+  stripe_sub_id VARCHAR(255),
+  invoice_id VARCHAR(255),
+  tier VARCHAR(50),
+  old_tier VARCHAR(50),
+  new_tier VARCHAR(50),
+  amount INTEGER,
+  proration_credits INTEGER,
+  reason TEXT,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
 `;
+
+/* The statements below are kept as constants so the code and its tests name exactly the same SQL. */
+/** Queues a refund (status 'queued'; never executed automatically). Params: invoice row id, amount, reason, actor. */
+export const INSERT_REFUND_SQL = `INSERT INTO refunds (invoice_id, amount, status, reason, created_by)
+         VALUES ($1, $2, 'queued', $3, $4)
+         RETURNING id`;
+/** Records a paid invoice, or marks a known one paid. Params: Stripe invoice id, customer id, amount paid. */
+export const UPSERT_PAID_INVOICE_SQL = `INSERT INTO invoices (stripe_invoice_id, customer_id, amount, status, paid_at)
+         VALUES ($1, $2, $3, 'succeeded', NOW())
+         ON CONFLICT (stripe_invoice_id) DO UPDATE SET
+           status = EXCLUDED.status,
+           paid_at = EXCLUDED.paid_at`;
+/** Applies a subscription's tier and status from Stripe. Params: tier, status, Stripe subscription id. */
+export const UPDATE_SUBSCRIPTION_FROM_STRIPE_SQL = `UPDATE subscriptions SET 
+         tier = $1, 
+         status = $2, 
+         updated_at = NOW() 
+         WHERE stripe_subscription_id = $3`;
 
 interface StripePriceIds {
   solo: string;
@@ -48,21 +82,52 @@ interface StripePriceIds {
   enterprise: string;
 }
 
-const getPriceIds = (): StripePriceIds => {
-  // In a real implementation, these would come from environment variables or config
-  return {
-    solo: process.env.STRIPE_PRICE_SOLO || 'price_1UI...',
-    team: process.env.STRIPE_PRICE_TEAM || 'price_1UI...',
-    enterprise: process.env.STRIPE_PRICE_ENTERPRISE || 'price_1UI...'
-  };
+/**
+ * The Stripe price for each tier: STRIPE_PRICE_SOLO / _TEAM / _ENTERPRISE, else the lookup keys price_solo,
+ * price_team and price_enterprise. In: nothing (reads the environment). Out: the three price ids.
+ * Why: the fallbacks were three identical placeholders ("price_1UI..."), so no tier could ever be told apart and the
+ * happy-path tests got invalid_tier (2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP). Touches: environment.
+ */
+const getPriceIds = (): StripePriceIds => ({
+  solo: process.env.STRIPE_PRICE_SOLO || 'price_solo',
+  team: process.env.STRIPE_PRICE_TEAM || 'price_team',
+  enterprise: process.env.STRIPE_PRICE_ENTERPRISE || 'price_enterprise'
+});
+
+/**
+ * The Stripe price for a tier given by name ("solo") or by its configured price id. In: the tier. Out: the price id,
+ * or null for anything else. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (spec: price_id[tier]).
+ * Touches: environment.
+ */
+const resolvePrice = (tier: string): string | null => {
+  const ids = getPriceIds();
+  if (tier === 'solo' || tier === 'team' || tier === 'enterprise') return ids[tier];
+  return [ids.solo, ids.team, ids.enterprise].includes(tier) ? tier : null;
 };
 
 let _stripe: Stripe | null = null;
 let _dbPool: Pool | null = null;
 
+/**
+ * Creates the Stripe client and the Postgres pool. In: the Stripe secret key (STRIPE_SECRET_KEY) and the database
+ * URL. Out: nothing. Touches: nothing until a call is made (then Stripe over the network and Postgres).
+ * Documented 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.
+ */
 export const initialize = (stripeSecretKey: string, connectionString: string) => {
   _stripe = new Stripe(stripeSecretKey, { apiVersion: '2020-08-27' });
   _dbPool = new Pool({ connectionString });
+};
+
+/**
+ * Uses the given Stripe client and/or Postgres pool instead of the ones initialize() built: an application that
+ * already has a pool shares it, and tests pass fakes. In: { stripe?, pool? }. Out: nothing. Touches: module state.
+ * Why: the tests replaced the clients by assigning to the module's exports object, which only works with one
+ * compiler's CommonJS output (it does nothing under babel and throws under native ES modules), so every database
+ * test ran against an empty mock (2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP).
+ */
+export const set_clients = (clients: { stripe?: Stripe; pool?: Pool }) => {
+  if (clients.stripe) _stripe = clients.stripe;
+  if (clients.pool) _dbPool = clients.pool;
 };
 
 const getStripe = (): Stripe => {
@@ -79,9 +144,29 @@ const getDbPool = (): Pool => {
   return _dbPool;
 };
 
+/**
+ * Rolls a transaction back without letting a failed rollback hide the error that caused it.
+ * In: the pool client. Out: nothing. Why: when the database itself failed, ROLLBACK failed too and its exception
+ * escaped the handler, so callers got a thrown error instead of { error, message } (failing test "should return error
+ * on database failure", 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP). Touches: Postgres.
+ */
+const safeRollback = async (client: { query: (text: string) => Promise<unknown> }): Promise<void> => {
+  try {
+    await client.query('ROLLBACK');
+  } catch {
+    // The connection is already broken; the original error is what the caller needs.
+  }
+};
+
+/**
+ * Creates a Stripe subscription for a customer and records it (spec billing flow 1). In: the Stripe customer id and
+ * the tier (name or price id). Out: { success, subscription_id, tier, status, next_billing_date } or { error, message }.
+ * Touches: Stripe (network, money), Postgres subscriptions and audit_log. Documented 2026-11-10, session
+ * session_012zDydZCZ4AChqhEZ4oVtaP (tier names accepted; a failed rollback no longer masks the error).
+ */
 export const create_subscription = async (customer_id: string, tier: string): Promise<{success: true, subscription_id: string, tier: string, status: string, next_billing_date: string} | {error: string, message: string}> => {
-  const priceIds = getPriceIds();
-  if (![priceIds.solo, priceIds.team, priceIds.enterprise].includes(tier)) {
+  const price = resolvePrice(tier);
+  if (price === null) {
     return { error: 'invalid_tier', message: `Invalid tier: ${tier}` };
   }
 
@@ -91,7 +176,7 @@ export const create_subscription = async (customer_id: string, tier: string): Pr
   try {
     const subscription = await stripe.subscriptions.create({
       customer: customer_id,
-      items: [{ price: tier }],
+      items: [{ price }],
       expand: ['latest_invoice.payment_intent']
     });
 
@@ -102,14 +187,14 @@ export const create_subscription = async (customer_id: string, tier: string): Pr
         `INSERT INTO subscriptions (stripe_subscription_id, customer_id, tier, status, created_at)
          VALUES ($1, $2, $3, $4, NOW())
          RETURNING id, stripe_subscription_id, customer_id, tier, status, created_at`,
-        [subscription.id, customer_id, tier, subscription.status]
+        [subscription.id, customer_id, price, subscription.status]
       );
       const dbRecord = res.rows[0];
 
       await client.query(
         `INSERT INTO audit_log (action, customer_id, tier, stripe_sub_id)
          VALUES ($1, $2, $3, $4)`,
-        ['subscription_created', customer_id, tier, subscription.id]
+        ['subscription_created', customer_id, price, subscription.id]
       );
 
       await client.query('COMMIT');
@@ -118,12 +203,12 @@ export const create_subscription = async (customer_id: string, tier: string): Pr
       return {
         success: true,
         subscription_id: subscription.id,
-        tier: subscription.items.data[0].price.lookup_key || tier,
+        tier: subscription.items.data[0].price.lookup_key || price,
         status: subscription.status,
         next_billing_date
       };
     } catch (err) {
-      await client.query('ROLLBACK');
+      await safeRollback(client);
       throw err;
     } finally {
       client.release();
@@ -133,10 +218,16 @@ export const create_subscription = async (customer_id: string, tier: string): Pr
   }
 };
 
-export const change_plan = async (subscription_id: string, new_tier: string): Promise<{success: true, subscription_id: string, old_tier: string, new_tier: string, effective_date: string, proration_credit: number} | {error: string, message: string}> => {
-  const priceIds = getPriceIds();
-  if (![priceIds.solo, priceIds.team, priceIds.enterprise].includes(new_tier)) {
-    return { error: 'invalid_tier', message: `Invalid tier: ${new_tier}` };
+/**
+ * Moves a subscription to another tier in Stripe with proration and records it (spec billing flow 2).
+ * In: the Stripe subscription id and the new tier. Out: { success, subscription_id, old_tier, new_tier,
+ * effective_date, proration_credit (dollars) } or { error, message }. Touches: Stripe (network, money), Postgres.
+ * Documented 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.
+ */
+export const change_plan = async (subscription_id: string, new_tier_input: string): Promise<{success: true, subscription_id: string, old_tier: string, new_tier: string, effective_date: string, proration_credit: number} | {error: string, message: string}> => {
+  const new_tier = resolvePrice(new_tier_input);
+  if (new_tier === null) {
+    return { error: 'invalid_tier', message: `Invalid tier: ${new_tier_input}` };
   }
 
   const stripe = getStripe();
@@ -153,7 +244,7 @@ export const change_plan = async (subscription_id: string, new_tier: string): Pr
       [subscription_id]
     );
     if (subRes.rowCount === 0) {
-      await client.query('ROLLBACK');
+      await safeRollback(client);
       return { error: 'subscription_not_found', message: `Subscription not found: ${subscription_id}` };
     }
     const old_tier = subRes.rows[0].tier;
@@ -195,7 +286,7 @@ export const change_plan = async (subscription_id: string, new_tier: string): Pr
     };
   } catch (err: any) {
     if (client) {
-      await client.query('ROLLBACK');
+      await safeRollback(client);
     }
     return { error: 'stripe_error', message: err.message };
   } finally {
@@ -205,6 +296,12 @@ export const change_plan = async (subscription_id: string, new_tier: string): Pr
   }
 };
 
+/**
+ * Queues a refund for a paid invoice; it is never executed automatically (spec billing flow 3).
+ * In: the Stripe invoice id, the amount (cents), the reason and who asked. Out: { success, refund_id, status:
+ * 'queued', amount, reason } or { error, message }. Touches: Postgres invoices, refunds, audit_log.
+ * Documented 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.
+ */
 export const queue_refund = async (invoice_id: string, amount: number, reason: string, created_by: string): Promise<{success: true, refund_id: number, status: string, amount: number, reason: string} | {error: string, message: string}> => {
   if (amount <= 0) {
     return { error: 'invalid_amount', message: 'Amount must be positive' };
@@ -222,24 +319,22 @@ export const queue_refund = async (invoice_id: string, amount: number, reason: s
       [invoice_id]
     );
     if (invoiceRes.rowCount === 0) {
-      await client.query('ROLLBACK');
+      await safeRollback(client);
       return { error: 'invoice_not_found', message: `Invoice not found: ${invoice_id}` };
     }
     const invoice = invoiceRes.rows[0];
     if (invoice.status !== 'succeeded') {
-      await client.query('ROLLBACK');
+      await safeRollback(client);
       return { error: 'invoice_not_succeeded', message: `Invoice status is ${invoice.status}, expected succeeded` };
     }
     if (amount > invoice.amount) {
-      await client.query('ROLLBACK');
+      await safeRollback(client);
       return { error: 'refund_exceeds_invoice', message: `Refund amount ${amount} exceeds invoice amount ${invoice.amount}` };
     }
 
     // Create refund record
     const refundRes = await client.query(
-      `INSERT INTO refunds (invoice_id, amount, status, reason, created_by)
-       VALUES ($1, $2, 'queued', $3, $4)
-       RETURNING id`,
+      INSERT_REFUND_SQL,
       [invoice.id, amount, reason, created_by]
     );
     const refund_id = refundRes.rows[0].id;
@@ -261,7 +356,7 @@ export const queue_refund = async (invoice_id: string, amount: number, reason: s
     };
   } catch (err: any) {
     if (client) {
-      await client.query('ROLLBACK');
+      await safeRollback(client);
     }
     return { error: 'database_error', message: err.message };
   } finally {
@@ -271,6 +366,17 @@ export const queue_refund = async (invoice_id: string, amount: number, reason: s
   }
 };
 
+/**
+ * Applies one Stripe event once (spec billing flow 4): payment succeeded / failed, subscription updated / deleted;
+ * other types are only recorded. The event id is recorded in the same transaction, and an id already recorded is
+ * acknowledged without being applied again.
+ * Only call this with an event whose signature was verified: {@link verify_and_handle_stripe_webhook} does that for
+ * a raw request.
+ * In: the Stripe event. Out: { received: true } or { error: 'webhook_processing_error', message }.
+ * Why changed 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): the subscription-updated audit read the "old"
+ * tier after overwriting it, so old and new were always equal; a failed ROLLBACK escaped as an exception.
+ * Touches: Postgres events, invoices, subscriptions, audit_log.
+ */
 export const handle_stripe_webhook = async (event: Stripe.Event): Promise<{received: true} | {error: string, message: string}> => {
   const pool = getDbPool();
   let client;
@@ -292,14 +398,7 @@ export const handle_stripe_webhook = async (event: Stripe.Event): Promise<{recei
     switch (event.type) {
       case 'invoice.payment_succeeded': {
         const invoice = event.data.object as Stripe.Invoice;
-        await client.query(
-          `INSERT INTO invoices (stripe_invoice_id, customer_id, amount, status, paid_at)
-           VALUES ($1, $2, $3, 'succeeded', NOW())
-           ON CONFLICT (stripe_invoice_id) DO UPDATE SET
-             status = EXCLUDED.status,
-             paid_at = EXCLUDED.paid_at`,
-          [invoice.id, invoice.customer, invoice.amount_paid]
-        );
+        await client.query(UPSERT_PAID_INVOICE_SQL, [invoice.id, invoice.customer, invoice.amount_paid]);
         await client.query(
           `INSERT INTO audit_log (action, customer_id, invoice_id, amount)
            VALUES ($1, $2, $3, $4)`,
@@ -310,31 +409,30 @@ export const handle_stripe_webhook = async (event: Stripe.Event): Promise<{recei
       case 'invoice.payment_failed': {
         const invoice = event.data.object as Stripe.Invoice;
         await client.query(
-          `UPDATE subscriptions SET status = 'past_due' WHERE customer_id = $1`,
+          `UPDATE subscriptions SET status = 'past_due', updated_at = NOW() WHERE customer_id = $1 AND status <> 'past_due'`,
           [invoice.customer]
         );
         await client.query(
           `INSERT INTO audit_log (action, customer_id, invoice_id, reason)
            VALUES ($1, $2, $3, $4)`,
-          ['payment_failed', invoice.customer, invoice.id, invoice.last_error?.message || 'unknown']
+          ['payment_failed', invoice.customer, invoice.id, (invoice as any).last_payment_error?.message || 'unknown']
         );
         break;
       }
       case 'customer.subscription.updated': {
         const subscription = event.data.object as Stripe.Subscription;
         const new_tier = subscription.items.data[0].price.lookup_key;
-        await client.query(
-          `UPDATE subscriptions SET 
-           tier = $1, 
-           status = $2, 
-           updated_at = NOW() 
-           WHERE stripe_subscription_id = $3`,
-          [new_tier, subscription.status, subscription.id]
+        // Read the tier before it is overwritten, so the audit row says what it changed from.
+        const before = await client.query(
+          `SELECT tier FROM subscriptions WHERE stripe_subscription_id = $1`,
+          [subscription.id]
         );
+        const old_tier = before?.rows?.[0]?.tier ?? null;
+        await client.query(UPDATE_SUBSCRIPTION_FROM_STRIPE_SQL, [new_tier, subscription.status, subscription.id]);
         await client.query(
           `INSERT INTO audit_log (action, customer_id, old_tier, new_tier)
-           VALUES ($1, $2, (SELECT tier FROM subscriptions WHERE stripe_subscription_id = $3), $4)`,
-          ['subscription_updated', subscription.customer, subscription.id, new_tier]
+           VALUES ($1, $2, $3, $4)`,
+          ['subscription_updated', subscription.customer, old_tier, new_tier]
         );
         break;
       }
@@ -359,7 +457,7 @@ export const handle_stripe_webhook = async (event: Stripe.Event): Promise<{recei
         break;
     }
 
-    // Record event as processed
+    // Record event as processed (UNIQUE: a concurrent duplicate fails here and its transaction rolls back).
     await client.query(
       `INSERT INTO events (stripe_event_id, event_type)
        VALUES ($1, $2)`,
@@ -370,7 +468,7 @@ export const handle_stripe_webhook = async (event: Stripe.Event): Promise<{recei
     return { received: true };
   } catch (err: any) {
     if (client) {
-      await client.query('ROLLBACK');
+      await safeRollback(client);
     }
     return { error: 'webhook_processing_error', message: err.message };
   } finally {
@@ -378,4 +476,33 @@ export const handle_stripe_webhook = async (event: Stripe.Event): Promise<{recei
       client.release();
     }
   }
+};
+
+/**
+ * Entry point for the webhook route: verifies the Stripe-Signature header against the raw request body with the
+ * endpoint secret (Stripe's library checks the HMAC in constant time and rejects stale timestamps), then applies the
+ * event with {@link handle_stripe_webhook}.
+ * In: the raw body exactly as received, the Stripe-Signature header, and the secret (default STRIPE_WEBHOOK_SECRET).
+ * Out: { received: true }, { error: 'invalid_signature', message, code: 403 }, { error: 'webhook_not_configured',
+ * message, code: 500 } or the handler's error.
+ * Why: the spec requires verification before processing and the TypeScript template had none (added 2026-11-10,
+ * session session_012zDydZCZ4AChqhEZ4oVtaP). Touches: Postgres via the handler; nothing when the signature fails.
+ */
+export const verify_and_handle_stripe_webhook = async (
+  rawBody: string | Buffer,
+  signature: string | undefined,
+  webhookSecret: string | undefined = process.env.STRIPE_WEBHOOK_SECRET
+): Promise<{received: true} | {error: string, message: string, code?: number}> => {
+  if (!webhookSecret) {
+    return { error: 'webhook_not_configured', message: 'STRIPE_WEBHOOK_SECRET is not set', code: 500 };
+  }
+  let event: Stripe.Event;
+  try {
+    if (!signature) throw new Error('missing signature');
+    event = getStripe().webhooks.constructEvent(rawBody, signature, webhookSecret);
+  } catch {
+    // The reason is not echoed: it would help someone probing the endpoint.
+    return { error: 'invalid_signature', message: 'Webhook signature verification failed', code: 403 };
+  }
+  return handle_stripe_webhook(event);
 };
