@@ -123,6 +123,7 @@ FLOWS TO BUILD (exact sequence — no deviations):
 IMPLEMENTATION REQUIREMENTS:
   - Hash passwords with bcrypt (never log plaintext)
   - TOTP: use standard library (Python: pyotp, JS: speakeasy, Java: com.google.authenticator, etc.)
+    Where totp_two_factor is installed, its verify() is the gate; a package is used only to compute codes.
   - JWT: sign with HS256, include user_id and tier
   - Timestamps: UTC, ISO 8601 format
   - Response: always JSON {success: true, ...} or {error: "code", message: "..."}

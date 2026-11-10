@@ -12,6 +12,7 @@ Python, JavaScript, TypeScript, Java, C#, PHP, Go and Rust. Code lives in
 | auth_system | [auth_system.md](auth_system.md) | 16 |
 | background_jobs_task_queue | [background_jobs_task_queue.md](background_jobs_task_queue.md) | 9 |
 | billing_subscriptions | [billing_subscriptions.md](billing_subscriptions.md) | 10 |
+| byok_key_vault | [byok_key_vault.md](byok_key_vault.md) | 14 |
 | data_export_compliance | [data_export_compliance.md](data_export_compliance.md) | 15 |
 | feature_flags | [feature_flags.md](feature_flags.md) | 8 |
 | file_uploads | [file_uploads.md](file_uploads.md) | 7 |
@@ -20,8 +21,13 @@ Python, JavaScript, TypeScript, Java, C#, PHP, Go and Rust. Code lives in
 | idempotency_keys | [idempotency_keys.md](idempotency_keys.md) | 11 |
 | notifications | [notifications.md](notifications.md) | 12 |
 | organizations_teams | [organizations_teams.md](organizations_teams.md) | 6 |
+| passwordless_email_code_signin | [passwordless_email_code_signin.md](passwordless_email_code_signin.md) | 14 |
 | permissions_rbac | [permissions_rbac.md](permissions_rbac.md) | 10 |
 | quotas_rate_limiting | [quotas_rate_limiting.md](quotas_rate_limiting.md) | 13 |
+| safe_archive_ingest | [safe_archive_ingest.md](safe_archive_ingest.md) | 14 |
+| secret_pii_screening | [secret_pii_screening.md](secret_pii_screening.md) | 14 |
+| stripe_webhook_entitlements | [stripe_webhook_entitlements.md](stripe_webhook_entitlements.md) | 14 |
+| totp_two_factor | [totp_two_factor.md](totp_two_factor.md) | 14 |
 | trial_abuse_prevention | [trial_abuse_prevention.md](trial_abuse_prevention.md) | 15 |
 | webhooks | [webhooks.md](webhooks.md) | 8 |
 
