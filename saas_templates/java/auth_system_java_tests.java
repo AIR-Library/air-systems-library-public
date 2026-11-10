@@ -13,16 +13,56 @@ public class AuthSystemTests {
     // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
     static final String TEST_JWT_SECRET = "test-only-jwt-secret-0123456789abcdef";
     static final java.util.List<String> SENT = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+    /** Last code the fake mailer was handed, by email (codes are only hashed in the database since AUTH-16, 2026-11-10). */
+    static final Map<String, String> CODES = new java.util.concurrent.ConcurrentHashMap<>();
 
     static {
         System.setProperty("AUTH_JWT_SECRET", TEST_JWT_SECRET);
     }
 
+    /**
+     * Fake OAuth provider client: accepts only the codes it was told about and answers with a fixed identity, so a test
+     * can tell the provider's user id apart from the code. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (the
+     * implementation's DummyOAuthProvider, which ignored the code, was replaced by an injected client; AUTH spec
+     * "Secrets at rest"). Touches: memory only.
+     */
+    static final class FakeOAuthProvider implements AuthSystem.OAuthProvider {
+        final Map<String, AuthSystem.OAuthIdentity> byCode = new java.util.concurrent.ConcurrentHashMap<>();
+        final java.util.List<String> exchanged = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+        FakeOAuthProvider accept(String code, String sub, String email, boolean verified) {
+            byCode.put(code, new AuthSystem.OAuthIdentity(sub, email, verified));
+            return this;
+        }
+        public AuthSystem.OAuthIdentity exchangeCode(String code) {
+            exchanged.add(code);
+            return byCode.get(code);
+        }
+    }
+
+    static final FakeOAuthProvider GOOGLE = new FakeOAuthProvider();
+
+    /**
+     * Installs the fake mailer and the fake OAuth provider. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the
+     * mailer now also keeps the code (the database holds only its hash), and the provider is a FakeOAuthProvider.
+     */
     @BeforeAll
     public static void setup() {
-        // Register dummy OAuth provider
-        AuthSystem.OAuthProviderRegistry.register("google", new AuthSystem.DummyOAuthProvider("newuser@example.com"));
-        AuthSystem.setEmailSender((email, code) -> SENT.add(email));
+        GOOGLE.accept("code123", "google-sub-new", "newuser@example.com", true);
+        AuthSystem.OAuthProviderRegistry.register("google", GOOGLE);
+        AuthSystem.setEmailSender((email, code) -> { SENT.add(email); CODES.put(email, code); });
+    }
+
+    /** Puts the real clock back after a test that moved it. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+    @AfterEach
+    public void restoreClock() {
+        AuthSystem.setClock(java.time.Clock.systemUTC());
+    }
+
+    /** A fresh OAuth state for the provider (fails the test if refused). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+    private static String newState(String provider) {
+        Map<String, Object> start = AuthSystem.oauthStart(provider);
+        assertEquals(Boolean.TRUE, start.get("success"), String.valueOf(start));
+        return (String) start.get("state");
     }
 
     // AUTH-01
@@ -132,10 +172,16 @@ public class AuthSystemTests {
     // AUTH-10
     @Test
     public void testOauthCallbackHappyPathNewUser() {
-        Map<String, Object> res = AuthSystem.oauthCallback("google", "code123", "state123");
+        // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the state now comes from oauthStart (a made-up
+        // "state123" is refused since state is validated), and the link must hold the provider's id, not the code.
+        Map<String, Object> res = AuthSystem.oauthCallback("google", "code123", newState("google"));
         assertTrue((Boolean)res.get("success"));
         assertEquals("authenticated", res.get("status"));
         assertNotNull(res.get("token"));
+        assertNotNull(res.get("refresh_token"));
+        assertTrue(GOOGLE.exchanged.contains("code123"));
+        assertEquals(1, countRows("SELECT COUNT(*) FROM oauth_links WHERE provider_user_id = ?", "google-sub-new"));
+        assertEquals(0, countRows("SELECT COUNT(*) FROM oauth_links WHERE provider_user_id = ?", "code123"));
         // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: "user created + oauth linked" checked in the database.
         assertEquals(1, countRows("SELECT COUNT(*) FROM users WHERE email = ?", "newuser@example.com"));
         assertEquals(1, countRows("SELECT COUNT(*) FROM oauth_links WHERE provider = 'google' AND user_id = (SELECT id FROM users WHERE email = ?)", "newuser@example.com"));
@@ -145,12 +191,13 @@ public class AuthSystemTests {
     @Test
     public void testOauthCallbackExistingUser() {
         // Register a provider that returns the existing user's email
+        // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: fake provider client and a real state (see AUTH-10).
         AuthSystem.OAuthProviderRegistry.register("google_existing",
-                new AuthSystem.DummyOAuthProvider("existing@example.com"));
+                new FakeOAuthProvider().accept("code123", "google-sub-existing", "existing@example.com", true));
         AuthSystem.signup("existing@example.com", "StrongPassword123456", "Existing", "1.2.3.12");
         String code = extractCodeFromEmail("existing@example.com");
         AuthSystem.verifyEmail("existing@example.com", code);
-        Map<String, Object> res = AuthSystem.oauthCallback("google_existing", "code123", "state123");
+        Map<String, Object> res = AuthSystem.oauthCallback("google_existing", "code123", newState("google_existing"));
         assertTrue((Boolean)res.get("success"));
         assertEquals("authenticated", res.get("status"));
         // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: "linked to existing account" checked in the database: still one
@@ -210,8 +257,9 @@ public class AuthSystemTests {
         String code = extractCodeFromEmail("refresh@example.com");
         AuthSystem.verifyEmail("refresh@example.com", code);
         Map<String, Object> loginRes = AuthSystem.login("refresh@example.com", "StrongPassword123456", "device6", "1.2.3.15");
-        String sessionId = (String)loginRes.get("session_id");
-        String refreshToken = getRefreshTokenBySessionId(sessionId);
+        // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16): the token comes from login's answer; the
+        // database holds only its hash, so it can no longer be read back from the sessions table.
+        String refreshToken = (String)loginRes.get("refresh_token");
         Map<String, Object> res = AuthSystem.tokenRefresh(refreshToken);
         assertTrue((Boolean)res.get("success"));
         assertEquals("ok", res.get("status"));
@@ -226,8 +274,9 @@ public class AuthSystemTests {
         AuthSystem.verifyEmail("ban@example.com", code);
         banUser("ban@example.com");
         Map<String, Object> loginRes = AuthSystem.login("ban@example.com", "StrongPassword123456", "device7", "1.2.3.16");
-        String sessionId = (String)loginRes.get("session_id");
-        String refreshToken = getRefreshTokenBySessionId(sessionId);
+        // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16): refresh token from login's answer.
+        String refreshToken = (String)loginRes.get("refresh_token");
+        assertNotNull(refreshToken);
         Map<String, Object> res = AuthSystem.tokenRefresh(refreshToken);
         assertFalse((Boolean)res.get("success"));
         assertEquals("user_banned", res.get("error"));
@@ -351,29 +400,131 @@ public class AuthSystemTests {
         assertEquals("too_many_attempts", right.get("error"));
     }
 
-    /* ---------- Helper Methods for Tests ---------- */
-    private String extractCodeFromEmail(String email) {
-        // In real scenario, capture from email; here we query DB
-        try {
-            java.sql.Connection conn = java.sql.DriverManager.getConnection("jdbc:h2:mem:authdb;DB_CLOSE_DELAY=-1");
-            java.sql.PreparedStatement ps = conn.prepareStatement(
-                    "SELECT code FROM verification_codes WHERE user_id = (SELECT id FROM users WHERE email = ?) AND type='email'");
-            ps.setString(1, email);
-            java.sql.ResultSet rs = ps.executeQuery();
-            if (rs.next()) return rs.getString(1);
-        } catch (Exception e) {}
-        return null;
+    /**
+     * AUTH-16: login returns a refresh_token that token_refresh accepts; sessions keep only its SHA-256; the email
+     * verification code and the MFA challenge id are stored only as code_hash. Added 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 spec amendment). Touches: H2 (reads sessions, verification_codes).
+     */
+    // AUTH-16
+    @Test
+    public void testRefreshTokenAndCodesStoredOnlyAsHashes() {
+        AuthSystem.signup("hashes@example.com", "StrongPassword123456", "Hashes", "1.2.3.40");
+        String code = extractCodeFromEmail("hashes@example.com");
+        assertNotNull(code);
+        assertFalse(columns("verification_codes").contains("CODE"), "verification_codes must not have a plain code column");
+        assertEquals(AuthSystem.sha256Hex(code), queryString(
+                "SELECT code_hash FROM verification_codes WHERE user_id = (SELECT id FROM users WHERE email = ?) AND type = 'email'",
+                "hashes@example.com"));
+        assertEquals("verified", AuthSystem.verifyEmail("hashes@example.com", code).get("status"));
+
+        Map<String, Object> loginRes = AuthSystem.login("hashes@example.com", "StrongPassword123456", "dev", "1.2.3.40");
+        String refreshToken = (String) loginRes.get("refresh_token");
+        assertNotNull(refreshToken);
+        String sessionId = (String) loginRes.get("session_id");
+        assertFalse(columns("sessions").contains("REFRESH_TOKEN"), "sessions must not have a plain refresh_token column");
+        String stored = queryString("SELECT refresh_token_hash FROM sessions WHERE id = ?", sessionId);
+        assertEquals(AuthSystem.sha256Hex(refreshToken), stored);
+        assertNotEquals(refreshToken, stored);
+        // The stored hash is not itself a usable refresh token.
+        assertEquals("invalid_token", AuthSystem.tokenRefresh(stored).get("error"));
+        Map<String, Object> refreshed = AuthSystem.tokenRefresh(refreshToken);
+        assertEquals("ok", refreshed.get("status"), String.valueOf(refreshed));
+        assertNotNull(refreshed.get("token"));
+
+        // MFA: the challenge id is hashed too, and the session the challenge creates also returns a refresh token.
+        AuthSystem.signup("hashes-mfa@example.com", "StrongPassword123456", "HashesMfa", "1.2.3.41");
+        AuthSystem.verifyEmail("hashes-mfa@example.com", extractCodeFromEmail("hashes-mfa@example.com"));
+        enableMfa("hashes-mfa@example.com");
+        String challengeId = (String) AuthSystem.login("hashes-mfa@example.com", "StrongPassword123456", "dev", "1.2.3.41").get("challenge_id");
+        assertEquals(AuthSystem.sha256Hex(challengeId), queryString(
+                "SELECT code_hash FROM verification_codes WHERE user_id = (SELECT id FROM users WHERE email = ?) AND type = 'mfa'",
+                "hashes-mfa@example.com"));
+        Map<String, Object> mfa = AuthSystem.mfaChallenge(challengeId, generateTotpForUser("hashes-mfa@example.com"));
+        assertEquals("authenticated", mfa.get("status"), String.valueOf(mfa));
+        assertEquals("ok", AuthSystem.tokenRefresh((String) mfa.get("refresh_token")).get("status"));
     }
 
+    /**
+     * OAuth state: an unknown state, a reused state, a state older than 10 minutes and a state issued for another
+     * provider are all refused with invalid_state, and the provider is never asked to exchange the code for them; the
+     * state is stored only as its SHA-256. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH spec "Secrets at
+     * rest" amendment; java SECURITY bug: the state was not validated). Touches: H2, the injected clock.
+     */
+    // AUTH-10
+    @Test
+    public void testOauthStateIsSingleUseAndExpires() {
+        FakeOAuthProvider p = new FakeOAuthProvider()
+                .accept("c1", "sub-1", "state1@example.com", true)
+                .accept("c2", "sub-1", "state1@example.com", true)
+                .accept("c3", "sub-1", "state1@example.com", true)
+                .accept("c4", "sub-1", "state1@example.com", true);
+        AuthSystem.OAuthProviderRegistry.register("statecheck", p);
+        AuthSystem.OAuthProviderRegistry.register("statecheck_other", new FakeOAuthProvider());
+
+        assertEquals("invalid_state", AuthSystem.oauthCallback("statecheck", "c1", "made-up-state").get("error"));
+        assertEquals("invalid_state", AuthSystem.oauthCallback("statecheck", "c1", null).get("error"));
+
+        String state = newState("statecheck");
+        assertEquals(AuthSystem.sha256Hex(state), queryString("SELECT state_hash FROM oauth_states WHERE state_hash = ?", AuthSystem.sha256Hex(state)));
+        assertEquals(0, countRows("SELECT COUNT(*) FROM oauth_states WHERE state_hash = ?", state));
+        assertEquals("authenticated", AuthSystem.oauthCallback("statecheck", "c1", state).get("status"));
+        assertEquals("invalid_state", AuthSystem.oauthCallback("statecheck", "c2", state).get("error"), "a state is single-use");
+
+        String other = newState("statecheck_other");
+        assertEquals("invalid_state", AuthSystem.oauthCallback("statecheck", "c3", other).get("error"), "state is bound to its provider");
+
+        String old = newState("statecheck");
+        AuthSystem.setClock(java.time.Clock.offset(java.time.Clock.systemUTC(), java.time.Duration.ofMinutes(10).plusSeconds(1)));
+        assertEquals("invalid_state", AuthSystem.oauthCallback("statecheck", "c4", old).get("error"), "a state expires after 10 minutes");
+        AuthSystem.setClock(java.time.Clock.systemUTC());
+
+        // Only the one valid callback reached the provider.
+        assertEquals(java.util.List.of("c1"), p.exchanged);
+        // A code the provider refuses is not an identity.
+        assertEquals("oauth_exchange_failed", AuthSystem.oauthCallback("statecheck", "never-issued", newState("statecheck")).get("error"));
+        // A provider-unverified email is refused.
+        p.accept("c5", "sub-5", "unverified@example.com", false);
+        assertEquals("email_not_verified", AuthSystem.oauthCallback("statecheck", "c5", newState("statecheck")).get("error"));
+        assertEquals(0, countRows("SELECT COUNT(*) FROM users WHERE email = ?", "unverified@example.com"));
+    }
+
+    /**
+     * A password holding a control character is judged only by the spec's three reasons: a 15+ character one is
+     * accepted. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (java bug list: the "invalid_chars" reason is not in
+     * the spec). Touches: H2 (creates a user).
+     */
+    // AUTH-01
+    @Test
+    public void testControlCharacterIsNotARejectionReason() {
+        Map<String, Object> res = AuthSystem.signup("ctrl@example.com", "Strong\tPassword123456", "Ctrl", "1.2.3.42");
+        assertEquals(Boolean.TRUE, res.get("success"), String.valueOf(res));
+        assertEquals("pending_verification", res.get("status"));
+    }
+
+    /* ---------- Helper Methods for Tests ---------- */
+    /**
+     * The code the fake mailer was handed for this address. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP
+     * (AUTH-16): it read the plain code from verification_codes, which now holds only code_hash.
+     */
+    private String extractCodeFromEmail(String email) {
+        return CODES.get(email);
+    }
+
+    /**
+     * Moves a code's expiry into the past. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16): matches the
+     * row by code_hash = SHA-256(code). Touches: H2.
+     */
     private void expireCode(String code) {
         try {
             java.sql.Connection conn = java.sql.DriverManager.getConnection("jdbc:h2:mem:authdb;DB_CLOSE_DELAY=-1");
             java.sql.PreparedStatement ps = conn.prepareStatement(
-                    "UPDATE verification_codes SET expires_at = ? WHERE code = ?");
+                    "UPDATE verification_codes SET expires_at = ? WHERE code_hash = ?");
             ps.setTimestamp(1, java.sql.Timestamp.from(java.time.Instant.now().minusSeconds(1)));
-            ps.setString(2, code);
-            ps.executeUpdate();
-        } catch (Exception e) {}
+            ps.setString(2, AuthSystem.sha256Hex(code));
+            assertEquals(1, ps.executeUpdate());
+        } catch (java.sql.SQLException e) {
+            throw new AssertionError(e);
+        }
     }
 
     private void enableMfa(String email) {
@@ -413,16 +564,37 @@ public class AuthSystemTests {
         } catch (Exception e) {}
     }
 
-    private String getRefreshTokenBySessionId(String sessionId) {
-        try {
-            java.sql.Connection conn = java.sql.DriverManager.getConnection("jdbc:h2:mem:authdb;DB_CLOSE_DELAY=-1");
-            java.sql.PreparedStatement ps = conn.prepareStatement(
-                    "SELECT refresh_token FROM sessions WHERE id = ?");
-            ps.setString(1, sessionId);
-            java.sql.ResultSet rs = ps.executeQuery();
-            if (rs.next()) return rs.getString(1);
-        } catch (Exception e) {}
-        return null;
+    /**
+     * One string column of a one-parameter query (null when no row). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP
+     * (replaces getRefreshTokenBySessionId, which read the plain refresh token the sessions table no longer has).
+     * Touches: reads H2.
+     */
+    private String queryString(String sql, String param) {
+        try (java.sql.Connection conn = java.sql.DriverManager.getConnection("jdbc:h2:mem:authdb;DB_CLOSE_DELAY=-1");
+             java.sql.PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, param);
+            try (java.sql.ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getString(1) : null;
+            }
+        } catch (java.sql.SQLException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    /** Column names of a table, upper case (H2). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: reads H2. */
+    private java.util.Set<String> columns(String table) {
+        java.util.Set<String> cols = new java.util.HashSet<>();
+        try (java.sql.Connection conn = java.sql.DriverManager.getConnection("jdbc:h2:mem:authdb;DB_CLOSE_DELAY=-1");
+             java.sql.PreparedStatement ps = conn.prepareStatement(
+                     "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = ?")) {
+            ps.setString(1, table.toUpperCase());
+            try (java.sql.ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) cols.add(rs.getString(1).toUpperCase());
+            }
+        } catch (java.sql.SQLException e) {
+            throw new AssertionError(e);
+        }
+        return cols;
     }
 
     private String createExpiredToken(long userId) {

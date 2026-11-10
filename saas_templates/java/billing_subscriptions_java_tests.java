@@ -104,12 +104,15 @@ public class BillingServiceTest {
         // For a complete test, we'd need to mock the Stripe SDK.
 
         // Test invalid tier
-        JsonObject response = billingService.createSubscription("cus_123", "invalid_tier");
+        BillingService.BillingResponse response = billingService.createSubscription("cus_123", "invalid_tier");
         assertEquals("invalid_tier", response.get("error").getAsString());
+        // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (java bug list): flows return a BillingResponse; its HTTP status is checked.
+        assertEquals(400, response.status);
 
         // Happy path through the in-memory Stripe gateway: Stripe called once, DB row created
-        JsonObject created = fakeBilling.createSubscription("cus_123", "team");
+        BillingService.BillingResponse created = fakeBilling.createSubscription("cus_123", "team");
         assertTrue(created.get("success").getAsBoolean());
+        assertEquals(200, created.status);
         String subId = created.get("subscription_id").getAsString();
         assertEquals("team", created.get("tier").getAsString());
         assertEquals("active", created.get("status").getAsString());
@@ -123,8 +126,10 @@ public class BillingServiceTest {
     // BILL-02
     @Test
     void testCreateSubscriptionInvalidTier() {
-        JsonObject response = billingService.createSubscription("cus_123", "invalid_tier");
+        BillingService.BillingResponse response = billingService.createSubscription("cus_123", "invalid_tier");
         assertEquals("invalid_tier", response.get("error").getAsString());
+        // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (java bug list): flows return a BillingResponse; its HTTP status is checked.
+        assertEquals(400, response.status);
     }
 
     /** Invalid tier rejected; happy path updates Stripe (fake) and computes the proration credit. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: happy path added. */
@@ -146,14 +151,14 @@ public class BillingServiceTest {
 
         // For a complete test, we'd need to mock the Stripe SDK.
         // Let's test the invalid tier case
-        JsonObject response = billingService.changePlan("sub_123", "invalid_tier");
+        BillingService.BillingResponse response = billingService.changePlan("sub_123", "invalid_tier");
         assertEquals("invalid_tier", response.get("error").getAsString());
 
         // Happy path: Stripe updated, proration calculated. Period: 30 days, 10 days left at the test clock.
         long now = clock.instant().getEpochSecond();
         long day = 86_400L;
         fakeStripe.addExisting("sub_123", BillingService.PRICE_IDS.get("solo"), now - 20 * day, now + 10 * day);
-        JsonObject changed = fakeBilling.changePlan("sub_123", "team");
+        BillingService.BillingResponse changed = fakeBilling.changePlan("sub_123", "team");
         assertTrue(changed.get("success").getAsBoolean());
         assertEquals("solo", changed.get("old_tier").getAsString());
         assertEquals("team", changed.get("new_tier").getAsString());
@@ -187,13 +192,20 @@ public class BillingServiceTest {
                 now - 86_400L, now + 86_400L);
 
         assertEquals("invalid_tier", fakeBilling.changePlan("sub_two", "platinum").get("error").getAsString());
+        assertEquals(400, fakeBilling.changePlan("sub_two", "platinum").status);   // 2026-11-10: the status too
         assertTrue(fakeStripe.calls().isEmpty(), "an unknown tier must not reach Stripe");
 
-        JsonObject ambiguous = fakeBilling.changePlan("sub_two", "team");
+        BillingService.BillingResponse ambiguous = fakeBilling.changePlan("sub_two", "team");
         assertEquals("subscription_item_ambiguous", ambiguous.get("error").getAsString());
+        // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (java bug list): flows return a BillingResponse; its HTTP status is checked.
+        assertEquals(409, ambiguous.status);
         assertEquals(java.util.List.of("retrieve sub_two"), fakeStripe.calls());
         assertEquals(2, fakeStripe.itemCount("sub_two"));
         assertEquals(1, count("SELECT COUNT(*) FROM subscriptions WHERE stripe_subscription_id = ? AND tier = 'solo'", "sub_two"));
+        // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (java bug list): an unknown subscription is 404 not_found.
+        BillingService.BillingResponse missing = fakeBilling.changePlan("sub_missing", "team");
+        assertEquals("not_found", missing.get("error").getAsString());
+        assertEquals(404, missing.status);
     }
 
     /** A refund is queued and stored. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: asserts the stored row. */
@@ -209,7 +221,7 @@ public class BillingServiceTest {
             pstmt.executeUpdate();
         }
 
-        JsonObject response = billingService.queueRefund("inv_123", 5000, "Customer request", "admin");
+        BillingService.BillingResponse response = billingService.queueRefund("inv_123", 5000, "Customer request", "admin");
         assertTrue(response.get("success").getAsBoolean());
         assertEquals("queued", response.get("status").getAsString());
         assertEquals(5000, response.get("amount").getAsLong());
@@ -229,8 +241,10 @@ public class BillingServiceTest {
             pstmt.executeUpdate();
         }
 
-        JsonObject response = billingService.queueRefund("inv_123", 15000, "Customer request", "admin");
+        BillingService.BillingResponse response = billingService.queueRefund("inv_123", 15000, "Customer request", "admin");
         assertEquals("refund_exceeds_invoice", response.get("error").getAsString());
+        // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (java bug list): flows return a BillingResponse; its HTTP status is checked.
+        assertEquals(400, response.status);
 
         // Two refunds may not add up to more than the invoice either
         assertTrue(billingService.queueRefund("inv_123", 6000, "Customer request", "admin").get("success").getAsBoolean());
@@ -280,12 +294,12 @@ public class BillingServiceTest {
 
         // For a complete test, we'd need to mock the Webhook.constructEvent method.
         // Let's test the invalid signature case
-        JsonObject response = billingService.handleStripeWebhook(payload, "invalid_signature");
+        BillingService.BillingResponse response = billingService.handleStripeWebhook(payload, "invalid_signature");
         assertEquals("invalid_signature", response.get("error").getAsString());
 
         // A correctly signed, new event: invoice marked succeeded, audit logged
         String fresh = payload.replace("evt_123", "evt_124").replace("inv_123", "inv_124");
-        JsonObject ok = fakeBilling.handleStripeWebhook(fresh, sign(fresh));
+        BillingService.BillingResponse ok = fakeBilling.handleStripeWebhook(fresh, sign(fresh));
         assertTrue(ok.get("received").getAsBoolean());
         assertEquals(1, count("SELECT COUNT(*) FROM invoices WHERE stripe_invoice_id = ? AND status = 'succeeded' AND amount = 10000", "inv_124"));
         assertEquals(1, count("SELECT COUNT(*) FROM audit_log WHERE invoice_id = ? AND action = 'payment_succeeded'", "inv_124"));
@@ -322,11 +336,11 @@ public class BillingServiceTest {
         // For a complete test, we'd need to mock the Webhook.constructEvent method.
 
         // Let's test the invalid signature case
-        JsonObject response = billingService.handleStripeWebhook(payload, "invalid_signature");
+        BillingService.BillingResponse response = billingService.handleStripeWebhook(payload, "invalid_signature");
         assertEquals("invalid_signature", response.get("error").getAsString());
 
         // Correctly signed replay of the already-processed event: acknowledged, not processed again
-        JsonObject replay = fakeBilling.handleStripeWebhook(payload, sign(payload));
+        BillingService.BillingResponse replay = fakeBilling.handleStripeWebhook(payload, sign(payload));
         assertTrue(replay.get("received").getAsBoolean());
         assertEquals(0, count("SELECT COUNT(*) FROM invoices WHERE stripe_invoice_id = ?", "inv_123"));
         assertEquals(1, count("SELECT COUNT(*) FROM events WHERE stripe_event_id = ?", "evt_123"));
@@ -366,12 +380,13 @@ public class BillingServiceTest {
         }
 
         // Since we can't easily mock the webhook signature, we'll test the invalid signature case
-        JsonObject response = billingService.handleStripeWebhook(payload, "invalid_signature");
+        BillingService.BillingResponse response = billingService.handleStripeWebhook(payload, "invalid_signature");
         assertEquals("invalid_signature", response.get("error").getAsString());
 
         // Correctly signed: tier updated to the lookup key, status set
-        JsonObject ok = fakeBilling.handleStripeWebhook(payload, sign(payload));
+        BillingService.BillingResponse ok = fakeBilling.handleStripeWebhook(payload, sign(payload));
         assertTrue(ok.get("received").getAsBoolean());
+        assertEquals(200, ok.status);   // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: status checked
         assertEquals(1, count("SELECT COUNT(*) FROM subscriptions WHERE stripe_subscription_id = ? AND tier = 'team' AND status = 'active'", "sub_123"));
     }
 
@@ -379,8 +394,10 @@ public class BillingServiceTest {
     @Test
     void testWebhookSignatureInvalid() {
         String payload = "{}";
-        JsonObject response = billingService.handleStripeWebhook(payload, "invalid_signature");
+        BillingService.BillingResponse response = billingService.handleStripeWebhook(payload, "invalid_signature");
         assertEquals("invalid_signature", response.get("error").getAsString());
+        // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (java bug list): the spec's 403 comes back with the error.
+        assertEquals(403, response.status);
     }
 
     // BILL-10
@@ -389,7 +406,7 @@ public class BillingServiceTest {
         // Test that the response is returned quickly
         String payload = "{}";
         long startTime = System.currentTimeMillis();
-        JsonObject response = billingService.handleStripeWebhook(payload, "invalid_signature");
+        BillingService.BillingResponse response = billingService.handleStripeWebhook(payload, "invalid_signature");
         long endTime = System.currentTimeMillis();
 
         // Response should be returned quickly (less than 3 seconds)
@@ -403,7 +420,7 @@ public class BillingServiceTest {
         try {
             String header = sign(event);
             long t0 = System.nanoTime();
-            JsonObject ok = fakeBilling.handleStripeWebhook(event, header);
+            BillingService.BillingResponse ok = fakeBilling.handleStripeWebhook(event, header);
             long ms = (System.nanoTime() - t0) / 1_000_000;
             assertTrue(ok.get("received").getAsBoolean());
             assertTrue(ms < 3000, "took " + ms + " ms");

@@ -44,16 +44,21 @@ public class AuthSystem {
                 "tier VARCHAR(50) DEFAULT 'basic', status VARCHAR(20), email_verified_at TIMESTAMP, " +
                 "mfa_secret VARCHAR(255), mfa_enabled BOOLEAN DEFAULT FALSE, name VARCHAR(255))";
         String sessions = "CREATE TABLE IF NOT EXISTS sessions (" +
-                "id VARCHAR(255) PRIMARY KEY, user_id BIGINT, refresh_token VARCHAR(255), " +
+                "id VARCHAR(255) PRIMARY KEY, user_id BIGINT, refresh_token_hash CHAR(64) UNIQUE, " +
                 "created_at TIMESTAMP, expires_at TIMESTAMP, ip VARCHAR(45), device_id VARCHAR(255))";
         String audit = "CREATE TABLE IF NOT EXISTS audit_log (" +
                 "timestamp TIMESTAMP, actor_id BIGINT, action VARCHAR(255), resource_type VARCHAR(50), " +
                 "resource_id VARCHAR(255), old_value VARCHAR(255), new_value VARCHAR(255))";
         String verCodes = "CREATE TABLE IF NOT EXISTS verification_codes (" +
-                "id IDENTITY PRIMARY KEY, user_id BIGINT, code VARCHAR(255), created_at TIMESTAMP, " +
+                "id IDENTITY PRIMARY KEY, user_id BIGINT, code_hash CHAR(64), created_at TIMESTAMP, " +
                 "expires_at TIMESTAMP, type VARCHAR(10))";
         String oauthLinks = "CREATE TABLE IF NOT EXISTS oauth_links (" +
                 "id IDENTITY PRIMARY KEY, user_id BIGINT, provider VARCHAR(50), provider_user_id VARCHAR(255))";
+        // OAuth state values, stored only as their SHA-256 (AUTH spec "Secrets at rest", 2026-11-10,
+        // session_012zDydZCZ4AChqhEZ4oVtaP): single-use (used_at) and valid 10 minutes (expires_at).
+        String oauthStates = "CREATE TABLE IF NOT EXISTS oauth_states (" +
+                "state_hash CHAR(64) PRIMARY KEY, provider VARCHAR(50), created_at TIMESTAMP, " +
+                "expires_at TIMESTAMP, used_at TIMESTAMP)";
 
         try (Statement st = conn.createStatement()) {
             st.execute(users);
@@ -61,11 +66,54 @@ public class AuthSystem {
             st.execute(audit);
             st.execute(verCodes);
             st.execute(oauthLinks);
+            st.execute(oauthStates);
         }
     }
 
     /* ---------- Utilities ---------- */
     private static final SecureRandom random = new SecureRandom();
+
+    /**
+     * The clock every expiry and rate-limit window reads. In: none. Out: the current instant.
+     * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec README "Time comes from an injectable clock"; the OAuth
+     * state's 10-minute expiry needs a test that does not sleep). Touches: nothing.
+     */
+    private static volatile Clock clock = Clock.systemUTC();
+
+    /** Replaces the clock (tests). In: a Clock. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing else. */
+    public static void setClock(Clock c) {
+        clock = Objects.requireNonNull(c);
+    }
+
+    /** The current instant from the injected clock. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing. */
+    private static Instant now() {
+        return clock.instant();
+    }
+
+    /**
+     * Lowercase hex SHA-256 of a UTF-8 string. In: a secret (refresh token, verification code, challenge id, OAuth
+     * state). Out: 64 hex characters. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16 and the spec's
+     * "Secrets at rest": the database holds only this hash, so a read hands out no usable credential). Touches: nothing.
+     */
+    public static String sha256Hex(String value) {
+        try {
+            byte[] d = MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(64);
+            for (byte b : d) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /**
+     * Constant-time comparison of two hex hashes. In: two strings (null allowed). Out: true when equal.
+     * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec: secrets compared in constant time). Touches: nothing.
+     */
+    private static boolean hashEquals(String a, String b) {
+        if (a == null || b == null) return false;
+        return MessageDigest.isEqual(a.getBytes(StandardCharsets.US_ASCII), b.getBytes(StandardCharsets.US_ASCII));
+    }
     private static final DateTimeFormatter iso = DateTimeFormatter.ISO_INSTANT;
     private static final ObjectMapper mapper = new ObjectMapper();
     /**
@@ -124,7 +172,7 @@ public class AuthSystem {
     private static final ConcurrentHashMap<String, List<Instant>> loginAttempts = new ConcurrentHashMap<>();
 
     private static void recordAttempt(ConcurrentHashMap<String, List<Instant>> map, String key, Duration window) {
-        Instant now = Instant.now();
+        Instant now = now();
         map.compute(key, (k, list) -> {
             if (list == null) list = new ArrayList<>();
             list.removeIf(t -> t.isBefore(now.minus(window)));
@@ -136,7 +184,7 @@ public class AuthSystem {
     private static boolean isRateLimited(ConcurrentHashMap<String, List<Instant>> map, String key, int max, Duration window) {
         // Only attempts inside the window count. Pruning here as well matters: a blocked caller never records the attempt
         // that used to prune the list, so the block lasted forever (2026-11-08, session f3daac6e, from review of PR 17).
-        Instant cutoff = Instant.now().minus(window);
+        Instant cutoff = now().minus(window);
         List<Instant> list = map.computeIfPresent(key, (k, v) -> {
             v.removeIf(t -> t.isBefore(cutoff));
             return v;
@@ -180,7 +228,7 @@ public class AuthSystem {
     public static boolean verifyTotp(String secret, String code) {
         try {
             byte[] key = Base64.getDecoder().decode(secret);
-            return verifyTotp(key, code, Instant.now());
+            return verifyTotp(key, code, now());
         } catch (Exception e) {
             return false;
         }
@@ -189,7 +237,7 @@ public class AuthSystem {
     public static String generateTotpCode(String secret) {
         try {
             byte[] key = Base64.getDecoder().decode(secret);
-            int totp = generateTotp(key, Instant.now(), TOTP_TIME_STEP, TOTP_DIGITS);
+            int totp = generateTotp(key, now(), TOTP_TIME_STEP, TOTP_DIGITS);
             return String.format("%0" + TOTP_DIGITS + "d", totp);
         } catch (Exception e) {
             throw new RuntimeException("TOTP generation failed", e);
@@ -254,7 +302,7 @@ public class AuthSystem {
             // AUTH-06 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): an expired code is "code_expired", not
             // "code_invalid" as before; the expired row is deleted so it can never be used.
             VerificationCode any = getVerificationCodeIgnoringExpiry(userId, code, "email");
-            if (any != null && Instant.now().isAfter(any.expiresAt)) {
+            if (any != null && now().isAfter(any.expiresAt)) {
                 deleteVerificationCode(any.id);
                 decisions.add("code_valid");
                 return error("code_expired", "Code expired");
@@ -314,6 +362,8 @@ public class AuthSystem {
             // MFA check
             if (isMfaEnabled(userId)) {
                 decisions.add("mfa_gate");
+                // The challenge id is a bearer secret: only its SHA-256 is stored (AUTH spec "Secrets at rest", 2026-11-10,
+                // session_012zDydZCZ4AChqhEZ4oVtaP).
                 String challengeId = generateCode();
                 insertVerificationCode(userId, challengeId, "mfa");
                 return success(Map.of(
@@ -329,23 +379,110 @@ public class AuthSystem {
         }
     }
 
+    /**
+     * Starts an OAuth sign-in: issues the state value the provider must hand back to oauthCallback.
+     * In: provider name (must have a registered OAuthProvider). Out: {success, state, expires_in: 600} or
+     * {error: "unknown_provider"}. Why: AUTH spec "Secrets at rest" (2026-11-10 amendment) and the java bug list:
+     * the state was never checked. The state is 32 random bytes, stored only as its SHA-256, bound to the provider,
+     * single-use and valid 10 minutes. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (oauth_states).
+     */
+    public static Map<String, Object> oauthStart(String provider) {
+        try {
+            if (provider == null || OAuthProviderRegistry.get(provider) == null) {
+                return error("unknown_provider", "OAuth provider not configured");
+            }
+            byte[] bytes = new byte[32];
+            random.nextBytes(bytes);
+            String state = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+            Instant created = now();
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "INSERT INTO oauth_states (state_hash, provider, created_at, expires_at, used_at) VALUES (?, ?, ?, ?, NULL)")) {
+                ps.setString(1, sha256Hex(state));
+                ps.setString(2, provider);
+                ps.setTimestamp(3, java.sql.Timestamp.from(created));
+                ps.setTimestamp(4, java.sql.Timestamp.from(created.plus(OAUTH_STATE_TTL)));
+                ps.executeUpdate();
+            }
+            return success(Map.of("state", state, "expires_in", OAUTH_STATE_TTL.getSeconds()));
+        } catch (Exception e) {
+            return error("internal_error", e.getMessage());
+        }
+    }
+
+    /** How long an OAuth state is valid (AUTH spec: 10 minutes). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+    private static final Duration OAUTH_STATE_TTL = Duration.ofMinutes(10);
+
+    /**
+     * Uses up an OAuth state: true only for a state issued by oauthStart for this provider, not expired and not used
+     * before, and marks it used in the same UPDATE so two callbacks with one state cannot both pass.
+     * In: provider, state. Out: true when valid. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH spec
+     * "OAuth state is single-use and expires in 10 minutes"; java bug: state was not validated). The lookup is by the
+     * SHA-256 of the state (the raw state is never stored), then compared again in constant time.
+     * Touches: database (oauth_states).
+     */
+    private static boolean consumeOAuthState(String provider, String state) throws SQLException {
+        if (state == null || state.isEmpty()) return false;
+        String hash = sha256Hex(state);
+        Instant at = now();
+        String stored = null;
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT state_hash FROM oauth_states WHERE state_hash = ? AND provider = ?")) {
+            ps.setString(1, hash);
+            ps.setString(2, provider);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) stored = rs.getString(1);
+            }
+        }
+        if (!hashEquals(stored, hash)) return false;
+        try (PreparedStatement ps = conn.prepareStatement(
+                "UPDATE oauth_states SET used_at = ? WHERE state_hash = ? AND provider = ? AND used_at IS NULL AND expires_at > ?")) {
+            ps.setTimestamp(1, java.sql.Timestamp.from(at));
+            ps.setString(2, hash);
+            ps.setString(3, provider);
+            ps.setTimestamp(4, java.sql.Timestamp.from(at));
+            return ps.executeUpdate() == 1;
+        }
+    }
+
+    /**
+     * OAuth callback (spec flow 4). In: provider, the provider's authorization code, the state from oauthStart.
+     * Out: {status: "authenticated", session_id, token, refresh_token, expires_in, user} or {error: "invalid_state" |
+     * "unknown_provider" | "oauth_exchange_failed" | "email_not_verified"}.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH spec "Secrets at rest" amendment; java SECURITY bug):
+     * the state is now checked (single-use, 10 minutes, bound to the provider) before anything else, and the code is
+     * exchanged through the injected OAuthProvider client; the link stores the provider's user id, never the code.
+     * Touches: database (oauth_states, users, oauth_links, sessions, audit_log), the provider client (network in production).
+     */
     public static Map<String, Object> oauthCallback(String provider, String code, String state) {
         List<String> decisions = new ArrayList<>();
         try {
-            // Validate state (simplified)
-            if (state == null || state.isEmpty()) {
+            OAuthProvider client = provider == null ? null : OAuthProviderRegistry.get(provider);
+            if (client == null) {
+                return error("unknown_provider", "OAuth provider not configured");
+            }
+            if (!consumeOAuthState(provider, state)) {
                 decisions.add("state_valid");
-                return error("invalid_state", "State invalid");
+                logWhy("oauth_callback", decisions);
+                return error("invalid_state", "State invalid, expired or already used");
             }
             decisions.add("state_valid");
 
-            // Simulate provider email extraction
-            String email = OAuthProviderRegistry.get(provider).getEmail(code);
-            if (email == null) {
+            OAuthIdentity identity;
+            try {
+                identity = (code == null || code.isEmpty()) ? null : client.exchangeCode(code);
+            } catch (RuntimeException e) {
+                identity = null;
+            }
+            if (identity == null || identity.providerUserId() == null || identity.providerUserId().isEmpty()
+                    || identity.email() == null) {
+                return error("oauth_exchange_failed", "The provider did not accept the code");
+            }
+            if (!identity.emailVerified()) {
                 decisions.add("email_verified");
                 return error("email_not_verified", "Provider email not verified");
             }
             decisions.add("email_verified");
+            String email = identity.email();
 
             Long userId = getUserIdByEmail(email);
             if (userId == null) {
@@ -359,8 +496,8 @@ public class AuthSystem {
                 decisions.add("user_exists");
             }
 
-            // Link provider
-            linkOAuth(userId, provider, code);
+            // Link provider by the provider's own user id (from the exchange), never by the one-time code.
+            linkOAuth(userId, provider, identity.providerUserId());
             decisions.add("oauth_linked");
 
             // Create session
@@ -373,7 +510,7 @@ public class AuthSystem {
     public static Map<String, Object> mfaChallenge(String challengeId, String code) {
         List<String> decisions = new ArrayList<>();
         try {
-            VerificationCode vc = getVerificationCodeByCode(challengeId, "mfa");
+            VerificationCode vc = challengeId == null ? null : getVerificationCodeByCode(challengeId, "mfa");
             if (vc == null) {
                 decisions.add("challenge_valid");
                 return error("invalid_code", "Challenge not found or expired");
@@ -407,14 +544,14 @@ public class AuthSystem {
     public static Map<String, Object> tokenRefresh(String refreshToken) {
         List<String> decisions = new ArrayList<>();
         try {
-            Session session = getSessionByRefreshToken(refreshToken);
+            Session session = (refreshToken == null || refreshToken.isEmpty()) ? null : getSessionByRefreshToken(refreshToken);
             if (session == null) {
                 decisions.add("token_valid");
                 return error("invalid_token", "Refresh token invalid");
             }
             decisions.add("token_valid");
 
-            if (Instant.now().isAfter(session.expiresAt)) {
+            if (now().isAfter(session.expiresAt)) {
                 decisions.add("token_expired");
                 return error("token_expired", "Refresh token expired");
             }
@@ -430,7 +567,7 @@ public class AuthSystem {
             String token = JWT.create()
                     .withClaim("user_id", userId)
                     .withClaim("tier", getTier(userId))
-                    .withExpiresAt(java.util.Date.from(Instant.now().plus(Duration.ofHours(1))))
+                    .withExpiresAt(java.util.Date.from(now().plus(Duration.ofHours(1))))
                     .sign(jwtAlg);
 
             decisions.add("token_issued");
@@ -483,11 +620,20 @@ public class AuthSystem {
         }
     }
 
+    /**
+     * Creates a session row and returns the access token and refresh token. In: user id, email, ip, device id, the
+     * why-chain so far, flow name and audit action. Out: {status: "authenticated", session_id, token, refresh_token,
+     * expires_in, user}. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16): the refresh token is returned
+     * and only its SHA-256 is stored. Touches: database (sessions, audit_log).
+     */
     private static Map<String, Object> createSessionAndToken(long userId, String email, String ip, String deviceId,
             List<String> decisions, String flow, String auditAction) throws SQLException {
         String sessionId = UUID.randomUUID().toString();
-        String refreshToken = UUID.randomUUID().toString();
-        Instant now = Instant.now();
+        // 32 random bytes; only its SHA-256 is stored (AUTH-16, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
+        byte[] rt = new byte[32];
+        random.nextBytes(rt);
+        String refreshToken = Base64.getUrlEncoder().withoutPadding().encodeToString(rt);
+        Instant now = now();
         Instant exp = now.plus(Duration.ofHours(1));
         insertSession(sessionId, userId, refreshToken, now, exp, ip, deviceId);
         decisions.add("session_created");
@@ -500,10 +646,12 @@ public class AuthSystem {
 
         logWhy(flow, decisions);
         auditLog(userId, auditAction, "sessions", sessionId, null, null);
+        // refresh_token is returned by every flow that creates a session (login, MFA, OAuth), AUTH-16 2026-11-10.
         return success(Map.of(
                 "status", "authenticated",
                 "session_id", sessionId,
                 "token", token,
+                "refresh_token", refreshToken,
                 "expires_in", exp.getEpochSecond() - now.getEpochSecond(),
                 "user", Map.of(
                         "id", userId,
@@ -574,7 +722,7 @@ public class AuthSystem {
 
     private static void updateEmailVerifiedAt(long userId) throws SQLException {
         try (PreparedStatement ps = conn.prepareStatement("UPDATE users SET email_verified_at = ? WHERE id = ?")) {
-            ps.setTimestamp(1, java.sql.Timestamp.from(Instant.now()));
+            ps.setTimestamp(1, java.sql.Timestamp.from(now()));
             ps.setLong(2, userId);
             ps.executeUpdate();
         }
@@ -610,13 +758,18 @@ public class AuthSystem {
         }
     }
 
+    /**
+     * Inserts a session. In: ids, the raw refresh token (hashed here), times, ip, device. Out: none.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16): stores refresh_token_hash = SHA-256, never the token.
+     * Touches: database (sessions).
+     */
     private static void insertSession(String sessionId, long userId, String refreshToken,
                                       Instant createdAt, Instant expiresAt, String ip, String deviceId) throws SQLException {
         try (PreparedStatement ps = conn.prepareStatement(
-                "INSERT INTO sessions (id, user_id, refresh_token, created_at, expires_at, ip, device_id) VALUES (?, ?, ?, ?, ?, ?, ?)")) {
+                "INSERT INTO sessions (id, user_id, refresh_token_hash, created_at, expires_at, ip, device_id) VALUES (?, ?, ?, ?, ?, ?, ?)")) {
             ps.setString(1, sessionId);
             ps.setLong(2, userId);
-            ps.setString(3, refreshToken);
+            ps.setString(3, sha256Hex(refreshToken));
             ps.setTimestamp(4, java.sql.Timestamp.from(createdAt));
             ps.setTimestamp(5, java.sql.Timestamp.from(expiresAt));
             ps.setString(6, ip);
@@ -625,12 +778,18 @@ public class AuthSystem {
         }
     }
 
+    /**
+     * Finds the session of a refresh token. In: the raw token. Out: the Session or null.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16): looks up by SHA-256 and compares the stored hash
+     * in constant time. Touches: database (sessions, read).
+     */
     private static Session getSessionByRefreshToken(String refreshToken) throws SQLException {
+        String hash = sha256Hex(refreshToken);
         try (PreparedStatement ps = conn.prepareStatement(
-                "SELECT id, user_id, created_at, expires_at, ip, device_id FROM sessions WHERE refresh_token = ?")) {
-            ps.setString(1, refreshToken);
+                "SELECT id, user_id, created_at, expires_at, ip, device_id, refresh_token_hash FROM sessions WHERE refresh_token_hash = ?")) {
+            ps.setString(1, hash);
             ResultSet rs = ps.executeQuery();
-            if (rs.next()) {
+            if (rs.next() && hashEquals(rs.getString(7), hash)) {
                 return new Session(
                         rs.getString(1),
                         rs.getLong(2),
@@ -656,6 +815,11 @@ public class AuthSystem {
         }
     }
 
+    /**
+     * Records that a user signed in with a provider. In: user id, provider, the provider's user id (from the code
+     * exchange). Out: none. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: it was given the one-time code.
+     * Touches: database (oauth_links).
+     */
     private static void linkOAuth(long userId, String provider, String providerUserId) throws SQLException {
         try (PreparedStatement ps = conn.prepareStatement(
                 "INSERT INTO oauth_links (user_id, provider, provider_user_id) VALUES (?, ?, ?)")) {
@@ -672,13 +836,18 @@ public class AuthSystem {
         return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
     }
 
+    /**
+     * Stores a verification code or MFA challenge id. In: user id, the raw code, type 'email' | 'mfa'. Out: none.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16, java SECURITY bug): stores code_hash = SHA-256;
+     * the raw code only goes to the user. Touches: database (verification_codes).
+     */
     private static void insertVerificationCode(long userId, String code, String type) throws SQLException {
-        Instant now = Instant.now();
+        Instant now = now();
         Instant exp = now.plus(Duration.ofHours(24));
         try (PreparedStatement ps = conn.prepareStatement(
-                "INSERT INTO verification_codes (user_id, code, created_at, expires_at, type) VALUES (?, ?, ?, ?, ?)")) {
+                "INSERT INTO verification_codes (user_id, code_hash, created_at, expires_at, type) VALUES (?, ?, ?, ?, ?)")) {
             ps.setLong(1, userId);
-            ps.setString(2, code);
+            ps.setString(2, sha256Hex(code));
             ps.setTimestamp(3, java.sql.Timestamp.from(now));
             ps.setTimestamp(4, java.sql.Timestamp.from(exp));
             ps.setString(5, type);
@@ -689,16 +858,19 @@ public class AuthSystem {
     /**
      * The user's code row of that type matching code, expired or not (null if none). In: user id, code, type.
      * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP so verify_email can answer code_expired (AUTH-06).
-     * Touches: reads the database.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16): matches code_hash = SHA-256(code), compared again in
+     * constant time; VerificationCode.code now holds that hash. Touches: reads the database.
      */
     private static VerificationCode getVerificationCodeIgnoringExpiry(long userId, String code, String type) throws SQLException {
+        if (code == null) return null;
+        String hash = sha256Hex(code);
         try (PreparedStatement ps = conn.prepareStatement(
-                "SELECT id, user_id, code, created_at, expires_at, type FROM verification_codes WHERE user_id = ? AND code = ? AND type = ?")) {
+                "SELECT id, user_id, code_hash, created_at, expires_at, type FROM verification_codes WHERE user_id = ? AND code_hash = ? AND type = ?")) {
             ps.setLong(1, userId);
-            ps.setString(2, code);
+            ps.setString(2, hash);
             ps.setString(3, type);
             ResultSet rs = ps.executeQuery();
-            if (rs.next()) {
+            if (rs.next() && hashEquals(rs.getString(3), hash)) {
                 return new VerificationCode(rs.getLong(1), rs.getLong(2), rs.getString(3),
                         rs.getTimestamp(4).toInstant(), rs.getTimestamp(5).toInstant(), rs.getString(6));
             }
@@ -706,14 +878,20 @@ public class AuthSystem {
         }
     }
 
+    /**
+     * The unexpired code row of that type for that user, or null. In: user id, raw code, type.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16): matches code_hash = SHA-256(code) in constant time.
+     * Touches: reads the database.
+     */
     private static VerificationCode getVerificationCode(long userId, String code, String type) throws SQLException {
+        String hash = sha256Hex(code);
         try (PreparedStatement ps = conn.prepareStatement(
-                "SELECT id, user_id, code, created_at, expires_at, type FROM verification_codes WHERE user_id = ? AND code = ? AND type = ?")) {
+                "SELECT id, user_id, code_hash, created_at, expires_at, type FROM verification_codes WHERE user_id = ? AND code_hash = ? AND type = ?")) {
             ps.setLong(1, userId);
-            ps.setString(2, code);
+            ps.setString(2, hash);
             ps.setString(3, type);
             ResultSet rs = ps.executeQuery();
-            if (rs.next()) {
+            if (rs.next() && hashEquals(rs.getString(3), hash)) {
                 VerificationCode vc = new VerificationCode(
                         rs.getLong(1),
                         rs.getLong(2),
@@ -722,20 +900,26 @@ public class AuthSystem {
                         rs.getTimestamp(5).toInstant(),
                         rs.getString(6)
                 );
-                if (Instant.now().isAfter(vc.expiresAt)) return null;
+                if (now().isAfter(vc.expiresAt)) return null;
                 return vc;
             }
             return null;
         }
     }
 
+    /**
+     * The unexpired row whose code (here the MFA challenge id) matches, or null. In: raw code, type.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16): matches code_hash = SHA-256(code) in constant time.
+     * Touches: reads the database.
+     */
     private static VerificationCode getVerificationCodeByCode(String code, String type) throws SQLException {
+        String hash = sha256Hex(code);
         try (PreparedStatement ps = conn.prepareStatement(
-                "SELECT id, user_id, code, created_at, expires_at, type FROM verification_codes WHERE code = ? AND type = ?")) {
-            ps.setString(1, code);
+                "SELECT id, user_id, code_hash, created_at, expires_at, type FROM verification_codes WHERE code_hash = ? AND type = ?")) {
+            ps.setString(1, hash);
             ps.setString(2, type);
             ResultSet rs = ps.executeQuery();
-            if (rs.next()) {
+            if (rs.next() && hashEquals(rs.getString(3), hash)) {
                 VerificationCode vc = new VerificationCode(
                         rs.getLong(1),
                         rs.getLong(2),
@@ -744,7 +928,7 @@ public class AuthSystem {
                         rs.getTimestamp(5).toInstant(),
                         rs.getString(6)
                 );
-                if (Instant.now().isAfter(vc.expiresAt)) return null;
+                if (now().isAfter(vc.expiresAt)) return null;
                 return vc;
             }
             return null;
@@ -764,6 +948,9 @@ public class AuthSystem {
      * or the service name), checked IN THAT ORDER, first failure wins ("password123" is too_short).
      * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-03 amendment): length now comes before the blocklist,
      * length counts Unicode characters (code points), not UTF-16 units, and the blocklist has 15+ character entries.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (java bug list): the "invalid_chars" reason is gone; it is
+     * not one of the spec's three reasons, and the spec accepts all printable ASCII, spaces and Unicode, so a password
+     * is no longer refused for holding a control character.
      * Touches: nothing.
      */
     private static String passwordStrengthCheck(String password, String email, String name) {
@@ -776,9 +963,6 @@ public class AuthSystem {
         if (commonPasswords.contains(lower)) return "blocklisted";
         if (password.equalsIgnoreCase(email) || password.equalsIgnoreCase(name) || password.equalsIgnoreCase("auth_system"))
             return "blocklisted";
-
-        // Allow all printable ASCII, spaces, and Unicode - just reject control characters
-        if (password.codePoints().anyMatch(c -> Character.isISOControl(c))) return "invalid_chars";
 
         return null;
     }
@@ -796,7 +980,7 @@ public class AuthSystem {
                                  String oldValue, String newValue) {
         try (PreparedStatement ps = conn.prepareStatement(
                 "INSERT INTO audit_log (timestamp, actor_id, action, resource_type, resource_id, old_value, new_value) VALUES (?, ?, ?, ?, ?, ?, ?)")) {
-            ps.setTimestamp(1, java.sql.Timestamp.from(Instant.now()));
+            ps.setTimestamp(1, java.sql.Timestamp.from(now()));
             ps.setObject(2, actorId);
             ps.setString(3, action);
             ps.setString(4, resourceType);
@@ -854,25 +1038,33 @@ public class AuthSystem {
     }
 
     /* ---------- OAuth Provider Registry ---------- */
+    /**
+     * What the provider says about the person after the code exchange. providerUserId is the provider's stable id
+     * (the "sub"), email and whether the provider verified it. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     */
+    public record OAuthIdentity(String providerUserId, String email, boolean emailVerified) { }
+
+    /**
+     * The injected provider client. exchangeCode(code) trades the authorization code at the provider's token endpoint
+     * and returns the identity, or null (or throws) when the provider refuses the code. Changed 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP (AUTH spec "Secrets at rest"; java SECURITY bug): it was getEmail(code) and the
+     * code itself was stored as the provider user id. Tests pass a fake; production calls the provider (network).
+     */
     public interface OAuthProvider {
-        String getEmail(String code);
+        OAuthIdentity exchangeCode(String code);
     }
 
-    public static class DummyOAuthProvider implements OAuthProvider {
-        private final String email;
-        DummyOAuthProvider(String email) { this.email = email; }
-        public String getEmail(String code) { return email; }
-    }
-
+    /** Holds the provider clients by name. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only. */
     public static class OAuthProviderRegistry {
-        private static final Map<String, OAuthProvider> providers = new HashMap<>();
+        private static final Map<String, OAuthProvider> providers = new ConcurrentHashMap<>();
         public static void register(String name, OAuthProvider provider) { providers.put(name, provider); }
         public static OAuthProvider get(String name) { return providers.get(name); }
     }
 
     /* ---------- Main for demonstration (optional) ---------- */
     public static void main(String[] args) throws Exception {
-        OAuthProviderRegistry.register("google", new DummyOAuthProvider("user@example.com"));
+        // A stand-in client for the demo only; a real deployment registers one that calls the provider.
+        OAuthProviderRegistry.register("google", code -> new OAuthIdentity("demo-sub", "user@example.com", true));
         System.out.println(mapToJson(signup("user@example.com", "StrongPassword123456", "Alice", "127.0.0.1")));
         // Further demo omitted
     }

@@ -222,6 +222,51 @@ public class TrialAbusePreventionTest {
     }
 
     /**
+     * Gate 5 edge rows (Phase B.2 amendment): a user id with no users row is FAIL user_not_found (fail closed, no
+     * exception); a user with no ledger row at all is judged from users.created_at with no earlier payment, so 90 days
+     * after the trial is FAIL trial_ended_no_payment_cannot_retry and 4 days is PASS. Added 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the test database.
+     */
+    // TRIAL-11
+    @Test
+    public void testTrialPaymentTimingMissingUserAndMissingLedgerRow() throws Exception {
+        TrialAbusePrevention gates = fixedGates();
+        TrialAbusePrevention.TimingDecision missing = gates.judgeTrialPaymentTiming(987654321L);
+        assertEquals(GateDecision.FAIL, missing.decision());
+        assertEquals("user_not_found", missing.error());
+        assertEquals(GateDecision.FAIL, gates.checkTrialPaymentTiming(987654321L));
+        assertEquals("user_not_found", gates.judgeTrialPaymentTiming(null).error());
+
+        Long late = userWhoseTrialEnded(90, "noledger90@example.com");
+        Long early = userWhoseTrialEnded(4, "noledger4@example.com");
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement("DELETE FROM trial_abuse_ledger WHERE user_id IN (?, ?)")) {
+            ps.setLong(1, late);
+            ps.setLong(2, early);
+            ps.executeUpdate();
+        }
+        assertEquals(0, countLedgerRows(late) + countLedgerRows(early));
+        TrialAbusePrevention.TimingDecision lateDecision = gates.judgeTrialPaymentTiming(late);
+        assertEquals(GateDecision.FAIL, lateDecision.decision());
+        assertEquals("trial_ended_no_payment_cannot_retry", lateDecision.error());
+        TrialAbusePrevention.TimingDecision earlyDecision = gates.judgeTrialPaymentTiming(early);
+        assertEquals(GateDecision.PASS, earlyDecision.decision());
+        assertNull(earlyDecision.error());
+    }
+
+    /** Ledger rows of a user. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: reads the test database. */
+    private int countLedgerRows(Long userId) throws SQLException {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement("SELECT COUNT(*) FROM trial_abuse_ledger WHERE user_id = ?")) {
+            ps.setLong(1, userId);
+            try (ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                return rs.getInt(1);
+            }
+        }
+    }
+
+    /**
      * TRIAL-14: 4 OTHER users on a device -> CHALLENGE for a new user; exactly 5 -> FAIL, even for a user who already
      * has the device; a FAIL records no device row; a PASS/CHALLENGE through checkAndRecordDevice records one; a user
      * who already has the device (with 2-4 others) PASSes. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.

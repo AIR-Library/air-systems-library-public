@@ -172,12 +172,22 @@ public class QuotaManagerTest {
         assertEquals(200, r.getStatusCode());
     }
 
+    /**
+     * QUOTA-10: a solo user calling a team feature gets 403 {error: "feature_not_available_in_tier", tier: "solo",
+     * minimum_tier: "team", upgrade_url}. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (quotas spec, Phase B.2):
+     * the error is now named feature_not_available_in_tier, and the body is parsed so every field is checked exactly
+     * (it only searched the body for "feature_not_available", which the new name also contains).
+     */
     // QUOTA-10
     @Test
     public void testFeatureGateFail() throws Exception {
         QuotaManager.Response r = qm.handleApiCall(soloUser, "/feature", "127.0.0.1", null, "feature_a");
         assertEquals(403, r.getStatusCode());
-        assertTrue(r.getBody().contains("feature_not_available"));
+        com.fasterxml.jackson.databind.JsonNode body = new com.fasterxml.jackson.databind.ObjectMapper().readTree(r.getBody());
+        assertEquals("feature_not_available_in_tier", body.get("error").asText());
+        assertEquals("solo", body.get("tier").asText());
+        assertEquals("team", body.get("minimum_tier").asText());
+        assertEquals("/billing/upgrade?tier=team", body.get("upgrade_url").asText());
     }
 
     /** Usage resets in a new month. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: exhausts January on one manager, then moves its clock to February. */

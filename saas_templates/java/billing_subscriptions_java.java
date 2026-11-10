@@ -179,11 +179,13 @@ public class BillingService {
     /**
      * Flow 1: create a subscription for a Stripe customer on a tier.
      * Input: Stripe customer id, tier (solo|team|enterprise). Output: {success, subscription_id, tier, status,
-     * next_billing_date} or {error: invalid_tier|stripe_error|db_error, message}.
+     * next_billing_date} or {error: invalid_tier|stripe_error|db_error, message}, wrapped in a BillingResponse with its
+     * HTTP status (200; 400 invalid_tier/invalid_customer, 502 stripe_error, 500 db_error; added 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP).
      * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: Stripe goes through the gateway; times come
      * from the clock. Touches: Stripe (creates a billable subscription), the database.
      */
-    public JsonObject createSubscription(String customerId, String tier) {
+    public BillingResponse createSubscription(String customerId, String tier) {
         if (tier == null || !PRICE_IDS.containsKey(tier)) {
             return errorResponse("invalid_tier", "Invalid tier: " + tier);
         }
@@ -214,7 +216,7 @@ public class BillingService {
             response.addProperty("status", "active");
             response.addProperty("next_billing_date",
                     ISO_FORMATTER.format(Instant.ofEpochSecond(subscription.currentPeriodEnd)));
-            return response;
+            return BillingResponse.ok(response);
 
         } catch (StripeException e) {
             return errorResponse("stripe_error", e.getMessage());
@@ -228,14 +230,15 @@ public class BillingService {
      * unused part of the current period at the old tier's price.
      * Input: Stripe subscription id, new tier. Output: {success, subscription_id, old_tier, new_tier,
      * effective_date, proration_credit (cents)} or {error: invalid_tier (400) | not_found |
-     * subscription_item_ambiguous (409) | stripe_error | db_error}.
+     * subscription_item_ambiguous (409) | stripe_error | db_error}, wrapped in a BillingResponse with that HTTP status
+     * (404 not_found, 502 stripe_error, 500 db_error; status added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
      * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: the Stripe update did not compile and the
      * credit was always 0. Amended the same day (BILL-03, spec flow 2): the subscription is retrieved first, one
      * that does not have exactly one item is refused with subscription_item_ambiguous before any update, and the
      * update names that item's id with the new price and proration_behavior create_prorations (a bare price ADDS a
      * second item and bills both plans). Touches: Stripe (changes what the customer is billed), the database.
      */
-    public JsonObject changePlan(String subscriptionId, String newTier) {
+    public BillingResponse changePlan(String subscriptionId, String newTier) {
         if (newTier == null || !PRICE_IDS.containsKey(newTier)) {
             return errorResponse("invalid_tier", "Invalid tier: " + newTier);
         }
@@ -281,7 +284,7 @@ public class BillingService {
             response.addProperty("new_tier", newTier);
             response.addProperty("effective_date", ISO_FORMATTER.format(now));
             response.addProperty("proration_credit", prorationCredit);
-            return response;
+            return BillingResponse.ok(response);
 
         } catch (StripeException e) {
             return errorResponse("stripe_error", e.getMessage());
@@ -309,12 +312,14 @@ public class BillingService {
      * Flow 3: queue a refund for a paid invoice. Refunds are only queued here, never sent to Stripe.
      * Input: Stripe invoice id, amount in cents (> 0), reason, createdBy (the authenticated admin's id, taken
      * from the server-side session, never from the request body). Output: {success, refund_id, status: queued,
-     * amount, reason} or {error: invalid_amount|not_found|invalid_invoice_status|refund_exceeds_invoice|db_error}.
+     * amount, reason} or {error: invalid_amount|not_found|invalid_invoice_status|refund_exceeds_invoice|db_error}, in
+     * a BillingResponse with its HTTP status (400, 404 not_found, 500 db_error; added 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP).
      * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: refunds already queued or executed for the
      * invoice now count against its amount (two refunds could add up to more than was paid); non-positive
      * amounts are rejected. Touches: the database (money owed back to a customer).
      */
-    public JsonObject queueRefund(String invoiceId, long amount, String reason, String createdBy) {
+    public BillingResponse queueRefund(String invoiceId, long amount, String reason, String createdBy) {
         if (amount <= 0) {
             return errorResponse("invalid_amount", "Refund amount must be positive");
         }
@@ -375,7 +380,7 @@ public class BillingService {
             response.addProperty("status", "queued");
             response.addProperty("amount", amount);
             response.addProperty("reason", reason);
-            return response;
+            return BillingResponse.ok(response);
 
         } catch (SQLException e) {
             return errorResponse("db_error", e.getMessage());
@@ -388,12 +393,14 @@ public class BillingService {
      * events table is acknowledged and not processed again. The event's effects and its events row are written
      * in one transaction, so a failure leaves nothing half-applied and Stripe's retry processes it cleanly.
      * Input: raw request body, Stripe-Signature header. Output: {received: true} (plus duplicate: true for a
-     * replay) or {error: config_error|invalid_signature|invalid_payload|db_error, message}.
+     * replay) or {error: config_error|invalid_signature|invalid_payload|db_error, message}, in a BillingResponse with
+     * its HTTP status (200; 403 invalid_signature, 400 invalid_payload, 500 config_error/db_error; added 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP).
      * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: Webhook.constructEvent returns an Event,
      * not a JsonObject (compile error); the secret now also comes from a system property; one transaction.
      * Touches: the database.
      */
-    public JsonObject handleStripeWebhook(String payload, String signature) {
+    public BillingResponse handleStripeWebhook(String payload, String signature) {
         if (webhookSecret == null || webhookSecret.isEmpty()) {
             return errorResponse("config_error", "Webhook secret not configured");
         }
@@ -432,7 +439,7 @@ public class BillingService {
                         JsonObject response = new JsonObject();
                         response.addProperty("received", true);
                         response.addProperty("duplicate", true);
-                        return response;
+                        return BillingResponse.ok(response);
                     }
                 }
             }
@@ -474,7 +481,7 @@ public class BillingService {
 
         JsonObject response = new JsonObject();
         response.addProperty("received", true);
-        return response;
+        return BillingResponse.ok(response);
     }
 
     /**
@@ -650,12 +657,67 @@ public class BillingService {
         return (el == null || el.isJsonNull()) ? null : el.getAsString();
     }
 
-    /** {error, message} response. Documented 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Pure. */
-    private JsonObject errorResponse(String code, String message) {
+    /**
+     * HTTP status of each error code, as the spec and the other languages answer: 400 for bad input (invalid_tier,
+     * invalid_customer, invalid_amount, invalid_invoice_status, refund_exceeds_invoice, invalid_payload), 403
+     * invalid_signature, 404 not_found, 409 subscription_item_ambiguous, 502 stripe_error, 500 config_error and
+     * db_error. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (java bug list: billing returned a JSON body with no
+     * HTTP status). Touches nothing.
+     */
+    static final Map<String, Integer> ERROR_STATUS = Map.ofEntries(
+            Map.entry("invalid_tier", 400), Map.entry("invalid_customer", 400), Map.entry("invalid_amount", 400),
+            Map.entry("invalid_invoice_status", 400), Map.entry("refund_exceeds_invoice", 400),
+            Map.entry("invalid_payload", 400), Map.entry("invalid_signature", 403), Map.entry("not_found", 404),
+            Map.entry("subscription_item_ambiguous", 409), Map.entry("stripe_error", 502),
+            Map.entry("config_error", 500), Map.entry("db_error", 500));
+
+    /**
+     * {error, message} response with its HTTP status from ERROR_STATUS (500 for a code not listed).
+     * In: error code, message. Out: BillingResponse. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (java bug
+     * list: the status was missing). Pure.
+     */
+    private BillingResponse errorResponse(String code, String message) {
         JsonObject response = new JsonObject();
         response.addProperty("error", code);
         response.addProperty("message", message);
-        return response;
+        return new BillingResponse(ERROR_STATUS.getOrDefault(code, 500), response);
+    }
+
+    /**
+     * What every public flow returns: the HTTP status the route answers with and the JSON body. get/has read the body,
+     * so callers keep reading fields as before. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (java bug list:
+     * billing returned a JSON body with no HTTP status). Touches nothing.
+     */
+    public static final class BillingResponse {
+        /** HTTP status: 200 on success, else the error's status (see ERROR_STATUS). */
+        public final int status;
+        /** The JSON body: {success: true, ...}, {received: true}, or {error, message}. */
+        public final JsonObject body;
+
+        public BillingResponse(int status, JsonObject body) {
+            this.status = status;
+            this.body = body;
+        }
+
+        /** A 200 response around a success body. */
+        static BillingResponse ok(JsonObject body) {
+            return new BillingResponse(200, body);
+        }
+
+        /** A body member, or null. */
+        public JsonElement get(String name) {
+            return body.get(name);
+        }
+
+        /** True when the body has the member. */
+        public boolean has(String name) {
+            return body.has(name);
+        }
+
+        @Override
+        public String toString() {
+            return status + " " + body;
+        }
     }
 
     // ─── Stripe boundary ─────────────────────────────────────────────────────────────────────────────────
