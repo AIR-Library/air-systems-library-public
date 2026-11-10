@@ -252,6 +252,12 @@ export const create_subscription = async (customer_id: string, tier: string): Pr
  * In: the Stripe subscription id and the new tier. Out: { success, subscription_id, old_tier, new_tier,
  * effective_date, proration_credit (dollars) } or { error, message }. Touches: Stripe (network, money), Postgres.
  * Documented 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.
+ *
+ * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (BILL-03 amendment): the update sent a bare
+ * {price}, which makes Stripe ADD a second item and bill both plans. It now retrieves the subscription first;
+ * one that does not have exactly one item is { error: 'subscription_item_ambiguous' } (409) with no update, and
+ * the update replaces that item: items [{ id: current_item_id, price }], proration_behavior 'create_prorations'.
+ * An unknown tier is still { error: 'invalid_tier' } (400) before anything else.
  */
 export const change_plan = async (subscription_id: string, new_tier_input: string): Promise<{success: true, subscription_id: string, old_tier: string, new_tier: string, effective_date: string, proration_credit: number} | {error: string, message: string}> => {
   const new_tier = resolvePrice(new_tier_input);
@@ -279,9 +285,21 @@ export const change_plan = async (subscription_id: string, new_tier_input: strin
     const old_tier = subRes.rows[0].tier;
     const stripe_subscription_id = subRes.rows[0].stripe_subscription_id;
 
-    // Update in Stripe
+    // Read the current item: exactly one, or refuse before any update (spec BILL-03).
+    const current = await stripe.subscriptions.retrieve(stripe_subscription_id);
+    const currentItems = current?.items?.data ?? [];
+    if (currentItems.length !== 1 || !currentItems[0]?.id) {
+      await safeRollback(client);
+      return {
+        error: 'subscription_item_ambiguous',
+        message: `Subscription ${subscription_id} has ${currentItems.length} items; expected exactly one`,
+      };
+    }
+    const current_item_id = currentItems[0].id;
+
+    // Update in Stripe: replace the existing item's price (never add a second item).
     const subscription = await stripe.subscriptions.update(stripe_subscription_id, {
-      items: [{ price: new_tier }],
+      items: [{ id: current_item_id, price: new_tier }],
       proration_behavior: 'create_prorations',
       expand: ['latest_invoice']
     });

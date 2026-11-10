@@ -30,6 +30,7 @@ describe('API Key Service', () => {
   const userId = 'user-123';
   const scopes: Scope[] = ['read:deployments', 'write:webhooks'];
 
+  // KEYS-01
   test('Create key with scopes', async () => {
     const res = await service.createApiKey({
       user_id: userId,
@@ -44,6 +45,7 @@ describe('API Key Service', () => {
     expect(res.rate_limit).toBe(1000);
   });
 
+  // KEYS-02
   test('Use key: request succeeds with Authorization header', async () => {
     const { api_key_id, key } = await service.createApiKey({
       user_id: userId,
@@ -59,6 +61,7 @@ describe('API Key Service', () => {
     expect(validation.api_key_id).toBe(api_key_id);
   });
 
+  // KEYS-03
   test('Revoke key: subsequent requests return 401', async () => {
     const { api_key_id, key } = await service.createApiKey({
       user_id: userId,
@@ -71,6 +74,7 @@ describe('API Key Service', () => {
     ).rejects.toMatchObject({ status: 401 });
   });
 
+  // KEYS-04
   test('Rate limit: 1001st request in hour returns 429', async () => {
     const { key } = await service.createApiKey({
       user_id: userId,
@@ -89,6 +93,7 @@ describe('API Key Service', () => {
     ).rejects.toMatchObject({ status: 429 });
   });
 
+  // KEYS-05
   test('Scope check: key with read:deployments cannot write deployments (403)', async () => {
     const { key } = await service.createApiKey({
       user_id: userId,
@@ -100,6 +105,7 @@ describe('API Key Service', () => {
     ).rejects.toMatchObject({ status: 403 });
   });
 
+  // KEYS-06
   test('Rotate: new key works, old key stops after grace period', async () => {
     const { api_key_id, key: oldKey } = await service.createApiKey({
       user_id: userId,
@@ -122,6 +128,7 @@ describe('API Key Service', () => {
     await service.validateApiKey(newKey, '/deployments', 'GET', 'read:deployments');
   });
 
+  // KEYS-06
   test('Rotate: old key expires by itself when the 24 h grace period ends', async () => {
     // Added 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): the test above ends the grace period by hand; this
     // one moves a clock past it.
@@ -144,6 +151,7 @@ describe('API Key Service', () => {
     }
   });
 
+  // KEYS-07
   test('Expired key: after expires_at, request returns 401', async () => {
     const { key } = await service.createApiKey({
       user_id: userId,
@@ -156,6 +164,7 @@ describe('API Key Service', () => {
     ).rejects.toMatchObject({ status: 401 });
   });
 
+  // KEYS-08
   test('Usage stats: requests counted per endpoint', async () => {
     const { api_key_id, key } = await service.createApiKey({
       user_id: userId,
@@ -174,6 +183,7 @@ describe('API Key Service', () => {
     expect(stats.requests_by_endpoint['POST /webhooks']).toBe(1);
   });
 
+  // KEYS-09
   test('Admin audit: all keys visible to admin', async () => {
     const { api_key_id } = await service.createApiKey({
       user_id: userId,

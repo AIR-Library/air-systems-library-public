@@ -143,13 +143,24 @@ export class FileUploads {
   private hmacSecret: string;
   private allowedExtensions: Set<string>;
   private maxFileSize: number;
+  private now: () => number;
 
+  /**
+   * Builds the service.
+   *
+   * In: store, storageDir (outside any webroot), hmacSecret for download links, optional extension allowlist,
+   * maxFileSize in bytes (default 10 MB) and `now` (a clock returning epoch milliseconds; default Date.now).
+   * Out: the service. Why: the spec requires an injectable clock wherever time matters (link expiry), so tests
+   * never depend on the wall clock; `now` was added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * Touches: nothing until called.
+   */
   constructor(config: {
     store: FileStore;
     storageDir: string;
     hmacSecret: string;
     allowedExtensions?: string[];
     maxFileSize?: number;
+    now?: () => number;
   }) {
     this.store = config.store;
     this.storageDir = config.storageDir;
@@ -158,6 +169,7 @@ export class FileUploads {
       config.allowedExtensions ?? ['pdf', 'png', 'jpg', 'jpeg', 'gif', 'txt', 'csv', 'docx', 'xlsx']
     );
     this.maxFileSize = config.maxFileSize ?? 10 * 1024 * 1024; // 10 MB default
+    this.now = config.now ?? (() => Date.now());
   }
 
   upload(
@@ -210,7 +222,7 @@ export class FileUploads {
       mime_type: declared_content_type,
       size_bytes: bytes.length,
       sha256,
-      created_at: Date.now(),
+      created_at: this.now(),
       deleted_at: null,
     };
 
@@ -239,7 +251,7 @@ export class FileUploads {
       return { error: 'unauthorized' };
     }
 
-    const expiresAt = Math.floor(Date.now() / 1000) + ttl_seconds;
+    const expiresAt = Math.floor(this.now() / 1000) + ttl_seconds;
     const payload = `${record.id}:${expiresAt}`;
     const signature = crypto
       .createHmac('sha256', this.hmacSecret)
@@ -252,9 +264,16 @@ export class FileUploads {
 
   /**
    * Returns the bytes for a link token only in the exact form it was issued, unexpired, with a valid HMAC and an
-   * existing file. Output: { bytes } or { error }. Touches: the database and storage. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+   * existing file the caller may see. Output: { bytes } or { error }. Touches: the database and storage. Reviewed
+   * in PR 18 (2026-11-09, session 04ec72ff).
+   *
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: now download(user, token) as the spec says ("the caller is
+   * needed to re-check access"; UPLOAD-05): a link that leaks to a non-member of the file's org is refused with
+   * 'unauthorized'. The signature check no longer throws on a signature of the wrong length (timingSafeEqual
+   * throws on unequal lengths; the spec says a malformed token is an ordinary 'invalid link'), and expiry uses
+   * the injected clock.
    */
-  download(token: string): { bytes: Uint8Array } | { error: string } {
+  download(user: { id: string; orgs: string[] }, token: string): { bytes: Uint8Array } | { error: string } {
     let payload: string;
     try {
       payload = Buffer.from(token, 'base64url').toString('utf8');
@@ -286,7 +305,7 @@ export class FileUploads {
     }
 
     // Check expiration
-    if (expires_at < Math.floor(Date.now() / 1000)) {
+    if (expires_at < Math.floor(this.now() / 1000)) {
       return { error: 'link expired' };
     }
 
@@ -297,7 +316,9 @@ export class FileUploads {
       .update(expectedPayload)
       .digest('hex');
 
-    if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expectedSignature))) {
+    const given = Buffer.from(signature, 'utf8');
+    const expected = Buffer.from(expectedSignature, 'utf8');
+    if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) {
       return { error: 'invalid link' };
     }
 
@@ -305,6 +326,11 @@ export class FileUploads {
     const record = this.store.get(file_id);
     if (!record || record.deleted_at !== null) {
       return { error: 'not found' };
+    }
+
+    // Re-check that the caller may see this file (spec: download() re-checks access).
+    if (!user.orgs.includes(record.org_id)) {
+      return { error: 'unauthorized' };
     }
 
     // Read bytes from storage
@@ -331,15 +357,21 @@ export class FileUploads {
       return { error: 'unauthorized' };
     }
 
-    record.deleted_at = Date.now();
+    record.deleted_at = this.now();
     this.store.update(record);
 
     return { success: true };
   }
 
+  /**
+   * Display-name sanitiser: keeps only the last path part and drops control characters, max 255 chars.
+   * In: the client's filename. Out: a name with no path parts. Why: UPLOAD-03. 2026-11-10,
+   * session_012zDydZCZ4AChqhEZ4oVtaP: also splits on backslashes, which path.basename on Linux keeps, so
+   * "..\\..\\etc\\passwd.png" no longer keeps its path parts. Touches: nothing.
+   */
   private sanitizeFilename(filename: string): string {
-    // Strip path components
-    let name = path.basename(filename);
+    // Strip path components (both separators, whatever the host OS)
+    let name = filename.split(/[\\/]/).pop() ?? '';
     // Remove control characters and null bytes
     name = name.replace(/[\x00-\x1f\x7f]/g, '');
     // Limit length
@@ -349,24 +381,32 @@ export class FileUploads {
     return name;
   }
 
+  /**
+   * Checks the file's signature against its extension using the spec's FULL signatures.
+   * In: lower-case extension and the bytes. Out: true when they match. Why: UPLOAD-01; 2026-11-10,
+   * session_012zDydZCZ4AChqhEZ4oVtaP: PNG, GIF and PDF used 4-byte prefixes, shorter than the spec's
+   * signatures (PNG 8 bytes, "GIF87a"/"GIF89a", "%PDF-"). Touches: nothing.
+   */
   private validateMagicBytes(ext: string, bytes: Uint8Array): boolean {
     if (bytes.length === 0) return false;
 
-    const header = bytes.slice(0, 8);
+    const startsWith = (sig: number[]): boolean =>
+      bytes.length >= sig.length && sig.every((b, i) => bytes[i] === b);
+    const ascii = (text: string): number[] => Array.from(Buffer.from(text, 'latin1'));
 
     switch (ext) {
       case 'png':
-        return header[0] === 0x89 && header[1] === 0x50 && header[2] === 0x4e && header[3] === 0x47;
+        return startsWith([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
       case 'jpg':
       case 'jpeg':
-        return header[0] === 0xff && header[1] === 0xd8 && header[2] === 0xff;
+        return startsWith([0xff, 0xd8, 0xff]);
       case 'gif':
-        return header[0] === 0x47 && header[1] === 0x49 && header[2] === 0x46 && header[3] === 0x38;
+        return startsWith(ascii('GIF87a')) || startsWith(ascii('GIF89a'));
       case 'pdf':
-        return header[0] === 0x25 && header[1] === 0x50 && header[2] === 0x44 && header[3] === 0x46;
+        return startsWith(ascii('%PDF-'));
       case 'docx':
       case 'xlsx':
-        return header[0] === 0x50 && header[1] === 0x4b && header[2] === 0x03 && header[3] === 0x04;
+        return startsWith([0x50, 0x4b, 0x03, 0x04]);
       case 'txt':
       case 'csv':
         // Text types: reject if they contain NUL bytes

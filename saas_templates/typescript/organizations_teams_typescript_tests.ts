@@ -8,6 +8,7 @@ function createService() {
   return new OrganizationsTeams(store);
 }
 
+// ORG-01
 test('non-member cannot read members of another org (IDOR attempt)', () => {
   const svc = createService();
 
@@ -23,6 +24,7 @@ test('non-member cannot read members of another org (IDOR attempt)', () => {
   );
 });
 
+// ORG-02
 test('member cannot invite; admin can', () => {
   const svc = createService();
 
@@ -47,6 +49,7 @@ test('member cannot invite; admin can', () => {
   );
 });
 
+// ORG-03
 test('admin cannot remove owner; last owner cannot leave', () => {
   const svc = createService();
 
@@ -70,6 +73,7 @@ test('admin cannot remove owner; last owner cannot leave', () => {
   );
 });
 
+// ORG-04
 test('invitation works once; second use fails', () => {
   const svc = createService();
 
@@ -90,58 +94,29 @@ test('invitation works once; second use fails', () => {
   );
 });
 
+// ORG-05
+// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: uses the service's injected clock instead of replacing the
+// global Date (the spec requires an injectable clock; same assertion as before).
 test('expired invitation fails', () => {
-  const svc = createService();
+  let nowMs = Date.parse('2023-01-01T00:00:00Z');
+  const svc = new OrganizationsTeams(new InMemoryStore(), () => nowMs);
 
   const org = svc.createOrg('owner', 'Test Org');
   const orgId = org.body.id;
 
-  // Mock Date to control time
-  const OriginalDate = global.Date;
-  const fixedNow = new Date('2023-01-01');
-  global.Date = class extends OriginalDate {
-    constructor(value?: any) {
-      if (value === undefined) {
-        super(fixedNow.getTime());
-      } else {
-        super(value);
-      }
-    }
-    static now() {
-      return fixedNow.getTime();
-    }
-  };
+  // Create invitation that expires in 7 days (2023-01-08)
+  const inviteResult = svc.invite('owner', orgId, 'user@example.com', 'member');
+  const rawToken = inviteResult.body.token;
 
-  try {
-    // Create invitation that expires in 7 days from fixedNow (2023-01-08)
-    const inviteResult = svc.invite('owner', orgId, 'user@example.com', 'member');
-    const rawToken = inviteResult.body.token;
-
-    // Move time to after expiration (2023-01-09)
-    const fixedNowAfter = new Date('2023-01-09');
-    global.Date = class extends OriginalDate {
-      constructor(value?: any) {
-        if (value === undefined) {
-          super(fixedNowAfter.getTime());
-        } else {
-          super(value);
-        }
-      }
-      static now() {
-        return fixedNowAfter.getTime();
-      }
-    };
-
-    // Attempt to accept - should be expired
-    assert.throws(
-      () => svc.acceptInvitation('user@example.com', rawToken),
-      /expired/
-    );
-  } finally {
-    global.Date = OriginalDate;
-  }
+  // Move time to after expiration (2023-01-09)
+  nowMs = Date.parse('2023-01-09T00:00:00Z');
+  assert.throws(
+    () => svc.acceptInvitation('user@example.com', rawToken),
+    /expired/
+  );
 });
 
+// ORG-05
 test('accepting with different email fails', () => {
   const svc = createService();
 
@@ -158,6 +133,7 @@ test('accepting with different email fails', () => {
   );
 });
 
+// ORG-06
 test('raw token is not stored anywhere in the database', () => {
   const store = new InMemoryStore();
   const svc = new OrganizationsTeams(store);
@@ -232,4 +208,29 @@ test('admin cannot promote to owner', () => {
     () => svc.changeRole('admin@example.com', orgId, 'member@example.com', 'owner'),
     /forbidden/
   );
+});
+
+/**
+ * ORG-02 / ORG-03: only an owner grants the owner role: an admin cannot invite an owner, an owner can; with
+ * two owners one may demote the other, and the remaining sole owner still cannot leave or be removed.
+ * In: an in-memory service. Out: assertions only. Why: the spec's "only an OWNER may grant the owner role,
+ * so an org can have several owners and one of them can then leave"; the TypeScript build refused every
+ * owner invite and every change to an owner. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+ * Touches: in-memory store only.
+ */
+// ORG-03
+test('only an owner grants owner; one of several owners can step down, the last cannot', () => {
+  const svc = createService();
+  const orgId = svc.createOrg('owner', 'Test Org').body.id;
+  svc.acceptInvitation('admin@example.com', svc.invite('owner', orgId, 'admin@example.com', 'admin').body.token);
+  assert.throws(() => svc.invite('admin@example.com', orgId, 'x@example.com', 'owner'), /forbidden/);
+
+  const second = svc.invite('owner', orgId, 'co@example.com', 'owner');
+  svc.acceptInvitation('co@example.com', second.body.token);
+  assert.throws(() => svc.removeMember('admin@example.com', orgId, 'co@example.com'), /forbidden/);
+
+  assert.equal(svc.changeRole('co@example.com', orgId, 'owner', 'member').body.role, 'member');
+  assert.throws(() => svc.changeRole('co@example.com', orgId, 'co@example.com', 'admin'), /last owner protected/);
+  assert.throws(() => svc.leaveOrg('co@example.com', orgId), /last owner protected/);
+  assert.throws(() => svc.changeRole('co@example.com', orgId, 'owner', 'superuser' as any), /invalid role/);
 });

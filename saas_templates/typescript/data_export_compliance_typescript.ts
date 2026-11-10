@@ -10,7 +10,17 @@
  * - S3 client mock for encrypted-at-rest storage and signed URL generation.
  * - Email service mock for sending download links and deletion confirmations.
  * - ComplianceService coordinating exports, grace periods, cascade deletes, and audit logging.
+ *
+ * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-05/12/13/14 amendments and the review note that the
+ * caller's identity must come from the verified session): every caller id parameter is the VERIFIED caller from
+ * the auth layer, never a body or query value; confirm, cancel and export status act only on the caller's own
+ * request (anyone else's is 404); the deletion token is 32 random bytes stored only as its SHA-256, single-use,
+ * valid 24 h and compared in constant time; statutory reasons get no grace period and are erased on confirm; the
+ * cascade runs in one transaction and calls the injected audit eraser's erase_subject() last. Ids and tokens come
+ * from crypto, not Math.random.
  */
+
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'crypto';
 
 // =============================================================================
 // DATABASE SCHEMA (DDL)
@@ -95,12 +105,13 @@ CREATE TABLE export_requests (
 
 CREATE TABLE deletion_requests (
     id VARCHAR(255) PRIMARY KEY,
-    user_id VARCHAR(255) NOT NULL,
+    user_id VARCHAR(255) NULL,                  -- set NULL when the deletion completes (EXPORT-13)
     requested_at TIMESTAMP NOT NULL,
     status VARCHAR(50) NOT NULL, -- 'pending' | 'approved' | 'completed' | 'cancelled'
     reason VARCHAR(255) NOT NULL,
     deleted_at TIMESTAMP,
-    confirmation_token VARCHAR(255) NOT NULL,
+    confirmation_token_hash CHAR(64) NULL,      -- SHA-256 hex of the emailed token; NULL once used (EXPORT-14)
+    token_expires_at TIMESTAMP NOT NULL,        -- requested_at + 24 hours
     scheduled_for TIMESTAMP NOT NULL
 );
 `;
@@ -185,15 +196,54 @@ export interface ExportRequest {
   expires_at: Date | null;
 }
 
+/**
+ * A deletion request. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the raw confirmation token is no longer stored
+ * (only its SHA-256, cleared once used), the token expires 24 h after the request, and user_id becomes null when the
+ * deletion completes so the row cannot re-identify erased audit entries (EXPORT-13/14).
+ */
 export interface DeletionRequest {
   id: string;
-  user_id: string;
+  user_id: string | null;
   requested_at: Date;
   status: 'pending' | 'approved' | 'completed' | 'cancelled';
-  reason: 'user_requested' | 'gdpr_request' | 'gdpr_right_to_be_forgotten' | 'other';
+  reason: DeletionReason;
   deleted_at: Date | null;
-  confirmation_token: string;
+  confirmation_token_hash: string | null;
+  token_expires_at: Date;
   scheduled_for: Date;
+}
+
+export type DeletionReason = 'user_requested' | 'gdpr_request' | 'gdpr_right_to_be_forgotten' | 'other';
+
+/** Statutory erasure reasons: no grace period, erased as soon as the request is confirmed (EXPORT-12). */
+export const STATUTORY_REASONS: readonly DeletionReason[] = ['gdpr_request', 'gdpr_right_to_be_forgotten'];
+
+/**
+ * The audit system's eraser (audit_logging erase_subject), injected so the cascade can erase the user's personal
+ * audit data last, and tests can pass a fake. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-13).
+ */
+export interface AuditEraser {
+  erase_subject(userId: string): void | Promise<void>;
+}
+
+/**
+ * An error with an HTTP status and a stable code. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: confirm and cancel
+ * answer 404 not_found for a request that is not the caller's, 403 for a bad token. Touches nothing.
+ */
+export class ComplianceError extends Error {
+  constructor(public readonly code: string, message: string, public readonly status: number) {
+    super(message);
+    this.name = 'ComplianceError';
+  }
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const GRACE_DAYS = 30;
+const TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** SHA-256 hex of a token. Touches nothing. */
+function sha256Hex(text: string): string {
+  return createHash('sha256').update(text, 'utf8').digest('hex');
 }
 
 export interface Clock {
@@ -243,6 +293,8 @@ export class InMemoryDatabase {
 export interface S3Client {
   upload(key: string, body: string, contentType: string): Promise<string>;
   getSignedUrl(key: string, expiresInSeconds: number): Promise<string>;
+  /** Deletes one object (export files are erased with the user). Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+  delete(key: string): Promise<void>;
 }
 
 export class MockS3Client implements S3Client {
@@ -259,6 +311,11 @@ export class MockS3Client implements S3Client {
     }
     const expiresTimestamp = Date.now() + expiresInSeconds * 1000;
     return `https://compliance-exports-bucket.s3.amazonaws.com/${key}?signature=mock_signature&expires=${expiresTimestamp}`;
+  }
+
+  /** Removes one stored object. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches the in-memory map. */
+  public async delete(key: string): Promise<void> {
+    this.storage.delete(key);
   }
 }
 
@@ -291,12 +348,22 @@ export class ComplianceService {
   private s3: S3Client;
   private email: EmailService;
   private clock: Clock;
+  private auditEraser: AuditEraser;
 
-  constructor(db: InMemoryDatabase, s3: S3Client, email: EmailService, clock: Clock = new SystemClock()) {
+  /**
+   * In: the database, S3 client, email service, clock and the audit eraser (required: without it a deletion would
+   * leave the user's personal audit data behind). Out: the service. Throws when no eraser is given.
+   * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-13). Touches nothing.
+   */
+  constructor(db: InMemoryDatabase, s3: S3Client, email: EmailService, clock: Clock, auditEraser: AuditEraser) {
+    if (!auditEraser || typeof auditEraser.erase_subject !== 'function') {
+      throw new Error('audit_eraser_required: pass the audit system\'s erase_subject');
+    }
     this.db = db;
     this.s3 = s3;
     this.email = email;
-    this.clock = clock;
+    this.clock = clock ?? new SystemClock();
+    this.auditEraser = auditEraser;
   }
 
   // ---------------------------------------------------------------------------
@@ -312,7 +379,7 @@ export class ComplianceService {
       throw new Error(`User with ID ${userId} not found`);
     }
 
-    const exportId = `exp_${Math.random().toString(36).substr(2, 9)}`;
+    const exportId = `exp_${randomUUID()}`;
     const now = this.clock.now();
 
     const request: ExportRequest = {
@@ -352,7 +419,13 @@ export class ComplianceService {
   // ---------------------------------------------------------------------------
   // 2. Check Export Status
   // ---------------------------------------------------------------------------
-  public async getExportStatus(exportId: string): Promise<{
+  /**
+   * The caller's own export request. In: the verified caller id and the export id. Out: status, file_url, dates.
+   * Throws ComplianceError 404 for an unknown id or one belonging to someone else (its file_url is a link to all
+   * of that user's data). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the caller check is new.
+   * Touches: reads export_requests.
+   */
+  public async getExportStatus(callerUserId: string, exportId: string): Promise<{
     export_id: string;
     status: 'pending' | 'completed' | 'failed';
     file_url: string | null;
@@ -360,8 +433,8 @@ export class ComplianceService {
     requested_at: string;
   }> {
     const req = this.db.exportRequests.find(r => r.id === exportId);
-    if (!req) {
-      throw new Error(`Export request ${exportId} not found`);
+    if (!req || req.user_id !== callerUserId) {
+      throw new ComplianceError('not_found', `Export request ${exportId} not found`, 404);
     }
 
     return {
@@ -376,22 +449,32 @@ export class ComplianceService {
   // ---------------------------------------------------------------------------
   // 3. Request Account Deletion
   // ---------------------------------------------------------------------------
+  /**
+   * Starts an account deletion for the verified caller; nothing is deleted until it is confirmed.
+   *
+   * In: the verified caller id, the reason and an optional why_chain. Out: { success, deletion_id, status:
+   * 'pending', will_delete_at }. user_requested / other: will_delete_at = requested_at + 30 days (a grace period
+   * the user can cancel in); gdpr_request / gdpr_right_to_be_forgotten: will_delete_at = requested_at (no grace).
+   * Emails a confirmation link carrying a fresh token: 32 random bytes, stored only as its SHA-256, valid 24 h.
+   * Why: EXPORT-05/12/14 amendments 2026-11-10 (every reason got 30 days, and the raw Math.random token was stored).
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: deletion_requests, audit_logs, email.
+   */
   public async requestDeletion(
     userId: string,
-    reason: 'user_requested' | 'gdpr_request' | 'gdpr_right_to_be_forgotten' | 'other',
+    reason: DeletionReason,
     whyChain?: string
   ): Promise<{ success: boolean; deletion_id: string; status: 'pending'; will_delete_at: string }> {
     const user = this.db.users.find(u => u.id === userId);
     if (!user) {
-      throw new Error(`User with ID ${userId} not found`);
+      throw new ComplianceError('not_found', `User with ID ${userId} not found`, 404);
     }
 
-    const deletionId = `del_${Math.random().toString(36).substr(2, 9)}`;
+    const deletionId = `del_${randomUUID()}`;
     const now = this.clock.now();
-    const confirmationToken = `tok_${Math.random().toString(36).substr(2, 15)}`;
+    const confirmationToken = randomBytes(32).toString('base64url');
 
-    // 30-day grace period
-    const scheduledFor = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+    const statutory = STATUTORY_REASONS.includes(reason);
+    const scheduledFor = statutory ? new Date(now.getTime()) : new Date(now.getTime() + GRACE_DAYS * DAY_MS);
 
     const request: DeletionRequest = {
       id: deletionId,
@@ -400,7 +483,8 @@ export class ComplianceService {
       status: 'pending',
       reason,
       deleted_at: null,
-      confirmation_token: confirmationToken,
+      confirmation_token_hash: sha256Hex(confirmationToken),
+      token_expires_at: new Date(now.getTime() + TOKEN_TTL_MS),
       scheduled_for: scheduledFor,
     };
 
@@ -414,7 +498,7 @@ export class ComplianceService {
     await this.email.sendEmail(
       user.email,
       'Confirm your account deletion request',
-      `Hello ${user.name},\n\nWe received a request to delete your account. Please confirm this request by clicking the following link within 30 days:\n\n${confirmUrl}\n\nIf you did not request this, please ignore this email.`
+      `Hello ${user.name},\n\nWe received a request to delete your account. Please confirm this request by clicking the following link within 24 hours:\n\n${confirmUrl}\n\nIf you did not request this, please ignore this email.`
     );
 
     return {
@@ -425,30 +509,61 @@ export class ComplianceService {
     };
   }
 
+  /**
+   * The caller's own deletion request, or ComplianceError 404 (unknown, or someone else's). Touches: reads
+   * deletion_requests. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   */
+  private ownDeletion(callerUserId: string, deletionId: string): DeletionRequest {
+    const req = this.db.deletionRequests.find(r => r.id === deletionId);
+    if (!req || req.user_id === null || req.user_id !== callerUserId) {
+      throw new ComplianceError('not_found', `Deletion request ${deletionId} not found`, 404);
+    }
+    return req;
+  }
+
   // ---------------------------------------------------------------------------
   // 4. Approve/Confirm Deletion
   // ---------------------------------------------------------------------------
+  /**
+   * Confirms the caller's own deletion with the emailed token.
+   *
+   * In: the verified caller id, the deletion id and the token. Out: { success, deletion_scheduled_for }.
+   * Errors: 404 not_found (unknown or another user's request); 409 not_pending ("already approved", etc.);
+   * 403 confirmation_token_expired (over 24 h); 403 invalid_confirmation_token (wrong; compared in constant time as
+   * SHA-256 digests). The token is single-use: its hash is cleared on success. For a statutory reason the cascade
+   * runs before this returns: status 'completed', deleted_at = deletion_scheduled_for = now.
+   * Why: EXPORT-09/12/14 amendments 2026-11-10. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * Touches: deletion_requests, audit_logs, and (statutory) every user table, S3 and the audit eraser.
+   */
   public async confirmDeletion(
+    callerUserId: string,
     deletionId: string,
     confirmationToken: string
   ): Promise<{ success: boolean; deletion_scheduled_for: string }> {
-    const req = this.db.deletionRequests.find(r => r.id === deletionId);
-    if (!req) {
-      throw new Error(`Deletion request ${deletionId} not found`);
+    const req = this.ownDeletion(callerUserId, deletionId);
+
+    if (req.status !== 'pending' || req.confirmation_token_hash === null) {
+      throw new ComplianceError('not_pending', `Deletion request is already ${req.status}`, 409);
+    }
+    const now = this.clock.now();
+    if (now.getTime() > req.token_expires_at.getTime()) {
+      throw new ComplianceError('confirmation_token_expired', 'Confirmation token expired', 403);
+    }
+    const given = createHash('sha256').update(String(confirmationToken ?? ''), 'utf8').digest();
+    const stored = Buffer.from(req.confirmation_token_hash, 'hex');
+    if (stored.length !== given.length || !timingSafeEqual(given, stored)) {
+      throw new ComplianceError('invalid_confirmation_token', 'Invalid confirmation token', 403);
     }
 
-    if (req.status !== 'pending') {
-      throw new Error(`Deletion request is already ${req.status}`);
-    }
-
-    if (req.confirmation_token !== confirmationToken) {
-      throw new Error('Invalid confirmation token');
-    }
-
+    req.confirmation_token_hash = null;   // single use
     req.status = 'approved';
+    const userId = req.user_id!;
+    this.logAudit(userId, 'deletion_confirmed', 'User confirmed deletion via email token');
 
-    // Log in audit trail
-    this.logAudit(req.user_id, 'deletion_confirmed', 'User confirmed deletion via email token');
+    if (STATUTORY_REASONS.includes(req.reason)) {
+      req.scheduled_for = now;
+      await this.runCascade(req, now);
+    }
 
     return {
       success: true,
@@ -459,20 +574,28 @@ export class ComplianceService {
   // ---------------------------------------------------------------------------
   // 5. Cancel Deletion (Within Grace Period)
   // ---------------------------------------------------------------------------
-  public async cancelDeletion(deletionId: string): Promise<{ success: boolean; status: 'cancelled' }> {
-    const req = this.db.deletionRequests.find(r => r.id === deletionId);
-    if (!req) {
-      throw new Error(`Deletion request ${deletionId} not found`);
-    }
+  /**
+   * Cancels the caller's own pending or approved deletion before it runs.
+   * In: the verified caller id and the deletion id. Out: { success, status: 'cancelled' }. Errors: 404 not_found
+   * (unknown, another user's, or already completed: its user_id is gone), 409 not_cancellable (already cancelled,
+   * or past its scheduled time). Why: EXPORT-06/14. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the caller check
+   * is new. Touches: deletion_requests, audit_logs.
+   */
+  public async cancelDeletion(callerUserId: string, deletionId: string): Promise<{ success: boolean; status: 'cancelled' }> {
+    const req = this.ownDeletion(callerUserId, deletionId);
 
-    if (req.status === 'completed') {
-      throw new Error('Cannot cancel a completed deletion');
+    if (req.status !== 'pending' && req.status !== 'approved') {
+      throw new ComplianceError('not_cancellable', `Cannot cancel a ${req.status} deletion`, 409);
+    }
+    if (req.status === 'approved' && req.scheduled_for.getTime() <= this.clock.now().getTime()) {
+      throw new ComplianceError('not_cancellable', 'The grace period is over', 409);
     }
 
     req.status = 'cancelled';
+    req.confirmation_token_hash = null;
 
     // Log in audit trail
-    this.logAudit(req.user_id, 'deletion_cancelled', 'User cancelled deletion request');
+    this.logAudit(req.user_id!, 'deletion_cancelled', 'User cancelled deletion request');
 
     return {
       success: true,
@@ -606,43 +729,76 @@ export class ComplianceService {
   }
 
   /**
-   * Executes cascade deletion for approved deletion requests that have passed their grace period.
+   * Runs the cascade for every approved deletion whose grace period is over. In: nothing. Out: how many ran.
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the cascade itself is runCascade (EXPORT-13 order).
+   * Touches: every user table, S3, the audit eraser.
    */
   public async executeScheduledDeletions(): Promise<number> {
     const now = this.clock.now();
     const pendingDeletions = this.db.deletionRequests.filter(
-      r => r.status === 'approved' && r.scheduled_for <= now
+      r => r.status === 'approved' && r.user_id !== null && r.scheduled_for <= now
     );
 
     let count = 0;
     for (const req of pendingDeletions) {
-      const userId = req.user_id;
-
-      // Cascade delete: Delete from all tables where user_id = X, except audit_log
-      this.db.sessions = this.db.sessions.filter(s => s.user_id !== userId);
-      this.db.activityLogs = this.db.activityLogs.filter(a => a.user_id !== userId);
-      this.db.files = this.db.files.filter(f => f.user_id !== userId);
-      this.db.preferences = this.db.preferences.filter(p => p.user_id !== userId);
-      this.db.transactions = this.db.transactions.filter(t => t.user_id !== userId);
-      this.db.apiKeys = this.db.apiKeys.filter(k => k.user_id !== userId);
-      this.db.exportRequests = this.db.exportRequests.filter(e => e.user_id !== userId);
-      this.db.users = this.db.users.filter(u => u.id !== userId);
-
-      // Update deletion request status
-      req.status = 'completed';
-      req.deleted_at = now;
-
-      // Log in audit trail (audit_logs are preserved for compliance)
-      this.logAudit(userId, 'account_permanently_deleted', `Cascade delete completed for user ${userId}`);
+      await this.runCascade(req, now);
       count++;
     }
-
     return count;
+  }
+
+  /**
+   * The deletion cascade, in one transaction and in this order (EXPORT-07/08/13):
+   * (1) delete the user's rows from every table except the audit log (sessions, activity, files, preferences,
+   *     transactions, API keys, export requests and their S3 files, the user);
+   * (2) log 'user_deleted_cascade' with the user as subject;
+   * (3) call the audit eraser's erase_subject(user_id) LAST; nothing logs this user afterwards;
+   * then mark the request completed with deleted_at = now and user_id = NULL.
+   * Any error restores every table (S3 deletions happen only after the eraser succeeded) and is rethrown.
+   * In: the request and now. Out: nothing. Why: EXPORT-13 amendment 2026-11-10 (nothing erased the user's audit
+   * personal data, and the request row kept the user id). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * Touches: every user table, S3, the audit eraser.
+   */
+  private async runCascade(req: DeletionRequest, now: Date): Promise<void> {
+    const userId = req.user_id!;
+    const db = this.db;
+    const snapshot = {
+      users: [...db.users], sessions: [...db.sessions], activityLogs: [...db.activityLogs], files: [...db.files],
+      preferences: [...db.preferences], transactions: [...db.transactions], apiKeys: [...db.apiKeys],
+      auditLogs: [...db.auditLogs], exportRequests: [...db.exportRequests],
+    };
+    const exportKeys = db.exportRequests
+      .filter(e => e.user_id === userId)
+      .map(e => `export_${userId}_${e.id}.${e.format}`);
+    try {
+      // (1) the user's rows, never the audit log
+      db.sessions = db.sessions.filter(x => x.user_id !== userId);
+      db.activityLogs = db.activityLogs.filter(x => x.user_id !== userId);
+      db.files = db.files.filter(x => x.user_id !== userId);
+      db.preferences = db.preferences.filter(x => x.user_id !== userId);
+      db.transactions = db.transactions.filter(x => x.user_id !== userId);
+      db.apiKeys = db.apiKeys.filter(x => x.user_id !== userId);
+      db.exportRequests = db.exportRequests.filter(x => x.user_id !== userId);
+      db.users = db.users.filter(x => x.id !== userId);
+      // (2) the cascade is logged with the user as subject
+      this.logAudit(userId, 'user_deleted_cascade', `Cascade delete completed for user ${userId}`);
+      // (3) the audit system erases the user's personal audit data, last
+      await this.auditEraser.erase_subject(userId);
+    } catch (err) {
+      Object.assign(db, snapshot);
+      throw err;
+    }
+    for (const key of exportKeys) {
+      await this.s3.delete(key);
+    }
+    req.status = 'completed';
+    req.deleted_at = now;
+    req.user_id = null;
   }
 
   private logAudit(userId: string, action: string, reason?: string, whyChain?: string): void {
     const audit: AuditLog = {
-      id: `aud_${Math.random().toString(36).substr(2, 9)}`,
+      id: `aud_${randomUUID()}`,
       user_id: userId,
       action,
       reason,

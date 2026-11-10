@@ -97,9 +97,27 @@ class JobManager {
   private stripeInvoices: StripeInvoiceGateway = new StripeApiInvoiceGateway();
   private workerRunning = false;
   private readonly BATCH_SIZE = 10;
-  private readonly RETRY_DELAYS = [1000, 2000, 4000, 8000, 16000, 32000, 64000, 128000];
+  private clock: () => Date = () => new Date();
 
   private constructor() {}
+
+  /**
+   * Replaces the clock the retry logic reads (failed_at, next_retry_at and the worker's due checks).
+   * In: a function returning the current time. Out: nothing. Why: the spec's injectable-clock rule, so JOBS-03/04
+   * can be tested without waiting. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: this object.
+   */
+  public setClock(clock: () => Date): void {
+    this.clock = clock;
+  }
+
+  /**
+   * The wait before retry n (n = 1, 2, ...): 2^(n-1) seconds, in milliseconds (1 s, 2 s, 4 s, 8 s, ... with no cap).
+   * Why: JOBS-03 as amended 2026-11-10 (the old table stopped growing at 128 s). 2026-11-10,
+   * session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+   */
+  public static retryDelayMs(n: number): number {
+    return 1000 * 2 ** (n - 1);
+  }
 
   /**
    * Replaces how the sync_stripe_invoices task reads invoices from Stripe (tests install a fake).
@@ -181,7 +199,7 @@ class JobManager {
       JobStatus.ENQUEUED,
       now,
       scheduled_at || null,
-      max_retries || 3,
+      max_retries ?? 3,   // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: `||` turned max_retries 0 into 3
       0,
       scheduled_at && scheduled_at > now ? scheduled_at : null
     ];
@@ -414,7 +432,7 @@ class JobManager {
     for (const key of scheduledJobs) {
       const scheduledJobId = key.split(':')[2];
       const scheduledTime = await redis.get(key);
-      const now = new Date();
+      const now = this.clock();
       
       if (scheduledTime && new Date(parseInt(scheduledTime)) <= now) {
         await redis.del(key);
@@ -456,13 +474,13 @@ class JobManager {
         return;
       }
 
-      if (job.next_retry_at && new Date(job.next_retry_at) > new Date()) {
+      if (job.next_retry_at && new Date(job.next_retry_at) > this.clock()) {
         await client.query('ROLLBACK');
         await this.scheduleRetry(jobId, new Date(job.next_retry_at));
         return;
       }
 
-      if (job.scheduled_at && job.scheduled_at > new Date()) {
+      if (job.scheduled_at && job.scheduled_at > this.clock()) {
         await client.query('COMMIT');
         return;
       }
@@ -534,6 +552,13 @@ class JobManager {
     }
   }
 
+  /**
+   * send_bulk_email: e-mails every matching user in pages of 100, writing progress "<done>/<total>" after each one.
+   * In: the job (params.template_key, params.filter). Out: {sent, failed, template_key}.
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: `sent` is the number actually sent; it reported the COUNT(*) total
+   * even when fewer users were e-mailed (JOBS-09 "results available" must be true). Touches: Postgres users,
+   * notifications, jobs.progress.
+   */
   private async sendBulkEmail(job: Job): Promise<any> {
     const params = job.params;
     const filter = params.filter || {};
@@ -566,7 +591,7 @@ class JobManager {
     }
     
     return {
-      sent: total,
+      sent: processed,
       failed: 0,
       template_key: params.template_key
     };
@@ -1065,6 +1090,9 @@ class JobManager {
    * transaction open on a client returned to the pool, and a failed ROLLBACK hid the original error. Later the same
    * day, CodeRabbit review on PR 19: the retry was lpush'ed straight back onto job:queue, so the documented backoff
    * never happened; it now goes through the delayed path.
+   * Changed again 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP), JOBS-03/04 amendment: max_retries counts retries
+   * after the first attempt (3 -> at most 4 runs); retry n waits 2^(n-1) s from the injected clock (no cap); when
+   * attempt max_retries + 1 fails the job is 'failed' with retry_count = max_retries (it was max_retries + 1).
    * Touches: Postgres jobs and job_runs, Redis job:scheduled:<id>.
    */
   private async handleJobError(jobId: string, error: Error): Promise<void> {
@@ -1085,6 +1113,7 @@ class JobManager {
       
       const retryCount = job.retry_count + 1;
       const maxRetries = job.max_retries;
+      const failedAt = this.clock();
       
       if (retryCount > maxRetries) {
         await client.query(
@@ -1092,23 +1121,22 @@ class JobManager {
           [
             JobStatus.FAILED,
             error.message,
-            new Date(),
-            retryCount,
+            failedAt,
+            maxRetries,
             jobId
           ]
         );
         
         await client.query(
           'UPDATE job_runs SET status = $1, completed_at = $2 WHERE job_id = $3 AND status = $4',
-          [JobStatus.FAILED, new Date(), jobId, 'running']
+          [JobStatus.FAILED, failedAt, jobId, 'running']
         );
         
         await client.query('COMMIT');
         return;
       }
       
-      const backoffDelay = this.RETRY_DELAYS[Math.min(retryCount - 1, this.RETRY_DELAYS.length - 1)];
-      const nextRetryAt = new Date(Date.now() + backoffDelay);
+      const nextRetryAt = new Date(failedAt.getTime() + JobManager.retryDelayMs(retryCount));
       
       await client.query(
         'UPDATE jobs SET status = $1, error = $2, retry_count = $3, next_retry_at = $4 WHERE id = $5',

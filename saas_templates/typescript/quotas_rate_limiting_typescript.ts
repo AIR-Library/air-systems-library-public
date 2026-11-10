@@ -87,11 +87,21 @@ export interface QuotaService {
   getWhyChain(): WhyChainEntry[];
 }
 
+/**
+ * Monthly API-call limits per tier; -1 means unlimited, as in every quota (spec QUOTA-13).
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: enterprise was Infinity here and -1 in STORAGE_LIMITS; the spec
+ * names -1 for both, so the same constant now reads the same in every language.
+ */
 export const API_CALL_LIMITS: Record<Tier, number> = {
   solo: 1000,
   team: 10000,
-  enterprise: Infinity,
+  enterprise: -1,
 };
+
+/** True when a quota limit means "unlimited" (-1, spec QUOTA-13). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+export function isUnlimited(limit: number): boolean {
+  return limit === -1;
+}
 
 export const STORAGE_LIMITS: Record<Tier, number> = {
   solo: 1e9,
@@ -191,7 +201,8 @@ export class InMemoryQuotaService implements QuotaService {
   /**
    * Monthly API-call quota for a tier: passes while this call stays within the limit, else quota_exceeded with
    * current, limit and reset_date (first of next month, UTC). In: user id, tier. Out: { pass, error? }.
-   * Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: month and reset date from the service clock. Touches: memory.
+   * Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: month and reset date from the service clock; a limit
+   * of -1 is unlimited (QUOTA-13). Touches: memory.
    */
   async checkApiCallQuota(userId: string, tier: Tier): Promise<QuotaCheckResult> {
     const month = this.month();
@@ -204,10 +215,10 @@ export class InMemoryQuotaService implements QuotaService {
       user_id: userId,
       tier,
       current_usage: currentUsage,
-      limit: limit === Infinity ? -1 : limit,
+      limit,
     });
 
-    if (limit === Infinity) {
+    if (isUnlimited(limit)) {
       return { pass: true };
     }
 
@@ -241,10 +252,10 @@ export class InMemoryQuotaService implements QuotaService {
       user_id: userId,
       tier,
       current_usage: currentStorage,
-      limit: limit === -1 ? -1 : limit,
+      limit,
     });
 
-    if (limit === -1) {
+    if (isUnlimited(limit)) {
       return { pass: true };
     }
 

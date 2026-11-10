@@ -18,7 +18,7 @@ jest.mock('ioredis', () => {
   const g = globalThis as any;
   g.__mockRedis = g.__mockRedis ?? {
     setex: jest.fn(), set: jest.fn(), lpush: jest.fn(), lrange: jest.fn(), lrem: jest.fn(), keys: jest.fn(),
-    del: jest.fn(), pipeline: jest.fn(),
+    del: jest.fn(), pipeline: jest.fn(), get: jest.fn(),
   };
   return { __esModule: true, default: jest.fn(() => g.__mockRedis) };
 });
@@ -93,6 +93,7 @@ describe('Background Job Manager', () => {
       );
     });
     
+    // JOBS-07
     it('should schedule a job for future execution', async () => {
       const scheduledAt = new Date(Date.now() + 3600000);
       const mockJob = {
@@ -218,6 +219,7 @@ describe('Background Job Manager', () => {
   });
   
   describe('cancelJob', () => {
+    // JOBS-05
     it('should cancel a pending job', async () => {
       const mockJob = {
         id: 'test-uuid-123',
@@ -325,6 +327,7 @@ describe('Background Job Manager', () => {
   });
   
   describe('getJobResults', () => {
+    // JOBS-09
     it('should return results for completed job', async () => {
       const mockJob = {
         id: 'test-uuid-123',
@@ -381,6 +384,8 @@ describe('Background Job Manager', () => {
   });
   
   describe('processJob', () => {
+    // JOBS-01
+    // JOBS-02
     it('should process a job successfully', async () => {
       const mockJob = {
         id: 'test-uuid-123',
@@ -437,6 +442,14 @@ describe('Background Job Manager', () => {
         'SELECT * FROM jobs WHERE id = $1 FOR UPDATE',
         ['test-uuid-123']
       );
+      // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: added checks so this test proves JOBS-01 and JOBS-02: the worker
+      // moved the job to running, then to completed with its result stored.
+      const calls = mockClient.query.mock.calls;
+      const running = calls.find((c: any[]) => String(c[0]).startsWith('UPDATE jobs SET status = $1, started_at'));
+      expect(running[1][0]).toBe(JobStatus.RUNNING);
+      const done = calls.find((c: any[]) => String(c[0]).startsWith('UPDATE jobs SET status = $1, completed_at = $2, result'));
+      expect(done[1][0]).toBe(JobStatus.COMPLETED);
+      expect(JSON.parse(done[1][2])).toEqual({ sent: 2, failed: 0, template_key: 'trial_ending_soon' });
     });
 
     /**
@@ -546,6 +559,7 @@ describe('Background Job Manager', () => {
      * Why 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): CodeRabbit review on PR 19 (the documented 1 s, 2 s,
      * 4 s backoff never happened). Touches: memory only.
      */
+    // JOBS-03
     it('should schedule the retry after its backoff instead of queueing it now', async () => {
       const mockJob = {
         id: 'test-uuid-123', task_type: 'send_bulk_email', params: {}, status: JobStatus.RUNNING,
@@ -572,6 +586,7 @@ describe('Background Job Manager', () => {
       expect((update[1][3] as Date).getTime()).toBe(Number(runAt));
     });
     
+    // JOBS-04
     it('should mark job as failed after max retries exceeded', async () => {
       const mockJob = {
         id: 'test-uuid-123',
@@ -614,6 +629,138 @@ describe('Background Job Manager', () => {
     });
   });
   
+  /**
+   * JOBS-03 / JOBS-04 on an injected clock: a job with max_retries = 3 fails every time. Each failure is fed back
+   * through handleJobError with the row as the previous step left it. Retry n waits 2^(n-1) s from the failure
+   * (1 s, 2 s, 4 s) with status 'enqueued' and retry_count = n; the 4th failure (the 4th run) makes it 'failed'
+   * with retry_count = 3. In: fake database client and Redis. Out: assertions only.
+   * Why: JOBS-03/04 amendment 2026-11-10 (the job used to end with retry_count = 4). 2026-11-10,
+   * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+   */
+  describe('retry schedule (JOBS-03, JOBS-04)', () => {
+    // JOBS-03
+    // JOBS-04
+    it('max_retries = 3: retries after 1 s, 2 s, 4 s, then failed with retry_count 3 after 4 runs', async () => {
+      const t0 = Date.parse('2026-06-15T10:00:00Z');
+      let nowMs = t0;
+      jobManager.setClock(() => new Date(nowMs));
+      const row: any = { id: 'job-r', task_type: 'send_bulk_email', params: {}, status: JobStatus.RUNNING,
+        retry_count: 0, max_retries: 3, next_retry_at: null, scheduled_at: null };
+      let runs = 0;
+      const waits: number[] = [];
+      for (;;) {
+        runs++;                                    // an attempt runs and fails
+        const client = {
+          query: jest.fn().mockImplementation((sql: string, params: any[]) => {
+            if (sql.startsWith('SELECT * FROM jobs')) return Promise.resolve({ rows: [{ ...row }] });
+            if (sql.startsWith('UPDATE jobs SET status = $1, error = $2, retry_count = $3, next_retry_at = $4')) {
+              Object.assign(row, { status: params[0], retry_count: params[2], next_retry_at: params[3] });
+            } else if (sql.startsWith('UPDATE jobs SET status = $1, error = $2, completed_at = $3, retry_count = $4')) {
+              Object.assign(row, { status: params[0], retry_count: params[3] });
+            }
+            return Promise.resolve({ rows: [] });
+          }),
+          release: jest.fn(),
+        };
+        mockDb.connect.mockResolvedValue(client as any);
+        await jobManager.handleJobError('job-r', new Error('boom'));
+        if (row.status === JobStatus.FAILED) break;
+        expect(row.status).toBe(JobStatus.ENQUEUED);
+        expect(row.retry_count).toBe(waits.length + 1);
+        waits.push(row.next_retry_at.getTime() - nowMs);
+        nowMs = row.next_retry_at.getTime();       // the worker picks it up once next_retry_at has passed
+        row.status = JobStatus.RUNNING;
+        if (runs > 10) throw new Error('never failed');
+      }
+      expect(waits).toEqual([1000, 2000, 4000]);
+      expect(runs).toBe(4);
+      expect(row.status).toBe(JobStatus.FAILED);
+      expect(row.retry_count).toBe(3);
+      expect(mockRedis.set.mock.calls.map((c: any[]) => Number(c[1]))).toEqual([t0 + 1000, t0 + 3000, t0 + 7000]);
+    });
+
+    it('retry n waits 2^(n-1) seconds with no cap', () => {
+      const { JobManager } = require('./background_jobs_task_queue_typescript');
+      expect([1, 2, 3, 4, 10].map((n: number) => JobManager.retryDelayMs(n))).toEqual([1000, 2000, 4000, 8000, 512000]);
+    });
+  });
+
+  /**
+   * JOBS-06 / JOBS-08: a bulk e-mail to 10,000 users runs through the worker's task code, paging 100 at a time and
+   * writing progress after every user (so "45/100"-style progress is visible while it runs), and enqueueing it
+   * only queues it: the request returns before any e-mail is sent. In: a fake database answering by SQL text.
+   * Out: assertions only. Why: JOBS-06 and JOBS-08 had no test. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * Touches: memory only.
+   */
+  describe('bulk work (JOBS-06, JOBS-08)', () => {
+    function fakeUsers(total: number) {
+      const progress: string[] = [];
+      let sent = 0;
+      mockDb.query.mockImplementation((sql: string, params: any[] = []) => {
+        if (sql.startsWith('SELECT COUNT(*) FROM users')) return Promise.resolve({ rows: [{ count: String(total) }] });
+        if (sql.startsWith('SELECT id FROM users')) {
+          const [, limit, offset] = params;
+          const n = Math.max(0, Math.min(limit, total - offset));
+          return Promise.resolve({ rows: Array.from({ length: n }, (_, i) => ({ id: `user-${offset + i}` })) });
+        }
+        if (sql.startsWith('INSERT INTO notifications')) sent++;
+        if (sql.startsWith('UPDATE jobs SET progress')) progress.push(params[0]);
+        if (sql.includes('INSERT INTO jobs')) return Promise.resolve({ rows: [{ status: JobStatus.ENQUEUED }] });
+        return Promise.resolve({ rows: [] });
+      });
+      return { progress, sentCount: () => sent };
+    }
+
+    // JOBS-06
+    it('progress is written as the job runs (45/100 along the way)', async () => {
+      const fake = fakeUsers(100);
+      const result = await jobManager.executeJob({ id: 'job-p', task_type: 'send_bulk_email', params: { template_key: 't' } });
+      expect(fake.progress).toContain('45/100');
+      expect(fake.progress.indexOf('45/100')).toBeLessThan(fake.progress.indexOf('100/100'));
+      expect(fake.progress[fake.progress.length - 1]).toBe('100/100');
+      expect(result.sent).toBe(100);
+    });
+
+    // JOBS-08
+    it('10,000 items: enqueue returns at once, and the worker task processes all of them', async () => {
+      const fake = fakeUsers(10000);
+      const queued = await jobManager.enqueueJob('send_bulk_email', { template_key: 't' });
+      expect(queued).toEqual({ success: true, job_id: 'test-uuid-123', status: JobStatus.ENQUEUED });
+      expect(mockRedis.lpush).toHaveBeenCalledWith('job:queue', 'test-uuid-123');
+      expect(fake.sentCount()).toBe(0);           // the request did not do the work
+
+      const result = await jobManager.executeJob({ id: 'test-uuid-123', task_type: 'send_bulk_email', params: { template_key: 't' } });
+      expect(result.sent).toBe(10000);
+      expect(fake.sentCount()).toBe(10000);
+      expect(fake.progress[fake.progress.length - 1]).toBe('10000/10000');
+    });
+  });
+
+  /**
+   * JOBS-07: the worker moves a scheduled job onto the queue only once its run time has passed on the injected
+   * clock. In: two scheduled keys, one due and one in the future. Out: assertions only. Why: JOBS-07 needs the
+   * worker side as well as the enqueue side. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+   */
+  // JOBS-07
+  it('the worker queues a scheduled job only after its scheduled time', async () => {
+    const now = Date.parse('2026-06-15T10:00:00Z');
+    jobManager.setClock(() => new Date(now));
+    mockRedis.lrange.mockResolvedValue([]);
+    const pipeline: any = { exec: jest.fn().mockResolvedValue([]) };
+    pipeline.lrem = jest.fn().mockReturnValue(pipeline);
+    mockRedis.pipeline.mockReturnValue(pipeline);
+    mockRedis.keys.mockResolvedValue(['job:scheduled:due', 'job:scheduled:later']);
+    mockRedis.get.mockImplementation((key: string) =>
+      Promise.resolve(key === 'job:scheduled:due' ? String(now - 1) : String(now + 60000)));
+
+    await jobManager.processJobs();
+
+    expect(mockRedis.lpush).toHaveBeenCalledTimes(1);
+    expect(mockRedis.lpush).toHaveBeenCalledWith('job:queue', 'due');
+    expect(mockRedis.del).toHaveBeenCalledWith('job:scheduled:due');
+    expect(mockRedis.del).not.toHaveBeenCalledWith('job:scheduled:later');
+  });
+
   describe('executeJob', () => {
     it('should execute send_bulk_email task', async () => {
       const mockJob = {
@@ -644,8 +791,10 @@ describe('Background Job Manager', () => {
       
       const result = await jobManager.executeJob(mockJob);
       
+      // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the fake database returns two users, so two e-mails are sent;
+      // `sent` used to echo COUNT(*) (100) whatever was actually sent.
       expect(result).toEqual({
-        sent: 100,
+        sent: 2,
         failed: 0,
         template_key: 'trial_ending_soon'
       });

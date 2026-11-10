@@ -256,10 +256,6 @@ function generateSlug(name: string): string {
   return `${base}-${suffix}`;
 }
 
-function nowIso(): string {
-  return new Date().toISOString();
-}
-
 function addDays(iso: string, days: number): string {
   const d = new Date(iso);
   d.setDate(d.getDate() + days);
@@ -274,9 +270,35 @@ function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
 }
 
+const ROLES: Role[] = ['owner', 'admin', 'member'];
+
 export class OrganizationsTeams {
-  constructor(store: Store) {
+  private store: Store;
+  private now: () => number;
+
+  /**
+   * Builds the service over a store.
+   *
+   * In: the store and an optional clock `now` (epoch milliseconds; default Date.now). Out: the service.
+   * Why: the spec requires an injectable clock where time matters (invitation expiry, ORG-05); the test
+   * used to replace the global Date. Clock added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * Touches: nothing until called.
+   */
+  constructor(store: Store, now: () => number = () => Date.now()) {
     this.store = store;
+    this.now = now;
+  }
+
+  /** Current time as an ISO string from the injected clock. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+  private nowIso(): string {
+    return new Date(this.now()).toISOString();
+  }
+
+  /** Throws 'invalid role' unless role is owner, admin or member. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+  private assertRole(role: string): void {
+    if (!ROLES.includes(role as Role)) {
+      throw new Error('invalid role');
+    }
   }
 
   private getMembershipOrThrow(actor: string, orgId: string): Membership {
@@ -303,10 +325,14 @@ export class OrganizationsTeams {
     }
   }
 
+  /**
+   * Creates an org with the verified user as its owner. In: user, name. Out: 201 with the org.
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: created_at from the injected clock. Touches: the store.
+   */
   createOrg(user: string, name: string): { status: number; content_type: string; body: any } {
     const orgId = generateId();
     const slug = generateSlug(name);
-    const createdAt = nowIso();
+    const createdAt = this.nowIso();
     const org: Organization = { id: orgId, name, slug, created_at: createdAt };
     const membership: Membership = { org_id: orgId, user_id: user, role: 'owner', created_at: createdAt };
 
@@ -316,18 +342,27 @@ export class OrganizationsTeams {
     return { status: 201, content_type: 'application/json', body: org };
   }
 
+  /**
+   * Invites an email address into the org; returns the raw token once (only its SHA-256 is stored).
+   *
+   * In: the verified actor, org id, email and role. Out: 201 {token}. Throws 'not found' for a non-member,
+   * 'forbidden' for a member, or for a non-owner granting the owner role.
+   * Why: ORG-02; 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the spec says ONLY an owner may grant the
+   * owner role, so an owner may invite an owner (this used to be refused for everyone). Touches: the store.
+   */
   invite(actor: string, orgId: string, email: string, role: Role): { status: number; content_type: string; body: any } {
     const actorMembership = this.getMembershipOrThrow(actor, orgId);
     this.requireRole(actorMembership, 'admin', 'owner');
+    this.assertRole(role);
 
-    if (role === 'owner') {
+    if (role === 'owner' && actorMembership.role !== 'owner') {
       throw new Error('forbidden');
     }
 
     const rawToken = generateToken();
     const tokenHash = hashToken(rawToken);
     const invitationId = generateId();
-    const createdAt = nowIso();
+    const createdAt = this.nowIso();
     const expiresAt = addDays(createdAt, 7);
 
     const invitation: Invitation = {
@@ -347,6 +382,13 @@ export class OrganizationsTeams {
     return { status: 201, content_type: 'application/json', body: { token: rawToken } };
   }
 
+  /**
+   * Accepts an invitation for the verified user: the token is looked up by its SHA-256, must be unused and
+   * unexpired (on the injected clock) and addressed to this user's email; it is marked used with a conditional
+   * write. In: the user (email) and the raw token. Out: 200 with the new membership. Throws 'not found',
+   * 'already used', 'expired', 'email mismatch'. Why: ORG-04/05. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: expiry uses the injected clock.
+   * Touches: the store.
+   */
   acceptInvitation(user: string, rawToken: string): { status: number; content_type: string; body: any } {
     const tokenHash = hashToken(rawToken);
     const invitation = this.store.getInvitationByTokenHash(tokenHash);
@@ -359,7 +401,7 @@ export class OrganizationsTeams {
       throw new Error('already used');
     }
 
-    if (new Date(invitation.expires_at) < new Date()) {
+    if (new Date(invitation.expires_at).getTime() < this.now()) {
       throw new Error('expired');
     }
 
@@ -367,7 +409,7 @@ export class OrganizationsTeams {
       throw new Error('email mismatch');
     }
 
-    const acceptedAt = nowIso();
+    const acceptedAt = this.nowIso();
     const marked = this.store.markInvitationAccepted(invitation.id, acceptedAt);
     if (!marked) {
       throw new Error('already used');
@@ -385,16 +427,27 @@ export class OrganizationsTeams {
     return { status: 200, content_type: 'application/json', body: membership };
   }
 
+  /**
+   * Changes an existing member's role.
+   *
+   * In: the verified actor, org id, target user id and new role. Out: 200 with the updated membership.
+   * Throws 'not found' (actor or target not a member), 'forbidden' (member actor, or an admin touching an
+   * owner or granting owner), 'last owner protected' (demoting the only owner).
+   * Why: ORG-03 and the least-privilege rule; 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: an OWNER may
+   * now demote another owner while one owner remains (the spec allows several owners, one of whom can then
+   * step down); before, nobody could ever change an owner. Touches: the store.
+   */
   changeRole(actor: string, orgId: string, userId: string, role: Role): { status: number; content_type: string; body: any } {
     const actorMembership = this.getMembershipOrThrow(actor, orgId);
     this.requireRole(actorMembership, 'admin', 'owner');
+    this.assertRole(role);
 
     const targetMembership = this.store.getMembership(orgId, userId);
     if (!targetMembership) {
       throw new Error('not found');
     }
 
-    if (targetMembership.role === 'owner') {
+    if (targetMembership.role === 'owner' && actorMembership.role !== 'owner') {
       throw new Error('forbidden');
     }
 
@@ -412,6 +465,14 @@ export class OrganizationsTeams {
     return { status: 200, content_type: 'application/json', body: updated };
   }
 
+  /**
+   * Removes an existing member.
+   *
+   * In: the verified actor, org id and target user id. Out: 204. Throws 'not found', 'forbidden' (member
+   * actor, or an admin removing an owner) or 'last owner protected'.
+   * Why: ORG-03; 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: an owner may remove another owner while one
+   * owner remains, matching the other languages; admins still never touch an owner. Touches: the store.
+   */
   removeMember(actor: string, orgId: string, userId: string): { status: number; content_type: string; body: any } {
     const actorMembership = this.getMembershipOrThrow(actor, orgId);
     this.requireRole(actorMembership, 'admin', 'owner');
@@ -422,7 +483,10 @@ export class OrganizationsTeams {
     }
 
     if (targetMembership.role === 'owner') {
-      throw new Error('forbidden');
+      if (actorMembership.role !== 'owner') {
+        throw new Error('forbidden');
+      }
+      this.assertNotLastOwner(orgId, userId);
     }
 
     this.store.deleteMembership(orgId, userId);

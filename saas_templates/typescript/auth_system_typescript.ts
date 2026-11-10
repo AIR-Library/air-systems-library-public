@@ -182,9 +182,58 @@ class AuthSystem {
     );
   }
 
-  async signup(email: string, password: string, name: string): Promise<any> {
+  /**
+   * Bundled common passwords (lower-case), the same list as the other languages. Only entries of 15+ characters
+   * can decide a rejection, because too_short runs first. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   */
+  static readonly PASSWORD_BLOCKLIST: ReadonlySet<string> = new Set([
+    'password', '123456', '12345678', 'qwerty', 'abc123', 'monkey', 'letmein', 'dragon', 'baseball',
+    'iloveyou', 'passwordpassword', '123456789012345', '1234567890123456', 'qwertyuiopasdfgh',
+    'qwertyuiopasdfghjkl', 'iloveyouiloveyou', 'letmeinletmeinletmein', 'aaaaaaaaaaaaaaa',
+  ]);
+
+  /** The service's own name, which is never accepted as a password. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+  static readonly SERVICE_NAME = 'SaasAuth';
+
+  /**
+   * The reason a password is rejected, or null when it is accepted.
+   *
+   * In: the password and the user's email and name. Out: 'too_short' (< 15 characters), 'too_long' (> 64),
+   * 'blocklisted' (in the bundled list, or equal to the email, the name or the service name, ignoring case), or
+   * null. Checks run in that order and the first failure wins; lengths count Unicode code points, not UTF-16 units.
+   * Why: AUTH-03 as amended 2026-11-10 (NIST SP 800-63B-4 rules). The old blocklist held only short entries, which
+   * the length check always caught first, and compared the email and name case-sensitively.
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+   */
+  static passwordRejection(password: string, email: string, name: string): 'too_short' | 'too_long' | 'blocklisted' | null {
+    const length = Array.from(password).length;
+    if (length < 15) return 'too_short';
+    if (length > 64) return 'too_long';
+    const lowered = password.toLowerCase();
+    if (
+      AuthSystem.PASSWORD_BLOCKLIST.has(lowered) ||
+      lowered === (email ?? '').toLowerCase() ||
+      lowered === (name ?? '').toLowerCase() ||
+      lowered === AuthSystem.SERVICE_NAME.toLowerCase()
+    ) {
+      return 'blocklisted';
+    }
+    return null;
+  }
+
+  /**
+   * Signs a user up: IP rate limit, unique email, password rules, then creates the unverified user and sends the
+   * verification code.
+   *
+   * In: email, password, name and the request's client IP (from the server, never from the body; default
+   * '0.0.0.0' keeps old callers working). Out: {status: 'pending_verification', ...} or {error, reason?}.
+   * Why: AUTH-01..04. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: a weak password now returns
+   * {error: 'password_rejected', reason} (AUTH-03 amendment; 'password_too_weak' is gone), and the IP is a
+   * parameter instead of a constant, so the 5-per-24h limit is per address rather than global.
+   * Touches: the database, the email sender, the audit log.
+   */
+  async signup(email: string, password: string, name: string, ip: string = '0.0.0.0'): Promise<any> {
     try {
-      const ip = '0.0.0.0'; // In real implementation, extract from request
       if (!(await this.rateLimitSignup(ip))) {
         await this.logWhyChain('signup', ['email_unique', 'password_strength', 'rate_limit_ip_24h']);
         return { error: 'too_many_signups_from_ip' };
@@ -196,18 +245,10 @@ class AuthSystem {
         return { error: 'email_already_exists' };
       }
 
-      if (password.length < 15) {
+      const rejection = AuthSystem.passwordRejection(password, email, name);
+      if (rejection !== null) {
         await this.logWhyChain('signup', ['email_unique', 'password_strength', 'rate_limit_ip_24h']);
-        return { error: 'password_too_weak', reason: 'too_short' };
-      }
-      if (password.length > 64) {
-        await this.logWhyChain('signup', ['email_unique', 'password_strength', 'rate_limit_ip_24h']);
-        return { error: 'password_too_weak', reason: 'too_long' };
-      }
-      const blocklist = ['password', '123456', email, name, 'service']; // Simplified blocklist
-      if (blocklist.includes(password.toLowerCase())) {
-        await this.logWhyChain('signup', ['email_unique', 'password_strength', 'rate_limit_ip_24h']);
-        return { error: 'password_too_weak', reason: 'blocklisted' };
+        return { error: 'password_rejected', reason: rejection };
       }
 
       const passwordHash = await this.hashPassword(password);

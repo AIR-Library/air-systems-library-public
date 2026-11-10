@@ -1,5 +1,7 @@
-import { db, signup, subscription_created, check_email_trial_history, check_payment_method_history, check_ip_signup_rate_limit, check_device_fingerprint, check_trial_payment_timing, check_chargeback_history, record_device_fingerprint } from './trial_abuse_prevention_typescript';
+import { db, signup, subscription_created, check_email_trial_history, check_payment_method_history, check_ip_signup_rate_limit, check_device_fingerprint, check_trial_payment_timing, check_chargeback_history, record_device_fingerprint, device_fingerprint_gate, set_clock } from './trial_abuse_prevention_typescript';
 import { createHash } from 'crypto';
+
+afterEach(() => set_clock());
 
 beforeEach(() => {
   // Reset DB
@@ -46,6 +48,7 @@ beforeEach(() => {
   `);
 });
 
+// TRIAL-01
 test('email_trial_history PASS → new email allowed', () => {
   const result = signup({
     email: 'new@example.com',
@@ -60,6 +63,7 @@ test('email_trial_history PASS → new email allowed', () => {
   expect(result.error).toBeUndefined();
 });
 
+// TRIAL-02
 test('email_trial_history CHALLENGE → same email after 1 trial, flagged', () => {
   // Insert prior completed trial
   db.prepare(`
@@ -80,6 +84,7 @@ test('email_trial_history CHALLENGE → same email after 1 trial, flagged', () =
   expect(result.user?.abuse_flags).toContain('email_trial_attempt_2+');
 });
 
+// TRIAL-03
 test('email_trial_history FAIL → same email after 2 trials, rejected', () => {
   // Two prior trials
   db.prepare(`
@@ -105,11 +110,13 @@ test('email_trial_history FAIL → same email after 2 trials, rejected', () => {
   expect(result.error?.code).toBe(409);
 });
 
+// TRIAL-04
 test('payment_method_history PASS → new card allowed', () => {
   const decision = check_payment_method_history('pm_new', 200);
   expect(decision.decision).toBe('PASS');
 });
 
+// TRIAL-05
 test('payment_method_history FAIL → same card after 3 trials, rejected', () => {
   // Insert three prior trials with same payment method
   for (let i = 0; i < 3; i++) {
@@ -122,6 +129,7 @@ test('payment_method_history FAIL → same card after 3 trials, rejected', () =>
   expect(decision.decision).toBe('FAIL');
 });
 
+// TRIAL-06
 test('ip_signup_rate_limit PASS → < 5 signups from IP, allowed', () => {
   // 3 prior signups
   for (let i = 0; i < 3; i++) {
@@ -134,6 +142,7 @@ test('ip_signup_rate_limit PASS → < 5 signups from IP, allowed', () => {
   expect(decision.decision).toBe('PASS');
 });
 
+// TRIAL-07
 test('ip_signup_rate_limit FAIL → 10+ signups from IP, rejected', () => {
   for (let i = 0; i < 10; i++) {
     db.prepare(`
@@ -145,6 +154,7 @@ test('ip_signup_rate_limit FAIL → 10+ signups from IP, rejected', () => {
   expect(decision.decision).toBe('FAIL');
 });
 
+// TRIAL-08
 test('device_fingerprint PASS → device < 2 users, allowed', () => {
   const device = {
     user_agent: 'ua1',
@@ -156,6 +166,7 @@ test('device_fingerprint PASS → device < 2 users, allowed', () => {
   expect(decision.decision).toBe('PASS');
 });
 
+// TRIAL-09
 test('device_fingerprint FAIL → device > 5 users, rejected', () => {
   const device = {
     user_agent: 'ua_shared',
@@ -178,6 +189,7 @@ test('device_fingerprint FAIL → device > 5 users, rejected', () => {
   expect(decision.decision).toBe('FAIL');
 });
 
+// TRIAL-10
 test('trial_payment_timing PASS → payment within trial window, allowed', () => {
   // Create a user with trial started 5 days ago
   const now = new Date();
@@ -191,10 +203,14 @@ test('trial_payment_timing PASS → payment within trial window, allowed', () =>
   expect(decision.decision).toBe('PASS');
 });
 
+// TRIAL-11
+// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the TRIAL-11 amendment counts days AFTER the trial ended (FAIL at 90
+// with no earlier payment). A trial that started 100 days ago ended 86 days ago (CHALLENGE now), so the trial here
+// starts 104 days ago (14-day trial + 90 days) on a pinned clock.
 test('trial_payment_timing FAIL → trial ended, no payment, trying to re-add, rejected', () => {
-  // Trial started 100 days ago, no payment
-  const now = new Date();
-  const hundredDaysAgo = new Date(now.getTime() - 100 * 24 * 60 * 60 * 1000);
+  const now = new Date('2026-06-15T12:00:00.000Z');
+  set_clock(() => now);
+  const hundredDaysAgo = new Date(now.getTime() - 104 * 24 * 60 * 60 * 1000);
   db.prepare(`
     INSERT INTO trial_abuse_ledger (user_id, email, ip, signup_date, trial_started_at, gate_flags)
     VALUES (1300, 'ended@example.com', '2.2.2.2', ?, ?, '{}')
@@ -204,11 +220,13 @@ test('trial_payment_timing FAIL → trial ended, no payment, trying to re-add, r
   expect(decision.decision).toBe('FAIL');
 });
 
+// TRIAL-12
 test('chargeback_history PASS → no chargebacks, allowed', () => {
   const decision = check_chargeback_history('cust_no_cb', 1400);
   expect(decision.decision).toBe('PASS');
 });
 
+// TRIAL-13
 test('chargeback_history FAIL → 2+ chargebacks, requires prepayment', () => {
   // Insert two chargeback events
   db.exec(`
@@ -288,4 +306,124 @@ test('integration: payment method reuse challenge', () => {
   expect(subRes.success).toBe(true);
   expect(subRes.challenge?.type).toBe('email_confirm');
   expect(subRes.challenge?.flags).toContain('payment_reuse_2x');
+});
+
+/** Inserts a ledger row whose trial started `daysAgo` days before `now`. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+function trialStartedDaysAgo(userId: number, now: Date, daysAgo: number, paymentDaysAgo?: number) {
+  const start = new Date(now.getTime() - daysAgo * 24 * 60 * 60 * 1000).toISOString();
+  const paid = paymentDaysAgo === undefined ? null : new Date(now.getTime() - paymentDaysAgo * 24 * 60 * 60 * 1000).toISOString();
+  db.prepare(`
+    INSERT INTO trial_abuse_ledger (user_id, email, ip, signup_date, trial_started_at, payment_added_date, gate_flags)
+    VALUES (?, ?, '1.1.1.1', ?, ?, ?, '{}')
+  `).run(userId, `t${userId}@example.com`, start, start, paid);
+}
+
+const NOW = new Date('2026-06-15T12:00:00.000Z');
+const HOUR = 60 * 60 * 1000;
+
+/**
+ * TRIAL-10: a first payment during the trial and one 4 days (and 4 days 23 hours) after it ended both PASS, on a
+ * pinned clock with a 14-day trial. In: ledger rows. Out: assertions only. Why: TRIAL-10 amendment 2026-11-10.
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite.
+ */
+// TRIAL-10
+test('trial_payment_timing PASS → during the trial and 4 days after it ended', () => {
+  set_clock(() => NOW);
+  trialStartedDaysAgo(1, NOW, 3);
+  trialStartedDaysAgo(2, NOW, 18);
+  expect(check_trial_payment_timing(1, 14)).toMatchObject({ decision: 'PASS', paymentDelay: -11 });
+  expect(check_trial_payment_timing(2, 14)).toMatchObject({ decision: 'PASS', paymentDelay: 4 });
+  set_clock(() => new Date(NOW.getTime() + 23 * HOUR));
+  expect(check_trial_payment_timing(2, 14).decision).toBe('PASS');   // 4.96 days floors to 4
+});
+
+/**
+ * TRIAL-11: a first payment exactly 90 days after the trial ended, with no earlier payment, is FAIL, and
+ * subscription_created answers 403 trial_ended_no_payment_cannot_retry; trial_days is configurable (a 30-day trial
+ * moves the boundary). In: ledger rows on a pinned clock. Out: assertions only. Why: TRIAL-11 amendment.
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite.
+ */
+// TRIAL-11
+test('trial_payment_timing FAIL → 90 days after the trial, no earlier payment; subscription refused 403', () => {
+  set_clock(() => NOW);
+  trialStartedDaysAgo(3, NOW, 104);
+  expect(check_trial_payment_timing(3, 14)).toMatchObject({ decision: 'FAIL', paymentDelay: 90 });
+  expect(check_trial_payment_timing(3, 30).decision).toBe('CHALLENGE');   // 74 days after a 30-day trial
+  const res = subscription_created({ user_id: 3, stripe_payment_method_id: 'pm_late', stripe_customer_id: 'cus_late' });
+  expect(res.success).toBe(false);
+  expect(res.error).toMatchObject({ error: 'trial_ended_no_payment_cannot_retry', code: 403 });
+});
+
+/**
+ * TRIAL-15: the timing boundaries: 5 days and 89 days after the trial are CHALLENGE, 90 days WITH an earlier payment
+ * is CHALLENGE, and a moment just before the 5th day (4 days 23 h 59 m) is still PASS while 1 ms before the trial
+ * end floors to -1 (PASS). In: ledger rows on pinned clocks. Out: assertions only. Why: TRIAL-15 amendment.
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite.
+ */
+// TRIAL-15
+test('trial_payment_timing boundaries → 5 and 89 days CHALLENGE; 90 days with an earlier payment CHALLENGE', () => {
+  set_clock(() => NOW);
+  trialStartedDaysAgo(4, NOW, 19);
+  trialStartedDaysAgo(5, NOW, 103);
+  trialStartedDaysAgo(6, NOW, 104, 100);
+  expect(check_trial_payment_timing(4, 14)).toMatchObject({ decision: 'CHALLENGE', paymentDelay: 5 });
+  expect(check_trial_payment_timing(5, 14)).toMatchObject({ decision: 'CHALLENGE', paymentDelay: 89 });
+  expect(check_trial_payment_timing(6, 14)).toMatchObject({ decision: 'CHALLENGE', paymentDelay: 90 });
+  set_clock(() => new Date(NOW.getTime() - 60 * 1000));
+  expect(check_trial_payment_timing(4, 14)).toMatchObject({ decision: 'PASS', paymentDelay: 4 });
+  trialStartedDaysAgo(7, NOW, 14);
+  set_clock(() => new Date(NOW.getTime() - 1));
+  expect(check_trial_payment_timing(7, 14).paymentDelay).toBe(-1);   // floor toward negative infinity, not truncation
+});
+
+/** A device the TRIAL-09/14 tests share. */
+const FARM = { user_agent: 'ua_farm', screen_resolution: '1280x720', timezone: 'UTC', browser_language: 'en' };
+
+/** Records FARM for each user id. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+function farm(userIds: number[]) {
+  for (const id of userIds) record_device_fingerprint({ user_id: id, device: FARM });
+}
+
+/** Device rows for one user. */
+function deviceRows(userId: number): number {
+  return (db.prepare('SELECT COUNT(*) AS n FROM device_fingerprints WHERE user_id = ?').get(userId) as { n: number }).n;
+}
+
+/**
+ * TRIAL-09: exactly 5 OTHER users on the device is FAIL (it used to need 6), and signup itself runs the device gate:
+ * the 6th account from a device farm is refused 403 device_suspected_fraud and leaves no device or ledger row.
+ * In: device rows. Out: assertions only. Why: TRIAL-09 amendment 2026-11-10 (signup recorded the device first, so a
+ * farm never failed). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite.
+ */
+// TRIAL-09
+test('device_fingerprint FAIL → 5 other users; signup from the farm is refused and records nothing', () => {
+  farm([11, 12, 13, 14, 15]);
+  expect(check_device_fingerprint(FARM, 99)).toMatchObject({ decision: 'FAIL', matchingUsers: 5 });
+  const before = (db.prepare('SELECT COUNT(*) AS n FROM device_fingerprints').get() as { n: number }).n;
+  const res = signup({ email: 'farm6@example.com', password: 'pwd', ip: '7.7.7.7', ...FARM });
+  expect(res.success).toBe(false);
+  expect(res.error).toMatchObject({ error: 'device_suspected_fraud', code: 403 });
+  expect((db.prepare('SELECT COUNT(*) AS n FROM device_fingerprints').get() as { n: number }).n).toBe(before);
+  expect((db.prepare("SELECT COUNT(*) AS n FROM trial_abuse_ledger WHERE email = 'farm6@example.com'").get() as { n: number }).n).toBe(0);
+});
+
+/**
+ * TRIAL-14: device boundaries: 4 other users is CHALLENGE (and records the device), a user who already has the
+ * device is PASS with 2-4 others, exactly 5 others is FAIL even for a user who already has the device, and a FAIL
+ * records no device row; the user's own row never counts toward the others. In: device rows. Out: assertions only.
+ * Why: TRIAL-14 amendment 2026-11-10. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite.
+ */
+// TRIAL-14
+test('device_fingerprint boundaries → 4 others CHALLENGE; 5 FAIL even for a known device; FAIL records nothing', () => {
+  farm([21, 22, 23, 24]);
+  expect(check_device_fingerprint(FARM, 30)).toMatchObject({ decision: 'CHALLENGE', matchingUsers: 4 });
+  expect(device_fingerprint_gate(FARM, 30).decision).toBe('CHALLENGE');
+  expect(deviceRows(30)).toBe(1);
+  // user 21 already has the device and sees 4 others (22, 23, 24, 30): PASS, own row not counted
+  expect(check_device_fingerprint(FARM, 21)).toMatchObject({ decision: 'PASS', matchingUsers: 4 });
+
+  farm([25]);   // now 21..25 and 30 = 6 users
+  expect(check_device_fingerprint(FARM, 21)).toMatchObject({ decision: 'FAIL', matchingUsers: 5 });
+  expect(device_fingerprint_gate(FARM, 40).decision).toBe('FAIL');
+  expect(deviceRows(40)).toBe(0);
 });

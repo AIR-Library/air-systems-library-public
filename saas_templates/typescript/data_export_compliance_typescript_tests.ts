@@ -1,3 +1,11 @@
+/**
+ * Data export & compliance tests.
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: converted from a hand-written runner to node:test (every check kept),
+ * and adapted to the EXPORT-05/12/13/14 amendments: the service takes the verified caller for confirm / cancel /
+ * export status and an audit eraser; confirmation tokens are read from the email (only their hash is stored);
+ * statutory reasons are erased on confirm. Each changed check carries a comment saying why. Touches: memory only.
+ */
+import { test } from 'node:test';
 import {
   InMemoryDatabase,
   MockS3Client,
@@ -14,6 +22,8 @@ import {
   AuditLog,
   ExportRequest,
   DeletionRequest,
+  AuditEraser,
+  ComplianceError,
 } from './data_export_compliance_typescript';
 
 // Simple custom assertion framework to run tests standalone
@@ -50,14 +60,50 @@ class MockClock implements Clock {
   }
 }
 
-async function runTests() {
-  console.log('Starting Compliance & Data Export Module Tests...\n');
+/**
+ * A fake audit eraser that records each call and what the database looked like at that moment (EXPORT-13).
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches memory.
+ */
+class FakeAuditEraser implements AuditEraser {
+  public calls: Array<{ userId: string; userRowsLeft: number; lastAuditAction: string | undefined; auditCount: number }> = [];
+  constructor(private db: InMemoryDatabase) {}
+  erase_subject(userId: string): void {
+    const mine = this.db.auditLogs.filter(a => a.user_id === userId);
+    this.calls.push({
+      userId,
+      userRowsLeft: this.db.users.filter(u => u.id === userId).length + this.db.sessions.filter(x => x.user_id === userId).length,
+      lastAuditAction: mine[mine.length - 1]?.action,
+      auditCount: mine.length,
+    });
+  }
+}
 
+/** The raw token from the newest deletion-confirmation email to `to`. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+function tokenFromEmail(email: MockEmailService, to: string): string {
+  const mails = email.sentEmails.filter(e => e.to === to && e.subject.includes('Confirm your account deletion'));
+  const m = /token=([A-Za-z0-9_-]+)/.exec(mails[mails.length - 1]?.body ?? '');
+  if (!m) throw new Error('no confirmation token emailed');
+  return m[1];
+}
+
+/** Runs fn and returns the ComplianceError it throws (fails when it does not throw one). */
+async function rejection(fn: () => Promise<unknown>): Promise<ComplianceError> {
+  try {
+    await fn();
+  } catch (e) {
+    if (e instanceof ComplianceError) return e;
+    throw e;
+  }
+  throw new Error('expected a ComplianceError');
+}
+
+{
   const db = new InMemoryDatabase();
   const s3 = new MockS3Client();
   const email = new MockEmailService();
   const clock = new MockClock(new Date('2026-09-25T09:00:00Z'));
-  const service = new ComplianceService(db, s3, email, clock);
+  const eraser = new FakeAuditEraser(db);
+  const service = new ComplianceService(db, s3, email, clock, eraser);
 
   // Helper to seed a standard user and related data
   const seedUser = () => {
@@ -139,25 +185,12 @@ async function runTests() {
     db.apiKeys.push(apiKey);
   };
 
-  let passed = 0;
-  let failed = 0;
-
-  async function test(name: string, fn: () => Promise<void>) {
-    try {
-      await fn();
-      console.log(`✓ ${name}`);
-      passed++;
-    } catch (e) {
-      console.error(`✗ ${name}`);
-      console.error(`  ${(e as Error).message}`);
-      failed++;
-    }
-  }
 
   // ---------------------------------------------------------------------------
   // TEST 1: Export JSON and CSV formats both work
   // ---------------------------------------------------------------------------
-  await test('Export: JSON and CSV formats both work', async () => {
+  // EXPORT-01
+  test('Export: JSON and CSV formats both work', async () => {
     seedUser();
     const resJson = await service.requestExport('user_123', 'json', 'gdpr_portal_request');
     assertEquals(resJson.success, true, 'JSON export request should succeed');
@@ -166,14 +199,14 @@ async function runTests() {
     // Process background job synchronously for testing
     await service.processExportAsync(resJson.export_id);
 
-    const statusJson = await service.getExportStatus(resJson.export_id);
+    const statusJson = await service.getExportStatus('user_123', resJson.export_id);
     assertEquals(statusJson.status, 'completed', 'JSON export status should be completed');
     assert(statusJson.file_url !== null, 'JSON export file URL should be populated');
 
     // Verify CSV format
     const resCsv = await service.requestExport('user_123', 'csv', 'ccpa_portal_request');
     await service.processExportAsync(resCsv.export_id);
-    const statusCsv = await service.getExportStatus(resCsv.export_id);
+    const statusCsv = await service.getExportStatus('user_123', resCsv.export_id);
     assertEquals(statusCsv.status, 'completed', 'CSV export status should be completed');
     assert(statusCsv.file_url !== null, 'CSV export file URL should be populated');
   });
@@ -181,7 +214,8 @@ async function runTests() {
   // ---------------------------------------------------------------------------
   // TEST 2: Export: All data categories included
   // ---------------------------------------------------------------------------
-  await test('Export: All data categories included', async () => {
+  // EXPORT-02
+  test('Export: All data categories included', async () => {
     seedUser();
     const res = await service.requestExport('user_123', 'json');
     await service.processExportAsync(res.export_id);
@@ -203,12 +237,13 @@ async function runTests() {
   // ---------------------------------------------------------------------------
   // TEST 3: Export: Email sent with download link
   // ---------------------------------------------------------------------------
-  await test('Export: Email sent with download link', async () => {
+  // EXPORT-03
+  test('Export: Email sent with download link', async () => {
     seedUser();
     const res = await service.requestExport('user_123', 'json');
     await service.processExportAsync(res.export_id);
 
-    const status = await service.getExportStatus(res.export_id);
+    const status = await service.getExportStatus('user_123', res.export_id);
     const sentEmail = email.sentEmails.find(e => e.to === 'alice@example.com');
     assert(sentEmail !== undefined, 'Email should be sent to the user');
     assert(sentEmail!.subject.includes('export is ready'), 'Email subject should match');
@@ -218,12 +253,13 @@ async function runTests() {
   // ---------------------------------------------------------------------------
   // TEST 4: Export: Signed URL works, expires after 7 days
   // ---------------------------------------------------------------------------
-  await test('Export: Signed URL works, expires after 7 days', async () => {
+  // EXPORT-04
+  test('Export: Signed URL works, expires after 7 days', async () => {
     seedUser();
     const res = await service.requestExport('user_123', 'json');
     await service.processExportAsync(res.export_id);
 
-    const status = await service.getExportStatus(res.export_id);
+    const status = await service.getExportStatus('user_123', res.export_id);
     assert(status.expires_at !== null, 'Expiry date must be set');
 
     const requestedTime = new Date(status.requested_at).getTime();
@@ -235,14 +271,19 @@ async function runTests() {
   // ---------------------------------------------------------------------------
   // TEST 5: Deletion: 30-day grace period enforced
   // ---------------------------------------------------------------------------
-  await test('Deletion: 30-day grace period enforced', async () => {
+  // EXPORT-05
+  // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the request reason is now user_requested. The EXPORT-05/12 amendment
+  // gives statutory reasons (gdpr_right_to_be_forgotten, used here before) no grace period; the 30 days apply to
+  // user_requested / other, and will_delete_at must be requested_at + 30 days. The token comes from the email.
+  test('Deletion: 30-day grace period enforced', async () => {
     seedUser();
-    const res = await service.requestDeletion('user_123', 'gdpr_right_to_be_forgotten');
+    const res = await service.requestDeletion('user_123', 'user_requested');
     assertEquals(res.status, 'pending', 'Deletion request should start as pending');
+    assertEquals(res.will_delete_at, new Date(clock.now().getTime() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+      'will_delete_at must be requested_at + 30 days');
 
     // Confirm deletion to move it to approved status
-    const req = db.deletionRequests.find(r => r.id === res.deletion_id)!;
-    await service.confirmDeletion(res.deletion_id, req.confirmation_token);
+    await service.confirmDeletion('user_123', res.deletion_id, tokenFromEmail(email, 'alice@example.com'));
 
     // Try to execute scheduled deletions immediately (0 days advanced)
     let deletedCount = await service.executeScheduledDeletions();
@@ -262,10 +303,11 @@ async function runTests() {
   // ---------------------------------------------------------------------------
   // TEST 6: Deletion: User can cancel within grace period
   // ---------------------------------------------------------------------------
-  await test('Deletion: User can cancel within grace period', async () => {
+  // EXPORT-06
+  test('Deletion: User can cancel within grace period', async () => {
     seedUser();
     const res = await service.requestDeletion('user_123', 'user_requested');
-    const cancelRes = await service.cancelDeletion(res.deletion_id);
+    const cancelRes = await service.cancelDeletion('user_123', res.deletion_id);
     assertEquals(cancelRes.status, 'cancelled', 'Cancellation should return cancelled status');
 
     // Advance clock past grace period and verify no deletion occurs
@@ -277,11 +319,11 @@ async function runTests() {
   // ---------------------------------------------------------------------------
   // TEST 7: Deletion: Cascade delete works
   // ---------------------------------------------------------------------------
-  await test('Deletion: Cascade delete works', async () => {
+  // EXPORT-07
+  test('Deletion: Cascade delete works', async () => {
     seedUser();
     const res = await service.requestDeletion('user_123', 'user_requested');
-    const req = db.deletionRequests.find(r => r.id === res.deletion_id)!;
-    await service.confirmDeletion(res.deletion_id, req.confirmation_token);
+    await service.confirmDeletion('user_123', res.deletion_id, tokenFromEmail(email, 'alice@example.com'));
 
     // Advance past grace period
     clock.advanceDays(31);
@@ -306,40 +348,41 @@ async function runTests() {
   // ---------------------------------------------------------------------------
   // TEST 8: Deletion: Audit log preserved (not deleted with user)
   // ---------------------------------------------------------------------------
-  await test('Deletion: Audit log preserved (not deleted with user)', async () => {
+  // EXPORT-08
+  test('Deletion: Audit log preserved (not deleted with user)', async () => {
     seedUser();
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: a gdpr_request is now erased on confirm (EXPORT-12), so no
+    // clock advance is needed; the final log is 'user_deleted_cascade' (EXPORT-13), which replaced
+    // 'account_permanently_deleted' because nothing may log the user after the audit eraser runs.
     const res = await service.requestDeletion('user_123', 'gdpr_request');
-    const req = db.deletionRequests.find(r => r.id === res.deletion_id)!;
-    await service.confirmDeletion(res.deletion_id, req.confirmation_token);
-
-    // Advance past grace period
-    clock.advanceDays(31);
-    await service.executeScheduledDeletions();
+    await service.confirmDeletion('user_123', res.deletion_id, tokenFromEmail(email, 'alice@example.com'));
 
     // Audit logs for this user should still exist
     const userAuditLogs = db.auditLogs.filter(a => a.user_id === 'user_123');
     assert(userAuditLogs.length > 0, 'Audit logs must be preserved for compliance');
 
-    // Should contain at least: deletion_requested, deletion_confirmed, account_permanently_deleted
+    // Should contain at least: deletion_requested, deletion_confirmed, user_deleted_cascade
     const actions = userAuditLogs.map(a => a.action);
     assert(actions.includes('deletion_requested'), 'Audit log should contain deletion_requested');
     assert(actions.includes('deletion_confirmed'), 'Audit log should contain deletion_confirmed');
-    assert(actions.includes('account_permanently_deleted'), 'Audit log should contain account_permanently_deleted');
+    assert(actions.includes('user_deleted_cascade'), 'Audit log should contain user_deleted_cascade');
   });
 
   // ---------------------------------------------------------------------------
   // TEST 9: Deletion: User confirmed via email token
   // ---------------------------------------------------------------------------
-  await test('Deletion: User confirmed via email token', async () => {
+  // EXPORT-09
+  test('Deletion: User confirmed via email token', async () => {
     seedUser();
     const res = await service.requestDeletion('user_123', 'user_requested');
     
-    // Get the confirmation token from the deletion request
+    // Get the confirmation token from the email (2026-11-10: only its SHA-256 is stored now)
     const req = db.deletionRequests.find(r => r.id === res.deletion_id)!;
-    const token = req.confirmation_token;
+    const token = tokenFromEmail(email, 'alice@example.com');
+    assert(!JSON.stringify(req).includes(token), 'The raw token must not be stored');
     
     // Confirm with valid token
-    const confirmRes = await service.confirmDeletion(res.deletion_id, token);
+    const confirmRes = await service.confirmDeletion('user_123', res.deletion_id, token);
     assertEquals(confirmRes.success, true, 'Confirmation should succeed with valid token');
     
     const updatedReq = db.deletionRequests.find(r => r.id === res.deletion_id)!;
@@ -347,7 +390,7 @@ async function runTests() {
     
     // Try to confirm again with same token - should fail
     try {
-      await service.confirmDeletion(res.deletion_id, token);
+      await service.confirmDeletion('user_123', res.deletion_id, token);
       assert(false, 'Second confirmation should fail');
     } catch (e) {
       assert((e as Error).message.includes('already approved'), 'Should reject duplicate confirmation');
@@ -357,7 +400,7 @@ async function runTests() {
     seedUser(); // Reset with new user
     const res2 = await service.requestDeletion('user_123', 'user_requested');
     try {
-      await service.confirmDeletion(res2.deletion_id, 'invalid_token');
+      await service.confirmDeletion('user_123', res2.deletion_id, 'invalid_token');
       assert(false, 'Invalid token should be rejected');
     } catch (e) {
       assert((e as Error).message.includes('Invalid confirmation token'), 'Should reject invalid token');
@@ -367,7 +410,8 @@ async function runTests() {
   // ---------------------------------------------------------------------------
   // TEST 10: Admin: Can see all export/deletion requests
   // ---------------------------------------------------------------------------
-  await test('Admin: Can see all export/deletion requests', async () => {
+  // EXPORT-10
+  test('Admin: Can see all export/deletion requests', async () => {
     seedUser();
     
     // Create multiple export requests
@@ -412,7 +456,8 @@ async function runTests() {
   // ---------------------------------------------------------------------------
   // TEST 11: Audit: All requests logged with why_chain support
   // ---------------------------------------------------------------------------
-  await test('Audit: All requests logged with why_chain support', async () => {
+  // EXPORT-11
+  test('Audit: All requests logged with why_chain support', async () => {
     seedUser();
     
     // Request export with why_chain
@@ -441,22 +486,110 @@ async function runTests() {
     
     // Confirm deletion and check audit log
     const delReq = db.deletionRequests.find(r => r.user_id === 'user_123')!;
-    await service.confirmDeletion(delReq.id, delReq.confirmation_token);
+    await service.confirmDeletion('user_123', delReq.id, tokenFromEmail(email, 'alice@example.com'));
     
     const confirmLog = db.auditLogs.find(a => a.action === 'deletion_confirmed' && a.user_id === 'user_123');
     assert(confirmLog !== undefined, 'Should have deletion_confirmed audit log');
     assertEquals(confirmLog!.reason, 'User confirmed deletion via email token', 'Confirm log should have reason');
   });
 
-  // Run all tests and report
+  /**
+   * EXPORT-12: gdpr_request and gdpr_right_to_be_forgotten get no grace period: will_delete_at = requested_at, and
+   * confirm() runs the cascade before returning (status completed, deleted_at = deletion_scheduled_for = now).
+   * In: the shared service on its mock clock. Out: throws on failure. Why: EXPORT-12 amendment 2026-11-10.
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+   */
+  // EXPORT-12
+  test('Deletion: statutory reasons are not held for 30 days and are erased on confirm', async () => {
+    for (const reason of ['gdpr_request', 'gdpr_right_to_be_forgotten'] as const) {
+      seedUser();
+      const now = clock.now();
+      const res = await service.requestDeletion('user_123', reason);
+      assertEquals(res.will_delete_at, now.toISOString(), `${reason}: will_delete_at must equal requested_at`);
+      assertEquals(db.users.some(u => u.id === 'user_123'), true, 'nothing is deleted before confirm');
+      const confirmed = await service.confirmDeletion('user_123', res.deletion_id, tokenFromEmail(email, 'alice@example.com'));
+      assertEquals(confirmed.deletion_scheduled_for, now.toISOString(), 'scheduled for now');
+      const req = db.deletionRequests.find(r => r.id === res.deletion_id)!;
+      assertEquals(req.status, 'completed', 'statutory deletion completes on confirm');
+      assertEquals(req.deleted_at?.toISOString(), now.toISOString(), 'deleted_at = now');
+      assertEquals(db.users.some(u => u.id === 'user_123'), false, 'the user is gone');
+    }
+  });
 
-  console.log(`\n--- Results: ${passed} passed, ${failed} failed ---`);
-  if (failed > 0) {
-    process.exit(1);
-  }
+  /**
+   * EXPORT-13: the cascade order. When erase_subject(user_id) is called the user's rows are already gone and the
+   * last audit entry for the user is 'user_deleted_cascade'; nothing is logged for the user after it; the eraser is
+   * called exactly once; deletion_requests.user_id is NULL; the user's export file is deleted from S3. A failing
+   * eraser rolls every table back. In: the shared service with the fake eraser. Out: throws on failure.
+   * Why: EXPORT-13 amendment 2026-11-10. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+   */
+  // EXPORT-13
+  test('Deletion cascade order: rows deleted, user_deleted_cascade logged, erase_subject last', async () => {
+    seedUser();
+    eraser.calls = [];
+    const exp = await service.requestExport('user_123', 'json');
+    await service.processExportAsync(exp.export_id);
+    const s3Key = `export_user_123_${exp.export_id}.json`;
+    assert(s3.storage.has(s3Key), 'export file exists before deletion');
+    const res = await service.requestDeletion('user_123', 'gdpr_right_to_be_forgotten');
+    await service.confirmDeletion('user_123', res.deletion_id, tokenFromEmail(email, 'alice@example.com'));
+
+    assertEquals(eraser.calls.length, 1, 'erase_subject called once');
+    assertEquals(eraser.calls[0].userId, 'user_123', 'erase_subject called with the user id');
+    assertEquals(eraser.calls[0].userRowsLeft, 0, "the user's rows were deleted before erase_subject");
+    assertEquals(eraser.calls[0].lastAuditAction, 'user_deleted_cascade', "'user_deleted_cascade' was logged before erase_subject");
+    assertEquals(db.auditLogs.filter(a => a.user_id === 'user_123').length, eraser.calls[0].auditCount, 'nothing logged for the user after erase_subject');
+    assertEquals(db.deletionRequests.find(r => r.id === res.deletion_id)!.user_id, null, 'deletion_requests.user_id is NULL');
+    assert(!s3.storage.has(s3Key), 'the export file is deleted with the user');
+
+    // A failing eraser rolls the whole cascade back.
+    seedUser();
+    const failing = new ComplianceService(db, s3, email, clock, { erase_subject: () => { throw new Error('audit store down'); } });
+    const res2 = await failing.requestDeletion('user_123', 'gdpr_request');
+    let threw = false;
+    try {
+      await failing.confirmDeletion('user_123', res2.deletion_id, tokenFromEmail(email, 'alice@example.com'));
+    } catch (e) {
+      threw = (e as Error).message === 'audit store down';
+    }
+    assert(threw, 'the eraser error is rethrown');
+    assertEquals(db.users.some(u => u.id === 'user_123'), true, 'user restored');
+    assertEquals(db.sessions.length, 1, 'sessions restored');
+    assert(!db.auditLogs.some(a => a.action === 'user_deleted_cascade'), 'the cascade log entry is rolled back');
+  });
+
+  /**
+   * EXPORT-14: nothing is deleted before confirm; a wrong token, a reused token and a token over 24 h old are
+   * refused; another user's deletion request is 404 for confirm and cancel (and their export status is 404 too).
+   * In: the shared service. Out: throws on failure. Why: EXPORT-14 amendment 2026-11-10.
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+   */
+  // EXPORT-14
+  test('Deletion confirmation: wrong, reused and expired tokens refused; other users get 404', async () => {
+    seedUser();
+    const res = await service.requestDeletion('user_123', 'user_requested');
+    const token = tokenFromEmail(email, 'alice@example.com');
+    assertEquals(db.users.some(u => u.id === 'user_123'), true, 'nothing deleted before confirm');
+    assertEquals(db.sessions.length, 1, 'sessions intact before confirm');
+
+    assertEquals((await rejection(() => service.confirmDeletion('admin_999', res.deletion_id, token))).status, 404, "another user's confirm is 404");
+    assertEquals((await rejection(() => service.cancelDeletion('admin_999', res.deletion_id))).status, 404, "another user's cancel is 404");
+    assertEquals((await rejection(() => service.confirmDeletion('user_123', 'del_unknown', token))).status, 404, 'unknown id is 404');
+    const wrong = await rejection(() => service.confirmDeletion('user_123', res.deletion_id, token.slice(0, -1) + (token.endsWith('A') ? 'B' : 'A')));
+    assertEquals(wrong.code, 'invalid_confirmation_token', 'a wrong token is refused');
+    assertEquals(db.deletionRequests.find(r => r.id === res.deletion_id)!.status, 'pending', 'still pending');
+
+    await service.confirmDeletion('user_123', res.deletion_id, token);
+    assertEquals((await rejection(() => service.confirmDeletion('user_123', res.deletion_id, token))).code, 'not_pending', 'a reused token is refused');
+
+    seedUser();
+    const late = await service.requestDeletion('user_123', 'user_requested');
+    const lateToken = tokenFromEmail(email, 'alice@example.com');
+    clock.advanceHours(24);
+    clock.advanceHours(0.001);
+    assertEquals((await rejection(() => service.confirmDeletion('user_123', late.deletion_id, lateToken))).code, 'confirmation_token_expired', 'a token over 24 h old is refused');
+
+    const exp = await service.requestExport('user_123', 'json');
+    assertEquals((await rejection(() => service.getExportStatus('admin_999', exp.export_id))).status, 404, "another user's export status is 404");
+  });
 }
-
-runTests().catch(err => {
-  console.error('Test runner crashed:', err);
-  process.exit(1);
-});

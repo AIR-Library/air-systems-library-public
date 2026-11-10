@@ -5,6 +5,8 @@ import {
   is_required,
   purge_expired,
   _test_store,
+  IdempotencyService,
+  OperationFailed,
 } from "./idempotency_keys_typescript.ts";
 
 type OpResult = { status: number; body: any };
@@ -36,6 +38,7 @@ function parseProblem(body: string) {
 }
 
 /* 1. first call runs the operation once */
+// IDEM-01
 test("first call runs operation once", async () => {
   const counter = { count: 0 };
   const resp = await handle(
@@ -54,6 +57,7 @@ test("first call runs operation once", async () => {
 });
 
 /* 2. second identical call returns stored response */
+// IDEM-02
 test("second identical call returns stored response", async () => {
   const counter = { count: 0 };
   const op = makeOp(counter);
@@ -64,6 +68,7 @@ test("second identical call returns stored response", async () => {
 });
 
 /* 3. same key, different body -> 422 */
+// IDEM-03
 test("same key, different body yields 422", async () => {
   const counter = { count: 0 };
   const op = makeOp(counter);
@@ -83,6 +88,7 @@ test("same key, different body yields 422", async () => {
 });
 
 /* 4. same key while first is in progress -> 409 */
+// IDEM-04
 test("concurrent request while in progress yields 409", async () => {
   const counter = { count: 0 };
   const op = makeOp(counter, true, 100); // 100ms delay
@@ -112,6 +118,7 @@ test("concurrent request while in progress yields 409", async () => {
 });
 
 /* 5. required operation with no key -> 400 */
+// IDEM-05
 test("missing key on required operation yields 400", async () => {
   const counter = { count: 0 };
   const resp = await handle(
@@ -129,6 +136,7 @@ test("missing key on required operation yields 400", async () => {
 });
 
 /* 6. same key under different scopes runs twice */
+// IDEM-06
 test("same key under different scopes are independent", async () => {
   const counter = { count: 0 };
   const op = makeOp(counter);
@@ -138,6 +146,7 @@ test("same key under different scopes are independent", async () => {
 });
 
 /* 7. expired key runs operation again */
+// IDEM-07
 test("expired key allows re‑execution", async () => {
   const counter = { count: 0 };
   const op = makeOp(counter);
@@ -152,14 +161,20 @@ test("expired key allows re‑execution", async () => {
 });
 
 /* 8. operation that throws frees the key */
+// IDEM-08
+// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the operation now raises OperationFailed. The IDEM-08/10 amendment
+// says only OperationFailed (a definite "did nothing") frees the key; any other error leaves it 'uncertain'
+// (see the IDEM-10 test below), so a plain Error here would no longer let the retry run.
 test("failed operation frees the key for retry", async () => {
   const counter = { count: 0 };
-  const failingOp = makeOp(counter, false);
+  const failingOp = () => {
+    throw new OperationFailed("card declined");
+  };
   try {
     await handle("userG", "key-6", "POST", "/test", "payload", failingOp);
     assert.fail("should have thrown");
   } catch (e) {
-    assert.ok(e instanceof Error);
+    assert.ok(e instanceof OperationFailed);
   }
   // retry with a successful op
   const successOp = makeOp(counter);
@@ -169,6 +184,7 @@ test("failed operation frees the key for retry", async () => {
 });
 
 /* 9. error responses have correct content type and fields */
+// IDEM-09
 test("error responses conform to problem+json spec", async () => {
   const counter = { count: 0 };
   const op = makeOp(counter);
@@ -198,4 +214,105 @@ test("error responses conform to problem+json spec", async () => {
   assert.ok(p409.title);
   assert.ok(p409.detail);
   await p1; // cleanup
+});
+
+/** A clock the test moves by hand. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+function fixedClock(start = Date.parse("2026-06-15T10:00:00Z")) {
+  const clock = { t: start, now: () => new Date(clock.t) };
+  return clock;
+}
+
+const DAY = 24 * 60 * 60 * 1000;
+
+/**
+ * IDEM-07: on an injected clock, a completed key 24 h old runs the operation again, while an in_progress key past
+ * expires_at (a crashed process) is uncertain: 409 outcome_unknown, the operation does not run, and purge_expired
+ * keeps it. In: a fresh service and a hand-moved clock. Out: assertions only. Why: IDEM-07 amendment.
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+ */
+// IDEM-07
+test("expired completed key runs again; in_progress past expires_at is outcome_unknown", async () => {
+  const clock = fixedClock();
+  const svc = new IdempotencyService(undefined, clock.now);
+  const counter = { count: 0 };
+  await svc.handle("u", "done", "POST", "/charge", "{}", makeOp(counter));
+  clock.t += DAY;
+  const again = await svc.handle("u", "done", "POST", "/charge", "{}", makeOp(counter));
+  assert.strictEqual(again.status, 200);
+  assert.strictEqual(counter.count, 2);
+
+  // An in_progress record whose process died: its operation never finishes.
+  const never = svc.handle("u", "stuck", "POST", "/charge", "{}", () => new Promise<OpResult>(() => {}));
+  void never;
+  clock.t += DAY;
+  svc.purge_expired();
+  const ran = { count: 0 };
+  const r = await svc.handle("u", "stuck", "POST", "/charge", "{}", makeOp(ran));
+  assert.strictEqual(r.status, 409);
+  assert.strictEqual(r.content_type, "application/problem+json");
+  assert.strictEqual(parseProblem(r.body).type, "outcome_unknown");
+  assert.strictEqual(ran.count, 0);
+  assert.deepStrictEqual(svc.list_uncertain(10).map((x) => x.idem_key), ["stuck"]);
+});
+
+/**
+ * IDEM-10: any error other than OperationFailed leaves the key 'uncertain': the retry gets 409 outcome_unknown
+ * and the operation count stays at 1; release() frees it and the next retry runs. release() on a key that is not
+ * uncertain is false and changes nothing. In: a fresh service. Out: assertions only. Why: IDEM-10 amendment (a
+ * timeout after the provider was called must never charge twice). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+ * Touches: memory only.
+ */
+// IDEM-10
+test("a non-OperationFailed error leaves the key uncertain until release()", async () => {
+  const svc = new IdempotencyService(undefined, fixedClock().now);
+  const counter = { count: 0 };
+  const timesOut = () => {
+    counter.count++;
+    throw new Error("socket timeout after provider call");
+  };
+  await assert.rejects(svc.handle("u", "k", "POST", "/charge", "{}", timesOut), /socket timeout/);
+  const retry = await svc.handle("u", "k", "POST", "/charge", "{}", timesOut);
+  assert.strictEqual(retry.status, 409);
+  const prob = parseProblem(retry.body);
+  assert.strictEqual(prob.type, "outcome_unknown");
+  assert.ok(prob.title && prob.detail);
+  assert.strictEqual(counter.count, 1);
+  // a different body is still 422 first
+  assert.strictEqual((await svc.handle("u", "k", "POST", "/charge", "{\"x\":1}", timesOut)).status, 422);
+
+  assert.strictEqual(svc.release("other-scope", "k"), false);
+  assert.strictEqual(svc.release("u", "k"), true);
+  assert.strictEqual(svc.release("u", "k"), false);
+  const ok = await svc.handle("u", "k", "POST", "/charge", "{}", makeOp(counter));
+  assert.strictEqual(ok.status, 200);
+  assert.strictEqual(counter.count, 2);
+  assert.strictEqual(svc.release("u", "k"), false, "a completed key is not released");
+});
+
+/**
+ * IDEM-11: resolve() on an uncertain key stores the given response; a retry returns it without running the
+ * operation; a second resolve() or a release() then returns false. The resolved record expires 24 h later.
+ * In: a fresh service on a fixed clock. Out: assertions only. Why: IDEM-11 amendment.
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+ */
+// IDEM-11
+test("resolve() stores the reconciled outcome once", async () => {
+  const clock = fixedClock();
+  const svc = new IdempotencyService(undefined, clock.now);
+  const counter = { count: 0 };
+  await assert.rejects(
+    svc.handle("u", "r", "POST", "/charge", "{}", () => { throw new Error("connection reset"); }),
+    /connection reset/,
+  );
+  assert.strictEqual(svc.resolve("u", "r", 201, { charge: "ch_1" }), true);
+  const retry = await svc.handle("u", "r", "POST", "/charge", "{}", makeOp(counter));
+  assert.strictEqual(retry.status, 201);
+  assert.strictEqual(retry.content_type, "application/json");
+  assert.deepStrictEqual(JSON.parse(retry.body), { charge: "ch_1" });
+  assert.strictEqual(counter.count, 0);
+  assert.strictEqual(svc.resolve("u", "r", 500, { other: true }), false);
+  assert.strictEqual(svc.release("u", "r"), false);
+  assert.deepStrictEqual(svc.list_uncertain(10), []);
+  const rec = (svc.store as any).get("u", "r");
+  assert.strictEqual(rec.expires_at.getTime(), clock.t + DAY);
 });

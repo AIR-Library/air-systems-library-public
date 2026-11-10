@@ -2,6 +2,7 @@ import { FeatureFlags, InMemoryFlagStore } from './feature_flags_typescript.ts';
 import * as assert from 'assert';
 import { test } from 'node:test';
 
+// FLAG-01
 test('unknown flag returns default with FLAG_NOT_FOUND', () => {
   const flags = new FeatureFlags();
   const result = flags.get_boolean_details('nonexistent', false, {});
@@ -10,6 +11,7 @@ test('unknown flag returns default with FLAG_NOT_FOUND', () => {
   assert.strictEqual(result.error_code, 'FLAG_NOT_FOUND');
 });
 
+// FLAG-02
 test('type mismatch returns default with TYPE_MISMATCH', () => {
   const flags = new FeatureFlags();
   flags.set_flag('admin', 'test_flag', 'boolean', true, true, []);
@@ -19,6 +21,7 @@ test('type mismatch returns default with TYPE_MISMATCH', () => {
   assert.strictEqual(result.error_code, 'TYPE_MISMATCH');
 });
 
+// FLAG-03
 test('disabled flag returns default with DISABLED', () => {
   const flags = new FeatureFlags();
   flags.set_flag('admin', 'disabled_flag', 'boolean', true, false, []);
@@ -27,6 +30,7 @@ test('disabled flag returns default with DISABLED', () => {
   assert.strictEqual(result.reason, 'DISABLED');
 });
 
+// FLAG-04
 test('matching rule returns value with TARGETING_MATCH', () => {
   const flags = new FeatureFlags();
   const rules = [
@@ -44,6 +48,7 @@ test('matching rule returns value with TARGETING_MATCH', () => {
   assert.strictEqual(result.reason, 'TARGETING_MATCH');
 });
 
+// FLAG-04
 test('non-matching rule falls through to default', () => {
   const flags = new FeatureFlags();
   const rules = [
@@ -60,6 +65,7 @@ test('non-matching rule falls through to default', () => {
   assert.strictEqual(result.reason, 'DEFAULT');
 });
 
+// FLAG-05
 test('30% rollout is deterministic and within range', () => {
   const flags = new FeatureFlags();
   const rules = [
@@ -90,6 +96,7 @@ test('30% rollout is deterministic and within range', () => {
   assert.ok(percentage >= 25 && percentage <= 35, `Rollout percentage ${percentage}% is outside expected range [25%, 35%]`);
 });
 
+// FLAG-06
 test('user outside rollout falls through to next rule', () => {
   const flags = new FeatureFlags();
   const rules = [
@@ -120,6 +127,7 @@ test('user outside rollout falls through to next rule', () => {
   assert.ok(foundOutside, 'Should find a user outside the rollout who falls through to the next rule');
 });
 
+// FLAG-07
 test('corrupt rules returns default with PARSE_ERROR', () => {
   const store = new InMemoryFlagStore();
   store.setFlag('corrupt_flag', {
@@ -138,6 +146,7 @@ test('corrupt rules returns default with PARSE_ERROR', () => {
   assert.strictEqual(result.error_code, 'PARSE_ERROR');
 });
 
+// FLAG-08
 test('set_flag writes audit row with old and new values', () => {
   const store = new InMemoryFlagStore();
   const flags = new FeatureFlags(store);
@@ -151,4 +160,25 @@ test('set_flag writes audit row with old and new values', () => {
   assert.strictEqual(audits[1].action, 'UPDATE');
   assert.strictEqual(audits[1].old_value, false);
   assert.strictEqual(audits[1].new_value, true);
+});
+/**
+ * FLAG-05: the bucket is the spec's stable_hash (first 8 bytes of SHA-256, unsigned big-endian) % 100,
+ * the same in every language. In: a 30% rollout and known keys. Out: asserts the served value per key.
+ * Expected buckets (computed independently with Python hashlib): "rollout_flag:user0" -> 84,
+ * "rollout_flag:user1" -> 37, "rollout_flag:user2" -> 12. Why: the old float-based hash put user0 in
+ * bucket 16 (served true) where every other language serves false. 2026-11-10,
+ * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory store only.
+ */
+// FLAG-05
+test('rollout bucket matches the cross-language stable_hash', () => {
+  const flags = new FeatureFlags();
+  flags.set_flag('admin', 'rollout_flag', 'boolean', false, true,
+    [{ conditions: [], variant: 'beta', value: true, rollout: { percentage: 30 } }]);
+  const at = (k: string) => flags.get_boolean_details('rollout_flag', false, { targeting_key: k });
+  assert.strictEqual(at('user0').value, false);
+  assert.strictEqual(at('user0').reason, 'DEFAULT');
+  assert.strictEqual(at('user1').value, false);
+  assert.strictEqual(at('user2').value, true);
+  assert.strictEqual(at('user2').reason, 'SPLIT');
+  assert.strictEqual(at('user2').variant, 'beta');
 });

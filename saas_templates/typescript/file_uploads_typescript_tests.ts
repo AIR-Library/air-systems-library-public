@@ -47,6 +47,7 @@ function makeLargeFile(size: number): Uint8Array {
   return new Uint8Array(size);
 }
 
+// UPLOAD-01
 test('a .exe is rejected; a .exe renamed to .png is rejected by its magic bytes', () => {
   const dir = makeTempDir();
   const store = new InMemoryFileStore();
@@ -71,6 +72,7 @@ test('a .exe is rejected; a .exe renamed to .png is rejected by its magic bytes'
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+// UPLOAD-02
 test('a real PNG is accepted and stored under a generated name, not the original', () => {
   const dir = makeTempDir();
   const store = new InMemoryFileStore();
@@ -98,6 +100,7 @@ test('a real PNG is accepted and stored under a generated name, not the original
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+// UPLOAD-03
 test('../../etc/passwd.png is stored safely; the display name has no path parts', () => {
   const dir = makeTempDir();
   const store = new InMemoryFileStore();
@@ -121,6 +124,7 @@ test('../../etc/passwd.png is stored safely; the display name has no path parts'
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+// UPLOAD-04
 test('a file over the size limit is rejected', () => {
   const dir = makeTempDir();
   const store = new InMemoryFileStore();
@@ -140,6 +144,7 @@ test('a file over the size limit is rejected', () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+// UPLOAD-05
 test('a non-member of the org cannot upload or download', () => {
   const dir = makeTempDir();
   const store = new InMemoryFileStore();
@@ -169,12 +174,19 @@ test('a non-member of the org cannot upload or download', () => {
   const validLink = uploads.create_download_link(user, uploadResult.file_id);
   assert.ok('url' in validLink, 'Member should get valid link');
   const token = validLink.url.split('/').pop()!;
-  const downloadResult = uploads.download(token);
+  const downloadResult = uploads.download(user, token);
   assert.ok('bytes' in downloadResult, 'Member download should succeed');
+
+  // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: download is now download(user, token) (spec), so the
+  // non-member half of UPLOAD-05 is provable: a valid link that leaks to a non-member is refused.
+  const leaked = uploads.download(nonMember, token);
+  assert.ok('error' in leaked, 'Non-member download with a valid link should fail');
+  assert.strictEqual(leaked.error, 'unauthorized');
   
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+// UPLOAD-06
 test('an expired link is rejected; a link with one changed character is rejected', () => {
   const dir = makeTempDir();
   const store = new InMemoryFileStore();
@@ -196,7 +208,7 @@ test('an expired link is rejected; a link with one changed character is rejected
 
   // Tamper with one character
   const tamperedToken = token.substring(0, token.length - 1) + (token.substring(token.length - 1) === 'A' ? 'B' : 'A');
-  const tamperedResult = uploads.download(tamperedToken);
+  const tamperedResult = uploads.download(user, tamperedToken);
   assert.ok('error' in tamperedResult, 'Tampered link should be rejected');
   assert.strictEqual(tamperedResult.error, 'invalid link');
 
@@ -208,13 +220,14 @@ test('an expired link is rejected; a link with one changed character is rejected
     .digest('hex');
   const expiredToken = Buffer.from(`${expiredPayload}:${expiredSig}`, 'utf8').toString('base64url');
 
-  const expiredResult = uploads.download(expiredToken);
+  const expiredResult = uploads.download(user, expiredToken);
   assert.ok('error' in expiredResult, 'Expired link should be rejected');
   assert.strictEqual(expiredResult.error, 'link expired');
   
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+// UPLOAD-07
 test('after delete_file, the file can no longer be linked or downloaded', () => {
   const dir = makeTempDir();
   const store = new InMemoryFileStore();
@@ -229,6 +242,11 @@ test('after delete_file, the file can no longer be linked or downloaded', () => 
   const uploadResult = uploads.upload(user, 'org1', 'photo.png', pngBytes, 'image/png');
   assert.ok('file_id' in uploadResult, 'Upload should succeed');
 
+  const earlyLink = uploads.create_download_link(user, uploadResult.file_id, 300);
+  assert.ok('url' in earlyLink, 'Link before delete should succeed');
+  const earlyToken = earlyLink.url.split('/').pop()!;
+  assert.ok('bytes' in uploads.download(user, earlyToken), 'Download before delete should succeed');
+
   // Delete the file
   const deleteResult = uploads.delete_file(user, uploadResult.file_id);
   assert.ok('success' in deleteResult, 'Delete should succeed');
@@ -238,10 +256,91 @@ test('after delete_file, the file can no longer be linked or downloaded', () => 
   assert.ok('error' in linkResult, 'Link creation for deleted file should fail');
   assert.strictEqual(linkResult.error, 'not found');
 
-  // Try to download deleted file with a token created before deletion
-  const validLink = uploads.create_download_link(user, uploadResult.file_id, 300);
-  assert.ok('error' in validLink, 'Link creation for deleted file should fail');
-  assert.strictEqual(validLink.error, 'not found');
+  // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: this half used to call create_download_link again, so it
+  // never downloaded anything; it now downloads with a link issued BEFORE the delete, as UPLOAD-07 says.
+  const downloaded = uploads.download(user, earlyToken);
+  assert.ok('error' in downloaded, 'Download of a deleted file should fail');
+  assert.strictEqual(downloaded.error, 'not found');
   
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+/**
+ * UPLOAD-06: with an injected clock, a link works until its expiry and is refused one second after; a token
+ * whose signature has the wrong length, the wrong number of parts or a non-numeric expiry is an ordinary
+ * 'invalid link', never an exception. In: a fixed clock the test advances. Out: assertions only. Why: spec
+ * UPLOAD-06 and its malformed-token rule; timingSafeEqual used to throw on a short signature.
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: a temporary directory.
+ */
+// UPLOAD-06
+test('links expire on the injected clock; malformed tokens are invalid links, not exceptions', () => {
+  const dir = makeTempDir();
+  let nowMs = 1_800_000_000_000;
+  const uploads = new FileUploads({
+    store: new InMemoryFileStore(),
+    storageDir: dir,
+    hmacSecret: 'test-secret',
+    now: () => nowMs,
+  });
+  const user = makeUser('user1', ['org1']);
+  const up = uploads.upload(user, 'org1', 'photo.png', makePNG(), 'image/png');
+  assert.ok('file_id' in up);
+  const link = uploads.create_download_link(user, up.file_id, 60);
+  assert.ok('url' in link);
+  const token = link.url.split('/').pop()!;
+
+  nowMs += 60_000;
+  assert.ok('bytes' in uploads.download(user, token), 'valid at its expiry second');
+  nowMs += 1_000;
+  const late = uploads.download(user, token);
+  assert.ok('error' in late);
+  assert.strictEqual(late.error, 'link expired');
+
+  const enc = (t: string) => Buffer.from(t, 'utf8').toString('base64url');
+  for (const bad of [enc(`${up.file_id}:9999999999:abc`), enc('only:two'), enc(`${up.file_id}:soon:${'0'.repeat(64)}`), '!!!']) {
+    const r = uploads.download(user, bad);
+    assert.ok('error' in r);
+    assert.strictEqual(r.error, 'invalid link');
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+/**
+ * UPLOAD-01: the full signatures from the spec are required: a PNG with only its first 4 bytes, and a GIF
+ * that starts "GIF8" but is neither GIF87a nor GIF89a, are refused; real ones pass. In: byte arrays.
+ * Out: assertions only. Why: the spec's amended 2026-09-26 full-signature rule; the TypeScript build still
+ * checked 4-byte prefixes. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: a temporary directory.
+ */
+// UPLOAD-01
+test('magic bytes use the full signatures', () => {
+  const dir = makeTempDir();
+  const uploads = new FileUploads({ store: new InMemoryFileStore(), storageDir: dir, hmacSecret: 'test-secret' });
+  const user = makeUser('user1', ['org1']);
+  const shortPng = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x00, 0x00, 0x00, 0x00]);
+  assert.deepStrictEqual(uploads.upload(user, 'org1', 'a.png', shortPng, 'image/png'), { error: 'magic bytes mismatch' });
+  const badGif = new Uint8Array(Buffer.from('GIF8xa......', 'latin1'));
+  assert.deepStrictEqual(uploads.upload(user, 'org1', 'a.gif', badGif, 'image/gif'), { error: 'magic bytes mismatch' });
+  assert.ok('file_id' in uploads.upload(user, 'org1', 'a.gif', new Uint8Array(Buffer.from('GIF89a......', 'latin1')), 'image/gif'));
+  assert.ok('file_id' in uploads.upload(user, 'org1', 'a.pdf', makePDF(), 'application/pdf'));
+  assert.ok('file_id' in uploads.upload(user, 'org1', 'a.jpg', makeJPEG(), 'image/jpeg'));
+  assert.ok('file_id' in uploads.upload(user, 'org1', 'a.docx', makeZIP(), 'application/zip'));
+  assert.ok('file_id' in uploads.upload(user, 'org1', 'a.txt', makeText(), 'text/plain'));
+  assert.deepStrictEqual(uploads.upload(user, 'org1', 'b.txt', makeTextWithNull(), 'text/plain'), { error: 'magic bytes mismatch' });
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+/**
+ * UPLOAD-03: a Windows-style traversal name keeps no path parts either. In: "..\\..\\etc\\passwd.png".
+ * Out: the display name is "passwd.png". Why: path.basename on Linux kept backslash paths whole.
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: a temporary directory.
+ */
+// UPLOAD-03
+test('backslash traversal names are reduced to the last part', () => {
+  const dir = makeTempDir();
+  const store = new InMemoryFileStore();
+  const uploads = new FileUploads({ store, storageDir: dir, hmacSecret: 'test-secret' });
+  const r = uploads.upload(makeUser('user1', ['org1']), 'org1', '..\\..\\etc\\passwd.png', makePNG(), 'image/png');
+  assert.ok('file_id' in r);
+  assert.strictEqual(store.get(r.file_id)!.original_name, 'passwd.png');
   fs.rmSync(dir, { recursive: true, force: true });
 });
