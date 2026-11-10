@@ -26,6 +26,7 @@ name or in a comment on the line above it (for example `# EXPORT-01`), so a miss
 | `EXPORT-13` | Deletion cascade order: the user's rows are deleted, 'user_deleted_cascade' is logged, then the audit eraser's erase_subject(user_id) is called last, and nothing is logged for the user after it; deletion_requests.user_id is NULL once completed |
 | `EXPORT-14` | Deletion confirmation: nothing is deleted before confirm; a wrong, reused or expired (over 24h) token is refused; another user's deletion request is 404 for confirm and cancel |
 | `EXPORT-15` | confirm with a wrong, reused or expired token → the same 400 invalid_confirmation_token; confirm or cancel of a cancelled request → 409 deletion_not_pending; of a completed request → 404 not_found |
+| `EXPORT-16` | cancel: a pending (unconfirmed) request is cancelled even after will_delete_at; a confirmed one is cancelled one second before will_delete_at and gets 409 grace_period_over exactly at it and after it, staying confirmed |
 
 ## Contract
 
@@ -99,7 +100,9 @@ ENDPOINTS:
 5. Cancel deletion (within grace period)
    DELETE /compliance/delete/:deletion_id
    Response: { success: true, status: 'cancelled' }
-   After will_delete_at has passed (the deletion is due but not yet run): 409 {error: "grace_period_over"}.
+   A pending request (not yet confirmed) can always be cancelled: nothing is scheduled. A confirmed request
+   can be cancelled while now < will_delete_at; from will_delete_at on (now >= will_delete_at, the deletion is
+   due but not yet run) it is 409 {error: "grace_period_over"} and stays confirmed. Amended 2026-11-10 (Phase B.4: one answer in every language).
    Amended 2026-11-10 (Phase B.3).
 
 6. List export requests (admin only)
@@ -143,4 +146,5 @@ TESTS:
 - **EXPORT-13** Deletion cascade order: the user's rows are deleted, 'user_deleted_cascade' is logged, then the audit eraser's erase_subject(user_id) is called last, and nothing is logged for the user after it; deletion_requests.user_id is NULL once completed
 - **EXPORT-14** Deletion confirmation: nothing is deleted before confirm; a wrong, reused or expired (over 24h) token is refused; another user's deletion request is 404 for confirm and cancel
 - **EXPORT-15** confirm with a wrong, reused or expired token → the same 400 invalid_confirmation_token; confirm or cancel of a cancelled request → 409 deletion_not_pending; of a completed request → 404 not_found
+- **EXPORT-16** cancel: a pending (unconfirmed) request is cancelled even after will_delete_at; a confirmed one is cancelled one second before will_delete_at and gets 409 grace_period_over exactly at it and after it, staying confirmed
 ```

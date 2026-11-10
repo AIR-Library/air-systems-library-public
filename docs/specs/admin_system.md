@@ -68,6 +68,8 @@ DOMAINS:
         Return: {success: true, status: "reset_email_sent"}
 
       action=change_role → require(user_id, new_tier)
+        Order: the gate (owner_only, user_id != current_user_id) runs before the checks, so an owner changing
+        their own role gets cannot_change_own_role even when they are the last owner. Amended 2026-11-10 (Phase B.4: one answer in every language).
         Gate: owner_only, user_id != current_user_id
         Check: new_tier in valid_tiers, user != last_active_owner
         Action: update users.tier, audit_log

@@ -27,6 +27,7 @@ name or in a comment on the line above it (for example `# AUTH-01`), so a missin
 | `AUTH-14` | token_refresh happy path → new token issued |
 | `AUTH-15` | token_refresh banned user → 403 {error: "user_banned"} |
 | `AUTH-16` | login returns a refresh_token that token_refresh accepts; the sessions table holds only its HMAC-SHA256 under AUTH_SECRET_KEY, a verification code is stored only as its HMAC, and the service refuses to start without a 32-byte key |
+| `AUTH-17` | verify_email: a wrong code is 400 code_invalid; after 5 wrong codes the right code is also 400 code_invalid; after 4 wrong codes the right one verifies; a newly sent code works again |
 
 ## Contract
 
@@ -58,6 +59,8 @@ FLOWS TO BUILD (exact sequence — no deviations):
 
   2. verify_email(email, code_or_token)
      Gates: code_valid (not expired, matches), user_unverified (email_verified_at is null)
+     Answers: a wrong code is 400 {error: "code_invalid"}; an expired code is 400 {error: "code_expired"}.
+     Amended 2026-11-10 (Phase B.4: one answer in every language).
      Attempts: 5 wrong codes for one user invalidate that user's current code: further tries, even with the
      right code, get 400 {error: "code_invalid"} until a new code is sent (a 6-digit code must not be guessable
      by retrying). Amended 2026-11-10 (Phase B.3).
@@ -157,4 +160,5 @@ TESTS REQUIRED:
   - **AUTH-14** token_refresh happy path → new token issued
   - **AUTH-15** token_refresh banned user → 403 {error: "user_banned"}
   - **AUTH-16** login returns a refresh_token that token_refresh accepts; the sessions table holds only its HMAC-SHA256 under AUTH_SECRET_KEY, a verification code is stored only as its HMAC, and the service refuses to start without a 32-byte key
+  - **AUTH-17** verify_email: a wrong code is 400 code_invalid; after 5 wrong codes the right code is also 400 code_invalid; after 4 wrong codes the right one verifies; a newly sent code works again
 ```
