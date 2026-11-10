@@ -395,6 +395,12 @@ namespace ComplianceModule
     {
         private static long _sequence;
 
+        /// <summary>Next value of the process-wide sequence that breaks ties between rows written in the same tick
+        /// (insertion order). Static on purpose: services are created per request, so a per-instance counter would
+        /// restart at 1 for every request. Moved into this static helper 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP,
+        /// for code scanning ("static field written by instance method", PR 19). Touches: memory only.</summary>
+        private static long NextSequence() => Interlocked.Increment(ref _sequence);
+
         /// <summary>Adds an audit row for a user, with the acting user and JSON details. Touches: audit_logs.</summary>
         public static void Add(ComplianceDbContext db, Guid userId, Guid? actorId, string action, object details) =>
             db.AuditLogs.Add(new AuditLog
@@ -405,7 +411,7 @@ namespace ComplianceModule
                 Action = action,
                 Details = JsonConvert.SerializeObject(details),
                 Timestamp = DateTime.UtcNow,
-                Sequence = Interlocked.Increment(ref _sequence)
+                Sequence = NextSequence()
             });
     }
 
@@ -426,6 +432,12 @@ namespace ComplianceModule
         public static readonly string[] Reasons = { "user_requested", "gdpr_request", "gdpr_right_to_be_forgotten", "other" };
         public static readonly TimeSpan GracePeriod = TimeSpan.FromDays(30);
         private static long _sequence;
+
+        /// <summary>Next value of the process-wide sequence that breaks ties between rows written in the same tick
+        /// (insertion order). Static on purpose: services are created per request, so a per-instance counter would
+        /// restart at 1 for every request. Moved into this static helper 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP,
+        /// for code scanning ("static field written by instance method", PR 19). Touches: memory only.</summary>
+        private static long NextSequence() => Interlocked.Increment(ref _sequence);
 
         private readonly ComplianceDbContext _db;
         private readonly IUserDataStore _users;
@@ -451,7 +463,7 @@ namespace ComplianceModule
             var export = new ExportRequest
             {
                 Id = Guid.NewGuid(), UserId = userId, RequestedAt = now, Status = "pending", Format = fmt,
-                Sequence = Interlocked.Increment(ref _sequence)
+                Sequence = NextSequence()
             };
             _db.ExportRequests.Add(export);
             Audit.Add(_db, userId, userId, "data_export_requested", new { export_id = export.Id, format = fmt });
@@ -494,7 +506,7 @@ namespace ComplianceModule
             {
                 Id = Guid.NewGuid(), UserId = userId, RequestedAt = now, Status = "pending", Reason = reason,
                 ScheduledFor = now.Add(GracePeriod), ConfirmationTokenHash = SHA256.HashData(Encoding.UTF8.GetBytes(token)),
-                Sequence = Interlocked.Increment(ref _sequence)
+                Sequence = NextSequence()
             };
             _db.DeletionRequests.Add(deletion);
             Audit.Add(_db, userId, userId, "deletion_requested", new { deletion_id = deletion.Id, reason });

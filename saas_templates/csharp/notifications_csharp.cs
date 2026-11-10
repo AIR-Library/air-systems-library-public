@@ -372,6 +372,12 @@ namespace Notifications
         public const int MaxBatchSize = 5000;
         private static long _sequence;
 
+        /// <summary>Next value of the process-wide sequence that breaks ties between rows written in the same tick
+        /// (insertion order). Static on purpose: services are created per request, so a per-instance counter would
+        /// restart at 1 for every request. Moved into this static helper 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP,
+        /// for code scanning ("static field written by instance method", PR 19). Touches: memory only.</summary>
+        private static long NextSequence() => Interlocked.Increment(ref _sequence);
+
         private readonly NotificationDbContext _db;
         private readonly DeliverySignal _signal;
         private readonly UnsubscribeTokens _tokens;
@@ -444,7 +450,7 @@ namespace Notifications
                 VarsUsed = JsonSerializer.Serialize(kept),
                 CreatedAt = now,
                 ScheduledFor = now,
-                Sequence = Interlocked.Increment(ref _sequence)
+                Sequence = NextSequence()
             };
 
             if (selected == null)

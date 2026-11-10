@@ -150,7 +150,7 @@ namespace ComplianceModule.Tests
         {
             // Arrange
             var request = new ExportRequestDto { Format = "json" };
-            var content = new StringContent(JsonConvert.SerializeObject(request), Encoding.UTF8, "application/json");
+            using var content = new StringContent(JsonConvert.SerializeObject(request), Encoding.UTF8, "application/json");
 
             // Act
             var response = await _client.PostAsync("/compliance/export", content);
@@ -171,7 +171,7 @@ namespace ComplianceModule.Tests
         {
             // Test JSON
             var jsonRequest = new ExportRequestDto { Format = "json" };
-            var jsonContent = new StringContent(JsonConvert.SerializeObject(jsonRequest), Encoding.UTF8, "application/json");
+            using var jsonContent = new StringContent(JsonConvert.SerializeObject(jsonRequest), Encoding.UTF8, "application/json");
             var jsonResponse = await _client.PostAsync("/compliance/export", jsonContent);
             jsonResponse.EnsureSuccessStatusCode();
             var jsonResponseString = await jsonResponse.Content.ReadAsStringAsync();
@@ -181,7 +181,7 @@ namespace ComplianceModule.Tests
 
             // Test CSV
             var csvRequest = new ExportRequestDto { Format = "csv" };
-            var csvContent = new StringContent(JsonConvert.SerializeObject(csvRequest), Encoding.UTF8, "application/json");
+            using var csvContent = new StringContent(JsonConvert.SerializeObject(csvRequest), Encoding.UTF8, "application/json");
             var csvResponse = await _client.PostAsync("/compliance/export", csvContent);
             csvResponse.EnsureSuccessStatusCode();
             var csvResponseString = await csvResponse.Content.ReadAsStringAsync();
@@ -195,7 +195,7 @@ namespace ComplianceModule.Tests
         {
             // First request an export
             var exportRequest = new ExportRequestDto { Format = "json" };
-            var exportContent = new StringContent(JsonConvert.SerializeObject(exportRequest), Encoding.UTF8, "application/json");
+            using var exportContent = new StringContent(JsonConvert.SerializeObject(exportRequest), Encoding.UTF8, "application/json");
             var exportResponse = await _client.PostAsync("/compliance/export", exportContent);
             exportResponse.EnsureSuccessStatusCode();
             var exportResponseString = await exportResponse.Content.ReadAsStringAsync();
@@ -217,7 +217,7 @@ namespace ComplianceModule.Tests
         {
             // Arrange
             var request = new DeletionRequestDto { Reason = "gdpr_request" };
-            var content = new StringContent(JsonConvert.SerializeObject(request), Encoding.UTF8, "application/json");
+            using var content = new StringContent(JsonConvert.SerializeObject(request), Encoding.UTF8, "application/json");
 
             // Act
             var response = await _client.PostAsync("/compliance/delete", content);
@@ -243,7 +243,7 @@ namespace ComplianceModule.Tests
         {
             // Request deletion
             var request = new DeletionRequestDto { Reason = "user_requested" };
-            var requestContent = new StringContent(JsonConvert.SerializeObject(request), Encoding.UTF8, "application/json");
+            using var requestContent = new StringContent(JsonConvert.SerializeObject(request), Encoding.UTF8, "application/json");
             var requestResponse = await _client.PostAsync("/compliance/delete", requestContent);
             requestResponse.EnsureSuccessStatusCode();
             var requestResponseString = await requestResponse.Content.ReadAsStringAsync();
@@ -265,7 +265,7 @@ namespace ComplianceModule.Tests
         {
             // Request deletion
             var request = new DeletionRequestDto { Reason = "gdpr_right_to_be_forgotten" };
-            var requestContent = new StringContent(JsonConvert.SerializeObject(request), Encoding.UTF8, "application/json");
+            using var requestContent = new StringContent(JsonConvert.SerializeObject(request), Encoding.UTF8, "application/json");
             var requestResponse = await _client.PostAsync("/compliance/delete", requestContent);
             requestResponse.EnsureSuccessStatusCode();
             var requestResponseString = await requestResponse.Content.ReadAsStringAsync();
@@ -274,7 +274,7 @@ namespace ComplianceModule.Tests
 
             // Attempt to confirm with invalid token
             var confirmRequest = new ConfirmDeletionDto { ConfirmationToken = "invalid_token" };
-            var confirmContent = new StringContent(JsonConvert.SerializeObject(confirmRequest), Encoding.UTF8, "application/json");
+            using var confirmContent = new StringContent(JsonConvert.SerializeObject(confirmRequest), Encoding.UTF8, "application/json");
             var confirmResponse = await _client.PostAsync($"/compliance/delete/{deletionId}/confirm", confirmContent);
             Assert.Equal(HttpStatusCode.BadRequest, confirmResponse.StatusCode); // Or Unauthorized, depending on implementation
 
@@ -321,7 +321,7 @@ namespace ComplianceModule.Tests
         public async Task AnonymousAndNonAdminCallersAreRefused()
         {
             var anonymous = _factory.CreateClient();
-            var content = new StringContent(JsonConvert.SerializeObject(new ExportRequestDto { Format = "json" }), Encoding.UTF8, "application/json");
+            using var content = new StringContent(JsonConvert.SerializeObject(new ExportRequestDto { Format = "json" }), Encoding.UTF8, "application/json");
             Assert.Equal(HttpStatusCode.Unauthorized, (await anonymous.PostAsync("/compliance/export", content)).StatusCode);
             Assert.Equal(HttpStatusCode.Unauthorized, (await anonymous.GetAsync("/admin/compliance/exports")).StatusCode);
             Assert.Equal(HttpStatusCode.Forbidden, (await _client.GetAsync("/admin/compliance/exports")).StatusCode);
@@ -354,8 +354,8 @@ namespace ComplianceModule.Tests
 
             var confirm = await PostAs<DeletionConfirmationResponse>(_client, $"/compliance/delete/{deletion.DeletionId}/confirm", new ConfirmDeletionDto { ConfirmationToken = token });
             Assert.True(confirm.Success);
-            var again = await _client.PostAsync($"/compliance/delete/{deletion.DeletionId}/confirm",
-                new StringContent(JsonConvert.SerializeObject(new ConfirmDeletionDto { ConfirmationToken = token }), Encoding.UTF8, "application/json"));
+            using var againContent = new StringContent(JsonConvert.SerializeObject(new ConfirmDeletionDto { ConfirmationToken = token }), Encoding.UTF8, "application/json");
+            var again = await _client.PostAsync($"/compliance/delete/{deletion.DeletionId}/confirm", againContent);
             Assert.Equal(HttpStatusCode.Conflict, again.StatusCode);
 
             var store = _factory.Services.GetRequiredService<InMemoryUserDataStore>();
@@ -402,7 +402,8 @@ namespace ComplianceModule.Tests
         /// <summary>POSTs a JSON body, requires success and reads the answer. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.</summary>
         private static async Task<T> PostAs<T>(HttpClient client, string url, object body)
         {
-            var response = await client.PostAsync(url, new StringContent(JsonConvert.SerializeObject(body), Encoding.UTF8, "application/json"));
+            using var content = new StringContent(JsonConvert.SerializeObject(body), Encoding.UTF8, "application/json");
+            var response = await client.PostAsync(url, content);
             response.EnsureSuccessStatusCode();
             return JsonConvert.DeserializeObject<T>(await response.Content.ReadAsStringAsync());
         }
@@ -410,7 +411,7 @@ namespace ComplianceModule.Tests
         private async Task CreateTestExportRequest(string format)
         {
             var request = new ExportRequestDto { Format = format };
-            var content = new StringContent(JsonConvert.SerializeObject(request), Encoding.UTF8, "application/json");
+            using var content = new StringContent(JsonConvert.SerializeObject(request), Encoding.UTF8, "application/json");
             await _client.PostAsync("/compliance/export", content);
         }
 
@@ -419,7 +420,7 @@ namespace ComplianceModule.Tests
             // This would require bypassing the API to directly insert for status setup
             // For simplicity, we'll use the API which always creates pending
             var request = new DeletionRequestDto { Reason = reason };
-            var content = new StringContent(JsonConvert.SerializeObject(request), Encoding.UTF8, "application/json");
+            using var content = new StringContent(JsonConvert.SerializeObject(request), Encoding.UTF8, "application/json");
             await _client.PostAsync("/compliance/delete", content);
             
             // To test non-pending statuses, we would need to directly update the DB
