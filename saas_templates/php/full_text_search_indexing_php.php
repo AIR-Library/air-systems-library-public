@@ -20,12 +20,12 @@
  * every non-ASCII letter, ties were broken by newest-first time stamps, and "reindex" answered
  * "enqueued" while doing nothing.
  *
- * Matching: words are lower-cased runs of Unicode letters and digits, minus stop words. A query
- * word matches a document word that equals it (score 1) or starts with it (score 0.5); a
- * document's relevance is the mean over the query words, and every query word must match. A
- * prefix expands to at most MAX_PREFIX_TERMS distinct words (like Elasticsearch's
- * max_expansions). Substring matches inside a word ("ripe" in "stripe") are not supported: an
- * inverted index cannot answer them in bounded time.
+ * Matching (SEARCH-03/09 as amended, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): a word is a maximal run of Unicode
+ * letters and digits (\p{L}, \p{N}), lower-cased with mb_strtolower; there are no stop words (they
+ * were removed before). A query term matches a document word that equals it (score 1) or starts with it
+ * (score 0.5): "stri" finds "stripe", "ripe" does not. A document's relevance is the mean over the query
+ * terms, every term must match (AND), and equal scores keep insertion order. A prefix matches every
+ * indexed word in its range (the old cap of 128 expansions silently dropped documents).
  *
  * Touches: the database (tables search_index, search_terms, search_fields, and a per-connection
  * TEMP table search_hits). No network, no files.
@@ -48,18 +48,11 @@ use Throwable;
  */
 final class SearchEngine
 {
-    /** Common English stop words removed during tokenization. */
-    public const STOP_WORDS = [
-        'a', 'an', 'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
-        'of', 'with', 'by', 'from', 'is', 'are', 'was', 'were', 'be', 'been',
-        'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
-        'could', 'should', 'may', 'might', 'can', 'shall', 'it', 'its', 'this',
-        'that', 'these', 'those', 'i', 'you', 'he', 'she', 'we', 'they', 'me',
-        'him', 'her', 'us', 'them', 'my', 'your', 'his', 'our', 'their',
-    ];
-
-    /** Most distinct words one query prefix expands to. */
-    public const MAX_PREFIX_TERMS = 128;
+    /**
+     * Upper bound appended to a prefix for range scans: byte 0xFF never occurs in UTF-8, so every word
+     * that starts with the prefix sorts below prefix . "\xFF" under SQLite's BINARY collation.
+     */
+    private const RANGE_END = "\xFF";
 
     /** Largest page search() returns. */
     public const MAX_LIMIT = 100;
@@ -70,13 +63,7 @@ final class SearchEngine
     /** Rows per multi-row INSERT. */
     private const INSERT_CHUNK = 200;
 
-    /** UTF-8 for U+10FFFF: sorts after every valid continuation of a prefix. */
-    private const MAX_CHAR = "\u{10FFFF}";
-
     private PDO $db;
-
-    /** @var array<string, true> */
-    private array $stopSet;
 
     /** @var Closure(): string */
     private Closure $clock;
@@ -97,7 +84,6 @@ final class SearchEngine
         $this->db = $db;
         $this->db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
         $this->db->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
-        $this->stopSet = array_fill_keys(self::STOP_WORDS, true);
         $this->clock = $clock ?? static fn (): string => gmdate('Y-m-d\TH:i:s') . sprintf('.%06dZ', (int) ((microtime(true) * 1e6) % 1e6));
     }
 
@@ -247,13 +233,14 @@ SQL);
         $empty = ['results' => [], 'total' => 0, 'has_more' => false] + ($facets ? ['facets' => array_fill_keys(array_values($facets), [])] : []);
 
         if ($types === [] || (trim($query) !== '' && $words === [])) {
-            return $empty; // nothing indexed, or only stop words
+            return $empty; // nothing indexed, or a query with no letters or digits
         }
 
-        // Expand each query word into the indexed words it matches
+        // The first two indexed words each query term matches: none -> no result (AND); exactly the
+        // term itself -> a candidate for the fast path below.
         $expansions = [];
         foreach ($words as $word) {
-            $terms = $this->expand($types, $word);
+            $terms = $this->expand($types, $word, 2);
             if ($terms === []) {
                 return $empty;
             }
@@ -361,22 +348,20 @@ SQL);
     }
 
     /**
-     * Lower-cased distinct words of $text (Unicode letters and digits), stop words removed,
-     * each cut to MAX_TERM_LENGTH characters, in first-seen order.
+     * Lower-cased distinct words of $text: maximal runs of Unicode letters and digits (\p{L}\p{N}),
+     * lower-cased with mb_strtolower (locale-independent), each cut to MAX_TERM_LENGTH characters, in
+     * first-seen order. No stop words.
      *
      * @return list<string>
      *
-     * Why: the old tokenizer dropped every non-ASCII letter. 2026-11-10, session
-     * session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+     * Why: the old tokenizer dropped every non-ASCII letter; SEARCH-03 as amended removes the stop
+     * words (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). Touches nothing.
      */
     public function tokenize(string $text): array
     {
         $parts = preg_split('/[^\p{L}\p{N}]+/u', mb_strtolower($text, 'UTF-8'), -1, PREG_SPLIT_NO_EMPTY) ?: [];
         $out = [];
         foreach ($parts as $word) {
-            if (isset($this->stopSet[$word])) {
-                continue;
-            }
             $out[mb_substr($word, 0, self::MAX_TERM_LENGTH, 'UTF-8')] = true;
         }
         return array_map('strval', array_keys($out));
@@ -387,7 +372,9 @@ SQL);
     /**
      * Fill temp.search_hits (doc, score) with the documents that match every query word and
      * every filter. Score per word: 10 for an exact word, 5 for a prefix; relevance is the sum
-     * over 10 x words. An empty query matches every document of the types with relevance 1.
+     * over 10 x words. An empty query matches every document of the types with relevance 1. Each
+     * term is matched with a range scan [term, term . 0xFF) over the index, so every word that starts
+     * with it counts (no cap on expansions; changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
      *
      * Why: one SQL pass over the inverted index. 2026-11-10, session
      * session_012zDydZCZ4AChqhEZ4oVtaP. Touches the database (TEMP table).
@@ -405,12 +392,10 @@ SQL);
         } else {
             $parts = [];
             foreach ($words as $word) {
-                $terms = $expansions[$word];
-                $termIn = implode(',', array_fill(0, count($terms), '?'));
                 $parts[] = "SELECT doc, MAX(CASE WHEN term = ? THEN 10 ELSE 5 END) AS s FROM search_terms
-                            WHERE document_type IN ($typeIn) AND term IN ($termIn) GROUP BY doc";
+                            WHERE document_type IN ($typeIn) AND term >= ? AND term < ? GROUP BY doc";
                 array_push($params, $word, ...$types);
-                array_push($params, ...$terms);
+                array_push($params, $word, $word . self::RANGE_END);
             }
             $sql = 'SELECT doc, SUM(s) * 1.0 / ' . (10 * count($words)) . ' FROM (' . implode(' UNION ALL ', $parts) . ')
                     GROUP BY doc HAVING COUNT(*) = ' . count($words);
@@ -455,22 +440,23 @@ SQL);
     }
 
     /**
-     * Indexed words of the given types that equal $word or start with it, exact word first,
-     * at most MAX_PREFIX_TERMS, found by seeking the index (no scan of the vocabulary).
+     * Up to $max indexed words of the given types that equal $word or start with it, exact word
+     * first, found by seeking the index (no scan of the vocabulary).
      *
      * @return list<string>
      *
-     * Why: prefix matching ("stri" -> "stripe") from the index. 2026-11-10, session
-     * session_012zDydZCZ4AChqhEZ4oVtaP. Touches the database (read).
+     * Why: prefix matching ("stri" -> "stripe") from the index; search() only needs to know whether a
+     * term matches at all and whether it matches nothing but itself, so it asks for 2 (the cap of 128
+     * that decided which documents matched is gone, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). Touches the database (read).
      */
-    private function expand(array $types, string $word): array
+    private function expand(array $types, string $word, int $max): array
     {
         $next = $this->statement('SELECT MIN(term) FROM search_terms WHERE document_type = ? AND term >= ? AND term < ?');
-        $upper = $word . self::MAX_CHAR;
+        $upper = $word . self::RANGE_END;
         $found = [];
         foreach ($types as $type) {
             $from = $word;
-            while (count($found) < self::MAX_PREFIX_TERMS) {
+            while (count($found) < $max) {
                 $next->execute([$type, $from, $upper]);
                 $term = $next->fetchColumn();
                 if ($term === null || $term === false) {

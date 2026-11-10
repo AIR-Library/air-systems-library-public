@@ -63,6 +63,7 @@ final class PermissionsRBACTest extends TestCase
         return new User((int)$row['id'], $row['username'], $row['tier']);
     }
 
+    // RBAC-01
     public function testRequireOwnerNonOwner(): void
     {
         $user = $this->getUser('admin');
@@ -71,6 +72,7 @@ final class PermissionsRBACTest extends TestCase
         $this->assertEquals('owner_only', $response['error']);
     }
 
+    // RBAC-02
     public function testRequireAdminMember(): void
     {
         $user = $this->getUser('member');
@@ -79,6 +81,7 @@ final class PermissionsRBACTest extends TestCase
         $this->assertEquals('admin_only', $response['error']);
     }
 
+    // RBAC-03
     public function testRequireAuthenticatedPublic(): void
     {
         $response = $this->middleware->requireAuthenticated(fn() => ['ok' => true], null, 'public_signup');
@@ -86,6 +89,7 @@ final class PermissionsRBACTest extends TestCase
         $this->assertEquals('authentication_required', $response['error']);
     }
 
+    // RBAC-04
     public function testCascadeDeleteUser(): void
     {
         $user = $this->getUser('owner');
@@ -99,8 +103,12 @@ final class PermissionsRBACTest extends TestCase
         $stmt = $this->pdo->prepare('SELECT COUNT(*) FROM sessions WHERE user_id = :id');
         $stmt->execute([':id' => $user->id]);
         $this->assertEquals(0, $stmt->fetchColumn());
+        $this->assertEquals(0, $this->pdo->query("SELECT COUNT(*) FROM api_keys WHERE user_id = {$user->id}")->fetchColumn());
+        $this->assertEquals(0, $this->pdo->query("SELECT COUNT(*) FROM files WHERE user_id = {$user->id}")->fetchColumn());
+        $this->assertSame(['sessions' => 1, 'keys' => 1, 'files' => 1], $result['deleted_items']);
     }
 
+    // RBAC-05
     public function testCascadeDeleteDeployment(): void
     {
         $deployId = $this->pdo->query("SELECT id FROM deployments")->fetchColumn();
@@ -110,19 +118,73 @@ final class PermissionsRBACTest extends TestCase
         $stmt = $this->pdo->prepare('SELECT COUNT(*) FROM deployments WHERE id = :id');
         $stmt->execute([':id' => $deployId]);
         $this->assertEquals(0, $stmt->fetchColumn());
+        foreach (['dns_records', 'theme_configs', 'deployment_logs'] as $table) {
+            $this->assertEquals(0, $this->pdo->query("SELECT COUNT(*) FROM $table")->fetchColumn(), "$table emptied");
+        }
     }
 
+    /**
+     * RBAC-06 as amended. Org1 (owner: 'owner'; members 'admin' and 'member') and Org2 (owner 'admin', who is
+     * also an Org1 member). Org2's owner gets 404 deleting Org1, as do a plain member and an anonymous caller;
+     * Org1's owner deletes it: its deployment (and DNS/theme/log rows), org API key, invitations and
+     * memberships go; every user account, session and personal API key stays, and the admin's Org2
+     * membership, Org2 key and Org2 itself are untouched.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: deleteOrganization now takes the caller and the test proves the gate
+     * and what is kept (it only checked that the org row was gone).
+     */
+    // RBAC-06
     public function testCascadeDeleteOrganization(): void
     {
-        $orgId = $this->pdo->query("SELECT id FROM organizations")->fetchColumn();
-        $result = $this->cascade->deleteOrganization((int)$orgId);
-        $this->assertTrue($result['ok']);
+        $orgId = (int)$this->pdo->query("SELECT id FROM organizations WHERE name = 'Org1'")->fetchColumn();
+        $owner = $this->getUser('owner');
+        $admin = $this->getUser('admin');
+        $member = $this->getUser('member');
+        $this->pdo->exec("INSERT INTO organizations (name) VALUES ('Org2')");
+        $org2 = (int)$this->pdo->lastInsertId();
+        $ins = $this->pdo->prepare('INSERT INTO memberships (org_id, user_id, role) VALUES (?, ?, ?)');
+        $ins->execute([$orgId, $owner->id, 'owner']);
+        $ins->execute([$orgId, $admin->id, 'admin']);
+        $ins->execute([$orgId, $member->id, 'member']);
+        $ins->execute([$org2, $admin->id, 'owner']);
+        $key = $this->pdo->prepare('INSERT INTO api_keys (user_id, org_id, key) VALUES (?, ?, ?)');
+        $key->execute([$owner->id, $orgId, 'org1-key']);
+        $key->execute([$admin->id, null, 'admin-personal']);
+        $key->execute([$admin->id, $org2, 'org2-key']);
+        $this->pdo->exec("INSERT INTO sessions (user_id, token) VALUES ({$admin->id}, 'admin-sess')");
+        $inv = $this->pdo->prepare('INSERT INTO invitations (org_id, email, token_hash) VALUES (?, ?, ?)');
+        $inv->execute([$orgId, 'a@example.com', 'h1']);
+        $inv->execute([$orgId, 'b@example.com', 'h2']);
+        $inv->execute([$org2, 'c@example.com', 'h3']);
+        $count = fn(string $sql) => (int)$this->pdo->query($sql)->fetchColumn();
+        $before = $count('SELECT COUNT(*) FROM users');
 
-        $stmt = $this->pdo->prepare('SELECT COUNT(*) FROM organizations WHERE id = :id');
-        $stmt->execute([':id' => $orgId]);
-        $this->assertEquals(0, $stmt->fetchColumn());
+        foreach ([$admin, $member, null] as $who) {
+            $this->assertSame(['error' => 'not_found', 'code' => 404], $this->cascade->deleteOrganization($who, $orgId));
+        }
+        $this->assertSame(['error' => 'not_found', 'code' => 404], $this->cascade->deleteOrganization($owner, 999));
+        $this->assertSame(1, $count("SELECT COUNT(*) FROM organizations WHERE id = $orgId"));
+
+        $result = $this->cascade->deleteOrganization($owner, $orgId);
+        $this->assertTrue($result['ok']);
+        $this->assertSame(['deployments' => 1, 'api_keys' => 1, 'invitations' => 2, 'memberships' => 3], $result['deleted_items']);
+
+        $this->assertSame(0, $count("SELECT COUNT(*) FROM organizations WHERE id = $orgId"));
+        $this->assertSame(0, $count("SELECT COUNT(*) FROM deployments WHERE org_id = $orgId"));
+        $this->assertSame(0, $count('SELECT COUNT(*) FROM dns_records') + $count('SELECT COUNT(*) FROM theme_configs') + $count('SELECT COUNT(*) FROM deployment_logs'));
+        $this->assertSame(0, $count("SELECT COUNT(*) FROM api_keys WHERE org_id = $orgId"));
+        $this->assertSame(0, $count("SELECT COUNT(*) FROM invitations WHERE org_id = $orgId"));
+        $this->assertSame(0, $count("SELECT COUNT(*) FROM memberships WHERE org_id = $orgId"));
+        // Kept: every account, sessions, personal keys, and everything of Org2.
+        $this->assertSame($before, $count('SELECT COUNT(*) FROM users'));
+        $this->assertSame(2, $count('SELECT COUNT(*) FROM sessions'));
+        $this->assertSame(['admin-personal', 'key1', 'org2-key'], $this->pdo->query('SELECT key FROM api_keys ORDER BY key')->fetchAll(PDO::FETCH_COLUMN));
+        $this->assertSame('owner', $this->pdo->query("SELECT role FROM memberships WHERE org_id = $org2 AND user_id = {$admin->id}")->fetchColumn());
+        $this->assertSame(1, $count("SELECT COUNT(*) FROM invitations WHERE org_id = $org2"));
+        $details = json_decode((string)$this->pdo->query("SELECT details FROM audit_logs WHERE endpoint = 'org_deleted_cascade'")->fetchColumn(), true);
+        $this->assertSame(['org_id' => $orgId, 'deleted_items' => $result['deleted_items']], $details);
     }
 
+    // RBAC-07
     public function testCascadeOnErrorRollback(): void
     {
         // Create a trigger that prevents session deletion to force rollback
@@ -154,6 +216,7 @@ final class PermissionsRBACTest extends TestCase
         $this->pdo->exec("DROP TRIGGER prevent_session_delete");
     }
 
+    // RBAC-08
     public function testPermissionAuditLogged(): void
     {
         $user = $this->getUser('member');
@@ -169,6 +232,7 @@ final class PermissionsRBACTest extends TestCase
         $this->assertEquals('FAIL', $log['decision']);
     }
 
+    // RBAC-09
     public function testTierHierarchy(): void
     {
         $owner = $this->getUser('owner');
@@ -190,6 +254,7 @@ final class PermissionsRBACTest extends TestCase
         $this->assertEquals('admin_only', $res['error']);
     }
 
+    // RBAC-10
     public function testPermissionCheckResponseTime(): void
     {
         $user = $this->getUser('admin');

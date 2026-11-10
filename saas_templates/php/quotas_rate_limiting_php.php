@@ -3,16 +3,28 @@
 //   tier fails closed, only served requests count against the monthly quota, months are UTC.
 // Why: the suite failed on CI (it was listed in ci/baseline.json). Reviewed by Claude; fixed by a free model from a continuity handoff, session c6ee9a72 (2026-11-03).
 // Touches: the database, error_log().
+// Changed 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): -1 is the unlimited limit in every quota (QUOTA-13), and
+//   time comes from an injectable clock (rate-limit windows, api_calls timestamps, the current month).
 declare(strict_types=1);
 
 class QuotaRateLimiter
 {
     private PDO $db;
     private ?string $currentMonthOverride = null;
+    /** Limit value that means "unlimited" in every quota (quotas_rate_limiting.md, QUOTA-13). */
+    public const UNLIMITED = -1;
+    /** @var Closure(): int */
+    private Closure $clock;
 
-    public function __construct(PDO $db)
+    /**
+     * Inputs: $db (shared connection), $clock (optional fn(): int unix seconds; default time()).
+     * Why: deterministic tests; the per-second IP window used SQLite's datetime('now') and could straddle a
+     * second boundary. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database connection settings.
+     */
+    public function __construct(PDO $db, ?Closure $clock = null)
     {
         $this->db = $db;
+        $this->clock = $clock ?? static fn(): int => time();
         $this->db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
     }
 
@@ -126,12 +138,13 @@ class QuotaRateLimiter
         return null;
     }
 
+    /** rate_limit_per_user: PASS if fewer than 100 calls in the last 60 s by the clock (QUOTA-05/06; clock 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). */
     private function checkRateLimitPerUser(int $user_id): bool
     {
         $stmt = $this->db->prepare(
-            "SELECT COUNT(*) FROM api_calls WHERE user_id = ? AND timestamp > datetime('now', '-1 minute')"
+            "SELECT COUNT(*) FROM api_calls WHERE user_id = ? AND timestamp > ?"
         );
-        $stmt->execute([$user_id]);
+        $stmt->execute([$user_id, $this->ts(($this->clock)() - 60)]);
         $count = (int)$stmt->fetchColumn();
 
         $this->whyChain('rate_limit_per_user', [
@@ -143,12 +156,13 @@ class QuotaRateLimiter
         return $count < 100;
     }
 
+    /** rate_limit_per_ip: PASS if fewer than 10 calls in the last 1 s by the clock (QUOTA-07/08; clock 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). */
     private function checkRateLimitPerIp(string $ip): bool
     {
         $stmt = $this->db->prepare(
-            "SELECT COUNT(*) FROM api_calls WHERE ip = ? AND timestamp > datetime('now', '-1 second')"
+            "SELECT COUNT(*) FROM api_calls WHERE ip = ? AND timestamp > ?"
         );
-        $stmt->execute([$ip]);
+        $stmt->execute([$ip, $this->ts(($this->clock)() - 1)]);
         $count = (int)$stmt->fetchColumn();
 
         $this->whyChain('rate_limit_per_ip', [
@@ -160,15 +174,16 @@ class QuotaRateLimiter
         return $count < 10;
     }
 
+    /** api_call_quota: PASS if the limit is -1 (unlimited) or usage + 1 <= limit, else the 429 body (QUOTA-01/02/13, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). */
     private function checkApiCallQuota(int $user_id, string $tier): bool|array
     {
         $month = $this->getCurrentMonth();
         $currentUsage = $this->getCurrentApiCallUsage($user_id, $month);
         $limit = $this->getQuotaLimit($tier, 'api_call');
 
-        if ($limit === null) { // unlimited (enterprise)
+        if ($limit === self::UNLIMITED) { // -1 = unlimited (QUOTA-13)
             $passed = true;
-            $limitForDisplay = 'unlimited';
+            $limitForDisplay = $limit;
         } else {
             $passed = ($currentUsage + 1) <= $limit;
             $limitForDisplay = $limit;
@@ -194,14 +209,15 @@ class QuotaRateLimiter
         return true;
     }
 
+    /** storage_quota: PASS if the limit is -1 (unlimited) or stored + incoming <= limit, else the 413 body (QUOTA-03/04/13, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). */
     private function checkStorageQuota(int $user_id, string $tier, int $file_size): bool|array
     {
         $currentStorage = $this->getCurrentStorageUsage($user_id);
         $limit = $this->getQuotaLimit($tier, 'storage');
 
-        if ($limit === null) { // unlimited (enterprise)
+        if ($limit === self::UNLIMITED) { // -1 = unlimited (QUOTA-13)
             $passed = true;
-            $limitForDisplay = 'unlimited';
+            $limitForDisplay = $limit;
         } else {
             $passed = ($currentStorage + $file_size) <= $limit;
             $limitForDisplay = $limit;
@@ -253,12 +269,19 @@ class QuotaRateLimiter
         return true;
     }
 
+    /** Record a served call in api_calls with the clock's UTC time (was SQLite's datetime('now'), 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). Touches: the database. */
     private function logApiCall(int $user_id, string $ip, string $endpoint): void
     {
         $stmt = $this->db->prepare(
-            "INSERT INTO api_calls (user_id, ip, endpoint, timestamp) VALUES (?, ?, ?, datetime('now'))"
+            "INSERT INTO api_calls (user_id, ip, endpoint, timestamp) VALUES (?, ?, ?, ?)"
         );
-        $stmt->execute([$user_id, $ip, $endpoint]);
+        $stmt->execute([$user_id, $ip, $endpoint, $this->ts(($this->clock)())]);
+    }
+
+    /** Format unix seconds as the UTC 'Y-m-d H:i:s' text stored in api_calls.timestamp. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing. */
+    private function ts(int $unix): string
+    {
+        return gmdate('Y-m-d H:i:s', $unix);
     }
 
     private function whyChain(string $gate, array $context): void
@@ -270,7 +293,12 @@ class QuotaRateLimiter
         error_log('why_chain: gate=' . $gate . ', ' . implode(', ', $parts));
     }
 
-    private function getQuotaLimit(string $tier, string $type): ?int
+    /**
+     * Limit for a tier and quota type ('api_call' or 'storage'). Output: the limit, or UNLIMITED (-1).
+     * Throws InvalidArgumentException for an unknown tier (fail closed). Why: QUOTA-13 makes -1 the unlimited
+     * value in every quota (it was null). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+     */
+    private function getQuotaLimit(string $tier, string $type): int
     {
         $limits = [
             'solo' => [
@@ -282,8 +310,8 @@ class QuotaRateLimiter
                 'storage' => 100000000000 // 100 GB
             ],
             'enterprise' => [
-                'api_call' => null,
-                'storage' => null
+                'api_call' => self::UNLIMITED,
+                'storage' => self::UNLIMITED
             ]
         ];
 
@@ -312,9 +340,10 @@ class QuotaRateLimiter
         return (int)$stmt->fetchColumn();
     }
 
+    /** 'Y-m' of the clock (UTC), unless overridden for tests. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
     private function getCurrentMonth(): string
     {
-        return $this->currentMonthOverride ?? (new DateTime('now', new DateTimeZone('UTC')))->format('Y-m');
+        return $this->currentMonthOverride ?? gmdate('Y-m', ($this->clock)());
     }
 
     private function getResetDate(string $month): string

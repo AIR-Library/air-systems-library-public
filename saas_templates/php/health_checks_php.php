@@ -46,6 +46,17 @@ function liveness(): array
     ];
 }
 
+/**
+ * Run every registered check and build the readiness response.
+ *
+ * Inputs: none (reads the in-memory CheckRegistry). Output: {http_status, content_type, body} where body is
+ * the JSON text {status, checks{"<componentId>:<componentType>": [ {componentId, componentType,
+ * observedValue, observedUnit, status, time} ]}}. A critical failure gives 503 "fail"; only non-critical
+ * failures give 200 "warn"; a check past its timeout_ms counts as "fail". Exceptions are reduced to
+ * "fail" and their messages are never written to the output.
+ * Why: health_checks.md HEALTH-01..06; the checks map now uses the spec's key and list shape.
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing outside memory (runs the check callables).
+ */
 function readiness(): array
 {
     $checks = CheckRegistry::get_checks();
@@ -74,7 +85,10 @@ function readiness(): array
             $status = 'fail';
         }
 
-        $results[$check['component_id']] = [
+        // Spec shape: checks{"<componentId>:<componentType>": [ {...} ]} (health_checks.md; 2026-11-10,
+        // session_012zDydZCZ4AChqhEZ4oVtaP). A check's exception message is never copied into the body,
+        // so a connection string in an error cannot leak (HEALTH-06).
+        $results[$check['component_id'] . ':' . $check['component_type']][] = [
             'componentId' => $check['component_id'],
             'componentType' => $check['component_type'],
             'observedValue' => $observedValue,

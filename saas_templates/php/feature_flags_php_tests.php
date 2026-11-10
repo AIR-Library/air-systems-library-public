@@ -37,6 +37,7 @@ function make_client_with_store(FlagStore $store, ?\Closure $clock = null): Feat
     return new FeatureFlagClient($store, $opts);
 }
 
+// FLAG-01
 function test_unknown_flag_returns_default(): void {
     global $failed;
     $client = make_client();
@@ -46,6 +47,7 @@ function test_unknown_flag_returns_default(): void {
     if ($v !== 'fallback') { echo "FAIL test_unknown_flag_returns_default: string value $v != fallback\n"; $failed++; }
 }
 
+// FLAG-02
 function test_string_method_on_boolean_flag_is_type_mismatch(): void {
     global $failed, $T0;
     $clock = fn() => $T0;
@@ -62,6 +64,7 @@ function test_string_method_on_boolean_flag_is_type_mismatch(): void {
     assert_details($d3, 'fallback', 'ERROR', null, 'TYPE_MISMATCH', 'test_string_method_on_boolean_flag_is_type_mismatch_disabled');
 }
 
+// FLAG-03
 function test_disabled_flag_returns_caller_default(): void {
     global $failed, $T0;
     $clock = fn() => $T0;
@@ -80,6 +83,7 @@ function test_disabled_flag_returns_caller_default(): void {
     if ($n2 !== 1) { echo "FAIL test_disabled_flag_returns_caller_default: number disabled $n2 != 1\n"; $failed++; }
 }
 
+// FLAG-04
 function test_matching_rule_and_non_matching_rule(): void {
     global $failed, $T0;
     $clock = fn() => $T0;
@@ -93,6 +97,7 @@ function test_matching_rule_and_non_matching_rule(): void {
     assert_details($d3, false, 'DEFAULT', null, null, 'test_matching_rule_and_non_matching_rule_empty');
 }
 
+// FLAG-05
 function test_rollout_30_percent_deterministic_and_distributed(): void {
     global $failed, $T0;
     $clock = fn() => $T0;
@@ -117,6 +122,7 @@ function test_rollout_30_percent_deterministic_and_distributed(): void {
     assert_details($d26, false, 'DEFAULT', null, null, 'test_rollout_30_percent_deterministic_and_distributed_user26');
 }
 
+// FLAG-06
 function test_user_outside_rollout_falls_through(): void {
     global $failed, $T0;
     $clock = fn() => $T0;
@@ -132,6 +138,7 @@ function test_user_outside_rollout_falls_through(): void {
     assert_details($d4, 'classic', 'DEFAULT', null, null, 'test_user_outside_rollout_falls_through_alice');
 }
 
+// FLAG-07
 function test_corrupt_rules_returns_parse_error(): void {
     global $failed, $T0;
     $bad_cases = [
@@ -164,6 +171,7 @@ function test_corrupt_rules_returns_parse_error(): void {
     if (count($audit) !== 0) { echo "FAIL test_corrupt_rules_returns_parse_error: audit not empty\n"; $failed++; }
 }
 
+// FLAG-08
 function test_set_flag_writes_audit_rows(): void {
     global $failed, $T0, $T1;
     $store = new InMemoryFlagStore();

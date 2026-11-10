@@ -11,8 +11,6 @@ require_once __DIR__ . '/webhooks_php.php';
 
 use Webhooks\Webhooks;
 use function Webhooks\verify_webhook;
-use PDO;
-use RuntimeException;
 
 class WebhooksTest
 {
@@ -66,6 +64,9 @@ class WebhooksTest
         $this->testRotateSecret();
         $this->testDisableAfterFiveFailures();
         $this->testVerifyHelperFunction();
+        $this->testDeliverStatusCodesWithFakeSender();
+        $this->testWebhookIdSameOnEveryRetry();
+        $this->testEventTypeMatchIsExact();
 
         echo "\n--- Results: {$this->passed} passed, {$this->failed} failed ---\n";
         if ($this->failed > 0) {
@@ -73,6 +74,7 @@ class WebhooksTest
         }
     }
 
+    // HOOK-08
     private function testSecretGeneration(): void
     {
         $result = $this->webhooks->createEndpoint('org_secret_gen', 'https://example.com/webhook', ['user.created']);
@@ -82,6 +84,7 @@ class WebhooksTest
         $this->assert(strlen($decoded) >= 24 && strlen($decoded) <= 64, 'Secret decodes to 24-64 bytes');
     }
 
+    // HOOK-01
     private function testSignVerifyRoundtrip(): void
     {
         $secret = 'whsec_' . base64_encode(random_bytes(32));
@@ -101,6 +104,7 @@ class WebhooksTest
         $this->assert($result === true, 'Valid signature verifies');
     }
 
+    // HOOK-02
     private function testChangedBodyFails(): void
     {
         $secret = 'whsec_' . base64_encode(random_bytes(32));
@@ -118,6 +122,7 @@ class WebhooksTest
         $this->assert($result !== true, 'Changed body fails verification');
     }
 
+    // HOOK-02
     private function testChangedTimestampFails(): void
     {
         $secret = 'whsec_' . base64_encode(random_bytes(32));
@@ -135,6 +140,7 @@ class WebhooksTest
         $this->assert($result !== true, 'Changed timestamp fails verification');
     }
 
+    // HOOK-03
     private function testOldTimestampRejected(): void
     {
         $secret = 'whsec_' . base64_encode(random_bytes(32));
@@ -153,6 +159,7 @@ class WebhooksTest
         $this->assertEquals('Timestamp outside tolerance', $result, 'Correct error message');
     }
 
+    // HOOK-04
     private function testMultipleSignatures(): void
     {
         $secret1 = 'whsec_' . base64_encode(random_bytes(32));
@@ -198,6 +205,7 @@ class WebhooksTest
         $this->assert(!empty($result2['id']), 'Allows localhost HTTP');
     }
 
+    // HOOK-06
     private function testSendEvent(): void
     {
         $orgId = 'org_send_event';
@@ -206,12 +214,15 @@ class WebhooksTest
         $this->webhooks->createEndpoint($orgId, 'https://example.com/3', ['user.deleted']); // not subscribed
 
         // Create endpoint for different org - should not receive
-        $this->webhooks->createEndpoint('org_other', 'https://example.com/4', ['user.created']);
+        $other = $this->webhooks->createEndpoint('org_other', 'https://example.com/4', ['user.created']);
 
         $msgId = $this->webhooks->sendEvent($orgId, 'user.created', ['user_id' => 123, 'name' => 'Test']);
 
         $deliveries = $this->db->query("SELECT COUNT(*) FROM webhook_deliveries WHERE message_id = '$msgId'")->fetchColumn();
         $this->assertEquals(2, $deliveries, 'Creates delivery for each subscribed endpoint');
+        $otherStmt = $this->db->prepare('SELECT COUNT(*) FROM webhook_deliveries WHERE endpoint_id = ?');
+        $otherStmt->execute([$other['id']]);
+        $this->assertEquals(0, (int)$otherStmt->fetchColumn(), "Other org's endpoint gets no delivery");
 
         $msg = $this->db->query("SELECT payload FROM webhook_messages WHERE id = '$msgId'")->fetchColumn();
         $this->assertEquals('{"user_id":123,"name":"Test"}', $msg, 'Stores payload correctly');
@@ -328,6 +339,111 @@ class WebhooksTest
         $epCheck = $this->db->query("SELECT active, failure_count FROM webhook_endpoints WHERE id = '{$ep['id']}'")->fetch(PDO::FETCH_ASSOC);
         $this->assertEquals(5, $epCheck['failure_count'], 'Failure count is 5');
         $this->assertEquals(0, $epCheck['active'], 'Endpoint disabled after 5 failures');
+    }
+
+    /**
+     * Build a service on a fresh database with a fixed, settable clock.
+     *
+     * Inputs: &$now (the clock reads it on every call). Output: [Webhooks, PDO].
+     * Why: the HOOK-05/07 tests drive deliver() with a fake sender and a fixed time instead of editing rows
+     * by hand. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: an in-memory SQLite database.
+     */
+    private function freshService(int &$now): array
+    {
+        $db = new PDO('sqlite::memory:');
+        $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $svc = new Webhooks($db, function () use (&$now): int { return $now; });
+        $svc->migrate();
+        return [$svc, $db];
+    }
+
+    /**
+     * HOOK-05: deliver() through a fake sender. 200 and 299 mark success with no retry; 301, 400, 500 and a
+     * sender that throws record a failure and schedule the next attempt 5 s later (RETRY_SCHEDULE[0]).
+     * Why: the older tests only edited delivery rows by hand and never called deliver(). 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: an in-memory SQLite database; no network.
+     */
+    // HOOK-05
+    private function testDeliverStatusCodesWithFakeSender(): void
+    {
+        $now = 1_700_000_000;
+        foreach ([200 => true, 299 => true, 301 => false, 400 => false, 500 => false, -1 => false] as $code => $ok) {
+            [$svc, $db] = $this->freshService($now);
+            $svc->createEndpoint('org_a', 'https://example.com/hook', ['test.event']);
+            $msgId = $svc->sendEvent('org_a', 'test.event', ['n' => 1]);
+            $row = $db->query('SELECT * FROM webhook_deliveries')->fetch(PDO::FETCH_ASSOC);
+            $sender = function (string $url, array $headers, string $body) use ($code): int {
+                if ($code === -1) {
+                    throw new RuntimeException('connection timed out');
+                }
+                return $code;
+            };
+            $res = $svc->deliver($row, $sender);
+            $after = $db->query('SELECT * FROM webhook_deliveries')->fetch(PDO::FETCH_ASSOC);
+            $label = $code === -1 ? 'throwing sender' : "HTTP $code";
+            $this->assertEquals($ok, $res['success'], "$label: success flag");
+            $this->assertEquals($ok ? 1 : 0, (int)$after['success'], "$label: stored success");
+            if ($ok) {
+                $this->assertEquals(null, $after['next_attempt_at'] === null ? null : 'scheduled', "$label: no retry was scheduled");
+                $this->assertEquals($now, (int)$after['delivered_at'], "$label: delivered_at is the clock time");
+            } else {
+                $this->assertEquals(2, (int)$after['attempt'], "$label: attempt incremented");
+                $this->assertEquals($now + Webhooks::RETRY_SCHEDULE[0], (int)$after['next_attempt_at'], "$label: retry in 5 s");
+                $this->assertEquals(null, $after['delivered_at'], "$label: not delivered");
+            }
+        }
+    }
+
+    /**
+     * HOOK-07: the webhook-id header is the message id on the first attempt and on the retry of the same
+     * message, and its signature verifies against the endpoint secret.
+     * Why: the older test only re-read message_id from a row it edited. 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: an in-memory SQLite database; no network.
+     */
+    // HOOK-07
+    private function testWebhookIdSameOnEveryRetry(): void
+    {
+        $now = 1_700_000_000;
+        [$svc, $db] = $this->freshService($now);
+        $ep = $svc->createEndpoint('org_a', 'https://example.com/hook', ['test.event']);
+        $msgId = $svc->sendEvent('org_a', 'test.event', ['n' => 1]);
+        $seen = [];
+        $codes = [500, 200];
+        $sender = function (string $url, array $headers, string $body) use (&$seen, &$codes, $ep, &$now): int {
+            $h = [];
+            foreach ($headers as $line) {
+                [$k, $v] = explode(': ', $line, 2);
+                $h[strtolower($k)] = $v;
+            }
+            $seen[] = $h['webhook-id'];
+            $this->assert(Webhooks::verify($ep['secret'], $h, $body, 300, $now) === true, 'Delivered signature verifies');
+            return array_shift($codes);
+        };
+        $row = $db->query('SELECT * FROM webhook_deliveries')->fetch(PDO::FETCH_ASSOC);
+        $svc->deliver($row, $sender);
+        $now += Webhooks::RETRY_SCHEDULE[0];
+        $pending = $svc->getPendingDeliveries();
+        $this->assertEquals(1, count($pending), 'The failed delivery is due for retry');
+        $res = $svc->deliver($pending[0], $sender);
+        $this->assertEquals(true, $res['success'], 'Retry succeeds');
+        $this->assertEquals([$msgId, $msgId], $seen, 'webhook-id is the message id on both attempts');
+    }
+
+    /**
+     * An event type is matched exactly: "%" and "_" are not wildcards, so "user.%" reaches no
+     * "user.created" endpoint. Why: sendEvent used a LIKE pattern built from the event type.
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: an in-memory SQLite database.
+     */
+    private function testEventTypeMatchIsExact(): void
+    {
+        $now = 1_700_000_000;
+        [$svc, $db] = $this->freshService($now);
+        $svc->createEndpoint('org_a', 'https://example.com/hook', ['user.created']);
+        $svc->sendEvent('org_a', 'user.%', ['n' => 1]);
+        $svc->sendEvent('org_a', 'user_created', ['n' => 2]);
+        $this->assertEquals(0, (int)$db->query('SELECT COUNT(*) FROM webhook_deliveries')->fetchColumn(), 'Wildcard event types match nothing');
+        $svc->sendEvent('org_a', 'user.created', ['n' => 3]);
+        $this->assertEquals(1, (int)$db->query('SELECT COUNT(*) FROM webhook_deliveries')->fetchColumn(), 'Exact event type matches');
     }
 
     private function testVerifyHelperFunction(): void

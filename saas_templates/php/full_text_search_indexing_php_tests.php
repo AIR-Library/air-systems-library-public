@@ -77,6 +77,7 @@ final class FullTextSearchIndexingTest extends TestCase
     }
 
     /** TEST 1: Index user, search finds it */
+    // SEARCH-01
     public function testIndexUserSearchFindsIt(): void
     {
         $engine = $this->makeEngine();
@@ -95,6 +96,7 @@ final class FullTextSearchIndexingTest extends TestCase
     }
 
     /** TEST 2: Index deployment, query works */
+    // SEARCH-02
     public function testIndexDeploymentQueryWorks(): void
     {
         $engine = $this->sharedEngine(2); // the script ran this block on the engine built by the blocks before it
@@ -104,15 +106,43 @@ final class FullTextSearchIndexingTest extends TestCase
     }
 
     /** TEST 3: Partial match: "stri" finds "stripe" */
+    // SEARCH-03
     public function testPartialMatchStriFindsStripe(): void
     {
         $engine = $this->sharedEngine(2); // the script ran this block on the engine built by the blocks before it
         $res = $engine->search('stri', 'deployment');
         $this->assertSame(1, $res['total'], '"stri" finds "stripe" via prefix/partial match');
         $this->assertSame(456, $res['results'][0]['document_id'], 'correct deployment found');
+        // Amended SEARCH-03: a term inside a word is not a prefix (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
+        $this->assertSame(0, $engine->search('ripe', 'deployment')['total'], '"ripe" does not find "stripe"');
+        $this->assertSame(0, $engine->search('tegration', 'deployment')['total'], '"tegration" does not find "integration"');
+    }
+
+    /**
+     * SEARCH-03 word rules: a word is a maximal run of Unicode letters and digits, lower-cased; "café" is
+     * one word; punctuation separates words; a prefix still matches when more than 128 distinct words
+     * share it (the old expansion cap dropped documents). Why: amended spec. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches: in-memory SQLite.
+     */
+    // SEARCH-03
+    public function testWordsAreUnicodeLetterDigitRuns(): void
+    {
+        $engine = $this->makeEngine();
+        $engine->indexDocument('doc', 1, 'Café-Owner: ÉCOLE42 naïve', []);
+        $this->assertSame(1, $engine->search('café', 'doc')['total'], '"café" is one word');
+        $this->assertSame(1, $engine->search('CAF', 'doc')['total'], 'queries are lower-cased too');
+        $this->assertSame(1, $engine->search('école42', 'doc')['total'], 'letters and digits form one word');
+        $this->assertSame(0, $engine->search('42', 'doc')['total'], 'digits inside a word are not a word');
+        $this->assertSame(1, $engine->search('owner', 'doc')['total'], 'punctuation separates words');
+        $this->assertSame(0, $engine->search('caf owner zzz', 'doc')['total'], 'AND: every term must match');
+        for ($i = 0; $i < 200; $i++) {
+            $engine->indexDocument('many', $i, sprintf('pre%03dfix', $i), []);
+        }
+        $this->assertSame(200, $engine->search('pre', 'many', [], [], 100)['total'], 'all 200 words with the prefix match');
     }
 
     /** TEST 4: Filters: tier:team returns only team tier */
+    // SEARCH-04
     public function testFiltersTierTeamReturnsOnlyTeamTier(): void
     {
         $engine = $this->sharedEngine(3); // the script ran this block on the engine built by the blocks before it
@@ -126,6 +156,7 @@ final class FullTextSearchIndexingTest extends TestCase
     }
 
     /** TEST 5: Facets: shows count per status */
+    // SEARCH-05
     public function testFacetsShowCountPerStatus(): void
     {
         $engine = $this->sharedEngine(4); // the script ran this block on the engine built by the blocks before it
@@ -142,6 +173,7 @@ final class FullTextSearchIndexingTest extends TestCase
     }
 
     /** TEST 6: Unindex: document no longer found after delete */
+    // SEARCH-06
     public function testUnindexDocumentNoLongerFound(): void
     {
         $engine = $this->sharedEngine(4); // the script ran this block on the engine built by the blocks before it
@@ -153,6 +185,7 @@ final class FullTextSearchIndexingTest extends TestCase
     }
 
     /** TEST 7: Real-time: index updated within 100ms of create */
+    // SEARCH-07
     public function testRealTimeIndexUpdatedWithin100ms(): void
     {
         $engine = $this->sharedEngine(4); // the script ran this block on the engine built by the blocks before it
@@ -170,6 +203,7 @@ final class FullTextSearchIndexingTest extends TestCase
     }
 
     /** TEST 8: Performance: 1M documents, search returns < 200ms */
+    // SEARCH-08
     public function testPerformanceOneMillionDocumentsSearchUnder200ms(): void
     {
         $perfEngine = $this->makeEngine();
@@ -205,6 +239,7 @@ final class FullTextSearchIndexingTest extends TestCase
     }
 
     /** TEST 9: Relevance: exact match ranks higher than partial */
+    // SEARCH-09
     public function testRelevanceExactMatchRanksHigherThanPartial(): void
     {
         $relEngine = $this->makeEngine();
@@ -218,6 +253,17 @@ final class FullTextSearchIndexingTest extends TestCase
             $res['results'][0]['relevance'] > $res['results'][1]['relevance'],
             'exact match relevance > partial match relevance'
         );
+        // Amended SEARCH-09: the exact word wins even when the prefix document was indexed first, and
+        // equal scores keep insertion order (not id order) (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
+        $e2 = $this->makeEngine();
+        $e2->indexDocument('user', 50, 'exactly prefix first', []);
+        $e2->indexDocument('user', 40, 'exact second', []);
+        $e2->indexDocument('user', 30, 'exact third', []);
+        $e2->indexDocument('user', 20, 'exactness prefix fourth', []);
+        $order = array_column($e2->search('exact', 'user')['results'], 'document_id');
+        $this->assertSame([40, 30, 50, 20], $order, 'exact words first, then prefixes, each in insertion order');
+        $order = array_column($e2->search('exact', 'user', [], ['status'])['results'], 'document_id');
+        $this->assertSame([40, 30, 50, 20], $order, 'same order on the general path (facets requested)');
     }
 
     /** TEST 10: Multi-word query (AND semantics) */
@@ -316,13 +362,17 @@ final class FullTextSearchIndexingTest extends TestCase
         $this->assertTrue($res2['has_more'] === false, 'has_more is false for last page');
     }
 
-    /** TEST 14: Stop words are removed */
+    /**
+     * TEST 14: there are no stop words.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: it asserted that "the" found nothing (stop words removed); the amended
+     * spec has no stop words, so "the" is an ordinary word.
+     */
     public function testStopWordsAreRemoved(): void
     {
         $swEngine = $this->makeEngine();
         $swEngine->indexDocument('user', 1, 'the quick brown fox', ['tier' => 'team', 'status' => 'active']);
         $res = $swEngine->search('the', 'user');
-        $this->assertSame(0, $res['total'], 'stop word "the" alone returns 0 results');
+        $this->assertSame(1, $res['total'], '"the" is an ordinary word (no stop words)');
         $res = $swEngine->search('quick', 'user');
         $this->assertSame(1, $res['total'], 'non-stop word "quick" returns 1 result');
     }
