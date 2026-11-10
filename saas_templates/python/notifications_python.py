@@ -361,6 +361,20 @@ class NotificationService:
         return {"status": 200, "body": {"success": True, "channel": channel, "unsubscribed": True}}
 
     # ---------- Notification Sending ----------
+    def _held_by_quiet_hours(self, pref: Dict[str, Any], channel: Optional[str], template_key: str) -> bool:
+        """Whether quiet hours hold this message: only email and SMS are held; an in-app message is stored at once
+        (it interrupts no one). The channel is the requested one, else the template's first enabled default; when
+        that cannot be told (no template, no enabled channel) the message is held as before, and the later steps
+        give their usual answer. In: preferences, the requested channel, the template key. Out: bool.
+        Why: NOTIF-05 as amended in Phase B.3 (spec notifications.md, 2026-11-10). 2026-11-10,
+        session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite (reads the template)."""
+        held_channel = channel
+        if not held_channel:
+            tmpl = self._get_template(template_key)
+            if tmpl is not None:
+                held_channel, _reason = self._skip_reason(pref, None, tmpl)
+        return held_channel != "in_app"
+
     def _skip_reason(self, pref: Dict[str, Any], channel: Optional[str], tmpl: sqlite3.Row) -> Tuple[Optional[str], Optional[str]]:
         """Pick the channel or the reason to skip. Out: (channel, None) or (None, "do_not_disturb" |
         "channel_disabled" | "no_enabled_channel"). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: shared by the
@@ -427,7 +441,10 @@ class NotificationService:
         quiet_hours_end) and sent later by deliver_due(); nothing is held in memory.
         [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] NOTIF-05/12 as amended: quiet hours and the clock use the
         injected clock, queued rows keep scheduled_at (they were dropped) and the channel (it was stored as
-        "queued"), and future sends are honoured. Touches: SQLite, the senders."""
+        "queued"), and future sends are honoured. Touches: SQLite, the senders.
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.3 (NOTIF-05): quiet hours are [start, end), so a
+        message sent exactly at quiet_hours_end goes out at once, and they hold email and SMS only: an in-app
+        message is stored at once (see _held_by_quiet_hours)."""
         vars = vars or {}
         now = self.clock()
         pref = self.get_user_preferences(user_id)
@@ -440,7 +457,8 @@ class NotificationService:
         # Scheduled for later, or quiet hours: queue for deliver_due
         due = _parse_iso(scheduled_at) if scheduled_at else None
         if due is None and _in_quiet_hours(pref["quiet_hours_start"], pref["quiet_hours_end"], now.astimezone(timezone.utc).time()):
-            due = _quiet_hours_end_after(now, pref["quiet_hours_end"])
+            if self._held_by_quiet_hours(pref, channel, template_key):
+                due = _quiet_hours_end_after(now, pref["quiet_hours_end"])
         if due is not None and due > now:
             if not self._get_template(template_key):
                 return {"success": False, "error": "template_not_found"}
@@ -479,7 +497,9 @@ class NotificationService:
         4. the final write is UPDATE ... WHERE id=? AND status='sending' AND claimed_at=<this claim>.
         Why: NOTIF-12 (spec amended 2026-11-10). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
         Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: step 3's quiet-hours re-queue (NOTIF-05, Phase B.2;
-        a due message used to be sent inside quiet hours). Touches: SQLite (notification_logs), the senders."""
+        a due message used to be sent inside quiet hours). Phase B.3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP):
+        the re-queue applies to email and SMS only; an in-app message is stored at once.
+        Touches: SQLite (notification_logs), the senders."""
         now = now or self.clock()
         now_s = _iso(now)
         counts = {"requeued": 0, "sent": 0, "skipped": 0, "failed": 0}
@@ -509,8 +529,8 @@ class NotificationService:
                 channel, reason = self._skip_reason(pref, row["channel"], tmpl)
                 if reason:
                     status, channel, error = "skipped", row["channel"], reason
-                elif _in_quiet_hours(pref["quiet_hours_start"], pref["quiet_hours_end"],
-                                     now.astimezone(timezone.utc).time()):
+                elif channel != "in_app" and _in_quiet_hours(pref["quiet_hours_start"], pref["quiet_hours_end"],
+                                                             now.astimezone(timezone.utc).time()):
                     self.conn.execute(
                         "UPDATE notification_logs SET status = 'queued', claimed_at = NULL, scheduled_at = ? "
                         "WHERE id = ? AND status = 'sending' AND claimed_at = ?",

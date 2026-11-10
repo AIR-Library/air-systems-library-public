@@ -78,6 +78,8 @@ class AuthSystem:
         OAuth provider client that exchanges the one-time code for the verified profile {id, email,
         email_verified}; the default now refuses (it invented a user for any code). clock() returns the aware UTC
         now (default the wall clock), so state expiry can be tested.
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.3: email_code_max_attempts = 5 wrong verify_email
+        codes invalidate the current code (auth_system.md flow 2, "Attempts").
         Touches: SQLite (creates tables); network only through the injected sender/oauth_profile."""
         self._secret_key = _load_secret_key(secret_key)
         self.email_sender = email_sender or (lambda email, code: None)
@@ -86,6 +88,7 @@ class AuthSystem:
         # Exchanges a provider's one-time code for the user's verified profile: pass a real provider client.
         self.oauth_profile = oauth_profile or _unconfigured_oauth_client
         self.mfa_max_attempts = 5
+        self.email_code_max_attempts = 5
         self.jwt_secret = jwt_secret or secrets.token_urlsafe(32)
         self.bcrypt_rounds = bcrypt_rounds
         self.access_token_expires_minutes = access_token_expires_minutes
@@ -409,7 +412,12 @@ class AuthSystem:
         compared in constant time in Python (docs/specs/README.md); it was matched with "code = ?" in SQL.
         [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2 (AUTH-16): the supplied code's HMAC-SHA256 is
         compared with the stored code_hash. Touches: SQLite (users, verification_codes, audit_log).
-        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: each stored or compared secret is now HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256)."""
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: each stored or compared secret is now HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.3 (auth_system.md flow 2, "Attempts"): each wrong code
+        adds one to the attempts of the user's current (unexpired) email codes; a code with 5 wrong attempts is
+        invalidated, and every further try, the right code included, answers {error: "code_invalid"} until a new
+        code is stored (a 6-digit code must not be guessable by retrying). A wrong code before that still answers
+        code_expired, as before."""
         decision_points = []
         cursor = self.db.cursor()
         cursor.execute("SELECT id, email_verified_at FROM users WHERE email = ?", (email,))
@@ -423,17 +431,24 @@ class AuthSystem:
             return {"error": "email_already_verified"}
         decision_points.append("user_unverified")
         cursor.execute(
-            """SELECT id, code_hash FROM verification_codes
+            """SELECT id, code_hash, attempts FROM verification_codes
                WHERE user_id = ? AND type = 'email' AND expires_at > ? ORDER BY id""",
             (user_id, self._now_iso())
         )
+        current = cursor.fetchall()
+        live = [row for row in current if (row[2] or 0) < self.email_code_max_attempts]
         supplied = self._hash_secret(code_or_token if isinstance(code_or_token, str) else "").encode("utf-8")
         code_record = None
-        for candidate in cursor.fetchall():
+        for candidate in live:
             if hmac.compare_digest(str(candidate[1]).encode("utf-8"), supplied):
                 code_record = candidate
         if not code_record:
             self._log_why_chain("verify_email", decision_points + ["code_valid:failed"])
+            if current and not live:
+                return {"error": "code_invalid"}
+            for row in live:
+                cursor.execute("UPDATE verification_codes SET attempts = attempts + 1 WHERE id = ?", (row[0],))
+            self.db.commit()
             return {"error": "code_expired"}
         decision_points.append("code_valid")
         now_iso = self._now_iso()

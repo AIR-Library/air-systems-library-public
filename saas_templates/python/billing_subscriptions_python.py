@@ -265,6 +265,14 @@ class BillingSystem:
         }
 
     def handle_stripe_webhook(self, payload: str, sig_header: str) -> Dict[str, Any]:
+        """Verify Stripe's signature, then record and apply the event once (BILL-06..10).
+
+        In: the raw payload and the Stripe-Signature header. Out: {received: true}, or {error, message} for a
+        refusal; a bad signature is {error: "invalid_signature", status: 400, message}.
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.3 (BILL-09 as amended): a bad signature answers HTTP
+        400, Stripe's documented answer and the same as stripe_webhook_entitlements (it was 403); the answer now
+        carries that status. Touches: STRIPE_WEBHOOK_SECRET (environment), the Stripe SDK's signature check, the
+        database (events, invoices, subscriptions), the audit log."""
         webhook_secret = os.getenv("STRIPE_WEBHOOK_SECRET", "")
         if not webhook_secret:
             return {"error": "missing_webhook_secret", "message": "Webhook secret not configured."}
@@ -274,7 +282,7 @@ class BillingSystem:
                 payload, sig_header, webhook_secret
             )
         except SignatureVerificationError:
-            return {"error": "invalid_signature", "message": "Invalid signature."}
+            return {"error": "invalid_signature", "status": 400, "message": "Invalid signature."}
         except Exception as e:
             return {"error": "invalid_payload", "message": str(e)}
 

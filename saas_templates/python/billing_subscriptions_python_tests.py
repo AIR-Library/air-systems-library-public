@@ -267,12 +267,19 @@ class TestBillingSystem(unittest.TestCase):
 
     # BILL-09
     def test_webhook_signature_invalid(self):
+        """A bad signature is 400 invalid_signature (BILL-09 as amended in Phase B.3: it was 403) and records no
+        event. In: the test fixtures and the mocked Stripe SDK. Out: assertions. Why: BILL-09.
+        Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: asserts the 400 status and that nothing is stored.
+        Touches: in-memory SQLite only, the mocked Stripe SDK."""
         payload = "{}"
         sig_header = "invalid"
         self.mock_stripe.Webhook.construct_event.side_effect = stripe.SignatureVerificationError("Invalid signature", sig_header)
         resp = self.bs.handle_stripe_webhook(payload, sig_header)
         self.assertIn("error", resp)
         self.assertEqual(resp["error"], "invalid_signature")
+        self.assertEqual(resp["status"], 400)
+        self.assertNotIn("received", resp)
+        self.assertIsNone(self.bs.db.fetchone("SELECT 1 FROM events"))
 
     # BILL-10
     def test_webhook_response_time(self):
