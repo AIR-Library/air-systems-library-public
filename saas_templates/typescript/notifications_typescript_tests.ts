@@ -10,6 +10,8 @@ describe('NotificationService', () => {
   let service: NotificationService;
   let mockEmailTransport: nodemailer.Transporter;
   let mockSmsClient: Twilio;
+  /** The retry waits the shared service asked for, in ms (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, Phase B.2 NOTIF-08). */
+  const sleeps: number[] = [];
 
   beforeAll(async () => {
     // Mock email transport
@@ -23,7 +25,12 @@ describe('NotificationService', () => {
       },
     } as any;
     // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the service now requires an unsubscribe secret (NOTIF-11).
-    service = new NotificationService(':memory:', mockEmailTransport, mockSmsClient, { unsubscribeSecret: SECRET });
+    // Phase B.2 the same day: retries wait 1 s / 2 s / 4 s now, so the shared service records its waits instead of
+    // sleeping (NOTIF-08 asserts them).
+    service = new NotificationService(':memory:', mockEmailTransport, mockSmsClient, {
+      unsubscribeSecret: SECRET,
+      sleep: async (ms: number) => { sleeps.push(ms); },
+    });
     await service.init();
   });
 
@@ -159,6 +166,7 @@ describe('NotificationService', () => {
     // The transport mock is shared by the whole file, so its call count already includes the earlier tests' 1,000+
     // sends; count only this test's attempts (2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP).
     sendMailMock.mockClear();
+    sleeps.length = 0;
     sendMailMock.mockRejectedValueOnce(new Error('SMTP error'));
     sendMailMock.mockRejectedValueOnce(new Error('SMTP error'));
     sendMailMock.mockResolvedValueOnce({});
@@ -171,6 +179,133 @@ describe('NotificationService', () => {
     });
     expect(res.status).toBe('sent');
     expect(sendMailMock).toHaveBeenCalledTimes(3);
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 NOTIF-08): the waits before the two retries.
+    expect(sleeps).toEqual([1000, 2000]);
+  });
+
+  /**
+   * NOTIF-08 (Phase B.2 wording): a failed email is retried at most 3 times after the first attempt (4 attempts,
+   * waiting 1 s, 2 s and 4 s); three failures then a success is 'sent'; a 4th failure marks it 'failed' and nothing
+   * is tried a 5th time. In: a service with a recording sleep and a scripted transport. Out: assertions only.
+   * Why: NOTIF-08 amendment 2026-11-10 (it gave up after 3 attempts). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * Touches: in-memory SQLite.
+   */
+  // NOTIF-08
+  test('Retry: at most 3 retries (4 attempts, 1 s / 2 s / 4 s); a 4th failure marks it failed', async () => {
+    const waits: number[] = [];
+    const sendMail = jest.fn(async (_mail: any): Promise<any> => ({}));
+    const svc = new NotificationService(':memory:', { sendMail } as any, mockSmsClient, {
+      unsubscribeSecret: SECRET,
+      sleep: async (ms: number) => { waits.push(ms); },
+    });
+    await svc.init();
+    try {
+      const send = () => svc.sendSingle({ user_id: 71, template_key: 'welcome_email', channel: 'email', vars: { app_name: 'R' }, scheduled_at: null });
+      for (let i = 0; i < 3; i++) sendMail.mockRejectedValueOnce(new Error('SMTP error'));
+      const recovered = await send();
+      expect(recovered.status).toBe('sent');
+      expect(sendMail).toHaveBeenCalledTimes(4);
+      expect(waits).toEqual([1000, 2000, 4000]);
+
+      sendMail.mockClear();
+      waits.length = 0;
+      for (let i = 0; i < 5; i++) sendMail.mockRejectedValueOnce(new Error('SMTP down'));
+      const gaveUp = await send();
+      expect(gaveUp.status).toBe('failed');
+      expect(sendMail).toHaveBeenCalledTimes(4);
+      expect(waits).toEqual([1000, 2000, 4000]);
+      const log = await svc.track({ message_id: gaveUp.message_id, status: 'failed' });
+      expect(log).toMatchObject({ status: 'failed', error: 'SMTP down' });
+    } finally {
+      await svc.close();
+    }
+  });
+
+  /**
+   * NOTIF-07 (Phase B.2 wording): GET /notifications/open/:message_id (handleOpen) sets opened_at and status 'opened'
+   * the first time; a second call answers 204 and changes nothing (opened_at stays the first time); an unknown id also
+   * answers 204. In: a service on a pinned clock. Out: assertions only. Why: NOTIF-07 amendment 2026-11-10 (there was
+   * no open route and a second open moved opened_at). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * Touches: in-memory SQLite.
+   */
+  // NOTIF-07
+  test('Open route: sets opened_at and status opened once, 204 either way', async () => {
+    let clock = new Date('2026-03-01T10:00:00.000Z');
+    const svc = new NotificationService(':memory:', { sendMail: jest.fn(async () => ({})) } as any, mockSmsClient, {
+      now: () => clock, unsubscribeSecret: SECRET,
+    });
+    await svc.init();
+    try {
+      const res = await svc.sendSingle({ user_id: 61, template_key: 'welcome_email', channel: 'email', vars: { app_name: 'O' }, scheduled_at: null });
+      expect(res.status).toBe('sent');
+      clock = new Date('2026-03-01T10:05:00.000Z');
+      expect(await svc.handleOpen(res.message_id)).toEqual({ http_status: 204 });
+      const first = await svc.track({ message_id: res.message_id, status: 'sent' });
+      expect(first).toMatchObject({ status: 'opened', opened_at: '2026-03-01T10:05:00.000Z' });
+
+      clock = new Date('2026-03-01T11:00:00.000Z');
+      expect(await svc.handleOpen(res.message_id)).toEqual({ http_status: 204 });
+      expect(await svc.track({ message_id: res.message_id, status: 'sent' })).toEqual(first);
+
+      expect(await svc.handleOpen('no-such-message')).toEqual({ http_status: 204 });
+    } finally {
+      await svc.close();
+    }
+  });
+
+  /**
+   * NOTIF-05 (Phase B.2 wording): quiet hours are HH:MM in UTC and may cross midnight. With 22:00-08:00 a send at
+   * 21:59 goes out, a send at 02:30 is queued with scheduled_at = 08:00 the same morning, and with 12:00-13:00 (not
+   * crossing) a send at 12:30 is queued for 13:00. deliver_due step 3: a message scheduled for 23:30 is due inside the
+   * window, so deliverDue puts it back to 'queued' with scheduled_at = 08:00 the next day (claim released, nothing
+   * sent), and sends it once that moment comes.
+   * In: a service on a pinned clock. Out: assertions only. Why: NOTIF-05 amendment 2026-11-10 (deliver_due sent a due
+   * message inside quiet hours). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite.
+   */
+  // NOTIF-05
+  test('Quiet hours: UTC HH:MM, across midnight; deliverDue re-queues a due message inside the window', async () => {
+    let clock = new Date('2026-04-10T21:59:00.000Z');
+    const sendMail = jest.fn(async (_mail: any) => ({}));
+    const svc = new NotificationService(':memory:', { sendMail } as any, mockSmsClient, { now: () => clock, unsubscribeSecret: SECRET });
+    await svc.init();
+    const send = (user_id: number, scheduled_at: string | null = null) =>
+      svc.sendSingle({ user_id, template_key: 'welcome_email', channel: 'email', vars: { app_name: 'Q' }, scheduled_at });
+    const row = (id: string) => svc.track({ message_id: id, status: 'queued' });
+    try {
+      await svc.updateUserPreferences(51, { quiet_hours_start: '22:00', quiet_hours_end: '08:00' });
+      await svc.updateUserPreferences(52, { quiet_hours_start: '12:00', quiet_hours_end: '13:00' });
+
+      expect((await send(51)).status).toBe('sent');                 // 21:59, just before the window
+      expect(sendMail).toHaveBeenCalledTimes(1);
+
+      const scheduled = await send(51, '2026-04-10T23:30:00.000Z'); // due inside the window
+      expect(scheduled.status).toBe('queued');
+
+      clock = new Date('2026-04-11T02:30:00.000Z');
+      const night = await send(51);
+      expect(night.status).toBe('queued');
+      expect((await row(night.message_id))?.scheduled_at).toBe('2026-04-11T08:00:00.000Z');
+
+      clock = new Date('2026-04-11T12:30:00.000Z');
+      const noon = await send(52);
+      expect(noon.status).toBe('queued');
+      expect((await row(noon.message_id))?.scheduled_at).toBe('2026-04-11T13:00:00.000Z');
+      expect(sendMail).toHaveBeenCalledTimes(1);
+
+      // deliver_due step 3 at 23:30 on the 10th: due, but inside quiet hours.
+      clock = new Date('2026-04-10T23:30:00.000Z');
+      expect(await svc.deliverDue()).toEqual({ delivered: 0, failed: 0, skipped: 0, message_ids: [] });
+      expect(await row(scheduled.message_id)).toMatchObject({ status: 'queued', scheduled_at: '2026-04-11T08:00:00.000Z', claimed_at: null });
+      expect(sendMail).toHaveBeenCalledTimes(1);
+
+      clock = new Date('2026-04-11T08:01:00.000Z');
+      const out = await svc.deliverDue();
+      expect(out.delivered).toBe(2);
+      expect(out.message_ids).toEqual([scheduled.message_id, night.message_id]);
+      expect(sendMail).toHaveBeenCalledTimes(3);
+    } finally {
+      await svc.close();
+    }
   });
 
   // NOTIF-09

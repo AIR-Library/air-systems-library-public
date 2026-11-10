@@ -54,8 +54,15 @@ export interface WhyChainEntry {
   timestamp: string;
 }
 
+/**
+ * The feature gate's answer. A refusal is HTTP 403 with the body { error: "feature_not_available_in_tier", tier,
+ * minimum_tier, upgrade_url } (the same name in every language); `status` carries the 403 for the route.
+ * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 quotas amendment): the refusal had no status.
+ */
 export interface FeatureGateResult {
   pass: boolean;
+  /** 403 on a refusal; absent when the gate passes. */
+  status?: 403;
   error?: {
     error: string;
     tier: string;
@@ -321,6 +328,13 @@ export class InMemoryQuotaService implements QuotaService {
     };
   }
 
+  /**
+   * The feature gate: may a user on `tier` use `feature`? In: user id, tier, feature name. Out: { pass: true }, or
+   * { pass: false, status: 403, error: { error: "feature_not_available_in_tier", tier, minimum_tier, upgrade_url } }.
+   * A feature with no gate passes. Logs a why-chain entry for a gated feature.
+   * Why: QUOTA feature-gate rows; 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 quotas amendment): the
+   * refusal now carries its 403. Touches: memory (the why-chain log).
+   */
   async checkFeatureGate(userId: string, tier: Tier, feature: string): Promise<FeatureGateResult> {
     const allowedTiers = FEATURE_GATES[feature];
 
@@ -343,6 +357,7 @@ export class InMemoryQuotaService implements QuotaService {
     const minimumTier = allowedTiers[0];
     return {
       pass: false,
+      status: 403,
       error: {
         error: "feature_not_available_in_tier",
         tier,

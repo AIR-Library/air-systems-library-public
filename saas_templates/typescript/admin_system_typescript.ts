@@ -13,7 +13,18 @@ import {
 // Types
 // ---------------------------------------------------------------------------
 
-export type Tier = 'free' | 'basic' | 'pro' | 'enterprise';
+/**
+ * Two different things share the word "tier" (admin spec TIERS, Phase B.2, 2026-11-10,
+ * session_012zDydZCZ4AChqhEZ4oVtaP; they were mixed in one list, free/basic/pro/enterprise, with 'enterprise' meaning
+ * owner and 'pro' meaning admin):
+ * - StaffRole is users.tier: who a staff member is (create, change_role, the last-owner rules, the gates);
+ * - PlanTier is a customer's or deployment's tier: what they pay for (change_plan, create_deployment, prices).
+ * A plan value where a role is expected, or the reverse, is 400 invalid_tier.
+ */
+export type StaffRole = 'owner' | 'admin' | 'user';
+export type PlanTier = 'solo' | 'team' | 'enterprise';
+/** The plan tier (kept under its old name for callers that import Tier). */
+export type Tier = PlanTier;
 export type UserStatus = 'active' | 'suspended';
 export type CustomerStatus = 'active' | 'suspended' | 'churned';
 export type DeploymentStatus = 'draft' | 'live' | 'suspended' | 'archived';
@@ -24,7 +35,7 @@ export interface User {
   id: number;
   email: string;
   name: string;
-  tier: Tier;
+  tier: StaffRole;
   status: UserStatus;
   created_at: string;
 }
@@ -106,7 +117,7 @@ export interface SafetyFlags {
  */
 export interface AdminContext {
   userId: number;
-  tier?: Tier;
+  tier?: string;
   csrfToken: string;
   safetyFlags: SafetyFlags;
 }
@@ -152,14 +163,39 @@ export class AdminError extends Error {
 // ---------------------------------------------------------------------------
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const VALID_TIERS: Tier[] = ['free', 'basic', 'pro', 'enterprise'];
+/** users.tier values (staff roles) and customer / deployment tiers (plans). Phase B.2, 2026-11-10. */
+const STAFF_ROLES: StaffRole[] = ['owner', 'admin', 'user'];
+const PLAN_TIERS: PlanTier[] = ['solo', 'team', 'enterprise'];
 
 function isValidEmail(email: string): boolean {
   return EMAIL_RE.test(email);
 }
 
-function isValidTier(tier: string): tier is Tier {
-  return VALID_TIERS.includes(tier as Tier);
+/**
+ * Whether a value is a staff role (users.tier). In: the value. Out: true for owner / admin / user.
+ * Why: admin spec TIERS (Phase B.2): roles and plans are separate lists. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+ * Touches nothing.
+ */
+function isStaffRole(value: unknown): value is StaffRole {
+  return typeof value === 'string' && (STAFF_ROLES as string[]).includes(value);
+}
+
+/**
+ * Whether a value is a plan tier (customers.tier, deployments.tier). In: the value. Out: true for solo / team /
+ * enterprise. Why: admin spec TIERS (Phase B.2). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+ */
+function isPlanTier(value: unknown): value is PlanTier {
+  return typeof value === 'string' && (PLAN_TIERS as string[]).includes(value);
+}
+
+/**
+ * The 400 invalid_tier refusal for a value that is not in the expected list (a plan where a role is expected, or the
+ * reverse, or anything else). In: which list was expected. Out: the AdminError. 2026-11-10,
+ * session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2). Touches nothing.
+ */
+function invalidTier(expected: 'role' | 'plan'): AdminError {
+  const list = expected === 'role' ? STAFF_ROLES : PLAN_TIERS;
+  return new AdminError('invalid_tier', `Tier must be one of: ${list.join(', ')} (a ${expected}).`, 400);
 }
 
 function requireString(value: unknown, field: string): string {
@@ -313,7 +349,7 @@ CREATE TABLE IF NOT EXISTS users (
   id INT AUTO_INCREMENT PRIMARY KEY,
   email VARCHAR(255) NOT NULL UNIQUE,
   name VARCHAR(255) NOT NULL,
-  tier ENUM('free','basic','pro','enterprise') NOT NULL DEFAULT 'free',
+  tier ENUM('owner','admin','user') NOT NULL DEFAULT 'user',   -- the STAFF ROLE (Phase B.2, 2026-11-10)
   status ENUM('active','suspended') NOT NULL DEFAULT 'active',
   password_hash VARCHAR(255) NOT NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -323,7 +359,7 @@ CREATE TABLE IF NOT EXISTS customers (
   customer_id INT AUTO_INCREMENT PRIMARY KEY,
   email VARCHAR(255) NOT NULL UNIQUE,
   name VARCHAR(255) NOT NULL,
-  tier ENUM('free','basic','pro','enterprise') NOT NULL DEFAULT 'free',
+  tier ENUM('solo','team','enterprise') NOT NULL DEFAULT 'solo',   -- the PLAN (Phase B.2, 2026-11-10)
   subscription_status VARCHAR(50) NOT NULL DEFAULT 'active',
   payment_method VARCHAR(50) NOT NULL DEFAULT 'card',
   address TEXT,
@@ -358,11 +394,11 @@ CREATE TABLE IF NOT EXISTS deployments (
   deployment_id INT AUTO_INCREMENT PRIMARY KEY,
   customer_id INT NOT NULL,
   domain VARCHAR(255) NOT NULL UNIQUE,
-  tier ENUM('free','basic','pro','enterprise') NOT NULL,
+  tier ENUM('solo','team','enterprise') NOT NULL,   -- the PLAN (Phase B.2, 2026-11-10)
   status ENUM('draft','live','suspended','archived') NOT NULL DEFAULT 'draft',
   theme VARCHAR(255),
   theme_id INT,
-  domain_verified TINYINT(1) NOT NULL DEFAULT 0,
+  domain_verified BOOLEAN NOT NULL DEFAULT FALSE,   -- publish needs it (Phase B.2, 2026-11-10)
   suspend_reason TEXT,
   published_at TIMESTAMP NULL,
   archived_at TIMESTAMP NULL,
@@ -417,21 +453,25 @@ export class AdminSystem {
   private readonly pool: Pool;
   private readonly stripe: StripeClient;
   private readonly email: EmailService;
-  private readonly priceMap: Record<Tier, string>;
+  private readonly priceMap: Record<PlanTier, string>;
 
+  /**
+   * In: the database pool, Stripe client, email service and the Stripe price id of each PLAN tier. Out: the service.
+   * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 admin TIERS): prices are keyed by plan (solo /
+   * team / enterprise), no longer by the mixed free / basic / pro / enterprise list. Touches nothing.
+   */
   constructor(options: {
     pool: Pool;
     stripe?: StripeClient;
     email?: EmailService;
-    priceMap?: Partial<Record<Tier, string>>;
+    priceMap?: Partial<Record<PlanTier, string>>;
   }) {
     this.pool = options.pool;
     this.stripe = options.stripe ?? new LiveStripeClient();
     this.email = options.email ?? new ConsoleEmailService();
     this.priceMap = {
-      free: 'price_free',
-      basic: 'price_basic',
-      pro: 'price_pro',
+      solo: 'price_solo',
+      team: 'price_team',
       enterprise: 'price_enterprise',
       ...options.priceMap,
     };
@@ -440,40 +480,67 @@ export class AdminSystem {
   // -- Gate helpers ---------------------------------------------------------
 
   /**
-   * The caller's tier as stored in the users table (null when the verified user id is unknown).
-   * In: the context. Out: the tier or null. Why: identity and role come from the verified caller and the
-   * database, never from client-shaped input such as ctx.tier. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
-   * Touches: the database (one parameterized read).
+   * The caller's users row (role and status), or null when the verified user id is unknown.
+   * In: the context. Out: { tier, status } or null. Why: identity and role come from the verified caller and the
+   * database, never from client-shaped input such as ctx.tier. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP; Phase
+   * B.2 the same day: returns the status too, for ADMIN-19. Touches: the database (one parameterized read).
    */
-  private async callerTier(ctx: AdminContext): Promise<string | null> {
+  private async callerRow(ctx: AdminContext): Promise<{ tier: string; status: string } | null> {
     const [rows] = await this.pool.execute<RowDataPacket[]>(
       'SELECT id, tier, status FROM users WHERE id = ?',
       [ctx.userId]
     );
-    return rows.length > 0 ? String(rows[0].tier) : null;
+    return rows.length > 0 ? { tier: String(rows[0].tier), status: String(rows[0].status) } : null;
   }
 
   /**
-   * Gate for mutations: the caller must be an owner ('enterprise' tier) in the users table, else 403 owner_only.
-   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: reads the tier from the database instead of ctx.tier.
-   * Touches: the database.
+   * ADMIN-19: a caller whose account status is 'suspended' is refused before any gate (before CSRF and the role
+   * gates), 403 account_suspended, so nothing changes and nothing is read. Every public method calls this first.
+   * In: the context. Out: nothing, or the throw. Why: admin spec "EVERY ACTION" (Phase B.2) and the typescript bug
+   * list: a suspended owner could still act. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database (read).
+   */
+  private async refuseSuspended(ctx: AdminContext): Promise<void> {
+    const caller = await this.callerRow(ctx);
+    if (caller !== null && caller.status === 'suspended') {
+      throw new AdminError('account_suspended', 'This account is suspended.', 403);
+    }
+  }
+
+  /**
+   * Gate for mutations: the caller must be an active 'owner' (staff role) in the users table, else 403 owner_only.
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: reads the role from the database instead of ctx.tier; Phase B.2 the
+   * same day: the owner role is 'owner' (it was the plan name 'enterprise') and must be active. Touches: the database.
    */
   private async requireOwner(ctx: AdminContext): Promise<void> {
-    if ((await this.callerTier(ctx)) !== 'enterprise') {
+    const caller = await this.callerRow(ctx);
+    if (caller === null || caller.tier !== 'owner' || caller.status !== 'active') {
       throw new AdminError('owner_only', 'This action requires owner access.', 403);
     }
   }
 
   /**
-   * Gate for reads: owner ('enterprise') or admin ('pro') in the users table, else 403 admin_or_owner_required.
-   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: reads the tier from the database instead of ctx.tier.
-   * Touches: the database.
+   * Gate for reads: an active 'owner' or 'admin' (staff roles) in the users table, else 403 admin_or_owner_required.
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: reads the role from the database instead of ctx.tier; Phase B.2 the
+   * same day: the roles are 'owner' / 'admin' (they were the plan names 'enterprise' / 'pro'). Touches: the database.
    */
   private async requireAdminOrOwner(ctx: AdminContext): Promise<void> {
-    const tier = await this.callerTier(ctx);
-    if (tier !== 'enterprise' && tier !== 'pro') {
+    const caller = await this.callerRow(ctx);
+    if (caller === null || (caller.tier !== 'owner' && caller.tier !== 'admin') || caller.status !== 'active') {
       throw new AdminError('admin_or_owner_required', 'This action requires admin or owner access.', 403);
     }
+  }
+
+  /**
+   * Whether the user row is the last active owner. In: the row (tier, status). Out: true when it is an active owner
+   * and no other active owner exists. Why: the last-owner rules (ADMIN-07), now on the 'owner' role (Phase B.2,
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP; it counted 'enterprise'). Touches: the database (read).
+   */
+  private async isLastActiveOwner(user: RowDataPacket): Promise<boolean> {
+    if (user.tier !== 'owner' || user.status !== 'active') return false;
+    const [owners] = await this.pool.execute<RowDataPacket[]>(
+      "SELECT COUNT(*) AS cnt FROM users WHERE tier = 'owner' AND status = 'active'"
+    );
+    return Number(owners[0].cnt) === 1;
   }
 
   /**
@@ -507,11 +574,19 @@ export class AdminSystem {
 
   // -- USERS DOMAIN ---------------------------------------------------------
 
+  /**
+   * Owner-only: creates a staff user (users.tier = a staff role owner / admin / user; a plan value is 400
+   * invalid_tier) and sends the invite. Out: { success, user_id, email, tier, created_at }. Errors: 403
+   * account_suspended / csrf_mismatch / owner_only, 400 invalid_*, 409 email_exists. ADMIN-01/02/03. Touches: users,
+   * audit_log, email. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a suspended caller is
+   * refused first with 403 account_suspended (ADMIN-19), and roles and plans are separate lists (admin TIERS).
+   */
   async createUser(
     ctx: AdminContext,
     csrf: string,
     body: { email: string; name: string; tier: string; notify: boolean }
   ): Promise<ApiResponse> {
+    await this.refuseSuspended(ctx); // ADMIN-19, before any gate
     this.verifyCsrf(ctx, csrf);
     await this.requireOwner(ctx);
 
@@ -526,8 +601,8 @@ export class AdminSystem {
     if (name.length > 255) {
       throw new AdminError('invalid_name', 'Name must be 255 characters or fewer.', 400);
     }
-    if (!isValidTier(tier)) {
-      throw new AdminError('invalid_tier', `Tier must be one of: ${VALID_TIERS.join(', ')}.`, 400);
+    if (!isStaffRole(tier)) {
+      throw invalidTier('role'); // users.tier is the staff role; a plan value is refused (Phase B.2)
     }
 
     const [existing] = await this.pool.execute<RowDataPacket[]>(
@@ -562,11 +637,18 @@ export class AdminSystem {
     };
   }
 
+  /**
+   * Owner-only: emails a password-reset link to another user (not yourself, not the last active owner). Out: {
+   * success, status: 'reset_email_sent' }. ADMIN-04/05. Touches: reset_tokens, audit_log, email. Changed 2026-11-10,
+   * session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a suspended caller is refused first with 403 account_suspended
+   * (ADMIN-19), and roles and plans are separate lists (admin TIERS).
+   */
   async resetPassword(
     ctx: AdminContext,
     csrf: string,
     body: { user_id: number }
   ): Promise<ApiResponse> {
+    await this.refuseSuspended(ctx); // ADMIN-19, before any gate
     this.verifyCsrf(ctx, csrf);
     await this.requireOwner(ctx);
 
@@ -585,13 +667,8 @@ export class AdminSystem {
     }
     const user = rows[0];
 
-    if (user.tier === 'enterprise' && user.status === 'active') {
-      const [owners] = await this.pool.execute<RowDataPacket[]>(
-        "SELECT COUNT(*) AS cnt FROM users WHERE tier = 'enterprise' AND status = 'active'"
-      );
-      if (Number(owners[0].cnt) === 1) {
-        throw new AdminError('cannot_demote_last_owner', 'Cannot reset password of the last active owner.', 400);
-      }
+    if (await this.isLastActiveOwner(user)) {
+      throw new AdminError('cannot_demote_last_owner', 'Cannot reset password of the last active owner.', 400);
     }
 
     const token = randomBytes(32).toString('hex');
@@ -608,11 +685,18 @@ export class AdminSystem {
     return { success: true, status: 'reset_email_sent' };
   }
 
+  /**
+   * Owner-only: changes another user's staff role (owner / admin / user; a plan value is 400 invalid_tier); the last
+   * active owner cannot be demoted. Out: { success, user_id, old_tier, new_tier }. ADMIN-06/07. Touches: users,
+   * audit_log. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a suspended caller is refused first
+   * with 403 account_suspended (ADMIN-19), and roles and plans are separate lists (admin TIERS).
+   */
   async changeRole(
     ctx: AdminContext,
     csrf: string,
     body: { user_id: number; new_tier: string }
   ): Promise<ApiResponse> {
+    await this.refuseSuspended(ctx); // ADMIN-19, before any gate
     this.verifyCsrf(ctx, csrf);
     await this.requireOwner(ctx);
 
@@ -622,8 +706,8 @@ export class AdminSystem {
     if (userId === ctx.userId) {
       throw new AdminError('cannot_change_own_role', 'You cannot change your own role.', 400);
     }
-    if (!isValidTier(newTier)) {
-      throw new AdminError('invalid_tier', `Tier must be one of: ${VALID_TIERS.join(', ')}.`, 400);
+    if (!isStaffRole(newTier)) {
+      throw invalidTier('role'); // a plan value is not a role (Phase B.2)
     }
 
     const [rows] = await this.pool.execute<RowDataPacket[]>(
@@ -635,13 +719,8 @@ export class AdminSystem {
     }
     const user = rows[0];
 
-    if (user.tier === 'enterprise' && user.status === 'active' && newTier !== 'enterprise') {
-      const [owners] = await this.pool.execute<RowDataPacket[]>(
-        "SELECT COUNT(*) AS cnt FROM users WHERE tier = 'enterprise' AND status = 'active'"
-      );
-      if (Number(owners[0].cnt) === 1) {
-        throw new AdminError('cannot_demote_last_owner', 'Cannot demote the last active owner.', 400);
-      }
+    if (newTier !== 'owner' && (await this.isLastActiveOwner(user))) {
+      throw new AdminError('cannot_demote_last_owner', 'Cannot demote the last active owner.', 400);
     }
 
     const oldTier = user.tier;
@@ -652,11 +731,18 @@ export class AdminSystem {
     return { success: true, user_id: userId, old_tier: oldTier, new_tier: newTier };
   }
 
+  /**
+   * Owner-only: suspends another user (not yourself, not the last active owner). Out: { success, user_id, suspended:
+   * true }. ADMIN-08/09. Touches: users, audit_log. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase
+   * B.2): a suspended caller is refused first with 403 account_suspended (ADMIN-19), and roles and plans are
+   * separate lists (admin TIERS).
+   */
   async suspendUser(
     ctx: AdminContext,
     csrf: string,
     body: { user_id: number; reason: string }
   ): Promise<ApiResponse> {
+    await this.refuseSuspended(ctx); // ADMIN-19, before any gate
     this.verifyCsrf(ctx, csrf);
     await this.requireOwner(ctx);
 
@@ -676,13 +762,8 @@ export class AdminSystem {
     }
     const user = rows[0];
 
-    if (user.tier === 'enterprise' && user.status === 'active') {
-      const [owners] = await this.pool.execute<RowDataPacket[]>(
-        "SELECT COUNT(*) AS cnt FROM users WHERE tier = 'enterprise' AND status = 'active'"
-      );
-      if (Number(owners[0].cnt) === 1) {
-        throw new AdminError('cannot_demote_last_owner', 'Cannot suspend the last active owner.', 400);
-      }
+    if (await this.isLastActiveOwner(user)) {
+      throw new AdminError('cannot_demote_last_owner', 'Cannot suspend the last active owner.', 400);
     }
 
     await this.pool.execute("UPDATE users SET status = 'suspended' WHERE id = ?", [userId]);
@@ -694,10 +775,16 @@ export class AdminSystem {
 
   // -- CUSTOMERS DOMAIN -----------------------------------------------------
 
+  /**
+   * Admin or owner: one page of customers (tier = plan). Out: { items, total, limit, offset }. ADMIN-10. Touches:
+   * customers, invoices (read). Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a suspended caller
+   * is refused first with 403 account_suspended (ADMIN-19), and roles and plans are separate lists (admin TIERS).
+   */
   async listCustomers(
     ctx: AdminContext,
     params: { limit?: number; offset?: number }
   ): Promise<ApiResponse> {
+    await this.refuseSuspended(ctx); // ADMIN-19, before any gate
     await this.requireAdminOrOwner(ctx);
 
     const limit = Math.min(Math.max(params.limit ?? 50, 1), 200);
@@ -724,7 +811,13 @@ export class AdminSystem {
     return { success: true, items, total, limit, offset };
   }
 
+  /**
+   * Admin or owner: one customer's detail. Out: { success, customer_id, ... }. ADMIN-11. Touches: customers (read).
+   * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a suspended caller is refused first with 403
+   * account_suspended (ADMIN-19), and roles and plans are separate lists (admin TIERS).
+   */
   async getCustomer(ctx: AdminContext, customerId: number): Promise<ApiResponse> {
+    await this.refuseSuspended(ctx); // ADMIN-19, before any gate
     await this.requireAdminOrOwner(ctx);
 
     const [rows] = await this.pool.execute<RowDataPacket[]>(
@@ -758,6 +851,8 @@ export class AdminSystem {
    * 400 no_stripe_subscription, 409 subscription_item_ambiguous (not exactly one item; nothing updated).
    * Why: ADMIN-12 as amended 2026-11-10: the same rule as billing change_plan, update with
    * { id: current_item_id, price } and proration, never a bare price. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * Phase B.2 the same day: new_tier must be a PLAN (solo / team / enterprise; a staff role is 400 invalid_tier), a
+   * suspended caller is 403 account_suspended first (ADMIN-19), and the Stripe work moved to applyPlanChange.
    * Touches: Stripe (network, money), the database, the audit log.
    */
   async changePlan(
@@ -766,14 +861,38 @@ export class AdminSystem {
     customerId: number,
     body: { new_tier: string }
   ): Promise<ApiResponse> {
+    await this.refuseSuspended(ctx); // ADMIN-19, before any gate
     this.verifyCsrf(ctx, csrf);
     await this.requireOwner(ctx);
 
     const newTier = body.new_tier;
-    if (!isValidTier(newTier)) {
-      throw new AdminError('invalid_tier', `Tier must be one of: ${VALID_TIERS.join(', ')}.`, 400);
+    if (!isPlanTier(newTier)) {
+      throw invalidTier('plan'); // a customer's tier is the plan; a staff role is refused (Phase B.2)
     }
 
+    const { oldTier, effectiveDate } = await this.applyPlanChange(customerId, newTier);
+
+    await this.auditLog(ctx.userId, 'plan_changed', 'customer', String(customerId), oldTier, newTier, null);
+
+    return {
+      success: true,
+      customer_id: customerId,
+      old_tier: oldTier,
+      new_tier: newTier,
+      effective_date: effectiveDate,
+    };
+  }
+
+  /**
+   * Changes a customer's plan in Stripe and in the database, by billing flow 2's rule: read the subscription's
+   * current item; anything but exactly one item is 409 subscription_item_ambiguous before any update; then replace
+   * that item's price with proration (a bare { price } adds a second item and bills both plans).
+   * In: the customer id and a valid plan tier. Out: { oldTier, effectiveDate }. Errors: 404 customer_not_found, 400
+   * no_stripe_subscription, 409 subscription_item_ambiguous. Why: ADMIN-12; moved out of changePlan 2026-11-10,
+   * session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2) so an approved governance change_plan uses the same rule (it sent a
+   * bare { price }). Touches: Stripe (network, money), the database (customers).
+   */
+  private async applyPlanChange(customerId: number, newTier: PlanTier): Promise<{ oldTier: string; effectiveDate: string }> {
     const [rows] = await this.pool.execute<RowDataPacket[]>(
       'SELECT customer_id, tier, stripe_subscription_id FROM customers WHERE customer_id = ?',
       [customerId]
@@ -807,24 +926,22 @@ export class AdminSystem {
     });
 
     await this.pool.execute('UPDATE customers SET tier = ? WHERE customer_id = ?', [newTier, customerId]);
-
-    await this.auditLog(ctx.userId, 'plan_changed', 'customer', String(customerId), oldTier, newTier, null);
-
-    return {
-      success: true,
-      customer_id: customerId,
-      old_tier: oldTier,
-      new_tier: newTier,
-      effective_date: stripeResult.effective_date,
-    };
+    return { oldTier, effectiveDate: stripeResult.effective_date };
   }
 
+  /**
+   * Owner-only: queues a refund of a succeeded invoice of this customer. Out: { success, refund_id, status:
+   * 'queued', amount }. ADMIN-13. Touches: invoices (read), refunds, audit_log. Changed 2026-11-10,
+   * session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a suspended caller is refused first with 403 account_suspended
+   * (ADMIN-19), and roles and plans are separate lists (admin TIERS).
+   */
   async queueRefund(
     ctx: AdminContext,
     csrf: string,
     customerId: number,
     body: { invoice_id: number; amount: number; reason: string }
   ): Promise<ApiResponse> {
+    await this.refuseSuspended(ctx); // ADMIN-19, before any gate
     this.verifyCsrf(ctx, csrf);
     await this.requireOwner(ctx);
 
@@ -860,7 +977,13 @@ export class AdminSystem {
 
   // -- DEPLOYMENTS DOMAIN ---------------------------------------------------
 
+  /**
+   * Admin or owner: every deployment (tier = plan). Out: { success, items }. Touches: deployments (read). Changed
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a suspended caller is refused first with 403
+   * account_suspended (ADMIN-19), and roles and plans are separate lists (admin TIERS).
+   */
   async listDeployments(ctx: AdminContext): Promise<ApiResponse> {
+    await this.refuseSuspended(ctx); // ADMIN-19, before any gate
     await this.requireAdminOrOwner(ctx);
 
     const [rows] = await this.pool.execute<RowDataPacket[]>(
@@ -880,11 +1003,19 @@ export class AdminSystem {
     return { success: true, items };
   }
 
+  /**
+   * Owner-only: creates a draft deployment (tier = a plan: solo / team / enterprise; a staff role is 400
+   * invalid_tier) with domain_verified false, and its config. Out: { success, deployment_id, domain, tier }.
+   * ADMIN-14. Touches: customers (read), deployments, deployment_config, audit_log. Changed 2026-11-10,
+   * session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a suspended caller is refused first with 403 account_suspended
+   * (ADMIN-19), and roles and plans are separate lists (admin TIERS).
+   */
   async createDeployment(
     ctx: AdminContext,
     csrf: string,
     body: { customer_id: number; domain: string; tier: string; theme_id: number }
   ): Promise<ApiResponse> {
+    await this.refuseSuspended(ctx); // ADMIN-19, before any gate
     this.verifyCsrf(ctx, csrf);
     await this.requireOwner(ctx);
 
@@ -893,8 +1024,8 @@ export class AdminSystem {
     const tier = body.tier;
     const themeId = requireNumber(body.theme_id, 'theme_id');
 
-    if (!isValidTier(tier)) {
-      throw new AdminError('invalid_tier', `Tier must be one of: ${VALID_TIERS.join(', ')}.`, 400);
+    if (!isPlanTier(tier)) {
+      throw invalidTier('plan'); // a deployment's tier is the plan; a staff role is refused (Phase B.2)
     }
 
     const [custRows] = await this.pool.execute<RowDataPacket[]>(
@@ -923,7 +1054,7 @@ export class AdminSystem {
     // Fallback: accept any positive integer as a valid theme reference.
 
     const [result] = await this.pool.execute<ResultSetHeader>(
-      "INSERT INTO deployments (customer_id, domain, tier, status, theme_id, domain_verified) VALUES (?, ?, ?, 'draft', ?, 0)",
+      "INSERT INTO deployments (customer_id, domain, tier, status, theme_id, domain_verified) VALUES (?, ?, ?, 'draft', ?, FALSE)",
       [customerId, domain, tier, themeId]
     );
     const deploymentId = result.insertId;
@@ -939,11 +1070,19 @@ export class AdminSystem {
     return { success: true, deployment_id: deploymentId, domain, tier };
   }
 
+  /**
+   * Owner-only and SafetyFlags.can_publish (double gate): a draft with a verified domain (domain_verified) and a
+   * theme goes live. Out: { success, deployment_id, status: 'live', public_url }. Errors: 403 publish_not_allowed,
+   * 404 deployment_not_found, 400 not_draft / domain_not_verified / theme_not_set. ADMIN-15. Touches: deployments,
+   * audit_log. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a suspended caller is refused first
+   * with 403 account_suspended (ADMIN-19), and roles and plans are separate lists (admin TIERS).
+   */
   async publishDeployment(
     ctx: AdminContext,
     csrf: string,
     body: { deployment_id: number }
   ): Promise<ApiResponse> {
+    await this.refuseSuspended(ctx); // ADMIN-19, before any gate
     this.verifyCsrf(ctx, csrf);
     await this.requireOwner(ctx);
 
@@ -983,11 +1122,17 @@ export class AdminSystem {
     return { success: true, deployment_id: deploymentId, status: 'live', public_url: publicUrl };
   }
 
+  /**
+   * Owner-only: suspends a deployment with a reason. Out: { success, deployment_id, status: 'suspended' }. Touches:
+   * deployments, audit_log. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a suspended caller is
+   * refused first with 403 account_suspended (ADMIN-19), and roles and plans are separate lists (admin TIERS).
+   */
   async suspendDeployment(
     ctx: AdminContext,
     csrf: string,
     body: { deployment_id: number; reason: string }
   ): Promise<ApiResponse> {
+    await this.refuseSuspended(ctx); // ADMIN-19, before any gate
     this.verifyCsrf(ctx, csrf);
     await this.requireOwner(ctx);
 
@@ -1012,11 +1157,17 @@ export class AdminSystem {
     return { success: true, deployment_id: deploymentId, status: 'suspended' };
   }
 
+  /**
+   * Owner-only: archives a deployment. Out: { success, deployment_id, status: 'archived' }. Touches: deployments,
+   * audit_log. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a suspended caller is refused first
+   * with 403 account_suspended (ADMIN-19), and roles and plans are separate lists (admin TIERS).
+   */
   async retireDeployment(
     ctx: AdminContext,
     csrf: string,
     body: { deployment_id: number }
   ): Promise<ApiResponse> {
+    await this.refuseSuspended(ctx); // ADMIN-19, before any gate
     this.verifyCsrf(ctx, csrf);
     await this.requireOwner(ctx);
 
@@ -1042,10 +1193,16 @@ export class AdminSystem {
 
   // -- GOVERNANCE DOMAIN ----------------------------------------------------
 
+  /**
+   * Admin or owner: pending governance actions, paginated. Out: { success, items, total, limit, offset }. Touches:
+   * governance_actions (read). Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a suspended caller
+   * is refused first with 403 account_suspended (ADMIN-19), and roles and plans are separate lists (admin TIERS).
+   */
   async listGovernanceActions(
     ctx: AdminContext,
     params: { limit?: number; offset?: number }
   ): Promise<ApiResponse> {
+    await this.refuseSuspended(ctx); // ADMIN-19, before any gate
     await this.requireAdminOrOwner(ctx);
 
     const limit = Math.min(Math.max(params.limit ?? 50, 1), 200);
@@ -1074,6 +1231,14 @@ export class AdminSystem {
     return { success: true, items, total, limit, offset };
   }
 
+  /**
+   * Owner-only: approves (executes: change_plan through the same Stripe rule as changePlan, change_role under the
+   * role and last-owner rules (400 invalid_tier / cannot_demote_last_owner, nothing changed), suspend_user,
+   * publish_deployment only for a verified draft) or rejects (with a reason) a pending action. Out: { success,
+   * action_id, status }. ADMIN-16/17. Touches: governance_actions, customers, users, deployments, Stripe, audit_log.
+   * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a suspended caller is refused first with 403
+   * account_suspended (ADMIN-19), and roles and plans are separate lists (admin TIERS).
+   */
   async decideGovernanceAction(
     ctx: AdminContext,
     csrf: string,
@@ -1081,6 +1246,7 @@ export class AdminSystem {
     decide: 'approve' | 'reject',
     body: { reason?: string }
   ): Promise<ApiResponse> {
+    await this.refuseSuspended(ctx); // ADMIN-19, before any gate
     this.verifyCsrf(ctx, csrf);
     await this.requireOwner(ctx);
 
@@ -1097,42 +1263,69 @@ export class AdminSystem {
       throw new AdminError('action_not_pending', 'Action has already been decided.', 400);
     }
 
+    // A change_role action is checked before anything changes: the new value must be a staff role, and the last
+    // active owner cannot be demoted (ADMIN-07; the action stays pending). Added 2026-11-10,
+    // session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): with ADMIN-19 refusing a suspended owner first, this is where the
+    // last-owner rule is reachable (action=change_role always has a second active owner: the caller).
+    if (decide === 'approve' && action.action_type === 'change_role') {
+      if (!isStaffRole(action.reason)) {
+        throw invalidTier('role');
+      }
+      const [targetRows] = await this.pool.execute<RowDataPacket[]>(
+        'SELECT id, tier, status FROM users WHERE id = ?',
+        [action.target_resource_id]
+      );
+      if (targetRows.length === 0) {
+        throw new AdminError('user_not_found', 'User not found.', 404);
+      }
+      if (action.reason !== 'owner' && (await this.isLastActiveOwner(targetRows[0]))) {
+        throw new AdminError('cannot_demote_last_owner', 'Cannot demote the last active owner.', 400);
+      }
+    }
+
     if (decide === 'approve') {
       // Execute the original action based on action_type
       let executionResult: string = 'executed';
       try {
         switch (action.action_type) {
-          case 'change_plan':
-            // target_resource_id is customer_id, reason contains new_tier
-            const newTier = action.reason as Tier;
-            if (isValidTier(newTier)) {
-              const [custRows] = await this.pool.execute<RowDataPacket[]>(
-                'SELECT customer_id, tier, stripe_subscription_id FROM customers WHERE customer_id = ?',
-                [action.target_resource_id]
-              );
-              if (custRows.length > 0 && custRows[0].stripe_subscription_id) {
-                const priceId = this.priceMap[newTier];
-                await this.stripe.updateSubscription(custRows[0].stripe_subscription_id, {
-                  items: [{ price: priceId }],
-                });
-                await this.pool.execute('UPDATE customers SET tier = ? WHERE customer_id = ?', [
-                  newTier,
-                  action.target_resource_id,
-                ]);
-              }
+          case 'change_plan': {
+            // target_resource_id is customer_id, reason holds the new PLAN tier. Same rule as changePlan
+            // (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, Phase B.2: it sent a bare { price }).
+            const newTier = action.reason;
+            if (isPlanTier(newTier)) {
+              await this.applyPlanChange(action.target_resource_id, newTier);
+            } else {
+              executionResult = 'refused: invalid_tier';
             }
+            break;
+          }
+          case 'change_role':
+            // target_resource_id is the user, reason the new staff role (checked above).
+            await this.pool.execute('UPDATE users SET tier = ? WHERE id = ?', [action.reason, action.target_resource_id]);
             break;
           case 'suspend_user':
             await this.pool.execute("UPDATE users SET status = 'suspended' WHERE id = ?", [
               action.target_resource_id,
             ]);
             break;
-          case 'publish_deployment':
+          case 'publish_deployment': {
+            // Publish needs a draft with a verified domain and a theme, as publishDeployment (2026-11-10,
+            // session_012zDydZCZ4AChqhEZ4oVtaP, Phase B.2: it set any deployment live).
+            const [depRows] = await this.pool.execute<RowDataPacket[]>(
+              'SELECT deployment_id, status, domain, domain_verified, theme_id FROM deployments WHERE deployment_id = ?',
+              [action.target_resource_id]
+            );
+            const dep = depRows[0];
+            if (!dep || dep.status !== 'draft' || !dep.domain_verified || !dep.theme_id) {
+              executionResult = 'refused: not a draft with a verified domain and a theme';
+              break;
+            }
             await this.pool.execute(
               "UPDATE deployments SET status = 'live', published_at = NOW() WHERE deployment_id = ?",
               [action.target_resource_id]
             );
             break;
+          }
           default:
             executionResult = 'no_handler';
         }
@@ -1162,6 +1355,12 @@ export class AdminSystem {
     }
   }
 
+  /**
+   * Admin or owner: audit entries filtered by action, resource id and date range, newest first, paginated. Out: {
+   * success, items, total, limit, offset }. ADMIN-18. Touches: audit_log (read). Changed 2026-11-10,
+   * session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a suspended caller is refused first with 403 account_suspended
+   * (ADMIN-19), and roles and plans are separate lists (admin TIERS).
+   */
   async searchAuditLog(
     ctx: AdminContext,
     params: {
@@ -1172,6 +1371,7 @@ export class AdminSystem {
       offset?: number;
     }
   ): Promise<ApiResponse> {
+    await this.refuseSuspended(ctx); // ADMIN-19, before any gate
     await this.requireAdminOrOwner(ctx);
 
     const limit = Math.min(Math.max(params.limit ?? 100, 1), 500);
@@ -1232,7 +1432,7 @@ export async function createAdminSystem(options: {
   database: string;
   stripe?: StripeClient;
   email?: EmailService;
-  priceMap?: Partial<Record<Tier, string>>;
+  priceMap?: Partial<Record<PlanTier, string>>;
 }): Promise<AdminSystem> {
   const pool = createPool({
     host: options.host,

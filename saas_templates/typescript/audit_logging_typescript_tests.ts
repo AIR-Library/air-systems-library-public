@@ -103,9 +103,12 @@ describe('logMutation', () => {
   });
 
   it('should handle null actor_id', async () => {
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 audit amendment): a 'service' actor must name its
+    // service (400 actor_service_required otherwise), so this entry now carries actor_service.
     const input = {
       actor_id: null,
       actor_type: 'service' as const,
+      actor_service: 'backup',
       subject_user_id: 'none',
       action: 'system_backup',
       resource_type: 'database',
@@ -489,6 +492,70 @@ describe('validation and access', () => {
     expect(await code(auditLogger.replay(reader, 'x'))).toEqual([403, 'forbidden']);
     expect(await code(auditLogger.queryLogs(null as any, {}))).toEqual([403, 'forbidden']);
     expect((await auditLogger.queryLogs(ADMIN, {})).logs[0].metadata).toEqual({ feature_flag: 'new_billing' });
+  });
+
+  /**
+   * AUDIT-10 (Phase B.2 audit amendment): log() refuses actor_type other than user / service / api_key (400
+   * invalid_actor_type), a 'user' actor without actor_id (400 actor_required) and a 'service' actor without
+   * actor_service, or with an empty one (400 actor_service_required); nothing is written; a service entry that names
+   * its service is stored with it. In: the shared logger. Out: assertions only. Why: the spec now names these three
+   * refusals in every language. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite.
+   */
+  // AUDIT-10
+  it('refuses invalid_actor_type, actor_required and actor_service_required', async () => {
+    const base = { action: 'deployment_created', resource_type: 'deployment', resource_id: 'd1', subject_user_id: 'none',
+      new_value: { region: 'eu' } };
+    const code = async (p: Promise<unknown>) => {
+      try {
+        await p;
+      } catch (e) {
+        expect(e).toBeInstanceOf(AuditError);
+        return [(e as AuditError).status, (e as AuditError).code];
+      }
+      return 'no error';
+    };
+    expect(await code(auditLogger.log({ ...base, actor_type: 'robot' as any, actor_id: 1 }))).toEqual([400, 'invalid_actor_type']);
+    expect(await code(auditLogger.log({ ...base, actor_type: 'user' }))).toEqual([400, 'actor_required']);
+    expect(await code(auditLogger.log({ ...base, actor_type: 'user', actor_id: null }))).toEqual([400, 'actor_required']);
+    expect(await code(auditLogger.log({ ...base, actor_type: 'service' }))).toEqual([400, 'actor_service_required']);
+    expect(await code(auditLogger.log({ ...base, actor_type: 'service', actor_id: 'deployer' }))).toEqual([400, 'actor_service_required']);
+    expect(await code(auditLogger.log({ ...base, actor_type: 'service', actor_service: '' }))).toEqual([400, 'actor_service_required']);
+    expect((testDb.raw.prepare('SELECT COUNT(*) AS n FROM audit_log').get() as any).n).toBe(0);
+
+    await auditLogger.log({ ...base, actor_type: 'service', actor_service: 'deployer' });
+    expect(testDb.raw.prepare('SELECT actor_type, actor_service FROM audit_log').all()).toEqual([
+      { actor_type: 'service', actor_service: 'deployer' }]);
+  });
+});
+
+/**
+ * AUDIT-08 (Phase B.2 audit amendment): replay's `erased` reflects the entry's SUBJECT row only. An admin (actor row)
+ * acting on a user (subject row): erasing the admin removes 1 personal row (erased_rows = 1) and replay still shows
+ * the user's state; erasing the user removes that subject row (erased_rows = 1) and replay then answers erased: true.
+ * In: the shared logger. Out: assertions only. Why: the spec now says erased_rows counts audit_personal rows deleted
+ * and replay's erased follows the subject row, in every language. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+ * Touches: in-memory SQLite.
+ */
+describe('replay after erasure', () => {
+  // AUDIT-08
+  it('reports erased only when the entry\'s subject row is gone', async () => {
+    const ADMIN_ID = 5001;
+    const USER_ID = 5002;
+    const entry = await auditLogger.log({ actor_type: 'user', actor_id: ADMIN_ID, ip: '192.0.2.50', subject_user_id: USER_ID,
+      action: 'subscription_changed', resource_type: 'subscription', resource_id: 'sub_77',
+      old_value: { tier: 'solo' }, new_value: { tier: 'team' } });
+    const state = { log_id: entry.log_id, timestamp: expect.any(String), resource_state_at_time: { tier: 'solo' }, has_diverged: false };
+    expect(await auditLogger.replay(ADMIN, entry.log_id)).toEqual(state);
+
+    expect(await auditLogger.erase_subject(ADMIN_ID)).toEqual({ erased_rows: 1 });   // the actor row
+    const afterAdmin = await auditLogger.replay(ADMIN, entry.log_id);
+    expect(afterAdmin).toEqual(state);
+    expect(afterAdmin).not.toHaveProperty('erased');
+
+    expect(await auditLogger.erase_subject(USER_ID)).toEqual({ erased_rows: 1 });    // the subject row
+    expect(await auditLogger.replay(ADMIN, entry.log_id)).toEqual({
+      log_id: entry.log_id, timestamp: expect.any(String), erased: true, resource_state_at_time: null, has_diverged: null });
+    expect(await auditLogger.erase_subject(USER_ID)).toEqual({ erased_rows: 0 });    // nothing left to delete
   });
 });
 

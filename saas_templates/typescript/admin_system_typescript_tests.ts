@@ -1,3 +1,12 @@
+/**
+ * AdminSystem tests (vitest, fakes only).
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 admin amendments): users.tier is now the STAFF ROLE
+ * (owner / admin / user) and a customer's or deployment's tier the PLAN (solo / team / enterprise); the seeds and the
+ * values in the existing tests moved from the old mixed list (enterprise = owner, pro = admin, basic / free = user;
+ * for plans basic -> solo, pro -> team) with the same assertions. ADMIN-07's scenario used a suspended owner, which
+ * ADMIN-19 now refuses first; it is rewritten (see its comment). New: ADMIN-19, invalid_tier for a mixed value, and
+ * publish needing domain_verified. Touches: memory only.
+ */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   AdminSystem,
@@ -105,9 +114,10 @@ class MockPool {
       return [[{ id: user.id, email: user.email, tier: user.tier, status: user.status }], undefined];
     }
 
-    // SELECT COUNT(*) AS cnt FROM users WHERE tier = 'enterprise' AND status = 'active'
-    if (normalized.includes("SELECT COUNT(*) AS cnt FROM users WHERE tier = 'enterprise'")) {
-      const cnt = this.users.filter((u) => u.tier === 'enterprise' && u.status === 'active').length;
+    // SELECT COUNT(*) AS cnt FROM users WHERE tier = 'owner' AND status = 'active'
+    // (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, Phase B.2: the owner role is 'owner', it was 'enterprise')
+    if (normalized.includes("SELECT COUNT(*) AS cnt FROM users WHERE tier = 'owner' AND status = 'active'")) {
+      const cnt = this.users.filter((u) => u.tier === 'owner' && u.status === 'active').length;
       return [[{ cnt }], undefined];
     }
 
@@ -232,9 +242,13 @@ class MockPool {
       return [[{ theme_id: cfg.theme_id }], undefined];
     }
 
-    // INSERT INTO deployments
+    // INSERT INTO deployments (customer_id, domain, tier, status, theme_id, domain_verified) VALUES (?, ?, ?, 'draft', ?, FALSE)
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): the statement binds four values (status and
+    // domain_verified are literals); the stand-in read six, so it stored the theme id as the status.
     if (normalized.startsWith('INSERT INTO deployments')) {
-      const [customerId, domain, tier, status, themeId, domainVerified] = params as [number, string, string, string, number, number];
+      const [customerId, domain, tier, themeId] = params as [number, string, string, number];
+      const status = 'draft';
+      const domainVerified = !/,\s*'draft',\s*\?,\s*FALSE\)/i.test(normalized);
       const id = this.nextDeploymentId++;
       this.deployments.push({
         deployment_id: id,
@@ -494,21 +508,21 @@ class MockPool {
 
 const ownerCtx: AdminContext = {
   userId: 1,
-  tier: 'enterprise',
+  tier: 'owner',
   csrfToken: 'valid-csrf-token',
   safetyFlags: { can_publish: true },
 };
 
 const adminCtx: AdminContext = {
   userId: 2,
-  tier: 'pro',
+  tier: 'admin',
   csrfToken: 'valid-csrf-token',
   safetyFlags: { can_publish: false },
 };
 
 const userCtx: AdminContext = {
   userId: 3,
-  tier: 'basic',
+  tier: 'user',
   csrfToken: 'valid-csrf-token',
   safetyFlags: { can_publish: false },
 };
@@ -527,15 +541,15 @@ describe('AdminSystem', () => {
       pool: pool as unknown as import('mysql2/promise').Pool,
       stripe,
       email,
-      priceMap: { free: 'price_free', basic: 'price_basic', pro: 'price_pro', enterprise: 'price_enterprise' },
+      priceMap: { solo: 'price_solo', team: 'price_team', enterprise: 'price_enterprise' },
     });
 
     // Seed owner user
-    pool.seedUser({ email: 'owner@example.com', name: 'Owner', tier: 'enterprise', status: 'active' });
+    pool.seedUser({ email: 'owner@example.com', name: 'Owner', tier: 'owner', status: 'active' });
     // Seed admin user
-    pool.seedUser({ email: 'admin@example.com', name: 'Admin', tier: 'pro', status: 'active' });
+    pool.seedUser({ email: 'admin@example.com', name: 'Admin', tier: 'admin', status: 'active' });
     // Seed regular user
-    pool.seedUser({ email: 'user@example.com', name: 'User', tier: 'basic', status: 'active' });
+    pool.seedUser({ email: 'user@example.com', name: 'User', tier: 'user', status: 'active' });
   });
 
   // -- USERS DOMAIN ---------------------------------------------------------
@@ -546,7 +560,7 @@ describe('AdminSystem', () => {
       const result = await admin.createUser(ownerCtx, 'valid-csrf-token', {
         email: 'new@example.com',
         name: 'New User',
-        tier: 'basic',
+        tier: 'user',
         notify: true,
       });
 
@@ -554,7 +568,7 @@ describe('AdminSystem', () => {
       const res = result as { success: true; user_id: number; email: string; tier: string; created_at: string };
       expect(res.user_id).toBeGreaterThan(0);
       expect(res.email).toBe('new@example.com');
-      expect(res.tier).toBe('basic');
+      expect(res.tier).toBe('user');
       expect(res.created_at).toBeDefined();
       expect(email.invites.length).toBe(1);
       expect(email.invites[0].email).toBe('new@example.com');
@@ -566,7 +580,7 @@ describe('AdminSystem', () => {
         admin.createUser(ownerCtx, 'valid-csrf-token', {
           email: 'owner@example.com',
           name: 'Duplicate',
-          tier: 'basic',
+          tier: 'user',
           notify: false,
         })
       ).rejects.toMatchObject({ code: 'email_exists', status: 409 });
@@ -578,7 +592,7 @@ describe('AdminSystem', () => {
         admin.createUser(adminCtx, 'valid-csrf-token', {
           email: 'new@example.com',
           name: 'New User',
-          tier: 'basic',
+          tier: 'user',
           notify: false,
         })
       ).rejects.toMatchObject({ code: 'owner_only', status: 403 });
@@ -607,35 +621,55 @@ describe('AdminSystem', () => {
   describe('changeRole', () => {
     // ADMIN-06
     it('happy path: role changed + audit logged', async () => {
-      const result = await admin.changeRole(ownerCtx, 'valid-csrf-token', { user_id: 2, new_tier: 'enterprise' });
+      const result = await admin.changeRole(ownerCtx, 'valid-csrf-token', { user_id: 2, new_tier: 'owner' });
 
       expect(result.success).toBe(true);
-      expect(result.old_tier).toBe('pro');
-      expect(result.new_tier).toBe('enterprise');
+      expect(result.old_tier).toBe('admin');
+      expect(result.new_tier).toBe('owner');
       expect(pool.getAuditLog().some((entry) => entry.action === 'role_changed')).toBe(true);
     });
 
     it('own account returns 400 cannot_change_own_role', async () => {
       await expect(
-        admin.changeRole(ownerCtx, 'valid-csrf-token', { user_id: 1, new_tier: 'basic' })
+        admin.changeRole(ownerCtx, 'valid-csrf-token', { user_id: 1, new_tier: 'user' })
       ).rejects.toMatchObject({ code: 'cannot_change_own_role', status: 400 });
     });
 
     /**
-     * ADMIN-07: demoting the last active owner is 400 cannot_demote_last_owner and the tier is unchanged. Set up
-     * as the other languages do: a second owner is added and the acting owner is then suspended, so the second
-     * owner is the only ACTIVE owner. In: the mock pool. Out: assertions only. Why: ADMIN-07 had no test here.
-     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: fakes only.
+     * ADMIN-07: demoting the last active owner is 400 cannot_demote_last_owner and the role is unchanged.
+     * Corrected 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, ADMIN-19): the old scenario had a SUSPENDED
+     * owner do the demoting, which ADMIN-19 now refuses first with 403 account_suspended (asserted below). An active
+     * owner cannot reach the last-owner refusal through changeRole (the target is another owner, so two are active,
+     * and changing your own role is cannot_change_own_role), so the refusal is proven where it is reachable, as in
+     * Python: the remaining owner approving a governance change_role that demotes them; the action stays pending.
+     * In: the mock pool. Out: assertions only. Touches: fakes only.
      */
     // ADMIN-07
     it('demoting the last active owner returns 400 cannot_demote_last_owner', async () => {
-      const owner2 = pool.seedUser({ email: 'owner2@example.com', name: 'Owner 2', tier: 'enterprise', status: 'active' });
+      const owner2 = pool.seedUser({ email: 'owner2@example.com', name: 'Owner 2', tier: 'owner', status: 'active' });
+      const actionId = pool.seedGovernanceAction({ action_type: 'change_role', actor: 1, target_resource_id: owner2, reason: 'user' });
       await pool.execute("UPDATE users SET status = 'suspended' WHERE id = ?", [1]);
       await expect(
-        admin.changeRole(ownerCtx, 'valid-csrf-token', { user_id: owner2, new_tier: 'basic' })
+        admin.changeRole(ownerCtx, 'valid-csrf-token', { user_id: owner2, new_tier: 'user' })
+      ).rejects.toMatchObject({ code: 'account_suspended', status: 403 });
+
+      const owner2Ctx: AdminContext = { ...ownerCtx, userId: owner2 };
+      await expect(
+        admin.decideGovernanceAction(owner2Ctx, 'valid-csrf-token', actionId, 'approve', {})
       ).rejects.toMatchObject({ code: 'cannot_demote_last_owner', status: 400 });
       const [rows] = await pool.execute('SELECT id, tier, status FROM users WHERE id = ?', [owner2]);
-      expect(rows[0].tier).toBe('enterprise');
+      expect(rows[0].tier).toBe('owner');
+      const [actions] = await pool.execute(
+        'SELECT action_id, action_type, actor, target_resource_id, reason, status FROM governance_actions WHERE action_id = ?', [actionId]);
+      expect(actions[0].status).toBe('pending');
+
+      // With a second active owner the same governance demotion goes through.
+      await pool.execute("UPDATE users SET status = 'active' WHERE id = ?", [1]);
+      (pool as unknown as { users: MockRow[] }).users.find((u) => u.id === 1)!.status = 'active';
+      const done = await admin.decideGovernanceAction(owner2Ctx, 'valid-csrf-token', actionId, 'approve', {});
+      expect(done).toMatchObject({ success: true, status: 'approved' });
+      const [after] = await pool.execute('SELECT id, tier, status FROM users WHERE id = ?', [owner2]);
+      expect(after[0].tier).toBe('user');
     });
 
     /**
@@ -646,15 +680,15 @@ describe('AdminSystem', () => {
      */
     // ADMIN-03
     it('a context claiming owner for a basic user is refused; a wrong CSRF token is refused', async () => {
-      const forged: AdminContext = { ...userCtx, tier: 'enterprise' };
+      const forged: AdminContext = { ...userCtx, tier: 'owner' };
       await expect(
-        admin.changeRole(forged, 'valid-csrf-token', { user_id: 2, new_tier: 'basic' })
+        admin.changeRole(forged, 'valid-csrf-token', { user_id: 2, new_tier: 'user' })
       ).rejects.toMatchObject({ code: 'owner_only', status: 403 });
       await expect(
-        admin.changeRole(ownerCtx, 'valid-csrf-tokeX', { user_id: 2, new_tier: 'basic' })
+        admin.changeRole(ownerCtx, 'valid-csrf-tokeX', { user_id: 2, new_tier: 'user' })
       ).rejects.toMatchObject({ code: 'csrf_mismatch', status: 403 });
       await expect(
-        admin.changeRole(ownerCtx, '', { user_id: 2, new_tier: 'basic' })
+        admin.changeRole(ownerCtx, '', { user_id: 2, new_tier: 'user' })
       ).rejects.toMatchObject({ code: 'csrf_mismatch', status: 403 });
     });
   });
@@ -681,9 +715,9 @@ describe('AdminSystem', () => {
   describe('customers', () => {
     // ADMIN-10
     it('list: pagination works and all fields are present', async () => {
-      pool.seedCustomer({ email: 'one@example.com', name: 'One', tier: 'pro' });
-      pool.seedCustomer({ email: 'two@example.com', name: 'Two', tier: 'basic' });
-      pool.seedCustomer({ email: 'three@example.com', name: 'Three', tier: 'free' });
+      pool.seedCustomer({ email: 'one@example.com', name: 'One', tier: 'team' });
+      pool.seedCustomer({ email: 'two@example.com', name: 'Two', tier: 'solo' });
+      pool.seedCustomer({ email: 'three@example.com', name: 'Three', tier: 'enterprise' });
 
       const page = await admin.listCustomers(adminCtx, { limit: 2, offset: 0 });
 
@@ -703,28 +737,28 @@ describe('AdminSystem', () => {
 
     // ADMIN-11
     it('detail: all fields are present', async () => {
-      const id = pool.seedCustomer({ email: 'one@example.com', name: 'One', tier: 'pro' });
+      const id = pool.seedCustomer({ email: 'one@example.com', name: 'One', tier: 'team' });
 
       const detail = await admin.getCustomer(adminCtx, id);
 
-      expect(detail).toMatchObject({ success: true, customer_id: id, email: 'one@example.com', tier: 'pro' });
+      expect(detail).toMatchObject({ success: true, customer_id: id, email: 'one@example.com', tier: 'team' });
     });
 
     // ADMIN-12
     it('changePlan: Stripe is called and the change is audited', async () => {
       const id = pool.seedCustomer({
-        email: 'one@example.com', name: 'One', tier: 'basic', stripe_subscription_id: 'sub_123',
+        email: 'one@example.com', name: 'One', tier: 'solo', stripe_subscription_id: 'sub_123',
       });
 
-      const result = await admin.changePlan(ownerCtx, 'valid-csrf-token', id, { new_tier: 'pro' });
+      const result = await admin.changePlan(ownerCtx, 'valid-csrf-token', id, { new_tier: 'team' });
 
-      expect(result).toMatchObject({ success: true, customer_id: id, old_tier: 'basic', new_tier: 'pro' });
+      expect(result).toMatchObject({ success: true, customer_id: id, old_tier: 'solo', new_tier: 'team' });
       expect(stripe.calls).toHaveLength(1);
       expect(stripe.calls[0].subscriptionId).toBe('sub_123');
-      expect(stripe.calls[0].params.items[0].price).toBe('price_pro');
+      expect(stripe.calls[0].params.items[0].price).toBe('price_team');
       // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: ADMIN-12 amendment: the update names the existing item, so
       // Stripe replaces it instead of adding a second one, and prorates.
-      expect(stripe.calls[0].params).toEqual({ items: [{ id: 'si_current', price: 'price_pro' }], proration_behavior: 'create_prorations' });
+      expect(stripe.calls[0].params).toEqual({ items: [{ id: 'si_current', price: 'price_team' }], proration_behavior: 'create_prorations' });
       expect(pool.getAuditLog().length).toBeGreaterThan(0);
     });
 
@@ -736,7 +770,7 @@ describe('AdminSystem', () => {
      */
     // ADMIN-12
     it('changePlan refuses an ambiguous subscription and an unknown tier before any update', async () => {
-      const id = pool.seedCustomer({ email: 'one@example.com', name: 'One', tier: 'basic', stripe_subscription_id: 'sub_123' });
+      const id = pool.seedCustomer({ email: 'one@example.com', name: 'One', tier: 'solo', stripe_subscription_id: 'sub_123' });
       await expect(
         admin.changePlan(ownerCtx, 'valid-csrf-token', id, { new_tier: 'platinum' })
       ).rejects.toMatchObject({ code: 'invalid_tier', status: 400 });
@@ -744,16 +778,16 @@ describe('AdminSystem', () => {
       for (const items of [[], [{ id: 'si_a' }, { id: 'si_b' }]]) {
         stripe.items = items;
         await expect(
-          admin.changePlan(ownerCtx, 'valid-csrf-token', id, { new_tier: 'pro' })
+          admin.changePlan(ownerCtx, 'valid-csrf-token', id, { new_tier: 'team' })
         ).rejects.toMatchObject({ code: 'subscription_item_ambiguous', status: 409 });
       }
       expect(stripe.calls).toHaveLength(0);
-      expect((await admin.getCustomer(adminCtx, id)).tier).toBe('basic');
+      expect((await admin.getCustomer(adminCtx, id)).tier).toBe('solo');
     });
 
     // ADMIN-13
     it('queueRefund: a refund record is created with status queued', async () => {
-      const customerId = pool.seedCustomer({ email: 'one@example.com', name: 'One', tier: 'pro' });
+      const customerId = pool.seedCustomer({ email: 'one@example.com', name: 'One', tier: 'team' });
       const invoiceId = pool.seedInvoice({ customer_id: customerId, amount: 100, status: 'succeeded' });
 
       const result = await admin.queueRefund(ownerCtx, 'valid-csrf-token', customerId, {
@@ -770,21 +804,21 @@ describe('AdminSystem', () => {
   describe('deployments', () => {
     // ADMIN-14
     it('createDeployment: the deployment and its config are created', async () => {
-      const customerId = pool.seedCustomer({ email: 'one@example.com', name: 'One', tier: 'pro' });
+      const customerId = pool.seedCustomer({ email: 'one@example.com', name: 'One', tier: 'team' });
 
       const result = await admin.createDeployment(ownerCtx, 'valid-csrf-token', {
-        customer_id: customerId, domain: 'one.example.com', tier: 'pro', theme_id: 1,
+        customer_id: customerId, domain: 'one.example.com', tier: 'team', theme_id: 1,
       });
 
-      expect(result).toMatchObject({ success: true, domain: 'one.example.com', tier: 'pro' });
+      expect(result).toMatchObject({ success: true, domain: 'one.example.com', tier: 'team' });
       expect(result.deployment_id).toBeDefined();
     });
 
     // ADMIN-15
     it('publishDeployment: the double gate is checked and the status becomes live', async () => {
-      const customerId = pool.seedCustomer({ email: 'one@example.com', name: 'One', tier: 'pro' });
+      const customerId = pool.seedCustomer({ email: 'one@example.com', name: 'One', tier: 'team' });
       const id = pool.seedDeployment({
-        customer_id: customerId, domain: 'one.example.com', tier: 'pro', domain_verified: 1, theme_id: 1,
+        customer_id: customerId, domain: 'one.example.com', tier: 'team', domain_verified: 1, theme_id: 1,
       });
 
       const result = await admin.publishDeployment(ownerCtx, 'valid-csrf-token', { deployment_id: id });
@@ -849,7 +883,7 @@ describe('AdminSystem', () => {
       // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: changes user 3's role, not user 2's. The gate now reads the
       // caller's tier from the database, so demoting user 2 (the admin) and then searching AS user 2 is rightly
       // refused; the old gate trusted the context's stale 'pro'. The filters checked are unchanged.
-      await admin.changeRole(ownerCtx, 'valid-csrf-token', { user_id: 3, new_tier: 'free' });
+      await admin.changeRole(ownerCtx, 'valid-csrf-token', { user_id: 3, new_tier: 'admin' });
       const everything = await admin.searchAuditLog(adminCtx, {});
       expect(everything.total).toBeGreaterThanOrEqual(2);
 
@@ -866,7 +900,7 @@ describe('AdminSystem', () => {
   describe('invited users', () => {
     it('the one-time password is stored with a slow, salted hash, never in plain form', async () => {
       await admin.createUser(ownerCtx, 'valid-csrf-token', {
-        email: 'invited@example.com', name: 'Invited', tier: 'basic', notify: true,
+        email: 'invited@example.com', name: 'Invited', tier: 'user', notify: true,
       });
 
       const stored = (pool as unknown as { users: MockRow[] }).users.find((u) => u.email === 'invited@example.com');
@@ -887,6 +921,139 @@ describe('AdminSystem', () => {
       printed.mockRestore();
       expect(output).toContain('a@example.com');
       expect(output).not.toContain('the-secret');
+    });
+  });
+  // -- PHASE B.2 ------------------------------------------------------------
+
+  /**
+   * ADMIN-19: a suspended owner calling any admin action is refused before any gate (even with a wrong CSRF token)
+   * with 403 account_suspended, and nothing changes: no user, customer, deployment, refund, governance or audit
+   * write, and no Stripe or email call. A suspended admin is refused on reads the same way.
+   * In: the fakes. Out: assertions only. Why: ADMIN-19 (Phase B.2, 2026-11-10) and the typescript bug list (a
+   * suspended owner could still act). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: fakes only.
+   */
+  describe('suspended caller', () => {
+    // ADMIN-19
+    it('a suspended owner gets 403 account_suspended on every action and nothing changes', async () => {
+      const customerId = pool.seedCustomer({ email: 'c@example.com', name: 'C', tier: 'solo' });
+      const invoiceId = pool.seedInvoice({ customer_id: customerId, amount: 10, status: 'succeeded' });
+      const depId = pool.seedDeployment({ customer_id: customerId, domain: 'c.example.com', tier: 'solo' });
+      const actionId = pool.seedGovernanceAction({ action_type: 'suspend_user', actor: 2, target_resource_id: 3, reason: 'x' });
+      pool.seedUser({ email: 'owner2@example.com', name: 'Owner 2', tier: 'owner', status: 'active' });
+      (pool as unknown as { users: MockRow[] }).users.find((u) => u.id === 1)!.status = 'suspended';
+      const snapshot = () => JSON.stringify(pool);
+      const before = snapshot();
+
+      const calls: Array<() => Promise<unknown>> = [
+        () => admin.createUser(ownerCtx, 'valid-csrf-token', { email: 'n@example.com', name: 'N', tier: 'user', notify: true }),
+        () => admin.createUser(ownerCtx, 'wrong-csrf', { email: 'n@example.com', name: 'N', tier: 'user', notify: true }),
+        () => admin.resetPassword(ownerCtx, 'valid-csrf-token', { user_id: 2 }),
+        () => admin.changeRole(ownerCtx, 'valid-csrf-token', { user_id: 2, new_tier: 'user' }),
+        () => admin.suspendUser(ownerCtx, 'valid-csrf-token', { user_id: 3, reason: 'x' }),
+        () => admin.listCustomers(ownerCtx, {}),
+        () => admin.getCustomer(ownerCtx, customerId),
+        () => admin.changePlan(ownerCtx, 'valid-csrf-token', customerId, { new_tier: 'team' }),
+        () => admin.queueRefund(ownerCtx, 'valid-csrf-token', customerId, { invoice_id: invoiceId, amount: 5, reason: 'x' }),
+        () => admin.listDeployments(ownerCtx),
+        () => admin.createDeployment(ownerCtx, 'valid-csrf-token', { customer_id: customerId, domain: 'd.example.com', tier: 'solo', theme_id: 1 }),
+        () => admin.publishDeployment(ownerCtx, 'valid-csrf-token', { deployment_id: depId }),
+        () => admin.suspendDeployment(ownerCtx, 'valid-csrf-token', { deployment_id: depId, reason: 'x' }),
+        () => admin.retireDeployment(ownerCtx, 'valid-csrf-token', { deployment_id: depId }),
+        () => admin.listGovernanceActions(ownerCtx, {}),
+        () => admin.decideGovernanceAction(ownerCtx, 'valid-csrf-token', actionId, 'approve', {}),
+        () => admin.decideGovernanceAction(ownerCtx, 'valid-csrf-token', actionId, 'reject', { reason: 'no' }),
+        () => admin.searchAuditLog(ownerCtx, {}),
+      ];
+      for (const call of calls) {
+        await expect(call()).rejects.toMatchObject({ code: 'account_suspended', status: 403 });
+      }
+      expect(snapshot()).toBe(before);
+      expect(stripe.calls).toHaveLength(0);
+      expect(stripe.retrieved).toHaveLength(0);
+      expect(email.invites).toHaveLength(0);
+      expect(email.resets).toHaveLength(0);
+
+      (pool as unknown as { users: MockRow[] }).users.find((u) => u.id === 2)!.status = 'suspended';
+      await expect(admin.searchAuditLog(adminCtx, {})).rejects.toMatchObject({ code: 'account_suspended', status: 403 });
+    });
+  });
+
+  /**
+   * Admin TIERS (Phase B.2, under ADMIN-01/06/12/14): users.tier is a staff role (owner / admin / user) and a
+   * customer's or deployment's tier a plan (solo / team / enterprise). A plan value where a role is expected, or the
+   * reverse, is 400 invalid_tier and changes nothing; the old mixed values (pro, basic, free) are refused everywhere.
+   * In: the fakes. Out: assertions only. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: fakes only.
+   */
+  describe('roles and plans', () => {
+    // ADMIN-06
+    it('a plan value is not a role, and a role is not a plan: 400 invalid_tier', async () => {
+      const customerId = pool.seedCustomer({ email: 'c@example.com', name: 'C', tier: 'solo', stripe_subscription_id: 'sub_9' });
+      const before = JSON.stringify(pool);
+      for (const plan of ['solo', 'team', 'enterprise', 'pro', 'basic', 'free']) {
+        await expect(admin.createUser(ownerCtx, 'valid-csrf-token', { email: `${plan}@example.com`, name: 'X', tier: plan, notify: false }))
+          .rejects.toMatchObject({ code: 'invalid_tier', status: 400 });
+        await expect(admin.changeRole(ownerCtx, 'valid-csrf-token', { user_id: 2, new_tier: plan }))
+          .rejects.toMatchObject({ code: 'invalid_tier', status: 400 });
+      }
+      for (const role of ['owner', 'admin', 'user', 'pro', 'basic', 'free']) {
+        await expect(admin.changePlan(ownerCtx, 'valid-csrf-token', customerId, { new_tier: role }))
+          .rejects.toMatchObject({ code: 'invalid_tier', status: 400 });
+        await expect(admin.createDeployment(ownerCtx, 'valid-csrf-token', { customer_id: customerId, domain: `${role}.example.com`, tier: role, theme_id: 1 }))
+          .rejects.toMatchObject({ code: 'invalid_tier', status: 400 });
+      }
+      expect(JSON.stringify(pool)).toBe(before);
+      expect(stripe.retrieved).toHaveLength(0);
+
+      // A role still works as a role, and a plan as a plan.
+      await expect(admin.changeRole(ownerCtx, 'valid-csrf-token', { user_id: 3, new_tier: 'admin' })).resolves.toMatchObject({ new_tier: 'admin' });
+      await expect(admin.changePlan(ownerCtx, 'valid-csrf-token', customerId, { new_tier: 'enterprise' }))
+        .resolves.toMatchObject({ old_tier: 'solo', new_tier: 'enterprise' });
+      expect(stripe.calls[0].params.items).toEqual([{ id: 'si_current', price: 'price_enterprise' }]);
+    });
+
+    /**
+     * ADMIN-12 (Phase B.2): an approved governance change_plan uses the same Stripe rule as changePlan (the
+     * existing item id and the plan's price, never a bare price); a non-plan value is not executed.
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: fakes only.
+     */
+    // ADMIN-12
+    it('governance change_plan replaces the existing item; a role value is not executed', async () => {
+      const customerId = pool.seedCustomer({ email: 'g@example.com', name: 'G', tier: 'solo', stripe_subscription_id: 'sub_g' });
+      const bad = pool.seedGovernanceAction({ action_type: 'change_plan', actor: 2, target_resource_id: customerId, reason: 'admin' });
+      await admin.decideGovernanceAction(ownerCtx, 'valid-csrf-token', bad, 'approve', {});
+      expect(stripe.calls).toHaveLength(0);
+      const good = pool.seedGovernanceAction({ action_type: 'change_plan', actor: 2, target_resource_id: customerId, reason: 'team' });
+      await admin.decideGovernanceAction(ownerCtx, 'valid-csrf-token', good, 'approve', {});
+      expect(stripe.calls).toEqual([{ subscriptionId: 'sub_g', params: { items: [{ id: 'si_current', price: 'price_team' }], proration_behavior: 'create_prorations' } }]);
+      expect((await admin.getCustomer(adminCtx, customerId)).tier).toBe('team');
+    });
+  });
+
+  /**
+   * ADMIN-14/15 (Phase B.2): a new deployment carries domain_verified false, and publish needs it: an unverified
+   * draft is 400 domain_not_verified and stays a draft, also through an approved governance publish_deployment;
+   * once verified it goes live. In: the fakes. Out: assertions only. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * Touches: fakes only.
+   */
+  describe('domain verification', () => {
+    // ADMIN-15
+    it('publish needs domain_verified', async () => {
+      const customerId = pool.seedCustomer({ email: 'v@example.com', name: 'V', tier: 'team' });
+      const created = await admin.createDeployment(ownerCtx, 'valid-csrf-token', { customer_id: customerId, domain: 'v.example.com', tier: 'team', theme_id: 1 });
+      const id = created.deployment_id as number;
+      const deps = (pool as unknown as { deployments: MockRow[] }).deployments;
+      const dep = deps.find((d) => d.deployment_id === id)!;
+      expect(dep.domain_verified).toBe(false);
+
+      await expect(admin.publishDeployment(ownerCtx, 'valid-csrf-token', { deployment_id: id }))
+        .rejects.toMatchObject({ code: 'domain_not_verified', status: 400 });
+      const viaGovernance = pool.seedGovernanceAction({ action_type: 'publish_deployment', actor: 2, target_resource_id: id, reason: 'go live' });
+      await admin.decideGovernanceAction(ownerCtx, 'valid-csrf-token', viaGovernance, 'approve', {});
+      expect(dep.status).toBe('draft');
+
+      dep.domain_verified = true;
+      await expect(admin.publishDeployment(ownerCtx, 'valid-csrf-token', { deployment_id: id }))
+        .resolves.toMatchObject({ success: true, status: 'live', public_url: 'https://v.example.com' });
     });
   });
 });

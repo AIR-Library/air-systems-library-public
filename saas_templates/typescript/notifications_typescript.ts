@@ -46,7 +46,7 @@ interface UserPreferences {
   do_not_disturb: boolean;
   /** Start of the quiet window, "HH:mm" in UTC, or null for none (the default until the user sets one). */
   quiet_hours_start: string | null;
-  /** End of the quiet window, "HH:mm" in UTC, inclusive of that whole minute, or null for none. */
+  /** End of the quiet window, "HH:mm" in UTC, the first minute after the window (Phase B.2, 2026-11-10), or null for none. */
   quiet_hours_end: string | null;
   channels_enabled: { [key in NotificationChannel]?: boolean };
 }
@@ -69,10 +69,13 @@ interface TrackParams {
 /**
  * Options for {@link NotificationService}.
  * - `now`: the clock used for quiet hours, scheduling and timestamps (default: the system clock).
- * - `retryBaseDelayMs`: the first retry waits 2 x this, the second 4 x this (default 250 ms: 0.5 s then 1 s).
- * - `sleep`: how to wait between retries (default: a timer).
+ * - `retryBaseDelayMs`: the first retry waits this, the second 2 x this, the third 4 x this (default 1000 ms: the
+ *   spec's 1 s / 2 s / 4 s).
+ * - `sleep`: how to wait between retries (default: a timer; tests pass one that records the waits).
  * Why: retries waited 2 s then 4 s, longer than a request (and the test) can wait, and nothing could be pinned to a
- * moment (repair of the failing Retry test, 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP). Touches: nothing.
+ * moment (repair of the failing Retry test, 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP). Changed again the
+ * same day (Phase B.2 NOTIF-08 amendment): up to 3 retries after the first attempt waiting 1 s, 2 s and 4 s (it was 2
+ * retries waiting 2 x and 4 x a 250 ms base). Touches: nothing.
  */
 export interface NotificationServiceOptions {
   now?: () => Date;
@@ -104,8 +107,20 @@ export interface UnsubscribeResponse {
   body: Record<string, unknown>;
 }
 
-/** Attempts per message, the first included: one send and two retries (spec: "retry ... with exponential backoff"). */
-const MAX_SEND_ATTEMPTS = 3;
+/**
+ * Attempts per message, the first included: one send and up to three retries (spec: "retry up to 3 times after the
+ * first attempt (at most 4 attempts), waiting 1 s, 2 s and 4 s"). Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP
+ * (Phase B.2 NOTIF-08 amendment): was 3 attempts.
+ */
+const MAX_SEND_ATTEMPTS = 4;
+
+/**
+ * The answer to the open-tracking route: always 204 with no body. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP
+ * (Phase B.2 NOTIF-07 amendment).
+ */
+export interface OpenResponse {
+  http_status: 204;
+}
 
 /**
  * Notification service (spec TIER_2 system 2): templated email, SMS and in-app messages with per-user preferences
@@ -144,7 +159,7 @@ export class NotificationService {
     this.emailTransport = emailTransport ?? null;
     this.smsClient = smsClient ?? null;
     this.now = options.now ?? (() => new Date());
-    this.retryBaseDelayMs = options.retryBaseDelayMs ?? 250;
+    this.retryBaseDelayMs = options.retryBaseDelayMs ?? 1000;
     this.sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
     const secret = options.unsubscribeSecret ?? process.env.NOTIFICATIONS_UNSUBSCRIBE_SECRET ?? '';
     if (Buffer.byteLength(secret, 'utf8') < 32) {
@@ -423,37 +438,49 @@ export class NotificationService {
   }
 
   /**
-   * Whether a message may go out now: not under do-not-disturb and not inside the quiet window. The window is in UTC
-   * at minute resolution and includes both ends' whole minutes, so 00:00-23:59 covers the whole day; a window whose
-   * start is after its end runs over midnight. In: the preferences. Out: true to send.
+   * Whether a message may go out now: not under do-not-disturb and not inside the quiet window (see
+   * {@link isInQuietHours}). In: the preferences. Out: true to send.
    * Why: it compared against the server's local clock to the second, so 23:59:30 fell outside 00:00-23:59, and it
-   * read the real clock only (2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP). Touches: reads the clock.
+   * read the real clock only (2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP). The window test moved to
+   * isInQuietHours the same day (Phase B.2) so deliverDue can ask it at its own `now`. Touches: reads the clock.
    */
   private async shouldSendNow(prefs: UserPreferences): Promise<boolean> {
     if (prefs.do_not_disturb) return false;
-    if (!prefs.quiet_hours_start || !prefs.quiet_hours_end) return true;
-    const start = this.parseMinutes(prefs.quiet_hours_start);
-    const end = this.parseMinutes(prefs.quiet_hours_end);
-    if (start === null || end === null) return true;
-    const now = this.now();
-    const minute = now.getUTCHours() * 60 + now.getUTCMinutes();
-    const inQuiet = start <= end ? minute >= start && minute <= end : minute >= start || minute <= end;
-    return !inQuiet;
+    return !this.isInQuietHours(prefs, this.now());
   }
 
   /**
-   * When the user's quiet window ends next: today's quiet_hours_end (UTC, HH:mm:00) unless that whole minute has
-   * already passed, else tomorrow's. In: the preferences (with a window). Out: the moment, or null when there is no
-   * valid window. Why: spec "in quiet hours the message is stored 'queued' with scheduled_at = quiet_hours_end"
-   * (NOTIF-05 amendment). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: reads the clock.
+   * Whether `at` falls inside the user's quiet window [start, end): "HH:MM" in UTC at minute resolution, the start
+   * minute included and the end excluded, so a message queued with scheduled_at = quiet_hours_end goes out at that
+   * moment. A window whose start is after its end crosses midnight (22:00-08:00); start = end, no window, or an
+   * unparseable one is never quiet.
+   * In: the preferences and the moment. Out: true when inside the window.
+   * Why: Phase B.2 notifications amendment (quiet hours are HH:MM in UTC and may cross midnight; deliver_due step 3
+   * re-checks them at its own now, and a message due at quiet_hours_end must not be re-queued to the same moment).
+   * The end minute used to be inside the window. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
    */
-  private quietHoursEndAt(prefs: UserPreferences): Date | null {
+  private isInQuietHours(prefs: UserPreferences, at: Date): boolean {
+    if (!prefs.quiet_hours_start || !prefs.quiet_hours_end) return false;
+    const start = this.parseMinutes(prefs.quiet_hours_start);
+    const end = this.parseMinutes(prefs.quiet_hours_end);
+    if (start === null || end === null || start === end) return false;
+    const minute = at.getUTCHours() * 60 + at.getUTCMinutes();
+    return start < end ? minute >= start && minute < end : minute >= start || minute < end;
+  }
+
+  /**
+   * When the user's quiet window ends next, seen from `at`: the first time of day quiet_hours_end (UTC, HH:MM:00)
+   * after `at`. In: the preferences (with a window) and the moment (default the service clock). Out: the moment, or
+   * null when there is no valid window. Why: spec "in quiet hours the message is stored 'queued' with scheduled_at =
+   * quiet_hours_end" (NOTIF-05 amendment). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP; `at` added the same day
+   * (Phase B.2) for deliverDue's step 3. Touches: reads the clock when `at` is not given.
+   */
+  private quietHoursEndAt(prefs: UserPreferences, at: Date = this.now()): Date | null {
     if (!prefs.quiet_hours_end) return null;
     const end = this.parseMinutes(prefs.quiet_hours_end);
     if (end === null) return null;
-    const now = this.now();
-    const today = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), Math.floor(end / 60), end % 60);
-    return new Date(today + 60_000 <= now.getTime() ? today + 24 * 60 * 60 * 1000 : today);
+    const sameDay = Date.UTC(at.getUTCFullYear(), at.getUTCMonth(), at.getUTCDate(), Math.floor(end / 60), end % 60);
+    return new Date(sameDay > at.getTime() ? sameDay : sameDay + 24 * 60 * 60 * 1000);
   }
 
   /**
@@ -584,8 +611,9 @@ export class NotificationService {
   }
 
   /**
-   * Sends one message on its channel, retrying a failed email or SMS with exponential backoff (2 x base, then
-   * 4 x base) up to {@link MAX_SEND_ATTEMPTS} attempts. In: the channel, user, template, variables and log id.
+   * Sends one message on its channel, retrying a failure with exponential backoff (base, 2 x base, 4 x base: 1 s,
+   * 2 s, 4 s by default) up to {@link MAX_SEND_ATTEMPTS} attempts (the first and up to 3 retries; Phase B.2 NOTIF-08,
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: it was 3 attempts waiting 2 x and 4 x base). In: the channel, user, template, variables and log id.
    * Out: { ok: true } or { ok: false, error }. Writes nothing: the caller records the outcome (sendSingle directly,
    * deliverDue only while it still holds its claim).
    * Why: rewritten as a loop 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP); split from the status write the
@@ -606,7 +634,7 @@ export class NotificationService {
         if (attempt === MAX_SEND_ATTEMPTS) {
           return { ok: false, error: String(err?.message ?? err) };
         }
-        await this.sleep(Math.pow(2, attempt) * this.retryBaseDelayMs);
+        await this.sleep(Math.pow(2, attempt - 1) * this.retryBaseDelayMs);
       }
     }
     return { ok: false, error: 'unreachable' };
@@ -708,6 +736,8 @@ export class NotificationService {
    *    by one with UPDATE ... SET status = 'sending', claimed_at = now WHERE id = ? AND status = 'queued' (a row
    *    another worker claimed first is skipped);
    * 3. the user's preferences are read NOW: channel switched off (unsubscribed) or do-not-disturb -> 'skipped';
+   *    inside the user's quiet hours (at `now`) -> back to 'queued' with scheduled_at = quiet_hours_end and its claim
+   *    released (such a row is handed back, so it is in none of the counts or message_ids);
    * 4. the outcome ('sent' / 'failed' / 'skipped') is written only WHERE id = ? AND status = 'sending' AND
    *    claimed_at = this claim, so a worker whose claim was taken over cannot overwrite the newer outcome.
    * Each message is sent exactly once when no worker crashes, at least once after a crash; one send must finish in
@@ -715,7 +745,8 @@ export class NotificationService {
    * In: now (default the service clock) and limit (default 100). Out: { delivered, failed, skipped, message_ids }
    * for the rows this call claimed. Why: NOTIF-12 amendment 2026-11-10 (claimed_at, the stale-claim reset, the
    * preference re-check and the conditional final write were missing). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
-   * Touches: notification_logs, preferences, SMTP / Twilio.
+   * Changed again the same day (Phase B.2 NOTIF-05 amendment): step 3 re-queues a due message inside quiet hours
+   * (it was sent). Touches: notification_logs, preferences, SMTP / Twilio.
    */
   async deliverDue(now: Date = this.now(), limit: number = 100): Promise<{ delivered: number; failed: number; skipped: number; message_ids: string[] }> {
     const nowIso = now.toISOString();
@@ -755,9 +786,9 @@ export class NotificationService {
         row.id
       );
       if (!claim.changes) continue; // another worker claimed it first
-      message_ids.push(row.id);
       const template = this.templates.get(row.template_key);
       if (!template) {
+        message_ids.push(row.id);
         if (await finish(row.id, { status: 'failed', error: `template_not_found: ${row.template_key}` })) failed++;
         continue;
       }
@@ -765,9 +796,21 @@ export class NotificationService {
       const prefs = await this.getUserPreferences(row.user_id);
       if (prefs.channels_enabled[row.channel] === false || prefs.do_not_disturb) {
         const reason = prefs.do_not_disturb ? 'do_not_disturb' : 'channel_disabled';
+        message_ids.push(row.id);
         if (await finish(row.id, { status: 'skipped', error: reason })) skipped++;
         continue;
       }
+      const quietEnd = this.isInQuietHours(prefs, now) ? this.quietHoursEndAt(prefs, now) : null;
+      if (quietEnd !== null) {
+        // Inside quiet hours: hand it back, due again when the window ends (only while this claim still holds).
+        await this.db.run(
+          `UPDATE notification_logs SET status = 'queued', scheduled_at = ?, claimed_at = NULL
+           WHERE id = ? AND status = 'sending' AND claimed_at = ?`,
+          quietEnd.toISOString(), row.id, nowIso
+        );
+        continue;
+      }
+      message_ids.push(row.id);
       let vars: any = {};
       try {
         vars = JSON.parse(row.vars_used || '{}');
@@ -859,20 +902,48 @@ export class NotificationService {
 
   /**
    * Records an opened / clicked / bounced event for a message and returns its log row (any other status only reads).
+   * 'opened' goes through {@link markOpened}, so it is recorded the first time only.
    * In: { message_id, status }. Out: the log row or undefined. Touches: notification_logs.
-   * Documented 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (timestamps now from the service clock).
+   * Documented 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (timestamps now from the service clock); the same
+   * day (Phase B.2 NOTIF-07) a second 'opened' no longer moves opened_at.
    */
   async track(params: TrackParams): Promise<NotificationLog | null> {
     const { message_id, status } = params;
     const now = this.now().toISOString();
     if (status === 'opened') {
-      await this.updateLogStatus(message_id, { status: 'opened', opened_at: now });
+      await this.markOpened(message_id);
     } else if (status === 'clicked') {
       await this.updateLogStatus(message_id, { status: 'clicked', clicked_at: now });
     } else if (status === 'bounced') {
       await this.updateLogStatus(message_id, { status: 'bounced', bounced: true });
     }
     return await this.db.get<NotificationLog>(`SELECT * FROM notification_logs WHERE id = ?`, message_id);
+  }
+
+  /**
+   * Sets opened_at (the service clock) and status 'opened' on a message the first time it is opened; later calls,
+   * and unknown ids, change nothing. In: the message id. Out: true when this call recorded the open.
+   * Why: Phase B.2 NOTIF-07 amendment (an open is recorded once). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * Touches: notification_logs.
+   */
+  private async markOpened(message_id: string): Promise<boolean> {
+    const res = await this.db.run(
+      `UPDATE notification_logs SET status = 'opened', opened_at = ? WHERE id = ? AND opened_at IS NULL`,
+      this.now().toISOString(), String(message_id)
+    );
+    return !!res.changes;
+  }
+
+  /**
+   * The route GET /notifications/open/:message_id (the tracking pixel or link): records the open the first time
+   * (opened_at and status 'opened'), and answers 204 with no body either way, so a client learns nothing about the
+   * id. The host's router maps the path parameter to this. In: the message id from the path. Out: { http_status: 204 }.
+   * Why: Phase B.2 NOTIF-07 amendment (the open route was missing). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * Touches: notification_logs.
+   */
+  async handleOpen(message_id: string): Promise<OpenResponse> {
+    await this.markOpened(message_id);
+    return { http_status: 204 };
   }
 
   /**

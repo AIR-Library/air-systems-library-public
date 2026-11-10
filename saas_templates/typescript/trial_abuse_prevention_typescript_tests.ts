@@ -9,7 +9,16 @@ beforeEach(() => {
   db.exec('DROP TABLE IF EXISTS trial_abuse_ledger;');
   db.exec('DROP TABLE IF EXISTS device_fingerprints;');
   db.exec('DROP TABLE IF EXISTS gate_decisions;');
+  // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): the users table is reset too; payment timing reads
+  // users.created_at.
+  db.exec('DROP TABLE IF EXISTS users;');
   db.exec(`
+    CREATE TABLE users (
+      id INTEGER PRIMARY KEY,
+      email TEXT NOT NULL,
+      created_at DATETIME NOT NULL,
+      abuse_flags TEXT NOT NULL DEFAULT '[]'
+    );
     CREATE TABLE trial_abuse_ledger (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL,
@@ -47,6 +56,15 @@ beforeEach(() => {
     );
   `);
 });
+
+/**
+ * Inserts a users row (id, email t<id>@example.com, created_at). In: the user id and when the account was created.
+ * Out: nothing. Why: Phase B.2 trial spec amendment: payment timing is judged from users.created_at.
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite.
+ */
+function addUser(userId: number, createdAt: Date) {
+  db.prepare(`INSERT INTO users (id, email, created_at) VALUES (?, ?, ?)`).run(userId, `t${userId}@example.com`, createdAt.toISOString());
+}
 
 // TRIAL-01
 test('email_trial_history PASS → new email allowed', () => {
@@ -198,6 +216,9 @@ test('trial_payment_timing PASS → payment within trial window, allowed', () =>
     INSERT INTO trial_abuse_ledger (user_id, email, ip, signup_date, trial_started_at, gate_flags)
     VALUES (1200, 'timing@example.com', '1.1.1.1', ?, ?, '{}')
   `).run(fiveDaysAgo.toISOString(), fiveDaysAgo.toISOString());
+  // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): the trial starts at users.created_at now, so the user
+  // needs a users row (signup writes one).
+  addUser(1200, fiveDaysAgo);
 
   const decision = check_trial_payment_timing(1200, 14);
   expect(decision.decision).toBe('PASS');
@@ -215,6 +236,8 @@ test('trial_payment_timing FAIL → trial ended, no payment, trying to re-add, r
     INSERT INTO trial_abuse_ledger (user_id, email, ip, signup_date, trial_started_at, gate_flags)
     VALUES (1300, 'ended@example.com', '2.2.2.2', ?, ?, '{}')
   `).run(hundredDaysAgo.toISOString(), hundredDaysAgo.toISOString());
+  // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): the trial starts at users.created_at now.
+  addUser(1300, hundredDaysAgo);
 
   const decision = check_trial_payment_timing(1300, 14);
   expect(decision.decision).toBe('FAIL');
@@ -308,10 +331,15 @@ test('integration: payment method reuse challenge', () => {
   expect(subRes.challenge?.flags).toContain('payment_reuse_2x');
 });
 
-/** Inserts a ledger row whose trial started `daysAgo` days before `now`. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+/**
+ * Inserts a users row and a ledger row whose trial started `daysAgo` days before `now`.
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP; Phase B.2 the same day: also the users row, whose created_at the
+ * timing gate now reads. Touches: in-memory SQLite.
+ */
 function trialStartedDaysAgo(userId: number, now: Date, daysAgo: number, paymentDaysAgo?: number) {
   const start = new Date(now.getTime() - daysAgo * 24 * 60 * 60 * 1000).toISOString();
   const paid = paymentDaysAgo === undefined ? null : new Date(now.getTime() - paymentDaysAgo * 24 * 60 * 60 * 1000).toISOString();
+  addUser(userId, new Date(start));
   db.prepare(`
     INSERT INTO trial_abuse_ledger (user_id, email, ip, signup_date, trial_started_at, payment_added_date, gate_flags)
     VALUES (?, ?, '1.1.1.1', ?, ?, ?, '{}')
@@ -426,4 +454,34 @@ test('device_fingerprint boundaries → 4 others CHALLENGE; 5 FAIL even for a kn
   expect(check_device_fingerprint(FARM, 21)).toMatchObject({ decision: 'FAIL', matchingUsers: 5 });
   expect(device_fingerprint_gate(FARM, 40).decision).toBe('FAIL');
   expect(deviceRows(40)).toBe(0);
+});
+
+/**
+ * Phase B.2 trial spec amendment (gate 5, under TRIAL-10/11): a user with no users row is FAIL user_not_found (fail
+ * closed) and subscription_created answers 403 {error: 'user_not_found'}; a user with a users row but no ledger row
+ * is judged from users.created_at with no earlier payment (90 days after the trial is FAIL, 4 days is PASS), and a
+ * payment for such a user is recorded in a new ledger row, so the next check sees the earlier payment.
+ * In: users rows on a pinned clock. Out: assertions only. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+ * Touches: in-memory SQLite.
+ */
+// TRIAL-11
+test('trial_payment_timing → no users row FAIL user_not_found; no ledger row judged from users.created_at', () => {
+  set_clock(() => NOW);
+  expect(check_trial_payment_timing(9001, 14)).toMatchObject({ decision: 'FAIL', error: 'user_not_found', paymentDelay: null });
+  const refused = subscription_created({ user_id: 9001, stripe_payment_method_id: 'pm_ghost', stripe_customer_id: 'cus_ghost' });
+  expect(refused.success).toBe(false);
+  expect(refused.error).toMatchObject({ error: 'user_not_found', code: 403 });
+
+  addUser(9002, new Date(NOW.getTime() - 104 * 24 * HOUR));   // 90 days after a 14-day trial, no ledger row
+  expect(check_trial_payment_timing(9002, 14)).toMatchObject({ decision: 'FAIL', paymentDelay: 90 });
+
+  addUser(9003, new Date(NOW.getTime() - 18 * 24 * HOUR));    // 4 days after the trial, no ledger row
+  expect(check_trial_payment_timing(9003, 14)).toMatchObject({ decision: 'PASS', paymentDelay: 4 });
+  expect(subscription_created({ user_id: 9003, stripe_payment_method_id: 'pm_new', stripe_customer_id: 'cus_new' }).success).toBe(true);
+  const ledger = db.prepare('SELECT payment_added_date, subscription_status FROM trial_abuse_ledger WHERE user_id = ?').all(9003) as Array<{ payment_added_date: string; subscription_status: string }>;
+  expect(ledger).toEqual([{ payment_added_date: NOW.toISOString(), subscription_status: 'completed' }]);
+
+  // A later check for the same user now has an earlier payment: 90+ days after the trial is CHALLENGE, not FAIL.
+  set_clock(() => new Date(NOW.getTime() + 90 * 24 * HOUR));
+  expect(check_trial_payment_timing(9003, 14)).toMatchObject({ decision: 'CHALLENGE', paymentDelay: 94 });
 });
