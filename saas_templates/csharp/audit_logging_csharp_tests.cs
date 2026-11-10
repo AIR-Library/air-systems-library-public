@@ -378,6 +378,9 @@ public class AuditLoggingTests : IDisposable
         Assert.Equal(2, await _repo.EraseSubjectAsync("1")); // the admin's two actor rows
         var afterAdmin = await _repo.ReplayAsync(Admin, aboutUser);
         Assert.False(afterAdmin.Erased);
+        // The subject's snapshot is still there (only the admin's actor rows were erased). Asserted before use:
+        // code-quality review on PR 21, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        Assert.NotNull(afterAdmin.ResourceStateAtTime);
         Assert.Equal("team", afterAdmin.ResourceStateAtTime.Value.GetProperty("tier").GetString());
         var noSubjectReplay = await _repo.ReplayAsync(Admin, noSubject);
         Assert.False(noSubjectReplay.Erased);
