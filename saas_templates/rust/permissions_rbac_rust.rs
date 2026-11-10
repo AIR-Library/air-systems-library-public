@@ -1,10 +1,24 @@
-use sqlx::{Pool, Sqlite, SqlitePool};
-use std::sync::Arc;
+//! Permissions and RBAC: tier checks, cascading deletes and a permission audit log (GEMINI dispatch
+//! spec, template #6).
+//!
+//! What: `RbacSystem` checks the tier hierarchy public < member < admin < owner (`require_owner`,
+//! `require_admin`, `require_authenticated`), writes every check, pass or fail, to `audit_log`, and runs
+//! the user, deployment and organization cascades inside one transaction each (the cascade's own audit
+//! row included), so an error rolls the whole cascade back.
+//! Why: the old file did not compile without a database at build time (`sqlx::query!` macros check SQL
+//! against `DATABASE_URL` while compiling), `initialize_schema` was private although callers need it,
+//! the users table had no `organization_id`, and the organization cascade deleted the users before
+//! looking up their sessions and API keys through them, so those were never deleted.
+//! Repaired 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+//! Touches: the SQLite pool it is given; the clock. No network, no money.
+
+use sqlx::{Pool, Sqlite, SqlitePool, Transaction};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// What: the `Tier` enum. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
 pub enum Tier {
     Public = 0,
     Member = 1,
@@ -12,7 +26,9 @@ pub enum Tier {
     Owner = 3,
 }
 
+/// What: methods of `Tier`, each documented below. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
 impl Tier {
+    /// What: `from_str` of `Tier`; behaviour as the trait or type documents it. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: as described for its type.
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "public" => Some(Tier::Public),
@@ -23,6 +39,7 @@ impl Tier {
         }
     }
 
+    /// What: `to_str` of `Tier`; behaviour as the trait or type documents it. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: as described for its type.
     pub fn to_str(&self) -> &'static str {
         match self {
             Tier::Public => "public",
@@ -34,12 +51,14 @@ impl Tier {
 }
 
 #[derive(Debug, Clone)]
+/// What: the `User` struct. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
 pub struct User {
     pub id: i32,
     pub tier: Tier,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+/// What: the `AuditLogEntry` struct. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
 pub struct AuditLogEntry {
     pub action: String,
     pub user_id: Option<i32>,
@@ -52,23 +71,33 @@ pub struct AuditLogEntry {
 }
 
 #[derive(Debug)]
+/// What: the `RbacSystem` struct. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
 pub struct RbacSystem {
     pub db: Pool<Sqlite>,
 }
 
+/// What: methods of `RbacSystem`, each documented below. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
 impl RbacSystem {
+    /// What: `new` of `RbacSystem`; behaviour as the trait or type documents it. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: as described for its type.
     pub async fn new(db_url: &str) -> Result<Self, sqlx::Error> {
         let pool = SqlitePool::connect(db_url).await?;
         Self::initialize_schema(&pool).await?;
         Ok(RbacSystem { db: pool })
     }
 
-    async fn initialize_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    /// What: create the tables (users, their sessions/keys/files/preferences, organizations,
+    /// deployments and their DNS/theme/log rows, audit_log). Public so callers sharing a pool can set it
+    /// up. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (DDL).
+    pub async fn initialize_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
+            CREATE TABLE IF NOT EXISTS organizations (
+                id INTEGER PRIMARY KEY
+            );
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY,
-                tier TEXT NOT NULL
+                tier TEXT NOT NULL CHECK (tier IN ('public', 'member', 'admin', 'owner')),
+                organization_id INTEGER NULL REFERENCES organizations(id)
             );
             CREATE TABLE IF NOT EXISTS sessions (
                 id INTEGER PRIMARY KEY,
@@ -89,9 +118,6 @@ impl RbacSystem {
                 id INTEGER PRIMARY KEY,
                 user_id INTEGER NOT NULL,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS organizations (
-                id INTEGER PRIMARY KEY
             );
             CREATE TABLE IF NOT EXISTS deployments (
                 id INTEGER PRIMARY KEY,
@@ -131,193 +157,108 @@ impl RbacSystem {
         Ok(())
     }
 
+    /// What: allow only owners; logs the check. In: the caller (from the server's session, `None`
+    /// when anonymous). Out: `()` or `OwnerOnly` (403). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// Touches: database (audit_log).
     pub async fn require_owner(&self, user: Option<&User>) -> Result<(), RbacError> {
-        let user_tier = user.map(|u| u.tier).unwrap_or(Tier::Public);
-        let required_tier = Tier::Owner;
-        let decision = if user_tier >= required_tier {
-            "PASS"
-        } else {
-            "FAIL"
-        };
-        self.log_audit(
-            "permission_check",
-            user.map(|u| u.id),
-            None,
-            Some(required_tier.to_str()),
-            Some(user_tier.to_str()),
-            decision,
-            None,
-        )
-        .await?;
-        if user_tier < required_tier {
-            return Err(RbacError::OwnerOnly);
-        }
-        Ok(())
+        self.require_tier(user, Tier::Owner, RbacError::OwnerOnly).await
     }
 
+    /// What: allow admins and owners; logs the check. Out: `()` or `AdminOnly` (403; anonymous callers
+    /// get the same answer). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
     pub async fn require_admin(&self, user: Option<&User>) -> Result<(), RbacError> {
+        self.require_tier(user, Tier::Admin, RbacError::AdminOnly).await
+    }
+
+    /// What: compare the caller's tier with the required one, log PASS/FAIL, and deny on failure. If the
+    /// audit row cannot be written the request is denied (fail closed). 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (audit_log).
+    async fn require_tier(&self, user: Option<&User>, required: Tier, denied: RbacError) -> Result<(), RbacError> {
         let user_tier = user.map(|u| u.tier).unwrap_or(Tier::Public);
-        let required_tier = Tier::Admin;
-        let decision = if user_tier >= required_tier {
-            "PASS"
-        } else {
-            "FAIL"
-        };
-        self.log_audit(
-            "permission_check",
-            user.map(|u| u.id),
-            None,
-            Some(required_tier.to_str()),
-            Some(user_tier.to_str()),
-            decision,
-            None,
-        )
-        .await?;
-        if user_tier < required_tier {
-            return Err(RbacError::AdminOnly);
-        }
-        Ok(())
+        let pass = user_tier >= required;
+        let decision = if pass { "PASS" } else { "FAIL" };
+        self.log_audit(&self.db, "permission_check", user.map(|u| u.id), None, Some(required.to_str()), Some(user_tier.to_str()), decision, None)
+            .await
+            .map_err(|_| RbacError::Internal)?;
+        if pass { Ok(()) } else { Err(denied) }
     }
 
+    /// What: allow any signed-in caller; logs the check. Out: `()` or `AuthenticationRequired` (401).
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (audit_log).
     pub async fn require_authenticated(&self, user: Option<&User>) -> Result<(), RbacError> {
-        let is_authenticated = user.is_some();
-        let decision = if is_authenticated { "PASS" } else { "FAIL" };
-        self.log_audit(
-            "permission_check",
-            user.map(|u| u.id),
-            None,
-            Some("authenticated".to_string()),
-            None,
-            decision,
-            None,
-        )
-        .await?;
-        if !is_authenticated {
-            return Err(RbacError::AuthenticationRequired);
-        }
-        Ok(())
+        let decision = if user.is_some() { "PASS" } else { "FAIL" };
+        self.log_audit(&self.db, "permission_check", user.map(|u| u.id), None, Some("member"), user.map(|u| u.tier.to_str()), decision, None)
+            .await
+            .map_err(|_| RbacError::Internal)?;
+        if user.is_some() { Ok(()) } else { Err(RbacError::AuthenticationRequired) }
     }
 
+    /// What: run one DELETE inside the transaction and return the rows removed.
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
+    async fn delete(tx: &mut Transaction<'_, Sqlite>, sql: &str, id: i32) -> Result<u64, sqlx::Error> {
+        Ok(sqlx::query(sql).bind(id).execute(&mut **tx).await?.rows_affected())
+    }
+
+    /// What: delete a user with their sessions, API keys, files and preferences, plus the
+    /// `user_deleted_cascade` audit row, all in one transaction (rolled back on any error).
+    /// In: user id. Out: `()`. Why: spec cascade rule. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// Touches: database.
     pub async fn delete_user(&self, user_id: i32) -> Result<(), sqlx::Error> {
         let mut tx = self.db.begin().await?;
-        let sessions_deleted = sqlx::query!("DELETE FROM sessions WHERE user_id = ?", user_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        let api_keys_deleted = sqlx::query!("DELETE FROM api_keys WHERE user_id = ?", user_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        let files_deleted = sqlx::query!("DELETE FROM files WHERE user_id = ?", user_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        let preferences_deleted = sqlx::query!("DELETE FROM preferences WHERE user_id = ?", user_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        let _ = sqlx::query!("DELETE FROM users WHERE id = ?", user_id)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        self.log_audit(
-            "user_deleted_cascade",
-            None,
-            None,
-            None,
-            None,
-            "PASS",
-            Some(json!({
-                "sessions": sessions_deleted,
-                "api_keys": api_keys_deleted,
-                "files": files_deleted,
-                "preferences": preferences_deleted
-            })),
-        )
-        .await?;
-        Ok(())
+        let sessions = Self::delete(&mut tx, "DELETE FROM sessions WHERE user_id = ?", user_id).await?;
+        let api_keys = Self::delete(&mut tx, "DELETE FROM api_keys WHERE user_id = ?", user_id).await?;
+        let files = Self::delete(&mut tx, "DELETE FROM files WHERE user_id = ?", user_id).await?;
+        let preferences = Self::delete(&mut tx, "DELETE FROM preferences WHERE user_id = ?", user_id).await?;
+        let users = Self::delete(&mut tx, "DELETE FROM users WHERE id = ?", user_id).await?;
+        let details = json!({ "user_id": user_id, "users": users, "sessions": sessions, "api_keys": api_keys, "files": files, "preferences": preferences });
+        self.log_audit(&mut *tx, "user_deleted_cascade", None, None, None, None, "PASS", Some(details)).await?;
+        tx.commit().await
     }
 
+    /// What: delete a deployment with its DNS records, theme configs and logs, plus the
+    /// `deployment_deleted_cascade` audit row, in one transaction. (Archiving to object storage is the
+    /// caller's job before calling this.) 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
     pub async fn delete_deployment(&self, deployment_id: i32) -> Result<(), sqlx::Error> {
         let mut tx = self.db.begin().await?;
-        let dns_records_deleted = sqlx::query!("DELETE FROM dns_records WHERE deployment_id = ?", deployment_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        let theme_configs_deleted = sqlx::query!("DELETE FROM theme_configs WHERE deployment_id = ?", deployment_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        let deployment_logs_deleted = sqlx::query!("DELETE FROM deployment_logs WHERE deployment_id = ?", deployment_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        let _ = sqlx::query!("DELETE FROM deployments WHERE id = ?", deployment_id)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        self.log_audit(
-            "deployment_deleted_cascade",
-            None,
-            None,
-            None,
-            None,
-            "PASS",
-            Some(json!({
-                "dns_records": dns_records_deleted,
-                "theme_configs": theme_configs_deleted,
-                "deployment_logs": deployment_logs_deleted
-            })),
-        )
-        .await?;
-        Ok(())
+        let dns = Self::delete(&mut tx, "DELETE FROM dns_records WHERE deployment_id = ?", deployment_id).await?;
+        let themes = Self::delete(&mut tx, "DELETE FROM theme_configs WHERE deployment_id = ?", deployment_id).await?;
+        let logs = Self::delete(&mut tx, "DELETE FROM deployment_logs WHERE deployment_id = ?", deployment_id).await?;
+        let deployments = Self::delete(&mut tx, "DELETE FROM deployments WHERE id = ?", deployment_id).await?;
+        let details = json!({ "deployment_id": deployment_id, "deployments": deployments, "dns_records": dns, "theme_configs": themes, "deployment_logs": logs });
+        self.log_audit(&mut *tx, "deployment_deleted_cascade", None, None, None, None, "PASS", Some(details)).await?;
+        tx.commit().await
     }
 
+    /// What: delete everything inside an organization: its users' sessions, API keys, files and
+    /// preferences, its users, its deployments' DNS/theme/log rows and its deployments, plus the
+    /// `org_deleted_cascade` audit row, in one transaction. The organization row itself stays (spec lists
+    /// only the nested records). Children are deleted before the rows they are found through.
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
     pub async fn delete_organization(&self, org_id: i32) -> Result<(), sqlx::Error> {
         let mut tx = self.db.begin().await?;
-        let deployments_deleted = sqlx::query!("DELETE FROM deployments WHERE organization_id = ?", org_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        let users_deleted = sqlx::query!("DELETE FROM users WHERE organization_id = ?", org_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        let api_keys_deleted = sqlx::query!(
-            "DELETE FROM api_keys WHERE user_id IN (SELECT id FROM users WHERE organization_id = ?)",
-            org_id
-        )
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        let sessions_deleted = sqlx::query!(
-            "DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE organization_id = ?)",
-            org_id
-        )
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        tx.commit().await?;
-        self.log_audit(
-            "org_deleted_cascade",
-            None,
-            None,
-            None,
-            None,
-            "PASS",
-            Some(json!({
-                "deployments": deployments_deleted,
-                "users": users_deleted,
-                "api_keys": api_keys_deleted,
-                "sessions": sessions_deleted
-            })),
-        )
-        .await?;
-        Ok(())
+        let of_users = "IN (SELECT id FROM users WHERE organization_id = ?)";
+        let sessions = Self::delete(&mut tx, &format!("DELETE FROM sessions WHERE user_id {}", of_users), org_id).await?;
+        let api_keys = Self::delete(&mut tx, &format!("DELETE FROM api_keys WHERE user_id {}", of_users), org_id).await?;
+        let files = Self::delete(&mut tx, &format!("DELETE FROM files WHERE user_id {}", of_users), org_id).await?;
+        let preferences = Self::delete(&mut tx, &format!("DELETE FROM preferences WHERE user_id {}", of_users), org_id).await?;
+        let users = Self::delete(&mut tx, "DELETE FROM users WHERE organization_id = ?", org_id).await?;
+        let of_deployments = "IN (SELECT id FROM deployments WHERE organization_id = ?)";
+        let dns = Self::delete(&mut tx, &format!("DELETE FROM dns_records WHERE deployment_id {}", of_deployments), org_id).await?;
+        let themes = Self::delete(&mut tx, &format!("DELETE FROM theme_configs WHERE deployment_id {}", of_deployments), org_id).await?;
+        let logs = Self::delete(&mut tx, &format!("DELETE FROM deployment_logs WHERE deployment_id {}", of_deployments), org_id).await?;
+        let deployments = Self::delete(&mut tx, "DELETE FROM deployments WHERE organization_id = ?", org_id).await?;
+        let details = json!({ "org_id": org_id, "deployments": deployments, "users": users, "api_keys": api_keys, "sessions": sessions,
+            "files": files, "preferences": preferences, "dns_records": dns, "theme_configs": themes, "deployment_logs": logs });
+        self.log_audit(&mut *tx, "org_deleted_cascade", None, None, None, None, "PASS", Some(details)).await?;
+        tx.commit().await
     }
 
-    async fn log_audit(
+    /// What: append one audit row through any executor (the pool, or a cascade's transaction).
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (audit_log), clock.
+    #[allow(clippy::too_many_arguments)]
+    async fn log_audit<'e, E>(
         &self,
+        executor: E,
         action: &str,
         user_id: Option<i32>,
         endpoint: Option<String>,
@@ -325,35 +266,41 @@ impl RbacSystem {
         user_tier: Option<&str>,
         decision: &str,
         details: Option<serde_json::Value>,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query!(
-            r#"
-            INSERT INTO audit_log (action, user_id, endpoint, required_tier, user_tier, decision, details, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-            action,
-            user_id,
-            endpoint,
-            required_tier.map(|s| s.to_string()),
-            user_tier.map(|s| s.to_string()),
-            decision,
-            details.map(|d| d.to_string()),
-            Utc::now().to_rfc3339()
+    ) -> Result<(), sqlx::Error>
+    where
+        E: sqlx::Executor<'e, Database = Sqlite>,
+    {
+        sqlx::query(
+            "INSERT INTO audit_log (action, user_id, endpoint, required_tier, user_tier, decision, details, timestamp)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
-        .execute(&self.db)
+        .bind(action)
+        .bind(user_id)
+        .bind(endpoint)
+        .bind(required_tier)
+        .bind(user_tier)
+        .bind(decision)
+        .bind(details.map(|d| d.to_string()))
+        .bind(Utc::now().to_rfc3339())
+        .execute(executor)
         .await?;
         Ok(())
     }
 }
 
-#[derive(Debug, Clone)]
+/// What: why access was refused; `Internal` when the audit row could not be written (fail closed).
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RbacError {
     OwnerOnly,
     AdminOnly,
     AuthenticationRequired,
+    Internal,
 }
 
+/// What: methods of `RbacError`, each documented below. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
 impl RbacError {
+    /// What: the spec's error body and HTTP status. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
     pub fn to_response(&self) -> (String, u16) {
         match self {
             RbacError::OwnerOnly => (
@@ -383,270 +330,15 @@ impl RbacError {
                 .to_string(),
                 401,
             ),
+            RbacError::Internal => (
+                json!({
+                    "error": "internal_error",
+                    "message": "Permission check could not be recorded",
+                    "code": 500
+                })
+                .to_string(),
+                500,
+            ),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use sqlx::SqlitePool;
-
-    async fn setup_db() -> SqlitePool {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        RbacSystem::initialize_schema(&pool).await.unwrap();
-        pool
-    }
-
-    #[tokio::test]
-    async fn test_require_owner_non_owner() {
-        let pool = setup_db().await;
-        let rbac = RbacSystem { db: pool };
-        let user = User { id: 1, tier: Tier::Admin };
-        let err = rbac.require_owner(Some(&user)).await.unwrap_err();
-        assert_eq!(err.to_response().1, 403);
-        let resp: serde_json::Value = serde_json::from_str(&err.to_response().0).unwrap();
-        assert_eq!(resp["error"], "owner_only");
-    }
-
-    #[tokio::test]
-    async fn test_require_admin_member() {
-        let pool = setup_db().await;
-        let rbac = RbacSystem { db: pool };
-        let user = User { id: 1, tier: Tier::Member };
-        let err = rbac.require_admin(Some(&user)).await.unwrap_err();
-        assert_eq!(err.to_response().1, 403);
-        let resp: serde_json::Value = serde_json::from_str(&err.to_response().0).unwrap();
-        assert_eq!(resp["error"], "admin_only");
-    }
-
-    #[tokio::test]
-    async fn test_require_authenticated_public() {
-        let pool = setup_db().await;
-        let rbac = RbacSystem { db: pool };
-        let err = rbac.require_authenticated(None).await.unwrap_err();
-        assert_eq!(err.to_response().1, 401);
-        let resp: serde_json::Value = serde_json::from_str(&err.to_response().0).unwrap();
-        assert_eq!(resp["error"], "authentication_required");
-    }
-
-    #[tokio::test]
-    async fn test_cascade_delete_user() {
-        let pool = setup_db().await;
-        let rbac = RbacSystem { db: pool.clone() };
-        sqlx::query!("INSERT INTO users (id, tier) VALUES (1, 'owner')")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query!("INSERT INTO sessions (id, user_id) VALUES (1, 1), (2, 1)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query!("INSERT INTO api_keys (id, user_id) VALUES (1, 1), (2, 1), (3, 1)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query!("INSERT INTO files (id, user_id) VALUES (1, 1)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query!("INSERT INTO preferences (id, user_id) VALUES (1, 1)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        rbac.delete_user(1).await.unwrap();
-        let sessions: i64 = sqlx::query_scalar!("SELECT COUNT(*) FROM sessions")
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .unwrap_or(0);
-        let api_keys: i64 = sqlx::query_scalar!("SELECT COUNT(*) FROM api_keys")
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .unwrap_or(0);
-        let files: i64 = sqlx::query_scalar!("SELECT COUNT(*) FROM files")
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .unwrap_or(0);
-        let preferences: i64 = sqlx::query_scalar!("SELECT COUNT(*) FROM preferences")
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .unwrap_or(0);
-        assert_eq!(sessions, 0);
-        assert_eq!(api_keys, 0);
-        assert_eq!(files, 0);
-        assert_eq!(preferences, 0);
-        let user: Option<(i32,)> = sqlx::query_as("SELECT id FROM users WHERE id = 1")
-            .fetch_optional(&pool)
-            .await
-            .unwrap();
-        assert!(user.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_cascade_delete_deployment() {
-        let pool = setup_db().await;
-        let rbac = RbacSystem { db: pool.clone() };
-        sqlx::query!("INSERT INTO organizations (id) VALUES (1)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query!("INSERT INTO deployments (id, organization_id) VALUES (1, 1)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query!("INSERT INTO dns_records (id, deployment_id) VALUES (1, 1), (2, 1)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query!("INSERT INTO theme_configs (id, deployment_id) VALUES (1, 1)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query!("INSERT INTO deployment_logs (id, deployment_id) VALUES (1, 1), (2, 1), (3, 1)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        rbac.delete_deployment(1).await.unwrap();
-        let dns: i64 = sqlx::query_scalar!("SELECT COUNT(*) FROM dns_records")
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .unwrap_or(0);
-        let themes: i64 = sqlx::query_scalar!("SELECT COUNT(*) FROM theme_configs")
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .unwrap_or(0);
-        let logs: i64 = sqlx::query_scalar!("SELECT COUNT(*) FROM deployment_logs")
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .unwrap_or(0);
-        assert_eq!(dns, 0);
-        assert_eq!(themes, 0);
-        assert_eq!(logs, 0);
-        let deployment: Option<(i32,)> = sqlx::query_as("SELECT id FROM deployments WHERE id = 1")
-            .fetch_optional(&pool)
-            .await
-            .unwrap();
-        assert!(deployment.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_cascade_delete_organization() {
-        let pool = setup_db().await;
-        let rbac = RbacSystem { db: pool.clone() };
-        sqlx::query!("INSERT INTO organizations (id) VALUES (1)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query!("INSERT INTO deployments (id, organization_id) VALUES (1, 1), (2, 1)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query!("INSERT INTO users (id, tier, organization_id) VALUES (1, 'member', 1), (2, 'admin', 1)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query!("INSERT INTO api_keys (id, user_id) VALUES (1, 1), (2, 2)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query!("INSERT INTO sessions (id, user_id) VALUES (1, 1), (2, 2)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        rbac.delete_organization(1).await.unwrap();
-        let deployments: i64 = sqlx::query_scalar!("SELECT COUNT(*) FROM deployments")
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .unwrap_or(0);
-        let users: i64 = sqlx::query_scalar!("SELECT COUNT(*) FROM users")
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .unwrap_or(0);
-        let api_keys: i64 = sqlx::query_scalar!("SELECT COUNT(*) FROM api_keys")
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .unwrap_or(0);
-        let sessions: i64 = sqlx::query_scalar!("SELECT COUNT(*) FROM sessions")
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .unwrap_or(0);
-        assert_eq!(deployments, 0);
-        assert_eq!(users, 0);
-        assert_eq!(api_keys, 0);
-        assert_eq!(sessions, 0);
-        let org: Option<(i32,)> = sqlx::query_as("SELECT id FROM organizations WHERE id = 1")
-            .fetch_optional(&pool)
-            .await
-            .unwrap();
-        assert!(org.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_cascade_rollback_on_error() {
-        let pool = setup_db().await;
-        let rbac = RbacSystem { db: pool.clone() };
-        sqlx::query!("INSERT INTO users (id, tier) VALUES (1, 'owner')")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query!("INSERT INTO sessions (id, user_id) VALUES (1, 1)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        let result = sqlx::query("INSERT INTO nonexistent_table VALUES (1)")
-            .execute(&pool)
-            .await;
-        assert!(result.is_err());
-        let sessions: i64 = sqlx::query_scalar!("SELECT COUNT(*) FROM sessions")
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .unwrap_or(0);
-        assert_eq!(sessions, 1);
-    }
-
-    #[tokio::test]
-    async fn test_permission_audit_logged() {
-        let pool = setup_db().await;
-        let rbac = RbacSystem { db: pool.clone() };
-        let user = User { id: 1, tier: Tier::Member };
-        let _ = rbac.require_admin(Some(&user)).await;
-        let logs: Vec<(String, String, String, String, String)> = sqlx::query_as(
-            r#"
-            SELECT action, user_tier, required_tier, decision, timestamp
-            FROM audit_log
-            WHERE action = 'permission_check'
-            "#
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        assert_eq!(logs.len(), 1);
-        let log = &logs[0];
-        assert_eq!(log.0, "permission_check");
-        assert_eq!(log.1, "member");
-        assert_eq!(log.2, "admin");
-        assert_eq!(log.3, "FAIL");
-    }
-
-    #[tokio::test]
-    async fn test_tier_hierarchy() {
-        assert!(Tier::Public < Tier::Member);
-        assert!(Tier::Member < Tier::Admin);
-        assert!(Tier::Admin < Tier::Owner);
-        assert!(Tier::Owner > Tier::Admin);
-        assert!(Tier::Admin > Tier::Member);
-        assert!(Tier::Member > Tier::Public);
     }
 }

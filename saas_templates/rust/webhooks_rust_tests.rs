@@ -1,6 +1,10 @@
+//! Webhooks tests (TIER 3 spec, system 1).
+//! Corrected 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the runner mounts this file as a child
+//! module of the implementation, so the nested `mod tests` sees the implementation as `crate`, not
+//! `super` (`use super::*` imported nothing and no test compiled). Touches: memory only.
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::*;
     use std::collections::HashMap;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

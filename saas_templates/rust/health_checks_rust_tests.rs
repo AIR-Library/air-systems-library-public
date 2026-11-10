@@ -1,3 +1,4 @@
+//! Health checks tests (TIER 3 spec, system 6). Touches: threads and memory only.
 mod health_checks_rust;
 
 use health_checks_rust::*;
@@ -213,9 +214,11 @@ fn test_invalid_registrations_are_rejected() {
     assert_eq!(err.unwrap_err().code, "INVALID_TIMEOUT");
     
     checker.register_check("db", "datastore", Arc::new(|| true), true, 5000).unwrap();
-    let err = checker.register_check("db", "datastore", Arc::new(|| true), true, 5000);
-    assert_eq!(err.unwrap_err().code, "DUPLICATE_COMPONENT");
-    assert_eq!(err.unwrap_err().http_status, 409);
+    // Corrected 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): `unwrap_err()` consumed `err`, so the
+    // second assertion could not compile; the error is unwrapped once and both fields are asserted.
+    let err = checker.register_check("db", "datastore", Arc::new(|| true), true, 5000).unwrap_err();
+    assert_eq!(err.code, "DUPLICATE_COMPONENT");
+    assert_eq!(err.http_status, 409);
     
     let ready = checker.readiness();
     assert!(ready.body.contains(r#""db:responseTime""#));

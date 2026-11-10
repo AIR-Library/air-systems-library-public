@@ -1,11 +1,21 @@
-use chrono::{Duration, Utc};
-use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
-use std::time::Duration as StdDuration;
-use tokio::time::sleep;
+//! Quotas and rate limiting tests (GEMINI spec, template #5).
+//! Corrected 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: imports the `Row` trait and the month
+//! helpers the tests call (they did not compile without them); the rate-limit, month-rollover and
+//! tier-upgrade tests run at a fixed instant through the `_at` functions instead of the wall clock
+//! (the 10-per-second IP test failed if 11 calls took over a second, and "now minus 30 days" is the
+//! same month on the 31st). Unused imports (`sleep`, `StdDuration`) removed. Touches: in-memory SQLite.
+use chrono::{TimeZone, Utc};
+use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
 use quotas_rate_limiting_rust::{
-    check_api_quota, check_feature_gate, check_rate_limit_per_ip,
-    check_rate_limit_per_user, check_storage_quota, init_db, QuotaError, Tier, User,
+    check_api_quota, check_api_quota_at, check_feature_gate, check_rate_limit_per_ip_at,
+    check_rate_limit_per_user_at, check_storage_quota, init_db, month_of, QuotaError, Tier, User,
 };
+
+/// What: a fixed instant (2026-03-31 12:00:00 UTC) for time-based tests. 2026-11-10,
+/// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+fn t0() -> chrono::DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 3, 31, 12, 0, 0).unwrap()
+}
 
 async fn setup_pool() -> SqlitePool {
     let pool = SqlitePoolOptions::new()
@@ -78,7 +88,7 @@ async fn rate_limit_per_user_pass() {
     let pool = setup_pool().await;
     let user = User { id: 5, tier: Tier::Team };
     for _ in 0..99 {
-        check_rate_limit_per_user(&pool, &user).await.unwrap();
+        check_rate_limit_per_user_at(&pool, &user, t0()).await.unwrap();
     }
 }
 
@@ -87,9 +97,9 @@ async fn rate_limit_per_user_fail() {
     let pool = setup_pool().await;
     let user = User { id: 6, tier: Tier::Team };
     for _ in 0..100 {
-        check_rate_limit_per_user(&pool, &user).await.unwrap();
+        check_rate_limit_per_user_at(&pool, &user, t0()).await.unwrap();
     }
-    let err = check_rate_limit_per_user(&pool, &user).await.unwrap_err();
+    let err = check_rate_limit_per_user_at(&pool, &user, t0()).await.unwrap_err();
     match err {
         QuotaError::RateLimitExceeded { reset_seconds } => {
             assert_eq!(reset_seconds, 60);
@@ -103,7 +113,7 @@ async fn rate_limit_per_ip_pass() {
     let pool = setup_pool().await;
     let ip = "192.168.1.1";
     for _ in 0..9 {
-        check_rate_limit_per_ip(&pool, ip).await.unwrap();
+        check_rate_limit_per_ip_at(&pool, ip, t0()).await.unwrap();
     }
 }
 
@@ -112,9 +122,9 @@ async fn rate_limit_per_ip_fail() {
     let pool = setup_pool().await;
     let ip = "10.0.0.1";
     for _ in 0..10 {
-        check_rate_limit_per_ip(&pool, ip).await.unwrap();
+        check_rate_limit_per_ip_at(&pool, ip, t0()).await.unwrap();
     }
-    let err = check_rate_limit_per_ip(&pool, ip).await.unwrap_err();
+    let err = check_rate_limit_per_ip_at(&pool, ip, t0()).await.unwrap_err();
     match err {
         QuotaError::IpRateLimitExceeded { reset_seconds } => {
             assert_eq!(reset_seconds, 1);
@@ -148,7 +158,7 @@ async fn month_rollover() {
     let pool = setup_pool().await;
     let user = User { id: 9, tier: Tier::Solo };
     // Simulate usage in previous month
-    let prev_month = (Utc::now() - Duration::days(30)).format("%Y-%m").to_string();
+    let prev_month = "2026-02".to_string(); // the month before t0()
     sqlx::query(
         r#"
         INSERT INTO usage_metrics (user_id, month, call_count, storage_bytes, updated_at)
@@ -157,13 +167,13 @@ async fn month_rollover() {
     )
     .bind(user.id)
     .bind(&prev_month)
-    .bind(Utc::now().to_string())
+    .bind(t0().to_rfc3339())
     .execute(&pool)
     .await
     .unwrap();
 
     // Current month usage should start at 0
-    check_api_quota(&pool, &user).await.unwrap();
+    check_api_quota_at(&pool, &user, t0()).await.unwrap();
     let row = sqlx::query(
         r#"
         SELECT call_count FROM usage_metrics
@@ -171,7 +181,7 @@ async fn month_rollover() {
         "#,
     )
     .bind(user.id)
-    .bind(&current_month())
+    .bind(&month_of(t0()))
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -185,12 +195,12 @@ async fn tier_upgrade() {
     let mut user = User { id: 10, tier: Tier::Solo };
     // Use up solo quota
     for _ in 0..1_000 {
-        check_api_quota(&pool, &user).await.unwrap();
+        check_api_quota_at(&pool, &user, t0()).await.unwrap();
     }
     // Upgrade tier
     user.tier = Tier::Team;
     // Should now be able to exceed solo limit
-    check_api_quota(&pool, &user).await.unwrap();
+    check_api_quota_at(&pool, &user, t0()).await.unwrap();
     // Verify usage count > 1_000
     let row = sqlx::query(
         r#"
@@ -199,7 +209,7 @@ async fn tier_upgrade() {
         "#,
     )
     .bind(user.id)
-    .bind(&current_month())
+    .bind(&month_of(t0()))
     .fetch_one(&pool)
     .await
     .unwrap();

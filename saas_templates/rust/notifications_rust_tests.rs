@@ -3,8 +3,13 @@ use notifications_rust::*;
 use rusqlite::Connection;
 use std::collections::HashMap;
 
+/// Corrected 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): the service's clock is pinned to 12:00 UTC.
+/// With the wall clock, test_quiet_hours_skip (quiet hours 00:00-23:59) passed or failed depending on
+/// the time of day the suite ran. Touches: memory only.
 fn setup_service() -> NotificationService {
-    let service = NotificationService::new_in_memory().unwrap();
+    let service = NotificationService::new_in_memory()
+        .unwrap()
+        .with_clock(Box::new(|| fixed_time(2026, 1, 15, 12, 0)));
     // Create a default user preference
     service
         .update_user_preferences(

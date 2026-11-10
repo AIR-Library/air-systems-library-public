@@ -1,3 +1,4 @@
+//! Trial abuse prevention tests (GEMINI spec, template #3). Touches: in-memory SQLite only.
 use super::*;
 use chrono::{Duration, Utc};
 
@@ -208,8 +209,12 @@ fn chargeback_history_pass() {
 #[test]
 fn chargeback_history_fail() {
     let db = Database::new_in_memory().unwrap();
-    db.insert_stripe_event("cust_1", "chargeback");
-    db.insert_stripe_event("cust_1", "chargeback");
+    // Corrected 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): nothing tied user 1 to customer
+    // "cust_1", so no implementation could count these events for user 1 without inventing the link.
+    // The link is now made explicitly; the event inserts are unwrapped instead of ignored.
+    db.link_billing_customer(1, "cust_1").unwrap();
+    db.insert_stripe_event("cust_1", "chargeback").unwrap();
+    db.insert_stripe_event("cust_1", "chargeback").unwrap();
     db.insert_refund(1, "chargebacked").unwrap();
     let result = db.check_chargeback_history(1).unwrap();
     assert_eq!(result.decision, Decision::Fail);

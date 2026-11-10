@@ -1,17 +1,41 @@
+//! Admin system tests (GEMINI spec, template #2).
+//! Corrected 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP; each change is marked "Corrected" where it
+//! is made. Touches: in-memory SQLite only.
 use super::*;
 use rusqlite::Connection;
-use std::env;
+use std::cell::RefCell;
+use std::rc::Rc;
 
-struct MockStripe;
+/// Fake payment client that records each call (the "stripe.subscriptions.update called" check).
+struct MockStripe {
+    calls: Rc<RefCell<Vec<(String, String)>>>,
+}
 impl StripeClient for MockStripe {
-    fn update_subscription(&self, _stripe_id: &str, _price_id: &str) -> AdminResult<()> {
+    fn update_subscription(&self, stripe_id: &str, price_id: &str) -> AdminResult<()> {
+        self.calls.borrow_mut().push((stripe_id.to_string(), price_id.to_string()));
         Ok(())
     }
 }
 
+/// Fake domain verifier: every domain is verified (no DNS in tests).
+struct AllDomainsVerified;
+impl DomainVerifier for AllDomainsVerified {
+    fn is_verified(&self, _domain: &str) -> bool {
+        true
+    }
+}
+
+thread_local! {
+    static STRIPE_CALLS: Rc<RefCell<Vec<(String, String)>>> = Rc::new(RefCell::new(Vec::new()));
+}
+
+/// Corrected 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): the system gets a domain verifier (publishing
+/// needs a verified domain per the spec; the default verifies nothing) and the fake payment client
+/// records its calls. The unused `std::env` import was removed.
 fn setup() -> AdminSystem {
     let conn = Connection::open_in_memory().unwrap();
-    let system = AdminSystem::new(conn, Box::new(MockStripe));
+    let calls = STRIPE_CALLS.with(|c| { c.borrow_mut().clear(); c.clone() });
+    let system = AdminSystem::new(conn, Box::new(MockStripe { calls })).with_domain_verifier(Box::new(AllDomainsVerified));
     system.init_schema().unwrap();
     // Create an owner user
     let now = Utc::now().to_rfc3339();
@@ -49,8 +73,10 @@ fn test_create_user_duplicate_email() {
         .create_user(&owner, "dup@example.com", "Dup", "basic", true)
         .unwrap();
     let resp = system.create_user(&owner, "dup@example.com", "Dup2", "basic", true);
+    // Corrected 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): the spec's code is "email_exists"
+    // ("create user duplicate email -> 409 {error: "email_exists"}"), not "conflict".
     match resp {
-        Response::Error { error, .. } => assert_eq!(error, "conflict"),
+        Response::Error { error, .. } => assert_eq!(error, "email_exists"),
         _ => panic!("Expected conflict"),
     }
 }
@@ -211,29 +237,37 @@ fn test_change_plan() {
     system
         .conn
         .execute(
-            "INSERT INTO customers (email,name,tier,signup_date,invoice_count,status) VALUES (?1,?2,?3,?4,?5,?6)",
+            "INSERT INTO customers (email,name,tier,signup_date,invoice_count,status,stripe_subscription_id) VALUES (?1,?2,?3,?4,?5,?6,?7)",
             params![
                 "cust@example.com",
                 "Customer",
                 "basic",
                 now,
                 0,
-                "active"
+                "active",
+                "sub_1"
             ],
         )
         .unwrap();
     let cid = system.conn.last_insert_rowid();
+    // Corrected 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): the customer now has a subscription id,
+    // because the spec's change_plan updates the subscription at the payment provider (a customer
+    // with none cannot change plan); the provider call is asserted.
     let resp = system.change_plan(&owner, cid, "premium");
     match resp {
         Response::Success { .. } => {}
         _ => panic!("Expected success"),
     }
+    STRIPE_CALLS.with(|c| assert_eq!(c.borrow().as_slice(), [("sub_1".to_string(), "price_premium".to_string())]));
 }
 
 #[test]
 fn test_queue_refund() {
     let system = setup();
     let owner = system.get_user_by_email("owner@example.com").unwrap().unwrap();
+    // Corrected 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): invoice 1 is created first; the spec
+    // requires "invoice exists, status='succeeded'" before a refund is queued.
+    system.conn.execute("INSERT INTO invoices (id, amount, status) VALUES (1, 10000, 'succeeded')", []).unwrap();
     let resp = system.queue_refund(&owner, 1, 5000, "refund reason");
     match resp {
         Response::Success { data, .. } => {
@@ -291,7 +325,9 @@ fn test_publish_deployment() {
         .unwrap();
     let cid = system.conn.last_insert_rowid();
     let dep_resp = system.create_deployment(&owner, cid, "example.com", "basic", "theme1");
-    let dep_id: i64 = serde_json::from_value(dep_resp.data.get("deployment_id").unwrap().clone()).unwrap();
+    // Corrected 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): `Response` is an enum, so its data is
+    // reached through `unwrap()` as in the other tests (`dep_resp.data` could not compile).
+    let dep_id: i64 = serde_json::from_value(dep_resp.unwrap().data.get("deployment_id").unwrap().clone()).unwrap();
     let resp = system.publish_deployment(&owner, dep_id);
     match resp {
         Response::Success { .. } => {}
@@ -303,13 +339,18 @@ fn test_publish_deployment() {
 fn test_governance_approve() {
     let system = setup();
     let owner = system.get_user_by_email("owner@example.com").unwrap().unwrap();
+    // Corrected 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): the action targeted user 1, which is the
+    // approving owner himself; approving executes the action, and deleting the last active owner is
+    // refused by the spec's safety rules. It now targets a separate user, whose deletion is asserted.
+    let target = system.create_user(&owner, "target@example.com", "Target", "basic", false).unwrap();
+    let target_id: i64 = serde_json::from_value(target.data.get("user_id").unwrap().clone()).unwrap();
     // Insert pending action
     let now = Utc::now().to_rfc3339();
     system
         .conn
         .execute(
             "INSERT INTO governance_actions (action_type,actor_id,target_resource_id,reason,submitted_at,status) VALUES (?1,?2,?3,?4,?5,?6)",
-            params!["delete_user", owner.id, 1, "test", now, "pending"],
+            params!["delete_user", owner.id, target_id, "test", now, "pending"],
         )
         .unwrap();
     let action_id = system.conn.last_insert_rowid();
@@ -318,6 +359,7 @@ fn test_governance_approve() {
         Response::Success { .. } => {}
         _ => panic!("Expected success"),
     }
+    assert_eq!(system.get_user_by_id(target_id).unwrap().status, "deleted");
 }
 
 #[test]
