@@ -97,7 +97,9 @@ IMPLEMENTATION:
 - Retry: Email/SMS failures retry up to 3 times after the first attempt (at most 4 attempts), waiting 1 s,
   2 s and 4 s, the same counting as background jobs. Amended 2026-11-10 (Phase B.2: one answer in every language).
 - Quiet hours are "HH:MM" in UTC, and a window may cross midnight (22:00-08:00). The template stores no time
-  zone; a deployment that keeps one converts to UTC before comparing.
+  zone; a deployment that keeps one converts to UTC before comparing. The window is [start, end): a message
+  due exactly at quiet_hours_end is sent. Quiet hours hold email and SMS only; an in-app message is stored at
+  once (it interrupts no one). Amended 2026-11-10 (Phase B.3).
 - Opening: GET /notifications/open/:message_id records that a message was opened (the tracking pixel or
   link): it sets opened_at and status 'opened' the first time only and answers 204 either way (NOTIF-07).
 - Unsubscribe: Include unsubscribe link in emails (legal requirement). The link is

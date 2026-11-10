@@ -19,7 +19,7 @@ name or in a comment on the line above it (for example `# BILL-01`), so a missin
 | `BILL-06` | handle_webhook payment_succeeded → invoice marked succeeded, audit logged |
 | `BILL-07` | handle_webhook duplicate event → idempotency check prevents double-processing |
 | `BILL-08` | handle_webhook subscription_updated → tier updated, status changed |
-| `BILL-09` | webhook signature invalid → 403 {error: "invalid_signature"} |
+| `BILL-09` | webhook signature invalid → 400 {error: "invalid_signature"} (Stripe's documented answer; same as stripe_webhook_entitlements) |
 | `BILL-10` | webhook response time < 3 seconds → {received: true} |
 
 ## Contract
@@ -95,6 +95,6 @@ TESTS REQUIRED:
   - **BILL-06** handle_webhook payment_succeeded → invoice marked succeeded, audit logged
   - **BILL-07** handle_webhook duplicate event → idempotency check prevents double-processing
   - **BILL-08** handle_webhook subscription_updated → tier updated, status changed
-  - **BILL-09** webhook signature invalid → 403 {error: "invalid_signature"}
+  - **BILL-09** webhook signature invalid → 400 {error: "invalid_signature"} (Stripe's documented answer; same as stripe_webhook_entitlements)
   - **BILL-10** webhook response time < 3 seconds → {received: true}
 ```

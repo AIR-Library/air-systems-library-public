@@ -58,6 +58,9 @@ FLOWS TO BUILD (exact sequence — no deviations):
 
   2. verify_email(email, code_or_token)
      Gates: code_valid (not expired, matches), user_unverified (email_verified_at is null)
+     Attempts: 5 wrong codes for one user invalidate that user's current code: further tries, even with the
+     right code, get 400 {error: "code_invalid"} until a new code is sent (a 6-digit code must not be guessable
+     by retrying). Amended 2026-11-10 (Phase B.3).
      Action: mark user.email_verified_at = NOW(), delete verification code
      Log: why_chain(flow="verify_email", decision_points=["code_valid", "user_unverified"])
      Log: audit_log(action="email_verified", user_id)

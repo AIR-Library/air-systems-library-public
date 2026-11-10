@@ -99,6 +99,8 @@ ENDPOINTS:
 5. Cancel deletion (within grace period)
    DELETE /compliance/delete/:deletion_id
    Response: { success: true, status: 'cancelled' }
+   After will_delete_at has passed (the deletion is due but not yet run): 409 {error: "grace_period_over"}.
+   Amended 2026-11-10 (Phase B.3).
 
 6. List export requests (admin only)
    GET /admin/compliance/exports?user_id=123&status=completed

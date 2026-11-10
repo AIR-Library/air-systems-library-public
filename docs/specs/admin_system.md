@@ -35,7 +35,7 @@ name or in a comment on the line above it (for example `# ADMIN-01`), so a missi
 
 ```text
 EVERY ACTION: the caller is the verified session user. A caller whose account status is 'suspended' is refused
-  before any gate: 403 {error: "account_suspended"} (ADMIN-19). Amended 2026-11-10 (Phase B.2: one answer in every language).
+  before any gate, the CSRF check included: 403 {error: "account_suspended"} (ADMIN-19). Amended 2026-11-10 (Phase B.2: one answer in every language).
 
 TIERS: two different things share the word.
   - users.tier is the STAFF ROLE: 'owner' | 'admin' | 'user' (create, change_role, last-owner rules).
@@ -43,6 +43,11 @@ TIERS: two different things share the word.
     create_deployment, prices). A plan value given where a role is expected, or the reverse, is 400
     {error: "invalid_tier"}. deployments carry domain_verified (BOOLEAN, default false); publish needs it.
   Amended 2026-11-10 (Phase B.2).
+
+LAST OWNER (ADMIN-07): an owner cannot change their own role, and ADMIN-19 refuses a suspended owner, so a
+  direct change_role can only reach the last active owner through a governance-approved action. ADMIN-07 is
+  proven there: approving a change_role that would demote the last active owner fails with 400
+  {error: "cannot_demote_last_owner"} and leaves the action pending. Amended 2026-11-10 (Phase B.3).
 
 DOMAINS:
 
