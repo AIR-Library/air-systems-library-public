@@ -272,6 +272,10 @@ class AdminError extends Error {
  *   mailer      `{ send({to, subject, text}) }` (default InMemoryMailer)
  *   priceIds    tier -> Stripe price id (default env STRIPE_PRICE_<TIER>, else price_<tier>)
  *   safetyFlags `{ can_publish }`, the second gate on publishing (default `{ can_publish: true }`)
+ *   themes      the theme ids a deployment may be created with (default `['default']`); themes have no table of their
+ *               own in this template, so this list is the catalogue. Added 2026-11-10, session
+ *               session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit review on PR 19: a theme used to "exist" only once some
+ *               deployment used it, so a fresh database could never create its first deployment).
  *   baseUrl     origin used in e-mailed links (default env APP_BASE_URL or https://example.com)
  *   now         clock in ms (default Date.now)
  * Out: `{ app, knex, runMigrations, csrfTokenFor, mailer, safetyFlags }`.
@@ -286,6 +290,7 @@ function createAdminSystem(options = {}) {
   const csrfSecret = options.csrfSecret || process.env.ADMIN_CSRF_SECRET || crypto.randomBytes(32).toString('hex');
   const mailer = options.mailer || new InMemoryMailer();
   const safetyFlags = options.safetyFlags || { can_publish: true };
+  const themes = new Set(options.themes || ['default']);
   const baseUrl = options.baseUrl || process.env.APP_BASE_URL || 'https://example.com';
   const now = options.now || Date.now;
   const priceIds = options.priceIds || Object.fromEntries(
@@ -717,8 +722,13 @@ function createAdminSystem(options = {}) {
 
   /**
    * POST /admin/deployments/action (owner): create | publish (also needs safetyFlags.can_publish) | suspend | retire.
+   * In: { action, ... }; create takes { customer_id, domain, tier, theme_id }, and theme_id must be one of the
+   * configured `themes` (createAdminSystem option, default ['default']), else 404 theme_not_found.
    * Out: { success: true, ... } or { error, message }.
-   * Why: spec endpoint; rebuilt 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP behind the token gate (see module header). Touches: database.
+   * Why: spec endpoint; rebuilt 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP behind the token gate (see module header).
+   * Changed the same day (CodeRabbit review on PR 19): create checks theme_id against the configured theme list
+   * instead of requiring an existing deployment to use it, so a fresh database can create its first deployment.
+   * Touches: database.
    */
   app.post('/admin/deployments/action', requireOwner, route(async (req) => {
     const { action } = req.body;
@@ -737,8 +747,8 @@ function createAdminSystem(options = {}) {
         if (await trx('deployments').where({ domain }).first()) {
           throw new AdminError(400, 'domain_taken', 'Domain already registered');
         }
-        // Themes have no table of their own in this template: a theme exists once a deployment uses it.
-        if (!(await trx('deployments').where({ theme: themeId }).first())) {
+        // Themes have no table of their own in this template: the configured `themes` list is the catalogue.
+        if (!themes.has(themeId)) {
           throw new AdminError(404, 'theme_not_found', 'Theme not found');
         }
         const [deploymentId] = await trx('deployments').insert({

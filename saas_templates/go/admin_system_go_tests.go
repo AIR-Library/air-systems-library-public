@@ -24,7 +24,12 @@ func (f *fakeBilling) ChangePlan(_ context.Context, subscriptionID, tier string)
 	return nil
 }
 
+// setupTestEnv opens a fresh in-memory database, registers the routes, and opts in to reading the
+// caller's id from X-User-ID (TrustedHeaderResolver), which the tests stand in for a trusted proxy.
+// Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit review on PR 19: the
+// default resolver now fails closed, so the tests opt in explicitly). Touches: the test database.
 func setupTestEnv(t *testing.T) *http.ServeMux {
+	ResolveUserID = TrustedHeaderResolver("X-User-ID")
 	if err := InitDB(":memory:"); err != nil {
 		t.Fatalf("DB init failed: %v", err)
 	}
@@ -469,6 +474,102 @@ func TestGovernanceReject(t *testing.T) {
 	_ = json.NewDecoder(resp.Body).Decode(&out)
 	if out["status"] != "rejected" {
 		t.Fatalf("not rejected")
+	}
+}
+
+// countDecisionAudits counts the action_approved / action_rejected audit rows for one action.
+// Input: the action id. Output: the count. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP
+// (CodeRabbit review on PR 19). Touches: the test SQLite database (read).
+func countDecisionAudits(t *testing.T, actID int64) int {
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE resource_type='action' AND resource_id=?
+		AND action IN ('action_approved','action_rejected')`, actID).Scan(&n); err != nil {
+		t.Fatalf("count audit rows: %v", err)
+	}
+	return n
+}
+
+// TestGovernanceDecideTwiceConflicts: once an action is approved, a second decide on it (here a
+// reject) gets 409 action_not_pending, leaves the action approved and writes no second audit row.
+// It also calls decideAction directly on the decided action, which is what a request that passed the
+// status check just before a concurrent one committed would reach: the conditional UPDATE must still
+// answer 409 and write nothing. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit
+// review on PR 19). Touches: the test SQLite database.
+func TestGovernanceDecideTwiceConflicts(t *testing.T) {
+	mux := setupTestEnv(t)
+	ownerID := seedOwner(t)
+	res, err := db.Exec(`INSERT INTO actions (action_type,actor_id,submitted_at,status) VALUES (?,?,?,?)`,
+		"user_create", 2, time.Now().UTC(), "pending")
+	if err != nil {
+		t.Fatalf("seed action: %v", err)
+	}
+	actID, _ := res.LastInsertId()
+	path := "/admin/governance/actions/" + strconv.FormatInt(actID, 10) + "/decide"
+
+	first := doRequest(mux, http.MethodPost, path, map[string]string{"decide": "approve"}, ownerID, "owner", nil)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first decide: expected 200, got %d %s", first.Code, first.Body.String())
+	}
+	if got := countDecisionAudits(t, actID); got != 1 {
+		t.Fatalf("after first decide: expected 1 audit row, got %d", got)
+	}
+
+	second := doRequest(mux, http.MethodPost, path, map[string]string{"decide": "reject", "reason": "too late"}, ownerID, "owner", nil)
+	if second.Code != http.StatusConflict {
+		t.Fatalf("second decide: expected 409, got %d %s", second.Code, second.Body.String())
+	}
+	var out map[string]interface{}
+	_ = json.NewDecoder(second.Body).Decode(&out)
+	if out["error"] != "action_not_pending" {
+		t.Fatalf("second decide: expected action_not_pending, got %v", out["error"])
+	}
+
+	status, body := decideAction(ownerID, actID, "approve", "")
+	if status != http.StatusConflict || body["error"] != "action_not_pending" {
+		t.Fatalf("racing decide: expected 409 action_not_pending, got %d %v", status, body)
+	}
+	status, body = decideAction(ownerID, actID, "reject", "racing")
+	if status != http.StatusConflict {
+		t.Fatalf("racing reject: expected 409, got %d %v", status, body)
+	}
+
+	if got := countDecisionAudits(t, actID); got != 1 {
+		t.Fatalf("expected exactly 1 audit row after the conflicting decides, got %d", got)
+	}
+	var st string
+	if err := db.QueryRow(`SELECT status FROM actions WHERE id=?`, actID).Scan(&st); err != nil || st != "approved" {
+		t.Fatalf("expected the action to stay approved, got %q (%v)", st, err)
+	}
+}
+
+// TestDefaultResolverFailsClosed: with no resolver installed (the default), a request carrying an
+// active owner's id in X-User-ID gets 401 and does not reach the handler; no user is created.
+// Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit review on PR 19, security).
+// Touches: the test SQLite database.
+func TestDefaultResolverFailsClosed(t *testing.T) {
+	mux := setupTestEnv(t)
+	ownerID := seedOwner(t)
+	ResolveUserID = nil
+	defer func() { ResolveUserID = TrustedHeaderResolver("X-User-ID") }()
+
+	read := doRequest(mux, http.MethodGet, "/admin/customers", nil, ownerID, "owner", nil)
+	if read.Code != http.StatusUnauthorized {
+		t.Fatalf("GET with owner X-User-ID and no resolver: expected 401, got %d %s", read.Code, read.Body.String())
+	}
+	payload := map[string]string{"action": "create", "email": "forged@example.com", "name": "Forged", "tier": "owner"}
+	write := doRequest(mux, http.MethodPost, "/admin/users/action", payload, ownerID, "owner", nil)
+	if write.Code != http.StatusUnauthorized {
+		t.Fatalf("POST with owner X-User-ID and no resolver: expected 401, got %d %s", write.Code, write.Body.String())
+	}
+	var out map[string]interface{}
+	_ = json.NewDecoder(write.Body).Decode(&out)
+	if out["error"] != "unauthenticated" {
+		t.Fatalf("expected error unauthenticated, got %v", out["error"])
+	}
+	var n int
+	_ = db.QueryRow(`SELECT COUNT(*) FROM users WHERE email='forged@example.com'`).Scan(&n)
+	if n != 0 {
+		t.Fatalf("expected no user created, found %d", n)
 	}
 }
 

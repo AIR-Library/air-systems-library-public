@@ -8,7 +8,9 @@ import {
   queue_refund,
   handle_stripe_webhook,
   set_clients,
-  verify_and_handle_stripe_webhook
+  verify_and_handle_stripe_webhook,
+  MARK_SUBSCRIPTION_PAST_DUE_SQL,
+  MARK_CUSTOMER_ACTIVE_SUBSCRIPTIONS_PAST_DUE_SQL
 } from './billing_subscriptions_typescript';
 
 /*
@@ -471,6 +473,84 @@ describe('Billing Subscriptions System', () => {
       
       const result = await handle_stripe_webhook(mockEvent);
       expect(result).toEqual({ error: 'webhook_processing_error', message: 'DB error' });
+    });
+
+    /**
+     * A client whose subscriptions table lives in memory: it applies the two past_due statements the way Postgres
+     * would (the row filter is read from the statement: by subscription id or by customer, and only 'active' rows),
+     * and answers everything else with an empty result. In: the starting rows. Out: { client, rows }.
+     * Why 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): CodeRabbit review on PR 19, payment_failed marked
+     * every subscription of the customer past_due, cancelled ones included. Touches: memory only.
+     */
+    const subscriptionsClient = (rows: Array<{ stripe_subscription_id: string; customer_id: string; status: string }>) => {
+      const client = {
+        query: jest.fn().mockImplementation((text: string, params: any[] = []) => {
+          if (text.includes('SELECT id FROM events WHERE stripe_event_id = $1')) {
+            return Promise.resolve({ rows: [], rowCount: 0 });
+          }
+          if (/^\s*UPDATE subscriptions SET status = 'past_due'/.test(text)) {
+            const bySubscription = /WHERE stripe_subscription_id = \$1/.test(text);
+            const byCustomer = /WHERE customer_id = \$1/.test(text);
+            const activeOnly = /AND status = 'active'/.test(text);
+            const notPastDueOnly = /AND status <> 'past_due'/.test(text);
+            let rowCount = 0;
+            for (const row of rows) {
+              const keyMatches = bySubscription ? row.stripe_subscription_id === params[0]
+                : byCustomer ? row.customer_id === params[0] : false;
+              const statusMatches = activeOnly ? row.status === 'active' : notPastDueOnly ? row.status !== 'past_due' : true;
+              if (keyMatches && statusMatches) { row.status = 'past_due'; rowCount++; }
+            }
+            return Promise.resolve({ rows: [], rowCount });
+          }
+          return Promise.resolve({ rows: [], rowCount: 0 });
+        }),
+        release: jest.fn(),
+      };
+      return { client, rows };
+    };
+
+    it('payment_failed marks only the invoice\'s subscription past_due; cancelled and other active ones untouched', async () => {
+      const { client, rows } = subscriptionsClient([
+        { stripe_subscription_id: 'sub_failed', customer_id: 'cus_123', status: 'active' },
+        { stripe_subscription_id: 'sub_other', customer_id: 'cus_123', status: 'active' },
+        { stripe_subscription_id: 'sub_old', customer_id: 'cus_123', status: 'cancelled' },
+      ]);
+      set_clients({ pool: { query: jest.fn(), connect: jest.fn().mockResolvedValue(client) } as any });
+
+      const result = await handle_stripe_webhook({
+        id: 'evt_failed_1', type: 'invoice.payment_failed',
+        data: { object: { id: 'in_failed', customer: 'cus_123', subscription: 'sub_failed' } },
+      } as any);
+
+      expect(result).toEqual({ received: true });
+      expect(client.query).toHaveBeenCalledWith(MARK_SUBSCRIPTION_PAST_DUE_SQL, ['sub_failed']);
+      expect(rows.map((r) => [r.stripe_subscription_id, r.status])).toEqual([
+        ['sub_failed', 'past_due'],
+        ['sub_other', 'active'],
+        ['sub_old', 'cancelled'],
+      ]);
+    });
+
+    it('payment_failed with no subscription on the invoice marks only active rows; cancelled stays cancelled', async () => {
+      const { client, rows } = subscriptionsClient([
+        { stripe_subscription_id: 'sub_live', customer_id: 'cus_123', status: 'active' },
+        { stripe_subscription_id: 'sub_old', customer_id: 'cus_123', status: 'cancelled' },
+        { stripe_subscription_id: 'sub_else', customer_id: 'cus_999', status: 'active' },
+      ]);
+      set_clients({ pool: { query: jest.fn(), connect: jest.fn().mockResolvedValue(client) } as any });
+
+      const result = await handle_stripe_webhook({
+        id: 'evt_failed_2', type: 'invoice.payment_failed',
+        data: { object: { id: 'in_oneoff', customer: 'cus_123', subscription: null } },
+      } as any);
+
+      expect(result).toEqual({ received: true });
+      expect(client.query).toHaveBeenCalledWith(MARK_CUSTOMER_ACTIVE_SUBSCRIPTIONS_PAST_DUE_SQL, ['cus_123']);
+      expect(rows.map((r) => [r.stripe_subscription_id, r.status])).toEqual([
+        ['sub_live', 'past_due'],
+        ['sub_old', 'cancelled'],
+        ['sub_else', 'active'],
+      ]);
     });
 
     it('should reject a webhook whose signature is invalid (403 invalid_signature)', async () => {

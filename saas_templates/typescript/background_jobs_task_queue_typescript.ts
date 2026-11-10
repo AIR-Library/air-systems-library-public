@@ -190,7 +190,11 @@ class JobManager {
     const job = result.rows[0];
     
     if (scheduled_at && scheduled_at > now) {
-      await redis.setex(`job:scheduled:${jobId}`, Math.floor((scheduled_at.getTime() - now.getTime()) / 1000), jobId);
+      // The worker (processJobs) reads job:scheduled:<id> as the run time in epoch milliseconds and queues the job once
+      // it has passed. This used to store the job id with a TTL of the delay: the reader parsed the id as a time (never
+      // due), and the key could expire before the worker saw it, so a scheduled job never ran. Fixed 2026-11-10,
+      // session_012zDydZCZ4AChqhEZ4oVtaP (found while fixing CodeRabbit's backoff finding on PR 19). Touches: Redis.
+      await redis.set(`job:scheduled:${jobId}`, String(scheduled_at.getTime()));
     } else {
       await redis.lpush('job:queue', jobId);
     }
@@ -419,25 +423,45 @@ class JobManager {
     }
   }
 
+  /**
+   * Runs one queued job: locks its row, records a job_run, marks it 'running', executes the task, then marks it
+   * 'completed'; a task error goes to handleJobError.
+   * In: the job id. Out: nothing (state is written to Postgres).
+   * Every path that does not run the job ends its transaction before returning: a missing job, a job that is no longer
+   * 'enqueued', and a retry whose next_retry_at is still in the future all issue ROLLBACK, so the pooled client is
+   * never released inside an open transaction still holding the row lock. A retry that is not yet due is not run; it
+   * is put back on the delayed path (scheduleRetry) for its next_retry_at, so the backoff in handleJobError holds.
+   * Why changed 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): CodeRabbit review on PR 19 (early returns left
+   * the transaction open; next_retry_at was never checked, so every retry ran within seconds).
+   * Touches: Postgres jobs and job_runs (row lock), Redis job:scheduled:<id> (via scheduleRetry), the task's own I/O.
+   */
   private async processJob(jobId: string): Promise<void> {
     const client = await db.connect();
-    
+
     try {
       await client.query('BEGIN');
-      
+
       const query = 'SELECT * FROM jobs WHERE id = $1 FOR UPDATE';
       const result = await client.query(query, [jobId]);
-      
+
       if (result.rows.length === 0) {
+        await client.query('ROLLBACK');
         return;
       }
-      
+
       const job = result.rows[0];
-      
+
       if (job.status !== JobStatus.ENQUEUED) {
+        await client.query('ROLLBACK');
         return;
       }
-      
+
+      if (job.next_retry_at && new Date(job.next_retry_at) > new Date()) {
+        await client.query('ROLLBACK');
+        await this.scheduleRetry(jobId, new Date(job.next_retry_at));
+        return;
+      }
+
       if (job.scheduled_at && job.scheduled_at > new Date()) {
         await client.query('COMMIT');
         return;
@@ -1017,14 +1041,31 @@ class JobManager {
   }
 
   /**
+   * Puts a job on the delayed path so the worker queues it once `runAt` has passed: writes job:scheduled:<id> with
+   * runAt in epoch milliseconds, the value processJobs reads and compares with the clock. No TTL, so the key cannot
+   * expire before the worker has moved the job to job:queue.
+   * In: the job id and when it may run. Out: nothing.
+   * Why 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): CodeRabbit review on PR 19; retries were pushed
+   * straight onto job:queue and ran within seconds, ignoring the backoff.
+   * Touches: Redis job:scheduled:<id>.
+   */
+  private async scheduleRetry(jobId: string, runAt: Date): Promise<void> {
+    await redis.set(`job:scheduled:${jobId}`, String(runAt.getTime()));
+  }
+
+  /**
    * Records a failed run: with retries left, the job goes back to 'enqueued' with retry_count + 1 and next_retry_at
-   * after an exponential backoff (1 s, 2 s, 4 s, ...) and is pushed onto the queue; with none left it becomes
-   * 'failed' and its running job_run is closed as failed. Both in one transaction on the locked job row.
+   * after an exponential backoff (1 s, 2 s, 4 s, ...) and, after the commit, is put on the delayed path
+   * (scheduleRetry) for next_retry_at, not onto job:queue, so it is not picked up before its backoff has passed
+   * (processJob also refuses to run it early). With none left it becomes 'failed' and its running job_run is closed
+   * as failed. Both in one transaction on the locked job row.
    * In: the job id and the error. Out: nothing.
    * Why changed 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): the status updates are written as single-line
    * statements ("UPDATE jobs SET status = $1, ..."), which is what the failing test looks for; a missing job left its
-   * transaction open on a client returned to the pool, and a failed ROLLBACK hid the original error.
-   * Touches: Postgres jobs and job_runs, Redis job:queue.
+   * transaction open on a client returned to the pool, and a failed ROLLBACK hid the original error. Later the same
+   * day, CodeRabbit review on PR 19: the retry was lpush'ed straight back onto job:queue, so the documented backoff
+   * never happened; it now goes through the delayed path.
+   * Touches: Postgres jobs and job_runs, Redis job:scheduled:<id>.
    */
   private async handleJobError(jobId: string, error: Error): Promise<void> {
     const client = await db.connect();
@@ -1081,9 +1122,9 @@ class JobManager {
       );
       
       await client.query('COMMIT');
-      
-      await redis.lpush('job:queue', jobId);
-      
+
+      await this.scheduleRetry(jobId, nextRetryAt);
+
     } catch (error) {
       try {
         await client.query('ROLLBACK');

@@ -181,4 +181,52 @@ describe('NotificationService', () => {
     expect(log?.channel).toBe('sms');
     await service.updateUserPreferences(9, { channels_enabled: { email: true, sms: false } });
   });
+
+  /**
+   * A message scheduled 30 days ahead (past setTimeout's 2,147,483,647 ms limit) is not sent now; deliverDue() does
+   * not send it before its time, and sends it once the clock has passed scheduled_at.
+   * In: a service on its own database with a movable clock. Out: assertions only.
+   * Why 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): CodeRabbit review on PR 19 (long delays fired after
+   * 1 ms and timers were lost on restart). Touches: an in-memory SQLite database only.
+   */
+  test('Scheduled: 30 days ahead is not sent now, and deliverDue sends it once due', async () => {
+    let clock = new Date('2026-01-01T12:00:00.000Z');
+    const sendMail = jest.fn(async (_mail: any) => ({}));
+    const scheduled = new NotificationService(':memory:', { sendMail } as any, mockSmsClient, { now: () => clock });
+    await scheduled.init();
+    try {
+      const dueAt = new Date(clock.getTime() + 30 * 24 * 60 * 60 * 1000);
+      const res = await scheduled.sendSingle({
+        user_id: 42,
+        template_key: 'welcome_email',
+        channel: 'email',
+        vars: { app_name: 'LaterApp' },
+        scheduled_at: dueAt.toISOString(),
+      });
+      expect(res.status).toBe('queued');
+      // Let any timer that would fire "after 1 ms" run: nothing may be sent.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(sendMail).not.toHaveBeenCalled();
+      const queued = await scheduled.track({ message_id: res.message_id, status: 'queued' });
+      expect(queued?.status).toBe('queued');
+      expect(queued?.scheduled_at).toBe(dueAt.toISOString());
+
+      clock = new Date(dueAt.getTime() - 60 * 1000);
+      expect(await scheduled.deliverDue()).toEqual({ delivered: 0, failed: 0, message_ids: [] });
+      expect(sendMail).not.toHaveBeenCalled();
+
+      clock = new Date(dueAt.getTime() + 60 * 1000);
+      expect(await scheduled.deliverDue()).toEqual({ delivered: 1, failed: 0, message_ids: [res.message_id] });
+      expect(sendMail).toHaveBeenCalledTimes(1);
+      const sent = await scheduled.track({ message_id: res.message_id, status: 'sent' });
+      expect(sent?.status).toBe('sent');
+      expect(sent?.sent_at).toBe(clock.toISOString());
+
+      // Delivered once: a second pass finds nothing due.
+      expect(await scheduled.deliverDue()).toEqual({ delivered: 0, failed: 0, message_ids: [] });
+      expect(sendMail).toHaveBeenCalledTimes(1);
+    } finally {
+      await scheduled.close();
+    }
+  });
 });

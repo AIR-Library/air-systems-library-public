@@ -381,7 +381,23 @@ func isLastActiveOwner(excludeUserID int64) (bool, error) {
 
 // ---------- Audit ----------
 func auditLogWrite(actorID int64, action, resourceType string, resourceID sql.NullInt64, oldVal, newVal, reason sql.NullString) error {
-	_, err := db.Exec(`INSERT INTO audit_log (timestamp, actor_id, action, resource_type, resource_id, old_value, new_value, reason)
+	return auditLogWriteWith(db, actorID, action, resourceType, resourceID, oldVal, newVal, reason)
+}
+
+// sqlExecer is what both *sql.DB and *sql.Tx offer for a write, so an audit row can be written inside
+// the caller's transaction. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit
+// review on PR 19). Touches: nothing by itself.
+type sqlExecer interface {
+	Exec(query string, args ...interface{}) (sql.Result, error)
+}
+
+// auditLogWriteWith inserts one audit_log row through ex (the database, or an open transaction so the
+// row commits or rolls back with the change it records). Inputs: ex, the actor, action, resource type
+// and id, old/new values and reason. Output: the insert's error. Why: CodeRabbit review on PR 19, the
+// governance decision and its audit row must be one transaction (2026-11-10, session
+// session_012zDydZCZ4AChqhEZ4oVtaP). Touches: SQLite audit_log.
+func auditLogWriteWith(ex sqlExecer, actorID int64, action, resourceType string, resourceID sql.NullInt64, oldVal, newVal, reason sql.NullString) error {
+	_, err := ex.Exec(`INSERT INTO audit_log (timestamp, actor_id, action, resource_type, resource_id, old_value, new_value, reason)
 		VALUES (?,?,?,?,?,?,?,?)`,
 		time.Now().UTC(), actorID, action, resourceType, resourceID, oldVal, newVal, reason)
 	return err
@@ -877,6 +893,15 @@ func handleGovernanceList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, list)
 }
 
+// handleGovernanceDecide is POST /admin/governance/actions/{id}/decide (owner): decide=approve, or
+// decide=reject with a reason. Output: 200 {success, action_id, status}; 400 bad_path, bad_form,
+// invalid_decide or missing_reason; 404 action_not_found; 409 action_not_pending when the action is
+// already decided, including when a concurrent request decided it first; 500 db_error.
+// The read of the status only tells 404 from 409; the decision itself is decideAction, whose update
+// is conditional on status='pending', so two concurrent requests cannot both act.
+// Why changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: a decided or unknown action used to
+// be "approved" again with a 200; later the same day, CodeRabbit review on PR 19: the check and the
+// unconditional UPDATE raced. Touches: SQLite actions and audit_log.
 func handleGovernanceDecide(w http.ResponseWriter, r *http.Request) {
 	actorID := r.Context().Value(ctxUserIDKey).(int64)
 	parts := strings.Split(r.URL.Path, "/")
@@ -891,8 +916,6 @@ func handleGovernanceDecide(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	decide := form.Get("decide")
-	// Only a pending action can be decided (added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP:
-	// a decided or unknown action used to be "approved" again with a 200).
 	var curStatus string
 	if err := db.QueryRow(`SELECT status FROM actions WHERE id=?`, actionID).Scan(&curStatus); err != nil {
 		writeJSON(w, http.StatusNotFound, jsonResponse{"error": "action_not_found", "message": "Action not found"})
@@ -902,38 +925,81 @@ func handleGovernanceDecide(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, jsonResponse{"error": "action_not_pending", "message": "Action already decided"})
 		return
 	}
+	reason := form.Get("reason")
 	switch decide {
 	case "approve":
-		// In real system, execute original action; here we just mark approved
-		_, err := db.Exec(`UPDATE actions SET status='approved', approved_by=?, approved_at=? WHERE id=?`, actorID, time.Now().UTC(), actionID)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": err.Error()})
-			return
-		}
-		_ = auditLogWrite(actorID, "action_approved", "action", sql.NullInt64{Int64: actionID, Valid: true},
-			sql.NullString{}, sql.NullString{}, sql.NullString{})
-		writeJSON(w, http.StatusOK, jsonResponse{
-			"success": true, "action_id": actionID, "status": "approved",
-		})
 	case "reject":
-		reason := form.Get("reason")
 		if reason == "" {
 			writeJSON(w, http.StatusBadRequest, jsonResponse{"error": "missing_reason", "message": "Reason required"})
 			return
 		}
-		_, err := db.Exec(`UPDATE actions SET status='rejected', rejection_reason=? WHERE id=?`, reason, actionID)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": err.Error()})
-			return
-		}
-		_ = auditLogWrite(actorID, "action_rejected", "action", sql.NullInt64{Int64: actionID, Valid: true},
-			sql.NullString{}, sql.NullString{}, sql.NullString{String: reason, Valid: true})
-		writeJSON(w, http.StatusOK, jsonResponse{
-			"success": true, "action_id": actionID, "status": "rejected",
-		})
 	default:
 		writeJSON(w, http.StatusBadRequest, jsonResponse{"error": "invalid_decide", "message": "Invalid decision"})
+		return
 	}
+	status, payload := decideAction(actorID, actionID, decide, reason)
+	writeJSON(w, status, payload)
+}
+
+// decideAction applies one governance decision in a single transaction: the status change (approve:
+// status='approved', approved_by, approved_at; reject: status='rejected', rejection_reason), the
+// action's execution (in this template, approving only marks it approved), and its audit row
+// (action_approved / action_rejected). The UPDATE carries AND status='pending' and its RowsAffected is
+// checked, so when another request has already decided the action nothing is changed, no audit row is
+// written, and the answer is 409 action_not_pending.
+// Inputs: the deciding owner's id, the action id, decide ("approve" or "reject"; anything else is 400
+// invalid_decide), and the rejection reason. Output: the HTTP status and JSON body to send.
+// Why: CodeRabbit review on PR 19 (2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP): the handler
+// read the status and then ran an unconditional UPDATE ... WHERE id=?, so two concurrent decide
+// requests could both act and write two audit rows. Touches: SQLite actions and audit_log.
+func decideAction(actorID, actionID int64, decide, reason string) (int, jsonResponse) {
+	var (
+		query     string
+		args      []interface{}
+		auditName string
+		auditWhy  sql.NullString
+		newStatus string
+	)
+	switch decide {
+	case "approve":
+		query = `UPDATE actions SET status='approved', approved_by=?, approved_at=? WHERE id=? AND status='pending'`
+		args = []interface{}{actorID, time.Now().UTC(), actionID}
+		auditName, newStatus = "action_approved", "approved"
+	case "reject":
+		query = `UPDATE actions SET status='rejected', rejection_reason=? WHERE id=? AND status='pending'`
+		args = []interface{}{reason, actionID}
+		auditName, newStatus = "action_rejected", "rejected"
+		auditWhy = sql.NullString{String: reason, Valid: true}
+	default:
+		return http.StatusBadRequest, jsonResponse{"error": "invalid_decide", "message": "Invalid decision"}
+	}
+	dbError := func(err error) (int, jsonResponse) {
+		return http.StatusInternalServerError, jsonResponse{"error": "db_error", "message": err.Error()}
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return dbError(err)
+	}
+	defer tx.Rollback() // no-op after a successful Commit
+	res, err := tx.Exec(query, args...)
+	if err != nil {
+		return dbError(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return dbError(err)
+	}
+	if n == 0 {
+		return http.StatusConflict, jsonResponse{"error": "action_not_pending", "message": "Action already decided"}
+	}
+	if err := auditLogWriteWith(tx, actorID, auditName, "action", sql.NullInt64{Int64: actionID, Valid: true},
+		sql.NullString{}, sql.NullString{}, auditWhy); err != nil {
+		return dbError(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return dbError(err)
+	}
+	return http.StatusOK, jsonResponse{"success": true, "action_id": actionID, "status": newStatus}
 }
 
 func handleAuditLogSearch(w http.ResponseWriter, r *http.Request) {
@@ -1045,32 +1111,64 @@ func requireOwnerOrAdmin(next http.Handler) http.Handler {
 
 // ---------- Auth Middleware (stand-in for the host app's session authentication) ----------
 
-// ResolveUserID returns the authenticated user id of a request. The default reads X-User-ID and
-// exists for local development and tests ONLY: a host app must replace it with its own session or
-// token authentication, because a client can send any header it likes.
-// Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the request headers only.
-var ResolveUserID = func(r *http.Request) (int64, bool) {
-	uid, err := strconv.ParseInt(r.Header.Get("X-User-ID"), 10, 64)
-	return uid, err == nil && uid > 0
+// IdentityResolver returns the authenticated user id of a request, and false when the request carries
+// no identity it trusts. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit review
+// on PR 19). Touches: whatever the host's implementation reads (session store, token verifier, ...).
+type IdentityResolver func(r *http.Request) (int64, bool)
+
+// ResolveUserID is the identity resolver AuthMiddleware uses. It is nil by default, and then every
+// request is refused with 401 (fail closed): the host app must install its own session or token
+// authentication here, or opt in to TrustedHeaderResolver behind a proxy it controls.
+// Why changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit review on PR 19,
+// security): the default used to read X-User-ID, so a host that exposed AuthMiddleware unchanged let
+// any caller act as an active owner by sending that owner's id. Touches: nothing by itself.
+var ResolveUserID IdentityResolver
+
+// TrustedHeaderResolver returns a resolver that reads the user id from the named request header (for
+// example "X-User-ID"). Install it ONLY behind a reverse proxy that authenticates the caller, sets that
+// header itself and strips any copy the client sent; anywhere else a client can claim any id.
+// Input: the header name. Output: the resolver (false for a missing, non-numeric or non-positive id).
+// Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit review on PR 19: reading the
+// header is now an explicit opt-in, not the default). Touches: the request headers only.
+func TrustedHeaderResolver(header string) IdentityResolver {
+	return func(r *http.Request) (int64, bool) {
+		uid, err := strconv.ParseInt(r.Header.Get(header), 10, 64)
+		return uid, err == nil && uid > 0
+	}
 }
 
 // AuthMiddleware puts the caller's user id and role into the request context. Input: the request.
-// Output: the wrapped handler sees ctxUserIDKey and ctxRoleKey, or no role at all (every gate then
-// answers 403). The role and status are read from the users table; the client-sent X-User-Role
-// header is ignored. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: it used to copy
-// the role from the client's X-User-Role header, so anyone could claim "owner".
+// Output: the wrapped handler sees ctxUserIDKey and ctxRoleKey; when no resolver is configured
+// (ResolveUserID is nil), the resolver finds no identity, or the user is unknown or not active, the
+// request is answered 401 {"error": "unauthenticated"} and never reaches the handler. The role and
+// status are read from the users table; the client-sent X-User-Role header is ignored.
+// Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: it used to copy the role from the
+// client's X-User-Role header, so anyone could claim "owner"; later the same day (CodeRabbit review on
+// PR 19, security) it fails closed instead of trusting X-User-ID by default.
 // Touches: SQLite database (one read of users).
 func AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx := r.Context()
-		if uid, ok := ResolveUserID(r); ok {
-			var role string
-			err := db.QueryRowContext(ctx, `SELECT role FROM users WHERE id=? AND status='active'`, uid).Scan(&role)
-			if err == nil {
-				ctx = context.WithValue(ctx, ctxUserIDKey, uid)
-				ctx = context.WithValue(ctx, ctxRoleKey, role)
-			}
+		unauthenticated := func(msg string) {
+			writeJSON(w, http.StatusUnauthorized, jsonResponse{"error": "unauthenticated", "message": msg})
 		}
+		resolve := ResolveUserID
+		if resolve == nil {
+			unauthenticated("No identity resolver is configured")
+			return
+		}
+		uid, ok := resolve(r)
+		if !ok {
+			unauthenticated("Authentication required")
+			return
+		}
+		ctx := r.Context()
+		var role string
+		if err := db.QueryRowContext(ctx, `SELECT role FROM users WHERE id=? AND status='active'`, uid).Scan(&role); err != nil {
+			unauthenticated("Authentication required")
+			return
+		}
+		ctx = context.WithValue(ctx, ctxUserIDKey, uid)
+		ctx = context.WithValue(ctx, ctxRoleKey, role)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

@@ -5,7 +5,12 @@ import { v4 as uuidv4 } from 'uuid';
 import { Twilio } from 'twilio';
 
 type NotificationChannel = 'email' | 'sms' | 'in_app';
-type NotificationStatus = 'sent' | 'queued' | 'failed' | 'skipped' | 'bounced' | 'opened' | 'clicked';
+/**
+ * 'queued' is a message waiting for its scheduled_at (or about to be sent); 'sending' is a scheduled message that
+ * deliverDue() has claimed and is sending now. 'sending' added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP
+ * (CodeRabbit review on PR 19).
+ */
+type NotificationStatus = 'sent' | 'queued' | 'sending' | 'failed' | 'skipped' | 'bounced' | 'opened' | 'clicked';
 
 interface NotificationTemplate {
   key: string;
@@ -28,6 +33,9 @@ interface NotificationLog {
   bounced: boolean;
   error: string | null;
   status: NotificationStatus;
+  /** When a scheduled message is due (ISO 8601, UTC), or null for one sent at once. Added 2026-11-10, session
+   * session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit review on PR 19: the schedule is persisted, not kept in a timer). */
+  scheduled_at?: string | null;
 }
 
 interface UserPreferences {
@@ -158,6 +166,11 @@ export class NotificationService {
     await this.loadTemplates();
   }
 
+  /**
+   * Creates the tables when missing and adds notification_logs.scheduled_at to a database created before it existed.
+   * In/out: nothing. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit review on PR 19:
+   * scheduled sends are persisted, so the log row carries scheduled_at). Touches: the SQLite schema.
+   */
   private async runDDL(): Promise<void> {
     const ddl = `
       CREATE TABLE IF NOT EXISTS notification_templates (
@@ -179,8 +192,10 @@ export class NotificationService {
         clicked_at TEXT,
         bounced INTEGER,
         error TEXT,
-        status TEXT
+        status TEXT,
+        scheduled_at TEXT
       );
+      CREATE INDEX IF NOT EXISTS idx_notification_logs_due ON notification_logs (status, scheduled_at);
       CREATE TABLE IF NOT EXISTS user_notification_preferences (
         user_id INTEGER PRIMARY KEY,
         do_not_disturb INTEGER,
@@ -189,6 +204,12 @@ export class NotificationService {
         channels_enabled TEXT
       );
     `;
+    // A table created before scheduled_at existed: CREATE TABLE IF NOT EXISTS leaves it as it was, so add the column
+    // before the index on it is created.
+    const columns = await this.db.all<{ name: string }[]>(`PRAGMA table_info(notification_logs)`);
+    if (columns.length > 0 && !columns.some((c) => c.name === 'scheduled_at')) {
+      await this.db.exec(`ALTER TABLE notification_logs ADD COLUMN scheduled_at TEXT`);
+    }
     await this.db.exec(ddl);
     await this.seedTemplates();
   }
@@ -395,12 +416,17 @@ export class NotificationService {
     };
   }
 
+  /**
+   * Inserts one log row and returns its id. In: the row without id (scheduled_at optional, default null).
+   * Out: the new id. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit review on PR 19): it
+   * also stores scheduled_at. Touches: notification_logs.
+   */
   private async logMessage(log: Omit<NotificationLog, 'id'>): Promise<string> {
     const id = uuidv4();
     await this.db.run(
       `INSERT INTO notification_logs
-      (id, user_id, template_key, channel, vars_used, sent_at, opened_at, clicked_at, bounced, error, status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      (id, user_id, template_key, channel, vars_used, sent_at, opened_at, clicked_at, bounced, error, status, scheduled_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       id,
       log.user_id,
       log.template_key,
@@ -411,7 +437,8 @@ export class NotificationService {
       log.clicked_at,
       log.bounced ? 1 : 0,
       log.error,
-      log.status
+      log.status,
+      log.scheduled_at ?? null
     );
     return id;
   }
@@ -521,14 +548,26 @@ export class NotificationService {
    * Sends one notification. The channel is the one asked for, or when null the template's default channels and
    * then email, SMS, in-app, the first the user has enabled. A channel the user switched off (unsubscribed), no
    * enabled channel, do-not-disturb and the quiet window each log the message as 'skipped'.
+   * A scheduled_at in the future is not sent now: the row stays 'queued' with its scheduled_at stored, and
+   * {@link deliverDue} sends it once the clock has passed that moment (the host calls deliverDue periodically, e.g.
+   * every minute). A scheduled_at that is not in the future is sent at once. An unparseable scheduled_at throws
+   * before anything is logged.
    * In: { user_id, template_key, channel, vars, scheduled_at }. Out: { success, message_id, status }.
    * Why changed 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): an explicit channel was used even when the user
-   * had disabled it, so unsubscribed users were still emailed. Touches: notification_logs, preferences, providers.
+   * had disabled it, so unsubscribed users were still emailed. Later the same day (CodeRabbit review on PR 19):
+   * scheduled sends used setTimeout, which fires after 1 ms for delays over 2,147,483,647 ms (about 24.8 days) and is
+   * lost on restart; the schedule is now persisted. Touches: notification_logs, preferences, providers.
    */
   async sendSingle(params: SendParams): Promise<{ success: boolean; message_id: string; status: NotificationStatus }> {
     const { user_id, template_key, channel, vars, scheduled_at } = params;
     const template = this.templates.get(template_key);
     if (!template) throw new Error(`Template ${template_key} not found`);
+    let dueAt: Date | null = null;
+    if (scheduled_at) {
+      dueAt = new Date(scheduled_at);
+      if (Number.isNaN(dueAt.getTime())) throw new Error(`invalid scheduled_at: ${scheduled_at}`);
+    }
+    const isFuture = dueAt !== null && dueAt.getTime() > this.now().getTime();
     const prefs = await this.getUserPreferences(user_id);
     const enabled = (ch: NotificationChannel) => prefs.channels_enabled[ch] !== false;
     let chosenChannel: NotificationChannel | null;
@@ -549,6 +588,8 @@ export class NotificationService {
       bounced: false,
       error: null,
       status: 'queued',
+      // Stored in toISOString() form so deliverDue can compare it with the clock as text.
+      scheduled_at: isFuture ? dueAt!.toISOString() : null,
     });
     if (chosenChannel === null || !enabled(chosenChannel)) {
       await this.updateLogStatus(message_id, { status: 'skipped', error: chosenChannel === null ? 'no_enabled_channel' : 'channel_disabled' });
@@ -560,16 +601,63 @@ export class NotificationService {
       return { success: true, message_id, status: 'skipped' };
     }
     const sendOn: NotificationChannel = chosenChannel;
-    if (scheduled_at) {
-      const delay = new Date(scheduled_at).getTime() - this.now().getTime();
-      setTimeout(() => {
-        this.attemptSend(sendOn, user_id, template, vars, message_id).catch(() => undefined);
-      }, delay > 0 ? delay : 0);
+    if (isFuture) {
+      // Persisted: deliverDue() sends it once due, across restarts and for any delay.
       return { success: true, message_id, status: 'queued' };
     }
     await this.attemptSend(sendOn, user_id, template, vars, message_id);
     const log = await this.db.get<NotificationLog>(`SELECT status FROM notification_logs WHERE id = ?`, message_id);
     return { success: true, message_id, status: log!.status };
+  }
+
+  /**
+   * Sends every scheduled message that is due: rows with status 'queued' and a scheduled_at at or before the service
+   * clock, oldest first, at most `limit` per call. Each row is claimed first ('queued' -> 'sending' with a conditional
+   * UPDATE), so two concurrent callers never send the same message; then it is sent on its logged channel with the
+   * usual retries and ends 'sent' or 'failed'. A row whose template no longer exists ends 'failed'. Preferences were
+   * applied when the message was scheduled. The host calls this periodically (a cron job or an interval); nothing
+   * in this class runs it by itself.
+   * In: limit (default 100). Out: { delivered, failed, message_ids } for the rows this call claimed.
+   * Why 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): CodeRabbit review on PR 19, scheduled sends used
+   * setTimeout (fired after 1 ms beyond ~24.8 days, lost on restart). Touches: notification_logs, SMTP / Twilio.
+   */
+  async deliverDue(limit: number = 100): Promise<{ delivered: number; failed: number; message_ids: string[] }> {
+    const nowIso = this.now().toISOString();
+    const due = await this.db.all<NotificationLog[]>(
+      `SELECT * FROM notification_logs
+       WHERE status = 'queued' AND scheduled_at IS NOT NULL AND scheduled_at <= ?
+       ORDER BY scheduled_at, id LIMIT ?`,
+      nowIso,
+      limit
+    );
+    let delivered = 0;
+    let failed = 0;
+    const message_ids: string[] = [];
+    for (const row of due) {
+      const claim = await this.db.run(
+        `UPDATE notification_logs SET status = 'sending' WHERE id = ? AND status = 'queued'`,
+        row.id
+      );
+      if (!claim.changes) continue; // another caller claimed it, or it was changed meanwhile
+      message_ids.push(row.id);
+      const template = this.templates.get(row.template_key);
+      if (!template) {
+        await this.updateLogStatus(row.id, { status: 'failed', error: `template_not_found: ${row.template_key}` });
+        failed++;
+        continue;
+      }
+      let vars: any = {};
+      try {
+        vars = JSON.parse(row.vars_used || '{}');
+      } catch {
+        vars = {};
+      }
+      await this.attemptSend(row.channel, row.user_id, template, vars, row.id);
+      const after = await this.db.get<NotificationLog>(`SELECT status FROM notification_logs WHERE id = ?`, row.id);
+      if (after?.status === 'sent') delivered++;
+      else failed++;
+    }
+    return { delivered, failed, message_ids };
   }
 
   async sendBatch(paramsArray: SendBatchParams[]): Promise<{ success: boolean; sent: number; failed: number; message_ids: string[] }> {

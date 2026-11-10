@@ -75,6 +75,35 @@ export const UPDATE_SUBSCRIPTION_FROM_STRIPE_SQL = `UPDATE subscriptions SET
          status = $2, 
          updated_at = NOW() 
          WHERE stripe_subscription_id = $3`;
+/**
+ * Marks the one subscription a failed invoice belongs to past_due, only while it is 'active'. Params: Stripe
+ * subscription id. Added 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP), CodeRabbit review on PR 19: a failed
+ * payment used to mark every subscription of the customer past_due, cancelled ones included. Touches: Postgres
+ * subscriptions.
+ */
+export const MARK_SUBSCRIPTION_PAST_DUE_SQL = `UPDATE subscriptions SET status = 'past_due', updated_at = NOW()
+         WHERE stripe_subscription_id = $1 AND status = 'active'`;
+/**
+ * Fallback when a failed invoice names no subscription: marks the customer's 'active' subscriptions past_due and
+ * leaves every other row (cancelled, already past_due, ...) alone. Params: Stripe customer id. Added 2026-11-10
+ * (session session_012zDydZCZ4AChqhEZ4oVtaP), CodeRabbit review on PR 19. Touches: Postgres subscriptions.
+ */
+export const MARK_CUSTOMER_ACTIVE_SUBSCRIPTIONS_PAST_DUE_SQL = `UPDATE subscriptions SET status = 'past_due', updated_at = NOW()
+         WHERE customer_id = $1 AND status = 'active'`;
+
+/**
+ * The Stripe subscription id a failed invoice belongs to: `invoice.subscription` when it is an id string, or the id
+ * of an expanded subscription object; null when the invoice names none (a one-off invoice).
+ * In: the invoice. Out: the id or null.
+ * Why 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): CodeRabbit review on PR 19, payment_failed must target
+ * the invoice's own subscription. Touches: nothing.
+ */
+const invoiceSubscriptionId = (invoice: Stripe.Invoice): string | null => {
+  const sub = (invoice as any).subscription;
+  if (typeof sub === 'string' && sub !== '') return sub;
+  if (sub && typeof sub === 'object' && typeof sub.id === 'string') return sub.id;
+  return null;
+};
 
 interface StripePriceIds {
   solo: string;
@@ -374,7 +403,10 @@ export const queue_refund = async (invoice_id: string, amount: number, reason: s
  * a raw request.
  * In: the Stripe event. Out: { received: true } or { error: 'webhook_processing_error', message }.
  * Why changed 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): the subscription-updated audit read the "old"
- * tier after overwriting it, so old and new were always equal; a failed ROLLBACK escaped as an exception.
+ * tier after overwriting it, so old and new were always equal; a failed ROLLBACK escaped as an exception. Later the
+ * same day (CodeRabbit review on PR 19): payment_failed marks only the invoice's own subscription past_due (or, when
+ * the invoice names none, the customer's 'active' ones), never a cancelled one; other status changes arrive as
+ * customer.subscription.updated with Stripe's own status.
  * Touches: Postgres events, invoices, subscriptions, audit_log.
  */
 export const handle_stripe_webhook = async (event: Stripe.Event): Promise<{received: true} | {error: string, message: string}> => {
@@ -407,15 +439,20 @@ export const handle_stripe_webhook = async (event: Stripe.Event): Promise<{recei
         break;
       }
       case 'invoice.payment_failed': {
+        // Only the invoice's own subscription, and only while active; cancelled rows are never touched
+        // (CodeRabbit review on PR 19, 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP).
         const invoice = event.data.object as Stripe.Invoice;
+        const subscriptionId = invoiceSubscriptionId(invoice);
+        if (subscriptionId) {
+          await client.query(MARK_SUBSCRIPTION_PAST_DUE_SQL, [subscriptionId]);
+        } else {
+          await client.query(MARK_CUSTOMER_ACTIVE_SUBSCRIPTIONS_PAST_DUE_SQL, [invoice.customer]);
+        }
         await client.query(
-          `UPDATE subscriptions SET status = 'past_due', updated_at = NOW() WHERE customer_id = $1 AND status <> 'past_due'`,
-          [invoice.customer]
-        );
-        await client.query(
-          `INSERT INTO audit_log (action, customer_id, invoice_id, reason)
-           VALUES ($1, $2, $3, $4)`,
-          ['payment_failed', invoice.customer, invoice.id, (invoice as any).last_payment_error?.message || 'unknown']
+          `INSERT INTO audit_log (action, customer_id, invoice_id, stripe_sub_id, reason)
+           VALUES ($1, $2, $3, $4, $5)`,
+          ['payment_failed', invoice.customer, invoice.id, subscriptionId,
+            (invoice as any).last_payment_error?.message || 'unknown']
         );
         break;
       }

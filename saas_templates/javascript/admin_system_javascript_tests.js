@@ -17,6 +17,9 @@ const { app, knex, runMigrations, csrfTokenFor } = createAdminSystem({
   stripe,
   mailer,
   priceIds: { owner: 'price_owner', admin: 'price_admin', user: 'price_user' },
+  // The seeded deployment and the create test use theme1, so it is configured (2026-11-10, session
+  // session_012zDydZCZ4AChqhEZ4oVtaP: themes are now a configured list, CodeRabbit review on PR 19).
+  themes: ['default', 'theme1'],
 });
 
 describe('Admin System Tests', () => {
@@ -302,6 +305,54 @@ describe('Admin System Tests', () => {
     expect(res.status).toBe(200);
     expect(Array.isArray(res.body)).toBe(true);
     expect(res.body.length).toBeLessThanOrEqual(10);
+  });
+
+  /**
+   * A fresh system, with no deployment yet, can create its first deployment with a configured theme, and an unknown
+   * theme gets 404 theme_not_found. In: a new in-memory system. Out: assertions only.
+   * Why 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): CodeRabbit review on PR 19 (a theme only "existed"
+   * once a deployment used it, so no first deployment could ever be created). Touches: an in-memory SQLite only.
+   */
+  test('create_deployment on a fresh database → configured theme accepted, unknown theme 404', async () => {
+    const fresh = createAdminSystem({
+      jwtSecret: JWT_SECRET,
+      csrfSecret: crypto.randomBytes(32).toString('hex'),
+      stripe,
+      mailer: new InMemoryMailer(),
+    });
+    try {
+      await fresh.runMigrations();
+      await fresh.knex('users').insert([{ id: 1, email: 'owner@example.com', name: 'Owner', tier: 'owner', status: 'active' }]);
+      await fresh.knex('customers').insert([{
+        id: 1, email: 'cust@example.com', name: 'Customer', tier: 'user', signup_date: '2023-01-01', status: 'active',
+        payment_method: 'pm_123', address: '123 Main St', stripe_subscription_id: 'sub_123',
+      }]);
+      expect(await fresh.knex('deployments').first()).toBeUndefined();
+      const headers = {
+        Authorization: `Bearer ${jwt.sign({ user_id: 1, tier: 'owner' }, JWT_SECRET, { algorithm: 'HS256', expiresIn: '15m' })}`,
+        'X-CSRF-Token': fresh.csrfTokenFor(1),
+      };
+
+      const unknown = await request(fresh.app)
+        .post('/admin/deployments/action')
+        .set(headers)
+        .send({ action: 'create', customer_id: 1, domain: 'nope.example.com', tier: 'user', theme_id: 'no-such-theme' });
+      expect(unknown.status).toBe(404);
+      expect(unknown.body.error).toBe('theme_not_found');
+      expect(await fresh.knex('deployments').first()).toBeUndefined();
+
+      const first = await request(fresh.app)
+        .post('/admin/deployments/action')
+        .set(headers)
+        .send({ action: 'create', customer_id: 1, domain: 'first.example.com', tier: 'user', theme_id: 'default' });
+      expect(first.status).toBe(200);
+      expect(first.body.success).toBe(true);
+      const deployment = await fresh.knex('deployments').where({ id: first.body.deployment_id }).first();
+      expect(deployment.domain).toBe('first.example.com');
+      expect(deployment.theme).toBe('default');
+    } finally {
+      await fresh.knex.destroy();
+    }
   });
 
   // Added 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): the gate must not be opened by anything the client controls.
