@@ -76,6 +76,7 @@ class TestRunner {
         $this->testEveryFlowThatCreatesASessionReturnsARefreshToken();
         $this->testOauthStateIsSingleUseAndExpires();
         $this->testServiceRefusesToStartWithoutSecretKey();
+        $this->testFiveWrongVerificationCodesInvalidateTheCode();
         echo "\nPassed: {$this->passed}, Failed: {$this->failed}\n";
         // A failed assertion must fail the run; it used to exit 0 whatever happened (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
         exit($this->failed > 0 ? 1 : 0);
@@ -540,6 +541,39 @@ class TestRunner {
         }
         $this->assertEqual(AuthSystem::secretHash('123456'), storedHash('123456'), 'with a 32-byte key the stored hash is HMAC-SHA256(key, value)');
         $this->assertEqual(AuthSystem::secretHash('123456') !== plainSha256('123456'), true, 'and not the plain SHA-256');
+    }
+    /**
+     * verify_email attempts (auth_system.md flow 2, Phase B.3): 5 wrong codes for one user invalidate that user's
+     * current code, so the right code then gets 400 code_invalid and the user stays unverified; with 4 wrong codes
+     * the right one, the 5th try, still verifies; another user's wrong codes never count against this one.
+     * Input: none. Output: assertions. Why: the Phase B.3 ruling (a 6-digit code must not be guessable by
+     * retrying). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory database.
+     */
+    private function testFiveWrongVerificationCodesInvalidateTheCode(): void {
+        $this->resetDB();
+        $db = Database::get();
+        AuthSystem::signup('guess@example.com','StrongPassword123456','Name');
+        $code = $this->mailedCode();
+        for ($i = 1; $i <= 5; $i++) {
+            $res = AuthSystem::verify_email('guess@example.com', 'wrong' . $i);
+            $this->assertEqual([$res['status_code'], $res['body']['error'] ?? null], [400, 'code_invalid'], "wrong code $i");
+        }
+        $res = AuthSystem::verify_email('guess@example.com', $code);
+        $this->assertEqual([$res['status_code'], $res['body']['error'] ?? null], [400, 'code_invalid'], 'the right code after 5 wrong ones is refused');
+        $this->assertEqual($db->query("SELECT email_verified_at FROM users WHERE email='guess@example.com'")->fetchColumn(), null, 'still unverified');
+        $this->assertEqual((int)$db->query("SELECT COUNT(*) FROM verification_codes vc JOIN users u ON u.id = vc.user_id WHERE u.email='guess@example.com'")->fetchColumn(), 0, 'the code is gone');
+
+        AuthSystem::signup('four@example.com','StrongPassword123456','Name');
+        $four = $this->mailedCode();
+        AuthSystem::signup('other@example.com','StrongPassword123456','Name');
+        for ($i = 1; $i <= 3; $i++) {
+            AuthSystem::verify_email('other@example.com', 'nope' . $i);
+        }
+        for ($i = 1; $i <= 4; $i++) {
+            AuthSystem::verify_email('four@example.com', 'wrong' . $i);
+        }
+        $res = AuthSystem::verify_email('four@example.com', $four);
+        $this->assertEqual([$res['status_code'], $res['body']['status'] ?? null], [200, 'verified'], 'the right code as the 5th try verifies');
     }
 }
 $runner = new TestRunner();

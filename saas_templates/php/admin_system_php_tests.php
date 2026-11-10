@@ -184,6 +184,11 @@ final class AdminSystemTest extends TestCase
     }
 
     // ADMIN-07
+    /**
+     * ADMIN-07 (direct path): changing the last active owner's role is refused with cannot_demote_last_owner.
+     * Kept from PR 18; the governance path the Phase B.3 spec names is testChangeRoleLastOwnerThroughGovernance.
+     * Touches: the in-memory SQLite database.
+     */
     public function testChangeRoleLastOwner(): void
     {
         // Make owner the only owner
@@ -200,6 +205,40 @@ final class AdminSystemTest extends TestCase
             'new_tier' => 'admin',
         ]);
         $this->assertEquals('cannot_demote_last_owner', $response['error']);
+    }
+
+    /**
+     * ADMIN-07 as the Phase B.3 spec proves it: approving a governance change_role that would demote the last
+     * active owner answers 400 {error: "cannot_demote_last_owner"}, the action stays pending and the owner keeps
+     * the role; with a second active owner the same kind of action runs (role changed, audit row role_changed).
+     * Input: the seeded database (one owner). Output: assertions only.
+     * Why: admin_system.md LAST OWNER (Phase B.3). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches: the in-memory SQLite database.
+     */
+    // ADMIN-07
+    public function testChangeRoleLastOwnerThroughGovernance(): void
+    {
+        $t = $this->admin->csrfToken();
+        $owner = $this->admin->getCurrentUserId();
+        $this->assertSame(1, (int)$this->pdo->query("SELECT COUNT(*) FROM users WHERE tier = 'owner' AND status = 'active'")->fetchColumn());
+        $insert = $this->pdo->prepare('INSERT INTO governance_actions (action_type, actor_id, target_resource_id, reason, submitted_at, new_value) VALUES (?, ?, ?, ?, ?, ?)');
+        $insert->execute(['change_role', 2, $owner, 'hand over', '2026-11-10 10:00:00', 'admin']);
+        $actionId = (int)$this->pdo->lastInsertId();
+        $before = $this->pdo->query('SELECT COUNT(*) FROM audit_logs')->fetchColumn();
+
+        $r = $this->admin->decideGovernanceAction($actionId, 'approve', ['csrf_token' => $t]);
+        $this->assertSame(['cannot_demote_last_owner', 400], [$r['error'] ?? null, $r['status'] ?? null]);
+        $this->assertSame('pending', $this->pdo->query("SELECT status FROM governance_actions WHERE id = $actionId")->fetchColumn());
+        $this->assertSame('owner', $this->pdo->query("SELECT tier FROM users WHERE id = $owner")->fetchColumn());
+        $this->assertSame($before, $this->pdo->query('SELECT COUNT(*) FROM audit_logs')->fetchColumn(), 'nothing logged');
+
+        // The executor itself works: with the admin promoted to a second active owner, demoting user 3 is fine.
+        $insert->execute(['change_role', 2, 3, 'promote', '2026-11-10 10:01:00', 'admin']);
+        $ok = (int)$this->pdo->lastInsertId();
+        $this->assertSame(['success' => true, 'action_id' => $ok, 'status' => 'approved'], $this->admin->decideGovernanceAction($ok, 'approve', ['csrf_token' => $t]));
+        $this->assertSame('admin', $this->pdo->query('SELECT tier FROM users WHERE id = 3')->fetchColumn());
+        $row = $this->pdo->query("SELECT resource_id, old_value, new_value FROM audit_logs WHERE action = 'role_changed'")->fetch(PDO::FETCH_ASSOC);
+        $this->assertSame([3, '{"tier":"user"}', '{"tier":"admin"}'], [(int)$row['resource_id'], $row['old_value'], $row['new_value']]);
     }
 
     // ADMIN-08
@@ -478,6 +517,8 @@ final class AdminSystemTest extends TestCase
      * {error: "account_suspended"} before any gate, even with a wrong CSRF token, and nothing changes.
      * Input: the seeded database with the owner suspended. Output: assertions only.
      * Why: the amended spec (Phase B.2). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory SQLite database.
+     * Phase B.3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): every CSRF-checked write is also called with a wrong
+     * token and must still answer account_suspended (the suspended check comes before the CSRF check).
      */
     // ADMIN-19
     public function testSuspendedOwnerIsRefusedEverywhere(): void
@@ -522,6 +563,25 @@ final class AdminSystemTest extends TestCase
         foreach ($calls as $name => $call) {
             $r = $call();
             $this->assertSame(['account_suspended', 403], [$r['error'] ?? null, $r['status'] ?? null], $name);
+        }
+        // Phase B.3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): the suspended caller is refused before the CSRF
+        // check too, so every CSRF-checked write with a wrong token still answers account_suspended.
+        $w = 'wrong';
+        $badCsrf = [
+            'resetPassword' => fn() => $this->admin->resetPassword(['csrf_token' => $w, 'user_id' => 3]),
+            'changeRole' => fn() => $this->admin->changeRole(['csrf_token' => $w, 'user_id' => 3, 'new_tier' => 'admin']),
+            'suspendUser' => fn() => $this->admin->suspendUser(['csrf_token' => $w, 'user_id' => 3, 'reason' => 'x']),
+            'changePlan' => fn() => $this->admin->changePlan(['csrf_token' => $w, 'customer_id' => 1, 'new_tier' => 'team']),
+            'queueRefund' => fn() => $this->admin->queueRefund(['csrf_token' => $w, 'invoice_id' => 9, 'amount' => 5, 'reason' => 'x']),
+            'createDeployment' => fn() => $this->admin->createDeployment(['csrf_token' => $w, 'customer_id' => 1, 'domain' => 'z.com', 'tier' => 'solo', 'theme_id' => 1]),
+            'publishDeployment' => fn() => $this->admin->publishDeployment(['csrf_token' => $w, 'deployment_id' => 1]),
+            'suspendDeployment' => fn() => $this->admin->suspendDeployment(['csrf_token' => $w, 'deployment_id' => 1, 'reason' => 'x']),
+            'retireDeployment' => fn() => $this->admin->retireDeployment(['csrf_token' => $w, 'deployment_id' => 1]),
+            'decideGovernanceAction' => fn() => $this->admin->decideGovernanceAction(1, 'approve', ['csrf_token' => $w]),
+        ];
+        foreach ($badCsrf as $name => $call) {
+            $r = $call();
+            $this->assertSame(['account_suspended', 403], [$r['error'] ?? null, $r['status'] ?? null], "$name (bad csrf)");
         }
         $this->assertSame($before, $snapshot(), 'nothing changed');
         $this->assertSame([], $this->mail, 'no e-mail sent');

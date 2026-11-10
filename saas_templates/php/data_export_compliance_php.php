@@ -71,7 +71,7 @@ class ComplianceException extends RuntimeException
         'not_found' => 404,
         'user_not_found' => 404,
         'deletion_not_pending' => 409,
-        'grace_period_elapsed' => 409,
+        'grace_period_over' => 409,
         'audit_eraser_not_configured' => 500,
         'audit_eraser_failed' => 500,
     ];
@@ -781,11 +781,14 @@ final class ComplianceService
      * @param string $deletionId
      * @return array {success: true, status: 'cancelled'}
      * @throws ComplianceException 404 not_found (none, another user's, or completed) | 409 deletion_not_pending (cancelled) |
-     *                             409 grace_period_elapsed (confirmed and its grace period is over)
+     *                             409 grace_period_over (will_delete_at has passed: the deletion is due, not yet run)
      *
      * Why: cancelling must stop at the end of the grace period; the caller is required since
      * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-14; it was optional). The code for a request no longer
      * pending is deletion_not_pending since the same day (EXPORT-15; it was not_cancellable).
+     * Phase B.3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, data_export_compliance.md endpoint 5): once
+     * will_delete_at (scheduled_at) is reached the answer is 409 grace_period_over (the code was
+     * grace_period_elapsed), for a pending request as for a confirmed one, and the row is left as it was.
      * Touches: the database and the audit log.
      */
     public function cancelDeletion(int $userId, string $deletionId): array
@@ -795,8 +798,8 @@ final class ComplianceService
             throw new ComplianceException('deletion_not_pending', 'Deletion request is no longer pending');
         }
         $now = self::format($this->now());
-        if ($row['status'] === 'approved' && $row['scheduled_at'] <= $now) {
-            throw new ComplianceException('grace_period_elapsed', 'The grace period has ended');
+        if ($row['scheduled_at'] <= $now) {
+            throw new ComplianceException('grace_period_over', 'The grace period has ended');
         }
         $stmt = $this->pdo->prepare(
             "UPDATE deletion_requests SET status = 'cancelled', confirmation_token_hash = NULL, confirmation_expires_at = NULL

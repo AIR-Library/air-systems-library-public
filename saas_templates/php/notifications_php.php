@@ -185,6 +185,8 @@ class NotificationService
      * 'skipped' (logged); a future scheduled_at or the user's quiet hours -> 'queued' with scheduled_at (the
      * given time, or the next quiet_hours_end) for deliverDue(); else sent now with retries.
      * Why: NOTIF-01..06/10, quiet hours amended 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP).
+     * Phase B.3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): quiet hours hold email and SMS only; an in-app
+     * message is stored at once, and the window is [start, end).
      * Touches: the database; e-mail / SMS through the senders.
      */
     public function sendNotification(
@@ -215,7 +217,7 @@ class NotificationService
             }
         }
         if ($queueAt === null) {
-            $queueAt = $this->quietHoursEnd($pref, $now);
+            $queueAt = $this->quietHoursEnd($pref, $now, $selectedChannel);
         }
 
         $logStmt = $this->pdo->prepare('INSERT INTO notification_logs (user_id, template_key, channel, vars_used, status, scheduled_at) VALUES (:uid, :tk, :ch, :vars, :st, :sched)');
@@ -253,6 +255,8 @@ class NotificationService
      * quiet hours). No in-process timers.
      * Why: NOTIF-12 (amended 2026-11-10 after an independent security review). session_012zDydZCZ4AChqhEZ4oVtaP.
      * The quiet-hours step and `deferred` are the same day (Phase B.2, NOTIF-05).
+     * Phase B.3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): step 3 holds email and SMS only; a due in-app
+     * message inside quiet hours is delivered.
      * Touches: the database; e-mail / SMS through the senders.
      */
     public function deliverDue(?\DateTimeImmutable $now = null): array
@@ -282,7 +286,7 @@ class NotificationService
                 $result['skipped'] += $final->rowCount();
                 continue;
             }
-            $quietUntil = $this->quietHoursEnd($pref, $now);
+            $quietUntil = $this->quietHoursEnd($pref, $now, (string)$row['channel']);
             if ($quietUntil !== null) {
                 $defer->execute([':at' => self::ts($quietUntil), ':id' => $id, ':claimed' => $nowText]);
                 $result['deferred'] += $defer->rowCount();
@@ -566,9 +570,15 @@ class NotificationService
      * Why: amended spec (queue with scheduled_at = quiet_hours_end); used by deliverDue step 3 too since the same
      * day (Phase B.2).
      * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+     * Phase B.3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): takes the message's channel; quiet hours hold email
+     * and SMS only, so for any other channel (in_app: stored at once, it interrupts no one) the answer is null.
+     * The window stays [start, end): a message due exactly at quiet_hours_end is sent.
      */
-    private function quietHoursEnd(array $pref, \DateTimeImmutable $now): ?\DateTimeImmutable
+    private function quietHoursEnd(array $pref, \DateTimeImmutable $now, string $channel): ?\DateTimeImmutable
     {
+        if ($channel !== 'email' && $channel !== 'sms') {
+            return null;
+        }
         $start = $pref['quiet_hours_start'];
         $end = $pref['quiet_hours_end'];
         if (!$start || !$end || !preg_match('/^(\d{2}):(\d{2})/', (string)$start, $s) || !preg_match('/^(\d{2}):(\d{2})/', (string)$end, $e)) {

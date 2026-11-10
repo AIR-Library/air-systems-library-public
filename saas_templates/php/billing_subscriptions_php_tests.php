@@ -364,17 +364,23 @@ class BillingSystemTest extends TestCase
         $this->assertEquals('past_due', $row['status']);
     }
 
+    /**
+     * BILL-09: a bad webhook signature answers 400 {error: "invalid_signature"} and records no event.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3): the status is asserted, and it is 400
+     * (Stripe's documented answer, the same as stripe_webhook_entitlements; it was 403).
+     * Touches: the in-memory SQLite database only.
+     */
     // BILL-09
     public function testWebhookSignatureInvalid()
     {
         $payload = json_encode(['id' => 'evt_invalid']);
         $result = BillingSystem::handleStripeWebhook($payload, ['Stripe-Signature' => 'invalid_sig']);
         $this->assertArrayHasKey('error', $result);
-        $this->assertEquals('invalid_signature', $result['error']);
+        $this->assertSame(['invalid_signature', 400], [$result['error'], $result['status'] ?? null]);
 
         // A well-formed signature made with the wrong secret is rejected too
         $result = BillingSystem::handleStripeWebhook($payload, ['Stripe-Signature' => $this->sign($payload, 'wrong_secret')]);
-        $this->assertEquals('invalid_signature', $result['error']);
+        $this->assertSame(['invalid_signature', 400], [$result['error'], $result['status'] ?? null]);
         $cnt = self::$pdo->query('SELECT COUNT(*) FROM events')->fetchColumn();
         $this->assertEquals(0, $cnt);
     }
@@ -407,11 +413,12 @@ class BillingSystemTest extends TestCase
 
     /**
      * Every billing error carries its HTTP status beside the code: 400 invalid_tier (create and change_plan),
-     * invalid_amount, invoice_not_succeeded, refund_exceeds_invoice, missing_signature; 403 invalid_signature;
+     * invalid_amount, invoice_not_succeeded, refund_exceeds_invoice, missing_signature, invalid_signature;
      * 404 subscription_not_found, invoice_not_found; 503 stripe_not_configured. No Stripe call is made.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.3, BILL-09): invalid_signature is 400 (was 403).
      * Input: the fresh in-memory database and the gateway mock. Output: assertions only.
      * Why: Phase B.2 bug "billing errors are {error} arrays without an HTTP status except the newest ones"
-     * (BILL-02, BILL-05 and BILL-09 name 400, 400 and 403). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * (BILL-02, BILL-05 and BILL-09 name 400, 400 and 400). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
      * Touches: the in-memory SQLite database only.
      */
     // BILL-02
@@ -437,7 +444,7 @@ class BillingSystemTest extends TestCase
         $this->assertSame(['refund_exceeds_invoice', 400], $pair(BillingSystem::queueRefund('inv_paid', 1001, 'x', 'admin')));
         $payload = json_encode(['id' => 'evt_status']);
         $this->assertSame(['missing_signature', 400], $pair(BillingSystem::handleStripeWebhook($payload, [])));
-        $this->assertSame(['invalid_signature', 403], $pair(BillingSystem::handleStripeWebhook($payload, ['Stripe-Signature' => $this->sign($payload, 'wrong_secret')])));
+        $this->assertSame(['invalid_signature', 400], $pair(BillingSystem::handleStripeWebhook($payload, ['Stripe-Signature' => $this->sign($payload, 'wrong_secret')])));
         BillingSystem::$stripe = null;
         $this->assertSame(['stripe_not_configured', 503], $pair(BillingSystem::createSubscription('cus_test', 'solo')));
     }

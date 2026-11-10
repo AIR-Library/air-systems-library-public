@@ -45,6 +45,8 @@ class Database {
      * session_012zDydZCZ4AChqhEZ4oVtaP; the plain columns refresh_token and code are gone). An older database that
      * still has those columns needs a migration that drops them; CREATE TABLE IF NOT EXISTS leaves it as it is.
      * Input: none. Output: none. Touches: the database (DDL).
+     * Phase B.3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): verification_codes has an attempts column (wrong
+     * e-mail codes; 5 invalidate the code); an older database gets it through ALTER TABLE.
      */
     private static function migrate(): void {
         $sql = <<<SQL
@@ -84,6 +86,7 @@ CREATE TABLE IF NOT EXISTS verification_codes (
     created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
     type TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
 CREATE TABLE IF NOT EXISTS oauth_accounts (
@@ -107,6 +110,13 @@ CREATE TABLE IF NOT EXISTS auth_attempts (
 CREATE INDEX IF NOT EXISTS idx_auth_attempts_bucket ON auth_attempts(bucket, at);
 SQL;
         self::$pdo->exec($sql);
+        // [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.3: verification_codes.attempts counts wrong e-mail
+        // codes (5 invalidate the code). A database made before it gets the column added here.
+        try {
+            self::$pdo->query('SELECT attempts FROM verification_codes LIMIT 0');
+        } catch (PDOException $e) {
+            self::$pdo->exec('ALTER TABLE verification_codes ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0');
+        }
     }
 }
 
@@ -376,6 +386,9 @@ class AuthSystem {
      * (hash_equals), never in the SQL WHERE.
      * Why: AUTH-05/06; expiry was never checked and status stayed 'unverified'. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
      * Codes are stored only as code_hash since the same day (Phase B.2, AUTH-16).
+     * Phase B.3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, auth_system.md flow 2 "Attempts"): every wrong code
+     * adds 1 to the attempts of the user's current e-mail codes, and a code with 5 wrong tries is deleted, so
+     * further tries, even with the right code, get 400 code_invalid until a new code is sent.
      * Touches: the database (users, verification_codes, audit_log).
      */
     public static function verify_email(string $email, string $code): array {
@@ -392,7 +405,12 @@ class AuthSystem {
         foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $vc) {
             if ($vc['code_hash'] !== null && hash_equals((string)$vc['code_hash'], $given)) { $row = $vc; }
         }
-        if ($row === null) return ['status_code'=>400,'body'=>['error'=>'code_invalid','message'=>'Invalid code']];
+        if ($row === null) {
+            // A wrong code counts against the user's current code; 5 wrong codes invalidate it (Phase B.3).
+            $db->prepare('UPDATE verification_codes SET attempts = attempts + 1 WHERE user_id=? AND type=\'email\'')->execute([$user['id']]);
+            $db->prepare('DELETE FROM verification_codes WHERE user_id=? AND type=\'email\' AND attempts >= 5')->execute([$user['id']]);
+            return ['status_code'=>400,'body'=>['error'=>'code_invalid','message'=>'Invalid code']];
+        }
         if (self::t() >= strtotime($row['expires_at'])) return ['status_code'=>400,'body'=>['error'=>'code_expired','message'=>'Code expired']];
         $row = ['id'=>$user['id'],'vc_id'=>$row['id']];
         $now = self::now();
