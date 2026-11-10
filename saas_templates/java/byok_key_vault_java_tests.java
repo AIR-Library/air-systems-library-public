@@ -333,7 +333,9 @@ public class byok_key_vault_java_tests {
 
         @Override
         public ByokKeyVault.KeyRow get(String u, String p) { return inner.get(u, p); }
+        @Override
         public List<ByokKeyVault.KeyRow> listForUser(String u) { return inner.listForUser(u); }
+        @Override
         public List<ByokKeyVault.KeyRow> listAll() { return inner.listAll(); }
         @Override
         public void saveWithAudit(ByokKeyVault.KeyRow row, String action, long at) { inner.saveWithAudit(row, action, at); }
@@ -343,6 +345,7 @@ public class byok_key_vault_java_tests {
         public boolean deleteWithAudit(String u, String p, long now) { return inner.deleteWithAudit(u, p, now); }
         @Override
         public boolean bumpWindow(String u, long w) { return inner.bumpWindow(u, w); }
+        @Override
         public List<ByokKeyVault.AuditRow> audit(String u) { return inner.audit(u); }
 
         /** Throws for failUser (nothing written); otherwise the real conditional write. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
