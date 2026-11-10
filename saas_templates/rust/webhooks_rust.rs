@@ -445,16 +445,30 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// What: receiver-side check of a delivery. In: secret, headers (`webhook-id`, `webhook-timestamp`,
-/// `webhook-signature` holding one or more space-separated `v1,<base64>`), raw body, tolerance.
-/// Out: `Ok(true)` when any signature matches; `InvalidHeader`, `TimestampOutOfRange`,
-/// `InvalidSecret` or `SignatureMismatch` otherwise. Why: spec `verify`; the old version did not
-/// compile. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the clock.
+/// What: receiver-side check of a delivery at the current time; see `verify_at`. 2026-11-10,
+/// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the clock.
 pub fn verify(
     secret: &str,
     headers: &HashMap<String, String>,
     raw_body: &[u8],
     tolerance_seconds: u64,
+) -> Result<bool, WebhookError> {
+    verify_at(secret, headers, raw_body, tolerance_seconds, now_secs())
+}
+
+/// What: receiver-side check of a delivery at time `now` (Unix seconds). In: secret, headers
+/// (`webhook-id`, `webhook-timestamp`, `webhook-signature` holding one or more space-separated
+/// `v1,<base64>`), raw body, tolerance, now. Out: `Ok(true)` when any signature matches;
+/// `InvalidHeader`, `TimestampOutOfRange`, `InvalidSecret` or `SignatureMismatch` otherwise.
+/// Why: spec `verify`; the old version did not compile; split from `verify` 2026-11-10 so tests use a
+/// fixed clock (specs README: injectable clock). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+/// Touches: nothing.
+pub fn verify_at(
+    secret: &str,
+    headers: &HashMap<String, String>,
+    raw_body: &[u8],
+    tolerance_seconds: u64,
+    now: u64,
 ) -> Result<bool, WebhookError> {
     let header = |name: &str| {
         headers
@@ -466,7 +480,6 @@ pub fn verify(
     let sig_header = header("webhook-signature")?;
     let msg_id = header("webhook-id")?;
     let ts: u64 = header("webhook-timestamp")?.trim().parse().map_err(|_| WebhookError::InvalidHeader)?;
-    let now = now_secs();
     if now.abs_diff(ts) > tolerance_seconds {
         return Err(WebhookError::TimestampOutOfRange);
     }
@@ -588,6 +601,17 @@ pub fn deliver<F>(store: &dyn Store, delivery_id: &str, sender: F) -> Result<(),
 where
     F: Fn(&str, &HashMap<String, String>, &[u8]) -> Result<(u16, Vec<u8>), Box<dyn Error>>,
 {
+    deliver_at(store, delivery_id, sender, now_secs())
+}
+
+/// What: `deliver` at time `now` (Unix seconds): the signature timestamp, `delivered_at` and the next
+/// retry time all come from `now`. In: store, delivery id, sender, now. Out: as `deliver`.
+/// Why: split from `deliver` 2026-11-10 so tests use a fixed clock (specs README: injectable clock).
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the store, and the network through the sender.
+pub fn deliver_at<F>(store: &dyn Store, delivery_id: &str, sender: F, now: u64) -> Result<(), Box<dyn Error>>
+where
+    F: Fn(&str, &HashMap<String, String>, &[u8]) -> Result<(u16, Vec<u8>), Box<dyn Error>>,
+{
     let mut delivery = store.get_delivery(delivery_id).ok_or(WebhookError::DeliveryNotFound)?;
     let message = store.get_message(&delivery.message_id).ok_or(WebhookError::MessageNotFound)?;
     let mut endpoint = store.get_endpoint(&delivery.endpoint_id).ok_or(WebhookError::EndpointNotFound)?;
@@ -595,7 +619,7 @@ where
         return Err(Box::new(WebhookError::EndpointNotFound));
     }
     let body = serde_json::to_vec(&message.payload)?;
-    let timestamp = now_secs();
+    let timestamp = now;
     let signature = sign(&endpoint.secret, &message.id, timestamp, &body)?;
     let mut headers = HashMap::new();
     headers.insert("webhook-id".to_string(), message.id.clone());
@@ -609,7 +633,7 @@ where
             delivery.status_code = Some(status);
             delivery.success = true;
             delivery.error = None;
-            delivery.delivered_at = Some(now_secs());
+            delivery.delivered_at = Some(now);
             delivery.next_attempt_at = None;
             endpoint.failure_count = 0;
         }
@@ -625,7 +649,7 @@ where
                 }
             }
             delivery.success = false;
-            delivery.next_attempt_at = schedule_next(delivery.attempt, now_secs());
+            delivery.next_attempt_at = schedule_next(delivery.attempt, now);
             if delivery.next_attempt_at.is_none() {
                 endpoint.failure_count += 1;
                 if endpoint.failure_count >= DISABLE_AFTER_FAILED_MESSAGES {

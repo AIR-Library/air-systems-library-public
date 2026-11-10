@@ -12,13 +12,22 @@
 //! removed `NO_PARAMS`), used the local wall clock for quiet hours, faked failures from a template
 //! variable inside production code, sent every email to a hard-coded address, and "unsubscribed" users
 //! by turning on do-not-disturb for every channel. Rewritten 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+//! Amended 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-02/05/11/12): default preferences have no
+//! quiet hours, do-not-disturb off and SMS off; email unsubscribe links carry an HMAC-SHA256 token (the
+//! secret must be at least 32 bytes or the service refuses to start), GET on the link only confirms and
+//! POST unsubscribes (channels_enabled[channel] = false); quiet hours queue the message until
+//! quiet_hours_end; `deliver_due(now)` re-queues rows stuck at 'sending' for over 300 s, claims due rows
+//! with a conditional update, re-checks preferences and finishes with a write conditional on its claim.
 //! Touches: the SQLite database it is given (in memory for tests); the network only through the
 //! injected sender; no money.
 
-use chrono::{DateTime, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, TimeZone, Timelike, Utc};
+use hmac::{Hmac, Mac};
 use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension, Result as SqlResult};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::Sha256;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -27,9 +36,27 @@ use std::time::Duration;
 pub const CHANNELS: [&str; 3] = ["email", "sms", "in_app"];
 /// Attempts per message before it is logged as failed (spec: "retry 3x").
 pub const MAX_ATTEMPTS: u32 = 3;
+/// A row claimed ('sending') longer ago than this is taken to belong to a crashed worker (spec: 300 s).
+pub const STALE_CLAIM_SECS: i64 = 300;
+/// Shortest accepted unsubscribe secret, in bytes (spec: the service refuses to start below 32).
+pub const MIN_UNSUBSCRIBE_SECRET_BYTES: usize = 32;
 
-/// What: create the spec's three tables (plus a `status` column on the log). In: a connection.
-/// Out: `()` or a SQLite error. Why: executable schema. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+/// What: a time as stored: RFC 3339, UTC, microseconds, `Z`, fixed width, so text order is time order
+/// and SQL can compare stored times as text. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+pub fn ts(t: DateTime<Utc>) -> String {
+    t.to_rfc3339_opts(SecondsFormat::Micros, true)
+}
+
+/// What: the default channel settings: email on, SMS off (opt-in: it costs money and marketing texts
+/// need prior consent), in-app on. Why: 2026-11-10 amendment (NOTIF-02). 2026-11-10,
+/// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+pub fn default_channels() -> HashMap<String, bool> {
+    [("email", true), ("sms", false), ("in_app", true)].iter().map(|(c, on)| (c.to_string(), *on)).collect()
+}
+
+/// What: create the spec's three tables (the log has status, scheduled_at and claimed_at; quiet hours
+/// are nullable). In: a connection. Out: `()` or a SQLite error. Why: executable schema; claimed_at and
+/// nullable quiet hours added 2026-11-10 (NOTIF-05/12). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
 /// Touches: database (DDL).
 pub fn init_db(conn: &Connection) -> SqlResult<()> {
     conn.execute_batch(
@@ -39,11 +66,12 @@ pub fn init_db(conn: &Connection) -> SqlResult<()> {
          CREATE TABLE IF NOT EXISTS notification_logs (
             id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, template_key TEXT NOT NULL, channel TEXT NOT NULL,
             vars_used TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL, scheduled_at TEXT NULL, sent_at TEXT NULL, opened_at TEXT NULL,
+            created_at TEXT NOT NULL, scheduled_at TEXT NULL, claimed_at TEXT NULL, sent_at TEXT NULL, opened_at TEXT NULL,
             clicked_at TEXT NULL, bounced INTEGER NOT NULL DEFAULT 0, error TEXT NULL);
+         CREATE INDEX IF NOT EXISTS notification_logs_due ON notification_logs (status, scheduled_at);
          CREATE TABLE IF NOT EXISTS user_notification_preferences (
-            user_id INTEGER PRIMARY KEY, do_not_disturb INTEGER NOT NULL, quiet_hours_start TEXT NOT NULL,
-            quiet_hours_end TEXT NOT NULL, channels_enabled TEXT NOT NULL, unsubscribed INTEGER NOT NULL DEFAULT 0);",
+            user_id INTEGER PRIMARY KEY, do_not_disturb INTEGER NOT NULL, quiet_hours_start TEXT NULL,
+            quiet_hours_end TEXT NULL, channels_enabled TEXT NOT NULL);",
     )
 }
 
@@ -84,16 +112,27 @@ pub struct NotificationTemplate {
     pub variables: Vec<String>,
 }
 
-/// What: a user's stored preferences. Quiet hours are "HH:MM" in UTC; equal start and end mean no
-/// quiet hours. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+/// What: a user's preferences. Quiet hours are "HH:MM" in UTC, `None` (the default) for none; equal
+/// start and end also mean none. Changed 2026-11-10 (NOTIF-02/05): quiet hours are optional and the
+/// separate `unsubscribed` flag is gone (unsubscribing turns the channel off).
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UserNotificationPreferences {
     pub user_id: i64,
     pub do_not_disturb: bool,
-    pub quiet_hours_start: String,
-    pub quiet_hours_end: String,
+    pub quiet_hours_start: Option<String>,
+    pub quiet_hours_end: Option<String>,
     pub channels_enabled: HashMap<String, bool>,
-    pub unsubscribed: bool,
+}
+
+/// What: the outcome counts of one `deliver_due` run. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP
+/// (NOTIF-12). Touches: nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliverCounts {
+    pub requeued: usize,
+    pub sent: usize,
+    pub skipped: usize,
+    pub failed: usize,
 }
 
 /// What: a partial preferences update; `None` keeps the stored value. 2026-11-10,
@@ -203,7 +242,8 @@ pub struct NotificationService {
     clock: Box<dyn Fn() -> DateTime<Utc>>,
     sleeper: Box<dyn Fn(Duration)>,
     backoff_base: Duration,
-    unsubscribe_link: Box<dyn Fn(i64) -> String>,
+    unsubscribe_secret: Vec<u8>,
+    base_url: String,
 }
 
 /// What: a new random message id (32 hex chars). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
@@ -221,11 +261,14 @@ fn parse_hhmm(s: &str) -> Option<u32> {
     if h < 24 && m < 60 { Some(h * 60 + m) } else { None }
 }
 
-/// What: is `now` inside the [start, end) quiet window? A window may wrap midnight; equal or invalid
-/// bounds mean no quiet hours. In: preferences, time. Out: bool. Why: spec "Quiet hours: check before
-/// sending". 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+/// What: is `now` inside the [start, end) quiet window? A window may wrap midnight; unset, equal or
+/// invalid bounds mean no quiet hours. In: preferences, time. Out: bool. Why: spec "Quiet hours: check
+/// before sending". 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
 pub fn in_quiet_hours(prefs: &UserNotificationPreferences, now: DateTime<Utc>) -> bool {
-    let (Some(start), Some(end)) = (parse_hhmm(&prefs.quiet_hours_start), parse_hhmm(&prefs.quiet_hours_end)) else {
+    let (Some(start), Some(end)) = (
+        prefs.quiet_hours_start.as_deref().and_then(parse_hhmm),
+        prefs.quiet_hours_end.as_deref().and_then(parse_hhmm),
+    ) else {
         return false;
     };
     let minute = now.hour() * 60 + now.minute();
@@ -236,6 +279,17 @@ pub fn in_quiet_hours(prefs: &UserNotificationPreferences, now: DateTime<Utc>) -
     } else {
         minute >= start || minute < end
     }
+}
+
+/// What: the next time of day `end` ("HH:MM", UTC) after `now`: when a message queued in quiet hours
+/// becomes due. In: time, end. Out: the instant, or `None` for an invalid end.
+/// Why: 2026-11-10 amendment (NOTIF-05: queued with scheduled_at = quiet_hours_end).
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+pub fn quiet_hours_end_after(now: DateTime<Utc>, end: &str) -> Option<DateTime<Utc>> {
+    let minutes = parse_hhmm(end)?;
+    let midnight = now.date_naive().and_hms_opt(0, 0, 0)?.and_utc();
+    let today = midnight + ChronoDuration::minutes(minutes as i64);
+    Some(if today > now { today } else { today + ChronoDuration::days(1) })
 }
 
 /// What: replace each `{name}` with its value in one pass, so a value containing `{other}` is never
@@ -282,20 +336,34 @@ fn parse_time(s: Option<String>) -> Option<DateTime<Utc>> {
     s.and_then(|s| DateTime::parse_from_rfc3339(&s).ok()).map(|d| d.with_timezone(&Utc))
 }
 
+/// What: constant-time equality of two byte strings (unequal lengths are simply false).
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-11). Touches: nothing.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// What: methods of `NotificationService`, each documented below. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
 impl NotificationService {
-    /// What: a service on an in-memory SQLite database with a `FakeSender`, the system clock and no
-    /// real sleeping between retries. Why: tests and demos. 2026-11-10,
-    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+    /// What: a service on an in-memory SQLite database with a `FakeSender`, the system clock, no real
+    /// sleeping between retries, and a fresh random 32-byte unsubscribe secret (never a hard-coded one).
+    /// Why: tests and demos. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory, OS randomness.
     pub fn new_in_memory() -> SqlResult<Self> {
-        let svc = Self::new(Connection::open_in_memory()?, Box::new(FakeSender::default()))?;
+        let mut secret = vec![0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut secret);
+        let svc = Self::new(Connection::open_in_memory()?, Box::new(FakeSender::default()), &secret)?;
         Ok(svc.with_sleeper(Box::new(|_| {})))
     }
 
     /// What: a production service: creates the tables and default templates, uses the system clock and
-    /// real sleeps between retries. In: a connection and a provider. Out: the service.
-    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (DDL and templates).
-    pub fn new(conn: Connection, sender: Box<dyn Sender>) -> SqlResult<Self> {
+    /// real sleeps between retries. The unsubscribe secret comes from configuration and must be at least
+    /// 32 bytes, or the service refuses to start (an empty key makes a forgeable HMAC).
+    /// In: a connection, a provider, the unsubscribe secret. Out: the service or an error.
+    /// Changed 2026-11-10 (NOTIF-11): the secret parameter. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// Touches: database (DDL and templates).
+    pub fn new(conn: Connection, sender: Box<dyn Sender>, unsubscribe_secret: &[u8]) -> SqlResult<Self> {
+        if unsubscribe_secret.len() < MIN_UNSUBSCRIBE_SECRET_BYTES {
+            return Err(rusqlite::Error::InvalidParameterName("unsubscribe secret must be at least 32 bytes".into()));
+        }
         init_db(&conn)?;
         load_default_templates(&conn)?;
         Ok(Self {
@@ -304,11 +372,12 @@ impl NotificationService {
             clock: Box::new(Utc::now),
             sleeper: Box::new(std::thread::sleep),
             backoff_base: Duration::from_millis(500),
-            unsubscribe_link: Box::new(|_| "/notifications/unsubscribe".to_string()),
+            unsubscribe_secret: unsubscribe_secret.to_vec(),
+            base_url: "https://app.example.com".to_string(),
         })
     }
 
-    /// What: replace the clock. Why: quiet hours must be testable at a fixed time of day.
+    /// What: replace the clock. Why: quiet hours and schedules must be testable at a fixed time.
     /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
     pub fn with_clock(mut self, clock: Box<dyn Fn() -> DateTime<Utc>>) -> Self {
         self.clock = clock;
@@ -321,12 +390,60 @@ impl NotificationService {
         self
     }
 
-    /// What: set how each email's unsubscribe link is built (it should carry a signed token in
-    /// production). Why: spec "Include unsubscribe link in emails (legal requirement)".
+    /// What: set the public base URL of unsubscribe links (no trailing slash needed). Replaces the old
+    /// free-form `with_unsubscribe_link` (2026-11-10, NOTIF-11: links must carry the signed token).
     /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
-    pub fn with_unsubscribe_link(mut self, link: Box<dyn Fn(i64) -> String>) -> Self {
-        self.unsubscribe_link = link;
+    pub fn with_base_url(mut self, base_url: &str) -> Self {
+        self.base_url = base_url.trim_end_matches('/').to_string();
         self
+    }
+
+    /// What: the unsubscribe token: lowercase hex of HMAC-SHA256(secret, "unsubscribe:" + user_id + ":" +
+    /// channel). In: user id, channel. Out: 64 hex characters. Why: 2026-11-10 amendment (NOTIF-11).
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+    pub fn unsubscribe_token(&self, user_id: i64, channel: &str) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.unsubscribe_secret).expect("HMAC accepts any key length");
+        mac.update(format!("unsubscribe:{}:{}", user_id, channel).as_bytes());
+        mac.finalize().into_bytes().iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    /// What: the unsubscribe link `<base_url>/unsubscribe?user_id=<id>&channel=<channel>&token=<token>`.
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-11). Touches: nothing.
+    pub fn unsubscribe_link(&self, user_id: i64, channel: &str) -> String {
+        format!("{}/unsubscribe?user_id={}&channel={}&token={}", self.base_url, user_id, channel, self.unsubscribe_token(user_id, channel))
+    }
+
+    /// What: the unsubscribe link's handler. A token that is missing or not exactly 64 characters of
+    /// [0-9a-f], an unknown channel, or a token that does not match (constant-time comparison, no panic
+    /// on unequal lengths) all get 403 {error: "invalid_unsubscribe_token"}, before any user lookup.
+    /// Then GET only returns a confirmation and changes nothing (mail scanners follow links); POST sets
+    /// channels_enabled[channel] = false; any other method is 405.
+    /// In: HTTP method, user id, channel and token from the link. Out: (HTTP status, JSON body).
+    /// Why: 2026-11-10 amendment (NOTIF-11): an unsigned link lets anyone unsubscribe anyone.
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (preferences) on POST only.
+    pub fn handle_unsubscribe(&self, method: &str, user_id: i64, channel: &str, token: Option<&str>) -> SqlResult<(u16, Value)> {
+        let refused = (403, json!({ "error": "invalid_unsubscribe_token" }));
+        let Some(token) = token else { return Ok(refused) };
+        if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            return Ok(refused);
+        }
+        if !CHANNELS.contains(&channel) {
+            return Ok(refused);
+        }
+        if !ct_eq(token.as_bytes(), self.unsubscribe_token(user_id, channel).as_bytes()) {
+            return Ok(refused);
+        }
+        match method.to_ascii_uppercase().as_str() {
+            "GET" => Ok((200, json!({ "confirm": true, "user_id": user_id, "channel": channel,
+                "message": format!("Press the button to stop {} notifications.", channel) }))),
+            "POST" => {
+                let mut p = self.get_user_preferences(user_id)?;
+                p.channels_enabled.insert(channel.to_string(), false);
+                self.save_preferences(&p)?;
+                Ok((200, json!({ "success": true, "channel": channel, "unsubscribed": true })))
+            }
+            _ => Ok((405, json!({ "error": "method_not_allowed" }))),
+        }
     }
 
     /// What: load a template. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (read).
@@ -349,25 +466,29 @@ impl NotificationService {
         )
     }
 
-    /// What: a user's preferences, or the defaults (no DND, no quiet hours, every channel on).
-    /// In: user id. Out: preferences. Why: spec "Get user preferences".
-    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (read).
+    /// What: a user's preferences, or the defaults: do_not_disturb false, no quiet hours, channels
+    /// {email: true, sms: false, in_app: true}; a channel missing from stored settings takes its default.
+    /// In: user id. Out: preferences. Why: spec "Get user preferences"; defaults amended 2026-11-10
+    /// (NOTIF-02: SMS is opt-in; NOTIF-05: no quiet hours). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// Touches: database (read).
     pub fn get_user_preferences(&self, user_id: i64) -> SqlResult<UserNotificationPreferences> {
         let row = self
             .conn
             .query_row(
-                "SELECT do_not_disturb, quiet_hours_start, quiet_hours_end, channels_enabled, unsubscribed
+                "SELECT do_not_disturb, quiet_hours_start, quiet_hours_end, channels_enabled
                  FROM user_notification_preferences WHERE user_id = ?1",
                 params![user_id],
                 |r| {
-                    let channels: String = r.get(3)?;
+                    let stored: String = r.get(3)?;
+                    let mut channels = default_channels();
+                    let stored: HashMap<String, bool> = serde_json::from_str(&stored).unwrap_or_default();
+                    channels.extend(stored);
                     Ok(UserNotificationPreferences {
                         user_id,
                         do_not_disturb: r.get::<_, i64>(0)? != 0,
                         quiet_hours_start: r.get(1)?,
                         quiet_hours_end: r.get(2)?,
-                        channels_enabled: serde_json::from_str(&channels).unwrap_or_default(),
-                        unsubscribed: r.get::<_, i64>(4)? != 0,
+                        channels_enabled: channels,
                     })
                 },
             )
@@ -375,10 +496,9 @@ impl NotificationService {
         Ok(row.unwrap_or_else(|| UserNotificationPreferences {
             user_id,
             do_not_disturb: false,
-            quiet_hours_start: "00:00".into(),
-            quiet_hours_end: "00:00".into(),
-            channels_enabled: CHANNELS.iter().map(|c| (c.to_string(), true)).collect(),
-            unsubscribed: false,
+            quiet_hours_start: None,
+            quiet_hours_end: None,
+            channels_enabled: default_channels(),
         }))
     }
 
@@ -387,9 +507,9 @@ impl NotificationService {
         let channels = serde_json::to_string(&p.channels_enabled).unwrap_or_else(|_| "{}".into());
         self.conn.execute(
             "INSERT OR REPLACE INTO user_notification_preferences
-                (user_id, do_not_disturb, quiet_hours_start, quiet_hours_end, channels_enabled, unsubscribed)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![p.user_id, p.do_not_disturb as i64, p.quiet_hours_start, p.quiet_hours_end, channels, p.unsubscribed as i64],
+                (user_id, do_not_disturb, quiet_hours_start, quiet_hours_end, channels_enabled)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![p.user_id, p.do_not_disturb as i64, p.quiet_hours_start, p.quiet_hours_end, channels],
         )?;
         Ok(())
     }
@@ -413,10 +533,10 @@ impl NotificationService {
             p.do_not_disturb = v;
         }
         if let Some(v) = &update.quiet_hours_start {
-            p.quiet_hours_start = v.trim().to_string();
+            p.quiet_hours_start = Some(v.trim().to_string());
         }
         if let Some(v) = &update.quiet_hours_end {
-            p.quiet_hours_end = v.trim().to_string();
+            p.quiet_hours_end = Some(v.trim().to_string());
         }
         if let Some(ch) = &update.channels_enabled {
             for (k, v) in ch {
@@ -426,12 +546,14 @@ impl NotificationService {
         self.save_preferences(&p)
     }
 
-    /// What: unsubscribe a user from email; SMS and in-app are untouched. In: user id. Out: `()`.
-    /// Why: spec "user unsubscribed, future emails skipped" (the old code silenced every channel).
-    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (write).
+    /// What: unsubscribe a user from email (channels_enabled.email = false); SMS and in-app are
+    /// untouched. The signed link (`handle_unsubscribe`) does the same for any channel. In: user id.
+    /// Out: `()`. Why: spec "user unsubscribed, future emails skipped"; since 2026-11-10 (NOTIF-11) it
+    /// turns the channel off instead of setting a separate flag. 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (write).
     pub fn unsubscribe_user(&self, user_id: i64) -> SqlResult<()> {
         let mut p = self.get_user_preferences(user_id)?;
-        p.unsubscribed = true;
+        p.channels_enabled.insert("email".to_string(), false);
         self.save_preferences(&p)
     }
 
@@ -444,19 +566,36 @@ impl NotificationService {
             "INSERT INTO notification_logs (id, user_id, template_key, channel, vars_used, status, attempts, created_at,
                 scheduled_at, sent_at, error) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![id, user_id, template_key, channel, serde_json::to_string(vars).unwrap_or_else(|_| "{}".into()),
-                status, attempts, (self.clock)().to_rfc3339(), scheduled_at.map(|t| t.to_rfc3339()),
-                sent_at.map(|t| t.to_rfc3339()), error],
+                status, attempts, ts((self.clock)()), scheduled_at.map(ts), sent_at.map(ts), error],
         )?;
         Ok(())
     }
 
+    /// What: the channel to use now, or why the message is skipped: do-not-disturb; the requested
+    /// channel turned off; or ("auto") the template's first default channel the user has on, else
+    /// "no_enabled_channel". In: preferences, requested channel ("auto" or a channel), template.
+    /// Out: Ok(channel) or Err(reason). Why: shared by the immediate send and `deliver_due`, which
+    /// re-checks preferences at delivery time (2026-11-10, NOTIF-12). 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+    fn choose_channel(prefs: &UserNotificationPreferences, requested: &str, template: &NotificationTemplate) -> Result<String, &'static str> {
+        if prefs.do_not_disturb {
+            return Err("do_not_disturb");
+        }
+        let enabled = |ch: &str| *prefs.channels_enabled.get(ch).unwrap_or(&false);
+        if requested != "auto" {
+            return if enabled(requested) { Ok(requested.to_string()) } else { Err("channel_disabled") };
+        }
+        template.channels_default.iter().find(|c| enabled(c)).cloned().ok_or("no_enabled_channel")
+    }
+
     /// What: send one templated notification. Order: unknown template or channel -> error;
-    /// do-not-disturb -> skipped; quiet hours -> skipped; channel chosen (the requested one, or the
-    /// template's first channel the user enabled) and skipped if disabled, or if it is email and the user
-    /// unsubscribed; a future `scheduled_at` -> queued; otherwise up to 3 attempts with exponential
-    /// backoff -> sent or failed. Every outcome is logged under the returned message id.
-    /// In: user, template key, channel or `None`, vars, schedule. Out: `SendResponse`.
-    /// Why: spec endpoint 1. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// do-not-disturb -> skipped; a future `scheduled_at`, or now inside the user's quiet hours ->
+    /// stored 'queued' with scheduled_at (the requested time, or the next quiet_hours_end) for
+    /// `deliver_due`; a disabled or unavailable channel -> skipped; otherwise up to 3 attempts with
+    /// exponential backoff -> sent or failed. Every outcome is logged under the returned message id.
+    /// In: user, template key, channel or `None` (auto), vars, schedule. Out: `SendResponse`.
+    /// Why: spec endpoint 1; quiet hours queue instead of dropping since the 2026-11-10 amendment
+    /// (NOTIF-05). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
     /// Touches: database, the sender (network in production), the clock, the sleeper.
     pub fn send_single_notification(
         &self,
@@ -475,38 +614,26 @@ impl NotificationService {
         let prefs = self.get_user_preferences(user_id)?;
         let message_id = new_message_id();
         let now = (self.clock)();
+        let requested = channel.unwrap_or("auto");
         let skip = |reason: &str, ch: &str| -> SqlResult<SendResponse> {
             self.log(&message_id, user_id, template_key, ch, vars, "skipped", 0, scheduled_at, None, Some(reason))?;
             Ok(SendResponse { success: false, message_id: message_id.clone(), status: "skipped".into() })
         };
-        let requested = channel.unwrap_or("auto");
         if prefs.do_not_disturb {
             return skip("do_not_disturb", requested);
         }
-        if scheduled_at.map(|t| t <= now).unwrap_or(true) && in_quiet_hours(&prefs, now) {
-            return skip("quiet_hours", requested);
+        let mut due = scheduled_at.filter(|t| *t > now);
+        if due.is_none() && in_quiet_hours(&prefs, now) {
+            due = prefs.quiet_hours_end.as_deref().and_then(|end| quiet_hours_end_after(now, end));
         }
-        let enabled = |ch: &str| *prefs.channels_enabled.get(ch).unwrap_or(&true);
-        let chosen = match channel {
-            Some(ch) => ch.to_string(),
-            None => match template.channels_default.iter().find(|c| enabled(c) && !(c.as_str() == "email" && prefs.unsubscribed)) {
-                Some(c) => c.clone(),
-                None => return skip("no_enabled_channel", "none"),
-            },
+        if let Some(at) = due {
+            self.log(&message_id, user_id, template_key, requested, vars, "queued", 0, Some(at), None, None)?;
+            return Ok(SendResponse { success: true, message_id, status: "queued".into() });
+        }
+        let chosen = match Self::choose_channel(&prefs, requested, &template) {
+            Ok(c) => c,
+            Err(reason) => return skip(reason, requested),
         };
-        if !enabled(&chosen) {
-            return skip("channel_disabled", &chosen);
-        }
-        if chosen == "email" && prefs.unsubscribed {
-            return skip("unsubscribed", &chosen);
-        }
-        if let Some(at) = scheduled_at {
-            if at > now {
-                self.log(&message_id, user_id, template_key, &chosen, vars, "queued", 0, scheduled_at, None, None)?;
-                return Ok(SendResponse { success: true, message_id, status: "queued".into() });
-            }
-        }
-
         let message = self.build_message(&template, &message_id, user_id, &chosen, vars);
         match self.send_with_retries(&message) {
             Ok(attempt) => {
@@ -520,16 +647,16 @@ impl NotificationService {
         }
     }
 
-    /// What: render a template into a provider message; email gets the unsubscribe link (text and
-    /// HTML). In: template, message id, user, chosen channel, vars. Out: `OutgoingMessage`.
+    /// What: render a template into a provider message; email gets the signed unsubscribe link (text
+    /// and HTML). In: template, message id, user, chosen channel, vars. Out: `OutgoingMessage`.
     /// Why: shared by `send_single_notification` and `deliver_due` so a queued message is rendered
-    /// exactly like an immediate one (CodeRabbit review on PR 19). 2026-11-10,
-    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing (calls the unsubscribe-link builder).
+    /// exactly like an immediate one (CodeRabbit review on PR 19); the link is signed since 2026-11-10
+    /// (NOTIF-11). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
     fn build_message(&self, template: &NotificationTemplate, message_id: &str, user_id: i64, channel: &str, vars: &HashMap<String, String>) -> OutgoingMessage {
         let mut body_text = render(&template.body_text, vars, false);
         let mut body_html = render(&template.body_html, vars, true);
         if channel == "email" {
-            let link = (self.unsubscribe_link)(user_id);
+            let link = self.unsubscribe_link(user_id, "email");
             body_text.push_str(&format!("\n\nUnsubscribe: {}", link));
             if !body_html.is_empty() {
                 body_html.push_str(&format!("<p><a href=\"{}\">Unsubscribe</a></p>", escape_html(&link)));
@@ -567,78 +694,91 @@ impl NotificationService {
         Err(last_error)
     }
 
-    /// What: deliver every `queued` message whose `scheduled_at` has come (`<= now` by the injected
-    /// clock), oldest first. Each row is claimed (`queued` -> `sending`, so two runners never send it
-    /// twice), the user's preferences are checked again (do-not-disturb, a disabled channel or an
-    /// email unsubscribe since scheduling -> `skipped`; quiet hours -> back to `queued` for a later
-    /// run), then it is rendered and sent with the same retry loop as an immediate send and updated to
-    /// `sent` or `failed`. The host must call this on a schedule (for example every minute); nothing
-    /// else sends queued messages. In: nothing. Out: how many messages were sent.
-    /// Why: CodeRabbit review on PR 19: a future `scheduled_at` was logged `queued` and reported as a
-    /// success, but nothing ever delivered it. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
-    /// Touches: database (read and update `notification_logs`), the sender (network in production),
-    /// the clock, the sleeper.
-    pub fn deliver_due(&self) -> SqlResult<usize> {
-        let now = (self.clock)();
-        let due: Vec<(String, i64, String, String, String)> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT id, user_id, template_key, channel, vars_used FROM notification_logs
-                 WHERE status = 'queued' AND scheduled_at IS NOT NULL AND julianday(scheduled_at) <= julianday(?1)
-                 ORDER BY julianday(scheduled_at), rowid",
-            )?;
-            let rows = stmt
-                .query_map(params![now.to_rfc3339()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
-                .collect::<SqlResult<Vec<_>>>()?;
+    /// What: deliver the queued messages that are due at `now`, exactly once; the host calls this on a
+    /// schedule (never an in-process timer, which a restart loses). In order:
+    /// 1. 'sending' rows with claimed_at + 300 s < now go back to 'queued' (a crashed worker);
+    /// 2. 'queued' rows with scheduled_at <= now, by scheduled_at then insertion order, are claimed one
+    ///    by one: UPDATE ... SET status = 'sending', claimed_at = now WHERE id = ? AND status = 'queued'
+    ///    (a row another worker claimed first is skipped);
+    /// 3. preferences are checked NOW: channel off (an unsubscribe), no enabled channel, or
+    ///    do-not-disturb -> 'skipped';
+    /// 4. the final write is UPDATE ... WHERE id = ? AND status = 'sending' AND claimed_at = <this claim>.
+    /// In: now. Out: counts {requeued, sent, skipped, failed}.
+    /// Why: CodeRabbit review on PR 19 (queued rows were never delivered); steps 1-4 from the 2026-11-10
+    /// amendment (NOTIF-12). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// Touches: database (notification_logs), the sender (network in production), the sleeper.
+    pub fn deliver_due(&self, now: DateTime<Utc>) -> SqlResult<DeliverCounts> {
+        let mut counts = DeliverCounts::default();
+        let claim = ts(now);
+        // 1. re-queue stale claims (compared as instants, not text)
+        let stuck: Vec<(String, String)> = {
+            let mut stmt = self.conn.prepare("SELECT id, claimed_at FROM notification_logs WHERE status = 'sending' ORDER BY rowid")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default())))?.collect::<SqlResult<Vec<_>>>()?;
             rows
         };
-        let mut sent = 0;
-        for (id, user_id, template_key, channel, vars_json) in due {
-            let claimed = self.conn.execute("UPDATE notification_logs SET status = 'sending' WHERE id = ?1 AND status = 'queued'", params![id])?;
-            if claimed == 0 {
-                continue;
-            }
-            let finish = |status: &str, attempts: u32, sent_at: Option<DateTime<Utc>>, error: Option<&str>| -> SqlResult<()> {
-                self.conn.execute(
-                    "UPDATE notification_logs SET status = ?2, attempts = ?3, sent_at = ?4, error = ?5 WHERE id = ?1",
-                    params![id, status, attempts, sent_at.map(|t| t.to_rfc3339()), error],
+        for (id, claimed_at) in stuck {
+            let stale = parse_time(Some(claimed_at.clone())).map_or(true, |c| c + ChronoDuration::seconds(STALE_CLAIM_SECS) < now);
+            if stale {
+                counts.requeued += self.conn.execute(
+                    "UPDATE notification_logs SET status = 'queued', claimed_at = NULL WHERE id = ?1 AND status = 'sending' AND claimed_at IS ?2",
+                    params![id, if claimed_at.is_empty() { None } else { Some(claimed_at) }],
                 )?;
-                Ok(())
+            }
+        }
+        // 2. claim due rows one by one
+        let due: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM notification_logs WHERE status = 'queued' AND scheduled_at IS NOT NULL AND scheduled_at <= ?1
+                 ORDER BY scheduled_at, rowid",
+            )?;
+            let rows = stmt.query_map(params![claim], |r| r.get(0))?.collect::<SqlResult<Vec<String>>>()?;
+            rows
+        };
+        for id in due {
+            let claimed = self.conn.execute(
+                "UPDATE notification_logs SET status = 'sending', claimed_at = ?2 WHERE id = ?1 AND status = 'queued'",
+                params![id, claim],
+            )?;
+            if claimed != 1 {
+                continue;
+            }
+            let (user_id, template_key, requested, vars_json): (i64, String, String, String) = self.conn.query_row(
+                "SELECT user_id, template_key, channel, vars_used FROM notification_logs WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+            // 4. every outcome is written only if this claim still holds
+            let finish = |status: &str, channel: &str, attempts: u32, sent_at: Option<DateTime<Utc>>, error: Option<&str>| -> SqlResult<usize> {
+                self.conn.execute(
+                    "UPDATE notification_logs SET status = ?2, channel = ?3, attempts = ?4, sent_at = ?5, error = ?6
+                     WHERE id = ?1 AND status = 'sending' AND claimed_at = ?7",
+                    params![id, status, channel, attempts, sent_at.map(ts), error, claim],
+                )
             };
-            let prefs = self.get_user_preferences(user_id)?;
-            if prefs.do_not_disturb {
-                finish("skipped", 0, None, Some("do_not_disturb"))?;
-                continue;
-            }
-            if !*prefs.channels_enabled.get(&channel).unwrap_or(&true) {
-                finish("skipped", 0, None, Some("channel_disabled"))?;
-                continue;
-            }
-            if channel == "email" && prefs.unsubscribed {
-                finish("skipped", 0, None, Some("unsubscribed"))?;
-                continue;
-            }
-            if in_quiet_hours(&prefs, now) {
-                finish("queued", 0, None, None)?;
-                continue;
-            }
             let template = match self.load_template(&template_key) {
                 Ok(t) => t,
                 Err(e) => {
-                    finish("failed", 0, None, Some(&format!("template: {}", e)))?;
+                    counts.failed += finish("failed", &requested, 0, None, Some(&format!("template: {}", e)))?;
+                    continue;
+                }
+            };
+            // 3. preferences as they are now
+            let prefs = self.get_user_preferences(user_id)?;
+            let channel = match Self::choose_channel(&prefs, &requested, &template) {
+                Ok(c) => c,
+                Err(reason) => {
+                    counts.skipped += finish("skipped", &requested, 0, None, Some(reason))?;
                     continue;
                 }
             };
             let vars: HashMap<String, String> = serde_json::from_str(&vars_json).unwrap_or_default();
             let message = self.build_message(&template, &id, user_id, &channel, &vars);
             match self.send_with_retries(&message) {
-                Ok(attempt) => {
-                    finish("sent", attempt, Some((self.clock)()), None)?;
-                    sent += 1;
-                }
-                Err(last_error) => finish("failed", MAX_ATTEMPTS, None, Some(&last_error))?,
+                Ok(attempt) => counts.sent += finish("sent", &channel, attempt, Some((self.clock)()), None)?,
+                Err(last_error) => counts.failed += finish("failed", &channel, MAX_ATTEMPTS, None, Some(&last_error))?,
             }
         }
-        Ok(sent)
+        Ok(counts)
     }
 
     /// What: send many notifications; sent counts sent and queued, failed counts everything else.
@@ -697,7 +837,7 @@ impl NotificationService {
     /// Touches: database (write).
     fn stamp(&self, message_id: &str, column: &str) -> SqlResult<()> {
         let sql = format!("UPDATE notification_logs SET {c} = COALESCE({c}, ?1) WHERE id = ?2 AND status = 'sent'", c = column);
-        let n = self.conn.execute(&sql, params![(self.clock)().to_rfc3339(), message_id])?;
+        let n = self.conn.execute(&sql, params![ts((self.clock)()), message_id])?;
         if n == 0 { Err(rusqlite::Error::QueryReturnedNoRows) } else { Ok(()) }
     }
 

@@ -9,10 +9,13 @@
 //! payment provider were never counted, hashed device fields without separators ("ab"+"c" equals
 //! "a"+"bc"), used "more than 5" where the spec says FAIL at 5 devices, and returned FAIL without a
 //! logged decision when a user had no ledger row. Repaired 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+//! Amended the same day (TRIAL-09/10/11/14/15): the device gate's order is FAIL >= 5 other users, PASS
+//! < 2, PASS for a known device, else CHALLENGE, and it records the device only after a PASS/CHALLENGE;
+//! payment timing counts whole days after trial_end = created_at + trial_days (default 14).
 //! Touches: the SQLite database it owns (in memory for tests); no network, no money.
 
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{params, Connection, OptionalExtension, Result as SqlResult};
+use rusqlite::{params, Connection, Result as SqlResult};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -95,6 +98,19 @@ pub fn fail_response(result: &GateResult) -> Option<ErrorResponse> {
 pub struct Database {
     conn: Connection,
     clock: Box<dyn Fn() -> DateTime<Utc>>,
+    trial_days: i64,
+}
+
+/// Default trial length in days (spec gate 5: "trial_days is configuration, default 14").
+pub const DEFAULT_TRIAL_DAYS: i64 = 14;
+
+/// What: the result of `signup`: the email, IP and device gate results (none FAIL).
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+#[derive(Debug, Clone, Serialize)]
+pub struct SignupGates {
+    pub email: GateResult,
+    pub ip: GateResult,
+    pub device: GateResult,
 }
 
 /// What: methods of `Database`, each documented below. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
@@ -109,7 +125,15 @@ impl Database {
     /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (DDL).
     pub fn open(conn: Connection) -> SqlResult<Self> {
         Self::migrate(&conn)?;
-        Ok(Self { conn, clock: Box::new(Utc::now) })
+        Ok(Self { conn, clock: Box::new(Utc::now), trial_days: DEFAULT_TRIAL_DAYS })
+    }
+
+    /// What: set the trial length used by gate 5 (default 14 days). In: days. Out: the database.
+    /// Why: 2026-11-10 amendment (TRIAL-10/11/15: trial_days is configuration).
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+    pub fn with_trial_days(mut self, trial_days: i64) -> Self {
+        self.trial_days = trial_days;
+        self
     }
 
     /// What: replace the clock (for tests of the time-based gates). 2026-11-10,
@@ -222,10 +246,15 @@ impl Database {
         Sha256::digest(canonical.as_bytes()).iter().map(|b| format!("{:02x}", b)).collect()
     }
 
-    /// What: gate 4. Distinct OTHER users seen on this device: PASS under 2 (or when the device is
-    /// already one of this user's known devices), CHALLENGE 2-4, FAIL 5+ (spec "FAIL if count >= 5").
-    /// In: device, the user (if known). Out: `GateResult`. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
-    /// Touches: database.
+    /// What: gate 4. Counts the distinct OTHER users seen on this device (null-safe: with no user id,
+    /// every user counts). Decision, in this order: FAIL if count >= 5; PASS if count < 2; PASS if this
+    /// user already has a row for this device; CHALLENGE otherwise. The device row is written AFTER the
+    /// decision and only for PASS or CHALLENGE (and only when the user is known), so a FAIL records
+    /// nothing and a device farm cannot make its own later checks pass.
+    /// In: device, the user (if known). Out: `GateResult`.
+    /// Why: 2026-11-10 amendment (TRIAL-09/14): the old order let a known device PASS at 5+ other users,
+    /// and the old CHALLENGE range overlapped FAIL at exactly 5. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// Touches: database (device_fingerprints, gate_decisions), clock.
     pub fn check_device_fingerprint(&self, device: &DeviceInfo, user_id: Option<i64>) -> SqlResult<GateResult> {
         let hash = Self::device_hash(device);
         let others: i64 = self.conn.query_row(
@@ -241,61 +270,53 @@ impl Database {
             )?,
             None => 0,
         };
-        let decision = if others < 2 || known > 0 {
-            Decision::Pass
-        } else if others < 5 {
-            Decision::Challenge
-        } else {
+        let decision = if others >= 5 {
             Decision::Fail
+        } else if others < 2 || known > 0 {
+            Decision::Pass
+        } else {
+            Decision::Challenge
         };
-        self.decide(user_id, "device_fingerprint", decision, json!({ "device_hash": hash, "matching_users": others, "known_device": known > 0 }))
+        let result = self.decide(user_id, "device_fingerprint", decision, json!({ "device_hash": hash, "matching_users": others, "known_device": known > 0 }))?;
+        if let (Some(u), true) = (user_id, decision != Decision::Fail) {
+            self.insert_device_fingerprint(u, device)?;
+        }
+        Ok(result)
     }
 
-    /// What: gate 5. From the user's latest ledger row: payment added after the trial started and
-    /// within trial_days + 5 days -> PASS; more than trial_days + 30 days in and payment added after the
-    /// trial ended -> CHALLENGE (late payment entry); trial over, no payment ever, more than 90 days
-    /// since it started -> FAIL; anything else PASS. No ledger row -> PASS (no trial to abuse).
-    /// In: user, trial length in days. Out: `GateResult`. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// What: gate 5, judged when a payment method is being added (the payment date is now).
+    /// trial_end = the user's created_at (earliest trial_started_at, else signup_date, in the ledger) +
+    /// trial_days; days_after_trial = floor((now - trial_end) / 1 day), rounding toward negative infinity
+    /// (negative while the trial runs); earlier_payment = the ledger already has a payment_added_date for
+    /// this user. PASS if days_after_trial < 5; FAIL if days_after_trial >= 90 and no earlier payment;
+    /// CHALLENGE otherwise. No ledger row -> PASS (no trial to abuse).
+    /// In: user. Out: `GateResult`. Why: 2026-11-10 amendment (TRIAL-10/11/15): the old rule measured from
+    /// the trial start with ad-hoc windows. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
     /// Touches: database, clock.
-    pub fn check_trial_payment_timing(&self, user_id: i64, trial_days: i64) -> SqlResult<GateResult> {
-        let row: Option<(Option<String>, Option<String>)> = self
-            .conn
-            .query_row(
-                "SELECT trial_started_at, payment_added_date FROM trial_abuse_ledger
-                 WHERE user_id = ?1 AND trial_started_at IS NOT NULL ORDER BY trial_started_at DESC, id DESC LIMIT 1",
-                params![user_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let parse = |s: &Option<String>| s.as_deref().and_then(|t| DateTime::parse_from_rfc3339(t).ok()).map(|d| d.with_timezone(&Utc));
-        let Some((Some(start), payment)) = row.as_ref().map(|(s, p)| (parse(s), parse(p))) else {
+    pub fn check_trial_payment_timing(&self, user_id: i64) -> SqlResult<GateResult> {
+        let (created, earlier_payments): (Option<String>, i64) = self.conn.query_row(
+            "SELECT MIN(COALESCE(trial_started_at, signup_date)), COUNT(payment_added_date) FROM trial_abuse_ledger WHERE user_id = ?1",
+            params![user_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let Some(created) = created.as_deref().and_then(|t| DateTime::parse_from_rfc3339(t).ok()).map(|d| d.with_timezone(&Utc)) else {
             return self.decide(Some(user_id), "trial_payment_timing", Decision::Pass, json!({ "reason": "no_trial_record" }));
         };
-        let now = (self.clock)();
-        let days_elapsed = (now - start).num_days();
-        let decision = match payment {
-            Some(paid) if paid > start => {
-                if days_elapsed < trial_days + 5 {
-                    Decision::Pass
-                } else if days_elapsed > trial_days + 30 && paid > start + Duration::days(trial_days) {
-                    Decision::Challenge
-                } else {
-                    Decision::Pass
-                }
-            }
-            _ => {
-                if days_elapsed >= trial_days && days_elapsed > 90 {
-                    Decision::Fail
-                } else {
-                    Decision::Pass
-                }
-            }
+        let trial_end = created + Duration::days(self.trial_days);
+        let days_after_trial = ((self.clock)() - trial_end).num_seconds().div_euclid(86_400);
+        let earlier_payment = earlier_payments > 0;
+        let decision = if days_after_trial < 5 {
+            Decision::Pass
+        } else if days_after_trial >= 90 && !earlier_payment {
+            Decision::Fail
+        } else {
+            Decision::Challenge
         };
         self.decide(
             Some(user_id),
             "trial_payment_timing",
             decision,
-            json!({ "trial_days": trial_days, "days_elapsed": days_elapsed, "payment_added": payment.map(|p| p.to_rfc3339()) }),
+            json!({ "trial_duration": self.trial_days, "payment_delay": days_after_trial, "earlier_payment": earlier_payment }),
         )
     }
 
@@ -322,6 +343,43 @@ impl Database {
         };
         self.decide(Some(user_id), "chargeback_history", decision,
             json!({ "provider_chargebacks": provider_count, "refund_chargebacks": refund_count, "total": total }))
+    }
+
+    /// What: the signup integration. Runs the email (1), IP (3) and device (4) gates BEFORE anything is
+    /// recorded; any FAIL returns its error response (409 / 429 / 403) and records no signup, ledger or
+    /// device row. Otherwise the device gate has written its row (PASS or CHALLENGE), and the signup and a
+    /// ledger row with gate_flags {email, ip, device} are recorded. In: the new user's id (created by the
+    /// auth system), email, the server-observed IP, device. Out: the three gate results, or the FAIL body.
+    /// Why: 2026-11-10 amendment (TRIAL-09/14): recording the device first made every later check pass.
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database, clock.
+    pub fn signup(&self, user_id: i64, email: &str, ip: &str, device: &DeviceInfo) -> SqlResult<Result<SignupGates, ErrorResponse>> {
+        let email_gate = self.check_email_trial_history(email)?;
+        if let Some(err) = fail_response(&email_gate) {
+            return Ok(Err(err));
+        }
+        let ip_gate = self.check_ip_signup_rate_limit(ip)?;
+        if let Some(err) = fail_response(&ip_gate) {
+            return Ok(Err(err));
+        }
+        let device_gate = self.check_device_fingerprint(device, Some(user_id))?;
+        if let Some(err) = fail_response(&device_gate) {
+            return Ok(Err(err));
+        }
+        self.insert_signup(ip)?;
+        let now = (self.clock)().to_rfc3339();
+        let flags = json!({ "email": email_gate.decision.as_str(), "ip": ip_gate.decision.as_str(), "device": device_gate.decision.as_str() });
+        self.conn.execute(
+            "INSERT INTO trial_abuse_ledger (user_id, email, ip, device_fingerprint, signup_date, trial_started_at, gate_flags, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?5)",
+            params![user_id, email.trim().to_lowercase(), ip.trim(), Self::device_hash(device), now, flags.to_string()],
+        )?;
+        Ok(Ok(SignupGates { email: email_gate, ip: ip_gate, device: device_gate }))
+    }
+
+    /// What: device rows recorded for a user (for audits and tests). 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (read).
+    pub fn device_rows_for_user(&self, user_id: i64) -> SqlResult<i64> {
+        self.conn.query_row("SELECT COUNT(*) FROM device_fingerprints WHERE user_id = ?1", params![user_id], |r| r.get(0))
     }
 
     /// What: record one signup attempt from an IP (input to gate 3). 2026-11-10,

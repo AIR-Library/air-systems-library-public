@@ -6,13 +6,24 @@ use rusqlite::Connection;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// Fake payment client that records each call (the "stripe.subscriptions.update called" check).
+/// What: fake payment client that records each update (the "stripe.subscriptions.update called" check)
+/// and serves each subscription's items from `items` (one item "si_<sub>" unless a test sets others).
+/// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-12): it now answers retrieve and records
+/// the item id sent with the price. Touches: memory.
 struct MockStripe {
     calls: Rc<RefCell<Vec<(String, String)>>>,
+    items: Rc<RefCell<std::collections::HashMap<String, Vec<SubscriptionItem>>>>,
 }
+/// What: `StripeClient` for the fake. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
 impl StripeClient for MockStripe {
-    fn update_subscription(&self, stripe_id: &str, price_id: &str) -> AdminResult<()> {
-        self.calls.borrow_mut().push((stripe_id.to_string(), price_id.to_string()));
+    /// What: the stored items, or one default item. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    fn retrieve_subscription(&self, stripe_id: &str) -> AdminResult<Vec<SubscriptionItem>> {
+        Ok(self.items.borrow().get(stripe_id).cloned().unwrap_or_else(|| vec![SubscriptionItem { id: format!("si_{}", stripe_id), price: "price_basic".into() }]))
+    }
+    /// What: record (subscription, "item=price proration") per update. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    fn update_subscription(&self, stripe_id: &str, update: &SubscriptionUpdate) -> AdminResult<()> {
+        let items: Vec<String> = update.items.iter().map(|i| format!("{}={}", i.id, i.price)).collect();
+        self.calls.borrow_mut().push((stripe_id.to_string(), format!("{} {}", items.join(","), update.proration_behavior)));
         Ok(())
     }
 }
@@ -27,6 +38,7 @@ impl DomainVerifier for AllDomainsVerified {
 
 thread_local! {
     static STRIPE_CALLS: Rc<RefCell<Vec<(String, String)>>> = Rc::new(RefCell::new(Vec::new()));
+    static STRIPE_ITEMS: Rc<RefCell<std::collections::HashMap<String, Vec<SubscriptionItem>>>> = Rc::new(RefCell::new(Default::default()));
 }
 
 /// Corrected 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): the system gets a domain verifier (publishing
@@ -35,7 +47,8 @@ thread_local! {
 fn setup() -> AdminSystem {
     let conn = Connection::open_in_memory().unwrap();
     let calls = STRIPE_CALLS.with(|c| { c.borrow_mut().clear(); c.clone() });
-    let system = AdminSystem::new(conn, Box::new(MockStripe { calls })).with_domain_verifier(Box::new(AllDomainsVerified));
+    let items = STRIPE_ITEMS.with(|c| { c.borrow_mut().clear(); c.clone() });
+    let system = AdminSystem::new(conn, Box::new(MockStripe { calls, items })).with_domain_verifier(Box::new(AllDomainsVerified));
     system.init_schema().unwrap();
     // Create an owner user
     let now = Utc::now().to_rfc3339();
@@ -49,6 +62,9 @@ fn setup() -> AdminSystem {
     system
 }
 
+/// What: ADMIN-01: an owner creates a user, who is stored and sent an invite. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP:
+/// the "invite sent" assertion was added. Touches: in-memory SQLite.
+// ADMIN-01
 #[test]
 fn test_create_user_happy_path() {
     let system = setup();
@@ -63,8 +79,11 @@ fn test_create_user_happy_path() {
         }
         _ => panic!("Expected success"),
     }
+    // ADMIN-01 "invite sent" (assertion added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+    assert!(system.sent_emails().iter().any(|m| m.to == "new@example.com"));
 }
 
+// ADMIN-02
 #[test]
 fn test_create_user_duplicate_email() {
     let system = setup();
@@ -81,6 +100,7 @@ fn test_create_user_duplicate_email() {
     }
 }
 
+// ADMIN-03
 #[test]
 fn test_create_user_non_owner() {
     let system = setup();
@@ -96,6 +116,10 @@ fn test_create_user_non_owner() {
     }
 }
 
+/// What: ADMIN-04/05: an owner cannot reset their own password; resetting another user emails a reset link.
+/// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the "email sent" assertion was added. Touches: in-memory SQLite.
+// ADMIN-04
+// ADMIN-05
 #[test]
 fn test_reset_password_happy_path() {
     let system = setup();
@@ -114,8 +138,13 @@ fn test_reset_password_happy_path() {
         Response::Success { .. } => {}
         _ => panic!("Expected success"),
     }
+    // ADMIN-04 "email sent" (assertion added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+    assert!(system.sent_emails().iter().any(|m| m.to == "reset@example.com" && m.body.contains("/reset?token=")));
 }
 
+/// What: ADMIN-06: an owner changes a user's role; the role is stored and audited. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP:
+/// the stored-role and audit assertions were added. Touches: in-memory SQLite.
+// ADMIN-06
 #[test]
 fn test_change_role_happy_path() {
     let system = setup();
@@ -129,8 +158,13 @@ fn test_change_role_happy_path() {
         Response::Success { .. } => {}
         _ => panic!("Expected success"),
     }
+    // ADMIN-06 "role changed + audit logged" (assertions added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+    assert_eq!(system.get_user_by_id(uid).unwrap().tier, Tier::Premium);
+    let audited: i64 = system.conn.query_row("SELECT COUNT(*) FROM audit_logs WHERE action = 'role_changed' AND resource_id = ?1", params![uid], |r| r.get(0)).unwrap();
+    assert_eq!(audited, 1);
 }
 
+// ADMIN-07
 #[test]
 fn test_change_role_last_owner() {
     let system = setup();
@@ -142,6 +176,9 @@ fn test_change_role_last_owner() {
     }
 }
 
+/// What: ADMIN-08: suspending a user changes their status. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the status assertion
+/// was added. Touches: in-memory SQLite.
+// ADMIN-08
 #[test]
 fn test_suspend_user_happy_path() {
     let system = setup();
@@ -155,8 +192,11 @@ fn test_suspend_user_happy_path() {
         Response::Success { .. } => {}
         _ => panic!("Expected success"),
     }
+    // ADMIN-08 "status changed" (assertion added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+    assert_eq!(system.get_user_by_id(uid).unwrap().status, "suspended");
 }
 
+// ADMIN-09
 #[test]
 fn test_suspend_own_account() {
     let system = setup();
@@ -168,6 +208,9 @@ fn test_suspend_own_account() {
     }
 }
 
+/// What: ADMIN-10: the customer list pages correctly and every field is present. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP:
+/// pagination and field assertions were added. Touches: in-memory SQLite.
+// ADMIN-10
 #[test]
 fn test_customers_list() {
     let system = setup();
@@ -198,8 +241,20 @@ fn test_customers_list() {
         }
         _ => panic!("Expected success"),
     }
+    // ADMIN-10 "pagination works, all fields present" (assertions added 2026-11-10,
+    // session_012zDydZCZ4AChqhEZ4oVtaP): 2 per page, page 3 holds the 5th customer
+    let page = |p: i64| system.list_customers(&owner, p, 2).unwrap().data.as_array().unwrap().clone();
+    assert_eq!(page(1).len(), 2);
+    assert_eq!(page(3).len(), 1);
+    assert_eq!(page(3)[0]["email"], "cust4@example.com");
+    for field in ["customer_id", "email", "name", "tier", "signup_date", "invoice_count", "status"] {
+        assert!(page(1)[0].get(field).is_some(), "missing {}", field);
+    }
 }
 
+/// What: ADMIN-11: a customer's detail has every field. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: field assertions added.
+/// Touches: in-memory SQLite.
+// ADMIN-11
 #[test]
 fn test_customers_detail() {
     let system = setup();
@@ -224,11 +279,19 @@ fn test_customers_detail() {
     match resp {
         Response::Success { data, .. } => {
             assert_eq!(data.get("customer_id").unwrap(), &serde_json::json!(cid));
+            // ADMIN-11 "all fields present" (added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+            for field in ["email", "name", "tier", "subscription_status", "payment_method", "address", "notes", "status"] {
+                assert!(data.get(field).is_some(), "missing {}", field);
+            }
         }
         _ => panic!("Expected success"),
     }
 }
 
+/// What: ADMIN-12: change_plan retrieves the subscription and updates its one item (item id + new price,
+/// create_prorations), stores the tier and audits; two items or an unknown tier are refused before any
+/// update. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP for the ADMIN-12 amendment. Touches: in-memory SQLite, the fake payment client.
+// ADMIN-12
 #[test]
 fn test_change_plan() {
     let system = setup();
@@ -258,9 +321,38 @@ fn test_change_plan() {
         Response::Success { .. } => {}
         _ => panic!("Expected success"),
     }
-    STRIPE_CALLS.with(|c| assert_eq!(c.borrow().as_slice(), [("sub_1".to_string(), "price_premium".to_string())]));
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-12 amendment): the update carries the existing
+    // item id with the new price and create_prorations (no second item)
+    STRIPE_CALLS.with(|c| assert_eq!(c.borrow().as_slice(), [("sub_1".to_string(), "si_sub_1=price_premium create_prorations".to_string())]));
+    let audited: i64 = system
+        .conn
+        .query_row("SELECT COUNT(*) FROM audit_logs WHERE action = 'plan_changed' AND resource_id = ?1 AND actor_id = ?2", params![cid, owner.id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(audited, 1);
+    let tier: String = system.conn.query_row("SELECT tier FROM customers WHERE id = ?1", params![cid], |r| r.get(0)).unwrap();
+    assert_eq!(tier, "premium");
+
+    // two items (or an unknown tier) are refused before any update, and nothing changes
+    STRIPE_ITEMS.with(|i| {
+        i.borrow_mut().insert("sub_1".into(), vec![
+            SubscriptionItem { id: "si_a".into(), price: "price_premium".into() },
+            SubscriptionItem { id: "si_b".into(), price: "price_basic".into() },
+        ])
+    });
+    match system.change_plan(&owner, cid, "enterprise") {
+        Response::Error { error, .. } => assert_eq!(error, "subscription_item_ambiguous"),
+        _ => panic!("Expected subscription_item_ambiguous"),
+    }
+    match system.change_plan(&owner, cid, "platinum") {
+        Response::Error { error, .. } => assert_eq!(error, "invalid_tier"),
+        _ => panic!("Expected invalid_tier"),
+    }
+    STRIPE_CALLS.with(|c| assert_eq!(c.borrow().len(), 1));
 }
 
+/// What: ADMIN-13: a queued refund row exists with status queued. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: row assertion added.
+/// Touches: in-memory SQLite.
+// ADMIN-13
 #[test]
 fn test_queue_refund() {
     let system = setup();
@@ -275,8 +367,14 @@ fn test_queue_refund() {
         }
         _ => panic!("Expected success"),
     }
+    // ADMIN-13 "refund record created" (assertion added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+    let rows: i64 = system.conn.query_row("SELECT COUNT(*) FROM refunds WHERE invoice_id = 1 AND amount = 5000 AND status = 'queued'", [], |r| r.get(0)).unwrap();
+    assert_eq!(rows, 1);
 }
 
+/// What: ADMIN-14: a deployment is created as a draft with its config initialized. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP:
+/// row and config assertions added. Touches: in-memory SQLite.
+// ADMIN-14
 #[test]
 fn test_create_deployment() {
     let system = setup();
@@ -298,12 +396,20 @@ fn test_create_deployment() {
         .unwrap();
     let cid = system.conn.last_insert_rowid();
     let resp = system.create_deployment(&owner, cid, "example.com", "basic", "theme1");
-    match resp {
-        Response::Success { .. } => {}
+    let dep_id = match resp {
+        Response::Success { data, .. } => data["deployment_id"].as_i64().unwrap(),
         _ => panic!("Expected success"),
-    }
+    };
+    // ADMIN-14 "config initialized" (assertion added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+    let (status, config): (String, String) = system.conn.query_row("SELECT status, config FROM deployments WHERE id = ?1", params![dep_id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!(status, "draft");
+    let config: serde_json::Value = serde_json::from_str(&config).unwrap();
+    assert_eq!((config["theme"].as_str(), config["tier"].as_str()), (Some("theme1"), Some("basic")));
 }
 
+/// What: ADMIN-15: publishing needs the owner AND the safety flag; then the status is live. Changed
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the safety-flag gate and live-status assertions were added. Touches: in-memory SQLite.
+// ADMIN-15
 #[test]
 fn test_publish_deployment() {
     let system = setup();
@@ -328,13 +434,27 @@ fn test_publish_deployment() {
     // Corrected 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): `Response` is an enum, so its data is
     // reached through `unwrap()` as in the other tests (`dep_resp.data` could not compile).
     let dep_id: i64 = serde_json::from_value(dep_resp.unwrap().data.get("deployment_id").unwrap().clone()).unwrap();
+    // ADMIN-15 double gate (added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): with the safety flag
+    // off an owner still cannot publish
+    let mut system = system;
+    system.safety.can_publish = false;
+    match system.publish_deployment(&owner, dep_id) {
+        Response::Error { error, .. } => assert_eq!(error, "publishing_disabled"),
+        _ => panic!("Expected publishing_disabled"),
+    }
+    system.safety.can_publish = true;
     let resp = system.publish_deployment(&owner, dep_id);
     match resp {
         Response::Success { .. } => {}
         _ => panic!("Expected success"),
     }
+    let status: String = system.conn.query_row("SELECT status FROM deployments WHERE id = ?1", params![dep_id], |r| r.get(0)).unwrap();
+    assert_eq!(status, "live");
 }
 
+/// What: ADMIN-16: approving executes the action and marks it approved. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the
+/// status assertion was added. Touches: in-memory SQLite.
+// ADMIN-16
 #[test]
 fn test_governance_approve() {
     let system = setup();
@@ -360,8 +480,14 @@ fn test_governance_approve() {
         _ => panic!("Expected success"),
     }
     assert_eq!(system.get_user_by_id(target_id).unwrap().status, "deleted");
+    // ADMIN-16 "status changed" (assertion added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+    let status: String = system.conn.query_row("SELECT status FROM governance_actions WHERE id = ?1", params![action_id], |r| r.get(0)).unwrap();
+    assert_eq!(status, "approved");
 }
 
+/// What: ADMIN-17: rejecting stores the status and the reason, and audits it. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP:
+/// assertions added. Touches: in-memory SQLite.
+// ADMIN-17
 #[test]
 fn test_governance_reject() {
     let system = setup();
@@ -380,8 +506,17 @@ fn test_governance_reject() {
         Response::Success { .. } => {}
         _ => panic!("Expected success"),
     }
+    // ADMIN-17 "rejected + reason logged" (assertions added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+    let (status, reason): (String, Option<String>) =
+        system.conn.query_row("SELECT status, rejection_reason FROM governance_actions WHERE id = ?1", params![action_id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!((status.as_str(), reason.as_deref()), ("rejected", Some("not needed")));
+    let logged: i64 = system.conn.query_row("SELECT COUNT(*) FROM audit_logs WHERE action = 'action_rejected' AND reason = 'not needed'", [], |r| r.get(0)).unwrap();
+    assert_eq!(logged, 1);
 }
 
+/// What: ADMIN-18: audit search filters by action, resource and date and pages correctly. Changed
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: filter and pagination assertions were added. Touches: in-memory SQLite.
+// ADMIN-18
 #[test]
 fn test_audit_log_search() {
     let system = setup();
@@ -397,4 +532,25 @@ fn test_audit_log_search() {
         }
         _ => panic!("Expected success"),
     }
+    // ADMIN-18 "filters applied, pagination works" (assertions added 2026-11-10,
+    // session_012zDydZCZ4AChqhEZ4oVtaP): three users created -> three user_created rows, newest first
+    let second = system.create_user(&owner, "audit2@example.com", "Audit Two", "basic", false).unwrap();
+    let second_id = second.data["user_id"].as_i64().unwrap();
+    system.create_user(&owner, "audit3@example.com", "Audit Three", "basic", false).unwrap();
+    let uid = system.get_user_by_email("audit@example.com").unwrap().unwrap().id;
+    system.suspend_user(&owner, uid, "test").unwrap();
+    let search = |action: Option<&str>, rid: Option<i64>, range: Option<(&str, &str)>, limit: i64, offset: i64| {
+        system.search_audit_log(&owner, action, rid, range, limit, offset).unwrap().data.as_array().unwrap().clone()
+    };
+    let created = search(Some("user_created"), None, None, 10, 0);
+    assert_eq!(created.len(), 3);
+    assert!(created.iter().all(|r| r["action"] == "user_created"));
+    assert_eq!(search(Some("user_created"), Some(second_id), None, 10, 0).len(), 1);
+    let page1 = search(Some("user_created"), None, None, 2, 0);
+    let page2 = search(Some("user_created"), None, None, 2, 2);
+    assert_eq!((page1.len(), page2.len()), (2, 1));
+    assert_ne!(page1[1]["resource_id"], page2[0]["resource_id"]);
+    let future = (now + chrono::Duration::days(1)).to_rfc3339();
+    let far = (now + chrono::Duration::days(2)).to_rfc3339();
+    assert!(search(None, None, Some((&future, &far)), 10, 0).is_empty());
 }

@@ -8,6 +8,7 @@
 use super::*;
 use uuid::Uuid;
 
+// KEYS-01
 #[tokio::test]
 async fn test_create_key_with_scopes() {
     let db = Database::new_in_memory().await.unwrap();
@@ -29,6 +30,7 @@ async fn test_create_key_with_scopes() {
     assert!(response.expires_at.is_some());
 }
 
+// KEYS-02
 #[tokio::test]
 async fn test_use_key_with_authorization_header() {
     let db = Database::new_in_memory().await.unwrap();
@@ -49,6 +51,9 @@ async fn test_use_key_with_authorization_header() {
     assert!(result.is_ok());
 }
 
+/// What: see the spec id above; the status (401) is asserted. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+/// Touches: memory only.
+// KEYS-03
 #[tokio::test]
 async fn test_revoke_key() {
     let db = Database::new_in_memory().await.unwrap();
@@ -72,7 +77,9 @@ async fn test_revoke_key() {
     let result = db.use_api_key(&create_response.key, "/api/deployments", "GET").await;
     
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("API key is not active"));
+    let err = result.unwrap_err();
+    assert!(err.to_string().contains("API key is not active"));
+    assert_eq!(err.status(), 401); // "return 401" (assertion added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
 }
 
 #[tokio::test]
@@ -101,6 +108,9 @@ async fn test_rate_limit() {
     assert!(result3.unwrap_err().to_string().contains("Rate limit exceeded"));
 }
 
+/// What: see the spec id above; the status (403) is asserted. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+/// Touches: memory only.
+// KEYS-05
 #[tokio::test]
 async fn test_scope_check() {
     let db = Database::new_in_memory().await.unwrap();
@@ -119,9 +129,12 @@ async fn test_scope_check() {
     let result = db.use_api_key(&create_response.key, "/api/deployments", "POST").await;
     
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("API key does not have permission"));
+    let err = result.unwrap_err();
+    assert!(err.to_string().contains("API key does not have permission"));
+    assert_eq!(err.status(), 403); // "(403)" (assertion added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
 }
 
+// KEYS-06
 #[tokio::test]
 async fn test_rotate_key() {
     let db = Database::new_in_memory().await.unwrap();
@@ -150,6 +163,9 @@ async fn test_rotate_key() {
     assert!(result.is_ok());
 }
 
+/// What: see the spec id above; the status (401) is asserted. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+/// Touches: memory only.
+// KEYS-07
 #[tokio::test]
 async fn test_expired_key() {
     let db = Database::new_in_memory().await.unwrap();
@@ -168,9 +184,12 @@ async fn test_expired_key() {
     let result = db.use_api_key(&create_response.key, "/api/deployments", "GET").await;
     
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("API key is not active"));
+    let err = result.unwrap_err();
+    assert!(err.to_string().contains("API key is not active"));
+    assert_eq!(err.status(), 401); // "returns 401" (assertion added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
 }
 
+// KEYS-08
 #[tokio::test]
 async fn test_usage_stats() {
     let db = Database::new_in_memory().await.unwrap();
@@ -201,6 +220,9 @@ async fn test_usage_stats() {
     assert_eq!(stats.requests_by_endpoint["POST /api/webhooks"], 1);
 }
 
+/// What: see the spec id above; the status (403 for a non-admin) is asserted. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (the admin list takes the verified caller).
+/// Touches: memory only.
+// KEYS-09
 #[tokio::test]
 async fn test_admin_audit() {
     let db = Database::new_in_memory().await.unwrap();
@@ -216,14 +238,25 @@ async fn test_admin_audit() {
     
     let create_response = db.create_api_key(user_id, create_req).await.unwrap();
     
-    let admin_response = db.admin_list_api_keys(Some(user_id), Some("active".to_string())).await.unwrap();
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the admin list takes the verified caller; a
+    // non-admin is refused 403, and an admin sees every user's keys
+    let admin = Caller { user_id: Uuid::new_v4(), is_admin: true };
+    let admin_response = db.admin_list_api_keys(&admin, Some(user_id), Some("active".to_string())).await.unwrap();
     
     assert_eq!(admin_response.total, 1);
     assert_eq!(admin_response.keys[0].id.to_string(), create_response.api_key_id);
+
+    let other_user = Uuid::new_v4();
+    let other_req = CreateApiKeyRequest { name: "Other".to_string(), scopes: vec!["read:deployments".to_string()], expires_at: None, rate_limit: 1000 };
+    db.create_api_key(other_user, other_req).await.unwrap();
+    assert_eq!(db.admin_list_api_keys(&admin, None, None).await.unwrap().total, 2);
+    let not_admin = Caller { user_id, is_admin: false };
+    assert_eq!(db.admin_list_api_keys(&not_admin, None, None).await.unwrap_err().status(), 403);
 }
 
 /// Added 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP), spec "Rotate: new key works, old key stops after
 /// grace period": the old key still works 23 hours after rotation and is refused after 24 hours.
+// KEYS-06
 #[tokio::test]
 async fn test_rotated_key_stops_after_grace_period() {
     let now = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(1_767_225_600));
@@ -282,4 +315,31 @@ async fn test_rotate_refuses_key_already_in_grace_period() {
     // The new key can be rotated in its turn.
     let new_id = Uuid::parse_str(&first.new_api_key_id).unwrap();
     assert!(db.rotate_api_key(new_id, user_id).await.is_ok());
+}
+
+/// What: KEYS-04: with the default limit of 1,000 requests per hour, the 1,001st request in the hour is
+/// refused with 429 (and is not counted as served); an hour after the first request the key works
+/// again. In: none. Out: panics on a wrong answer. Why: the old rate-limit test used a limit of 2, not
+/// the spec's 1,001st request. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+// KEYS-04
+#[tokio::test]
+async fn test_rate_limit_1001st_request_in_hour() {
+    let now = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(1_767_225_600));
+    let clock = now.clone();
+    let db = Database::new_in_memory()
+        .await
+        .unwrap()
+        .with_clock(Box::new(move || chrono::DateTime::from_timestamp(clock.load(std::sync::atomic::Ordering::SeqCst), 0).unwrap()));
+    let user_id = Uuid::new_v4();
+    let create_req = CreateApiKeyRequest { name: "Busy".to_string(), scopes: vec!["read:deployments".to_string()], expires_at: None, rate_limit: 1000 };
+    let created = db.create_api_key(user_id, create_req).await.unwrap();
+    for _ in 0..1000 {
+        db.use_api_key(&created.key, "/api/deployments", "GET").await.unwrap();
+    }
+    now.fetch_add(3599, std::sync::atomic::Ordering::SeqCst);
+    let err = db.use_api_key(&created.key, "/api/deployments", "GET").await.unwrap_err();
+    assert_eq!(err, ApiKeyError::RateLimited);
+    assert_eq!(err.status(), 429);
+    now.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    assert!(db.use_api_key(&created.key, "/api/deployments", "GET").await.is_ok());
 }

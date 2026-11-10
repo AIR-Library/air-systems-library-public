@@ -54,6 +54,7 @@ fn login_req(email: &str, password: &str) -> LoginRequest {
     LoginRequest { email: email.into(), password: password.into(), device_id: "device123".into(), ip: "127.0.0.1".into() }
 }
 
+// AUTH-01
 #[test]
 fn test_signup_happy_path() {
     let (mut auth_system, mailer, _, _) = setup();
@@ -68,6 +69,7 @@ fn test_signup_happy_path() {
     assert_eq!(mailer.sent.lock().unwrap().len(), 1);
 }
 
+// AUTH-02
 #[test]
 fn test_signup_duplicate_email() {
     let (mut auth_system, _, _, _) = setup();
@@ -80,6 +82,9 @@ fn test_signup_duplicate_email() {
     assert_eq!(result.unwrap_err(), AuthError::EmailAlreadyExists);
 }
 
+/// What: AUTH-03: a 5-character password is refused as 400 password_rejected / too_short. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP:
+/// the wire answer (status, error, reason) is now asserted. Touches: in-memory SQLite.
+// AUTH-03
 #[test]
 fn test_signup_weak_password() {
     let (mut auth_system, _, _, _) = setup();
@@ -87,9 +92,80 @@ fn test_signup_weak_password() {
 
     let result = auth_system.signup(signup_req);
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err(), AuthError::PasswordTooShort);
+    let err = result.unwrap_err();
+    assert_eq!(err, AuthError::PasswordTooShort);
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: AUTH-03 now names the wire answer, 400 password_rejected/too_short.
+    let (body, status) = err.to_response();
+    assert_eq!(status, 400);
+    assert_eq!(body["error"], "password_rejected");
+    assert_eq!(body["reason"], "too_short");
 }
 
+/// What: AUTH-03's order rule: too_short, too_long, blocklisted, first failure wins ("password123" is
+/// too_short although it is on every common list); a 129-character password is too_long; a 15+ character
+/// common or own-email password is blocklisted. In: none. Out: panics on a wrong reason.
+/// Why: 2026-11-10 spec amendment (AUTH-03). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+// AUTH-03
+#[test]
+fn test_signup_password_rejection_order() {
+    let (mut auth_system, _, _, _) = setup();
+    let reason = |sys: &mut AuthSystem, email: &str, pw: String| {
+        let err = sys.signup(SignupRequest { email: email.into(), password: pw, name: "Test User".into() }).unwrap_err();
+        let (body, status) = err.to_response();
+        assert_eq!(status, 400);
+        assert_eq!(body["error"], "password_rejected");
+        body["reason"].as_str().unwrap().to_string()
+    };
+    assert_eq!(reason(&mut auth_system, "a@example.com", "password123".into()), "too_short");
+    assert_eq!(reason(&mut auth_system, "a@example.com", "x".repeat(MAX_PASSWORD_LEN + 1)), "too_long");
+    assert_eq!(reason(&mut auth_system, "a@example.com", "passwordpassword".into()), "blocklisted");
+    assert_eq!(reason(&mut auth_system, "long.address@example.com", "long.address@example.com".into()), "blocklisted");
+    // no user was created by any rejected signup
+    assert!(auth_system.signup(SignupRequest { email: "a@example.com".into(), password: PASSWORD.into(), name: "Test User".into() }).is_ok());
+}
+
+/// What: AUTH-04: the sixth signup from one IP within 24 hours is refused with 429
+/// too_many_signups_from_ip; another IP is not affected. In: none. Out: panics on a wrong answer.
+/// Why: the spec's required test AUTH-04 had no Rust test. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+/// Touches: in-memory SQLite.
+// AUTH-04
+#[test]
+fn test_signup_ip_rate_limit() {
+    let (mut auth_system, _, _, _) = setup();
+    for i in 0..5 {
+        let req = SignupRequest { email: format!("user{}@example.com", i), password: PASSWORD.into(), name: "Test User".into() };
+        auth_system.signup_with_ip(req, "198.51.100.7").unwrap();
+    }
+    let req = SignupRequest { email: "user5@example.com".into(), password: PASSWORD.into(), name: "Test User".into() };
+    let err = auth_system.signup_with_ip(req.clone(), "198.51.100.7").unwrap_err();
+    assert_eq!(err, AuthError::TooManySignups);
+    let (body, status) = err.to_response();
+    assert_eq!(status, 429);
+    assert_eq!(body["error"], "too_many_signups_from_ip");
+    assert!(auth_system.signup_with_ip(req, "198.51.100.8").is_ok());
+}
+
+/// What: AUTH-06: the right code after its 15 minutes is refused with 400 code_expired and the user
+/// stays unverified. In: none. Out: panics on a wrong answer.
+/// Why: the spec's required test AUTH-06 had no Rust test. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+/// Touches: in-memory SQLite.
+// AUTH-06
+#[test]
+fn test_verify_email_expired_code() {
+    let (mut auth_system, mailer, _, now) = setup();
+    auth_system.signup(SignupRequest { email: "test@example.com".into(), password: PASSWORD.into(), name: "Test User".into() }).unwrap();
+    let code = last_code(&mailer, "test@example.com");
+    now.fetch_add(15 * 60, Ordering::SeqCst);
+    let err = auth_system.verify_email(VerifyEmailRequest { email: "test@example.com".into(), code_or_token: code }).unwrap_err();
+    assert_eq!(err, AuthError::CodeExpired);
+    let (body, status) = err.to_response();
+    assert_eq!(status, 400);
+    assert_eq!(body["error"], "code_expired");
+    // still unverified: login is refused
+    assert_eq!(auth_system.login(login_req("test@example.com", PASSWORD)).unwrap_err(), AuthError::EmailNotVerified);
+}
+
+// AUTH-05
 #[test]
 fn test_verify_email_happy_path() {
     let (mut auth_system, mailer, _, _) = setup();
@@ -108,6 +184,7 @@ fn test_verify_email_happy_path() {
     assert_eq!(response.data.status(), "verified");
 }
 
+// AUTH-07
 #[test]
 fn test_login_happy_path() {
     let (mut auth_system, mailer, _, _) = setup();
@@ -120,6 +197,7 @@ fn test_login_happy_path() {
     assert_eq!(response.data.status(), "authenticated");
 }
 
+// AUTH-08
 #[test]
 fn test_login_with_mfa() {
     let (mut auth_system, mailer, _, now) = setup();
@@ -134,6 +212,7 @@ fn test_login_with_mfa() {
     assert_eq!(response.data.status(), "mfa_required");
 }
 
+// AUTH-09
 #[test]
 fn test_login_invalid_password() {
     let (mut auth_system, mailer, _, _) = setup();
@@ -144,6 +223,7 @@ fn test_login_invalid_password() {
     assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
 }
 
+// AUTH-10
 #[test]
 fn test_oauth_callback_new_user() {
     let (mut auth_system, _, oauth, _) = setup();
@@ -164,6 +244,7 @@ fn test_oauth_callback_new_user() {
     assert_eq!(auth_system.oauth_callback(forged).unwrap_err(), AuthError::InvalidState);
 }
 
+// AUTH-11
 #[test]
 fn test_oauth_callback_existing_user() {
     let (mut auth_system, mailer, oauth, _) = setup();
@@ -187,6 +268,7 @@ fn test_oauth_callback_existing_user() {
     }
 }
 
+// AUTH-12
 #[test]
 fn test_mfa_challenge_happy_path() {
     let (mut auth_system, mailer, _, now) = setup();
@@ -207,6 +289,7 @@ fn test_mfa_challenge_happy_path() {
     assert_eq!(response.data.status(), "authenticated");
 }
 
+// AUTH-13
 #[test]
 fn test_mfa_challenge_wrong_code() {
     let (mut auth_system, mailer, _, now) = setup();
@@ -224,6 +307,7 @@ fn test_mfa_challenge_wrong_code() {
     assert_eq!(result.unwrap_err(), AuthError::InvalidCode);
 }
 
+// AUTH-14
 #[test]
 fn test_token_refresh_happy_path() {
     let (mut auth_system, mailer, _, _) = setup();
@@ -241,6 +325,7 @@ fn test_token_refresh_happy_path() {
     assert_eq!(response.data.status(), "ok");
 }
 
+// AUTH-15
 #[test]
 fn test_token_refresh_banned_user() {
     let (mut auth_system, mailer, _, _) = setup();

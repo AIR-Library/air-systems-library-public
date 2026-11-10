@@ -28,6 +28,9 @@ pub const IP_RATE_WINDOW_SECS: u64 = 1;
 /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: one-time IPs used to leave their rows forever).
 pub const LONGEST_RATE_WINDOW_SECS: u64 = if USER_RATE_WINDOW_SECS > IP_RATE_WINDOW_SECS { USER_RATE_WINDOW_SECS } else { IP_RATE_WINDOW_SECS };
 
+/// The spec's "unlimited" limit value (QUOTA-13).
+pub const UNLIMITED: i64 = -1;
+
 /// What: a subscription tier. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tier {
@@ -47,13 +50,14 @@ impl Tier {
         }
     }
 
-    /// What: (monthly API calls, storage bytes); `None` is unlimited. Why: spec tier table.
-    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
-    pub fn limits(&self) -> (Option<i64>, Option<i64>) {
+    /// What: (monthly API calls, storage bytes); -1 is unlimited, in every quota. Why: spec tier table,
+    /// amended 2026-11-10 (QUOTA-13: "-1 means unlimited, in every quota"). Changed from `Option` (None =
+    /// unlimited) to the spec's -1 the same day, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+    pub fn limits(&self) -> (i64, i64) {
         match self {
-            Tier::Solo => (Some(1_000), Some(1_000_000_000)),
-            Tier::Team => (Some(10_000), Some(100_000_000_000)),
-            Tier::Enterprise => (None, None),
+            Tier::Solo => (1_000, 1_000_000_000),
+            Tier::Team => (10_000, 100_000_000_000),
+            Tier::Enterprise => (UNLIMITED, UNLIMITED),
         }
     }
 }
@@ -180,13 +184,28 @@ pub async fn check_api_quota(pool: &SqlitePool, user: &User) -> Result<(), Quota
 }
 
 /// What: admit one API call at `now`: one UPSERT increments this month's count only while it is below
-/// the tier's limit (limits apply immediately after a tier change; a new month starts at 0).
+/// the tier's limit (limits apply immediately after a tier change; a new month starts at 0). A limit of
+/// -1 is unlimited: the call always passes and is still counted.
 /// In: pool, user, time. Out: `()` or `QuotaExceeded { current, limit, reset_date }`.
-/// Why: spec "PASS if (current_usage + 1) <= limit", without a read-then-write race.
-/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (usage_metrics).
+/// Why: spec "PASS if limit == -1, else PASS if (current_usage + 1) <= limit", without a read-then-write
+/// race; -1 handling amended 2026-11-10 (QUOTA-13). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+/// Touches: database (usage_metrics).
 pub async fn check_api_quota_at(pool: &SqlitePool, user: &User, now: DateTime<Utc>) -> Result<(), QuotaError> {
     let month = month_of(now);
-    let limit = user.tier.limits().0.unwrap_or(i64::MAX);
+    let limit = user.tier.limits().0;
+    if limit == UNLIMITED {
+        sqlx::query(
+            "INSERT INTO usage_metrics (user_id, month, call_count, storage_bytes, updated_at) VALUES (?1, ?2, 1, 0, ?3)
+             ON CONFLICT (user_id, month) DO UPDATE SET call_count = MIN(call_count, 9223372036854775806) + 1, updated_at = excluded.updated_at",
+        )
+        .bind(user.id)
+        .bind(&month)
+        .bind(now.to_rfc3339())
+        .execute(pool)
+        .await
+        .map_err(db)?;
+        return Ok(());
+    }
     let done = sqlx::query(
         "INSERT INTO usage_metrics (user_id, month, call_count, storage_bytes, updated_at)
          SELECT ?1, ?2, 1, 0, ?3 WHERE ?4 >= 1
@@ -221,12 +240,30 @@ pub async fn check_storage_quota(pool: &SqlitePool, user: &User, incoming_size: 
 }
 
 /// What: reserve bytes only if the user's total stored bytes plus the new file stay within the tier
-/// limit (one conditional UPSERT). In: pool, user, size, time. Out: `()` or `StorageQuotaExceeded`
-/// with the usage before this file. Why: spec "PASS if (current_storage + incoming_file_size) <=
-/// limit". 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (usage_metrics).
+/// limit (one conditional UPSERT). A limit of -1 is unlimited: a file of any size is admitted and its
+/// bytes recorded (saturating at the largest integer SQLite stores).
+/// In: pool, user, size, time. Out: `()` or `StorageQuotaExceeded` with the usage before this file.
+/// Why: spec "PASS if (current_storage + incoming_file_size) <= limit"; -1 handling amended 2026-11-10
+/// (QUOTA-13). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (usage_metrics).
 pub async fn check_storage_quota_at(pool: &SqlitePool, user: &User, incoming_size: u64, now: DateTime<Utc>) -> Result<(), QuotaError> {
-    let size = i64::try_from(incoming_size).map_err(|_| QuotaError::StorageQuotaExceeded { usage: 0, limit: 0 })?;
-    let limit = user.tier.limits().1.unwrap_or(i64::MAX);
+    let limit = user.tier.limits().1;
+    if limit == UNLIMITED {
+        let size = i64::try_from(incoming_size).unwrap_or(i64::MAX);
+        sqlx::query(
+            "INSERT INTO usage_metrics (user_id, month, call_count, storage_bytes, updated_at) VALUES (?1, ?2, 0, ?3, ?4)
+             ON CONFLICT (user_id, month) DO UPDATE SET storage_bytes = MIN(storage_bytes, 9223372036854775807 - ?3) + ?3,
+                updated_at = excluded.updated_at",
+        )
+        .bind(user.id)
+        .bind(month_of(now))
+        .bind(size)
+        .bind(now.to_rfc3339())
+        .execute(pool)
+        .await
+        .map_err(db)?;
+        return Ok(());
+    }
+    let size = i64::try_from(incoming_size).map_err(|_| QuotaError::StorageQuotaExceeded { usage: 0, limit: limit as u64 })?;
     let done = sqlx::query(
         "INSERT INTO usage_metrics (user_id, month, call_count, storage_bytes, updated_at)
          SELECT ?1, ?2, 0, ?3, ?4

@@ -21,6 +21,7 @@ fn make_checker() -> (Arc<InMemoryCheckStore>, HealthChecker) {
     (store, checker)
 }
 
+// HEALTH-01
 #[test]
 fn test_all_checks_pass_returns_200_pass() {
     let (_, checker) = make_checker();
@@ -34,6 +35,7 @@ fn test_all_checks_pass_returns_200_pass() {
     assert_eq!(resp.body, expected);
 }
 
+// HEALTH-02
 #[test]
 fn test_critical_check_fails_returns_503_fail() {
     let (_, checker) = make_checker();
@@ -47,6 +49,7 @@ fn test_critical_check_fails_returns_503_fail() {
     assert_eq!(resp.body, expected);
 }
 
+// HEALTH-03
 #[test]
 fn test_only_non_critical_fails_returns_200_warn() {
     let (_, checker) = make_checker();
@@ -60,6 +63,7 @@ fn test_only_non_critical_fails_returns_200_warn() {
     assert_eq!(resp.body, expected);
 }
 
+// HEALTH-04
 #[test]
 fn test_slow_check_past_timeout_fails_that_check() {
     let (_, checker) = make_checker();
@@ -76,6 +80,7 @@ fn test_slow_check_past_timeout_fails_that_check() {
     assert_eq!(resp.body, expected);
 }
 
+// HEALTH-05
 #[test]
 fn test_liveness_passes_when_dependency_would_fail() {
     let counter = Arc::new(AtomicU32::new(0));
@@ -98,6 +103,7 @@ fn test_liveness_passes_when_dependency_would_fail() {
     assert_eq!(counter.load(Ordering::SeqCst), 1);
 }
 
+// HEALTH-06
 #[test]
 fn test_output_contains_no_connection_string() {
     let (_, checker) = make_checker();

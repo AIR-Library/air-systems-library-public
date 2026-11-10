@@ -3,6 +3,9 @@ use notifications_rust::*;
 use rusqlite::Connection;
 use std::collections::HashMap;
 
+/// A 32-byte test-only unsubscribe secret (production reads it from configuration).
+const SECRET: &[u8] = b"test-only-unsubscribe-secret-0123456789";
+
 /// Corrected 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): the service's clock is pinned to 12:00 UTC.
 /// With the wall clock, test_quiet_hours_skip (quiet hours 00:00-23:59) passed or failed depending on
 /// the time of day the suite ran. Touches: memory only.
@@ -30,6 +33,7 @@ fn setup_service() -> NotificationService {
     service
 }
 
+// NOTIF-01
 #[test]
 fn test_send_email_with_template_variables() {
     let service = setup_service();
@@ -44,6 +48,7 @@ fn test_send_email_with_template_variables() {
     assert_eq!(log.status, "sent");
 }
 
+// NOTIF-02
 #[test]
 fn test_send_sms() {
     let service = setup_service();
@@ -57,6 +62,7 @@ fn test_send_sms() {
     assert_eq!(log.channel, "sms");
 }
 
+// NOTIF-03
 #[test]
 fn test_send_in_app() {
     let service = setup_service();
@@ -70,6 +76,7 @@ fn test_send_in_app() {
     assert_eq!(log.channel, "in_app");
 }
 
+// NOTIF-04
 #[test]
 fn test_batch_send_1000_notifications() {
     let service = setup_service();
@@ -90,6 +97,11 @@ fn test_batch_send_1000_notifications() {
     assert_eq!(resp.failed, 0);
 }
 
+/// What: NOTIF-05: a send inside the user's quiet hours is not sent now; it is stored 'queued' with
+/// scheduled_at = quiet_hours_end and delivered by deliver_due once quiet hours are over.
+/// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the old test expected 'skipped' (the message
+/// was dropped); the amended spec queues it until quiet_hours_end. Touches: memory only.
+// NOTIF-05
 #[test]
 fn test_quiet_hours_skip() {
     let service = setup_service();
@@ -110,9 +122,14 @@ fn test_quiet_hours_skip() {
     let resp = service
         .send_single_notification(1, "trial_ending_soon", Some("sms"), &vars, None)
         .unwrap();
-    assert_eq!(resp.status, "skipped");
+    assert_eq!(resp.status, "queued");
+    assert_eq!(service.track_message_status(&resp.message_id).unwrap().status, "queued");
+    assert_eq!(service.deliver_due(fixed_time(2026, 1, 15, 23, 58)).unwrap().sent, 0, "still quiet");
+    assert_eq!(service.deliver_due(fixed_time(2026, 1, 15, 23, 59)).unwrap().sent, 1, "due at quiet_hours_end");
+    assert_eq!(service.track_message_status(&resp.message_id).unwrap().status, "sent");
 }
 
+// NOTIF-06
 #[test]
 fn test_do_not_disturb_skip() {
     let service = setup_service();
@@ -135,6 +152,7 @@ fn test_do_not_disturb_skip() {
     assert_eq!(resp.status, "skipped");
 }
 
+// NOTIF-07
 #[test]
 fn test_track_opened() {
     let service = setup_service();
@@ -149,6 +167,7 @@ fn test_track_opened() {
     assert!(log.opened_at.is_some());
 }
 
+// NOTIF-08
 #[test]
 fn test_retry_on_failure() {
     let service = setup_service();
@@ -164,6 +183,7 @@ fn test_retry_on_failure() {
     assert_eq!(log.status, "sent");
 }
 
+// NOTIF-09
 #[test]
 fn test_unsubscribe_skips_future_emails() {
     let service = setup_service();
@@ -176,6 +196,7 @@ fn test_unsubscribe_skips_future_emails() {
     assert_eq!(resp.status, "skipped");
 }
 
+// NOTIF-10
 #[test]
 fn test_user_preferences_channels_enabled() {
     let service = setup_service();
@@ -222,13 +243,15 @@ impl Sender for RecordingSender {
 
 /// Added 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP), CodeRabbit review on PR 19: a message scheduled
 /// for later is queued, `deliver_due` does not send it early, and sends it (rendered, status `sent`)
-/// once the clock reaches its time; a second run sends nothing again. Touches: memory only.
+/// once the clock reaches its time; a second run sends nothing again. Changed the same day for the
+/// NOTIF-11/12 amendment: the service takes an unsubscribe secret and `deliver_due(now)` takes the time
+/// and returns counts. Touches: memory only.
 #[test]
 fn test_scheduled_message_is_delivered_when_due() {
     let delivered = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let now = std::rc::Rc::new(std::cell::Cell::new(fixed_time(2026, 1, 15, 12, 0)));
     let clock = now.clone();
-    let service = NotificationService::new(Connection::open_in_memory().unwrap(), Box::new(RecordingSender(delivered.clone())))
+    let service = NotificationService::new(Connection::open_in_memory().unwrap(), Box::new(RecordingSender(delivered.clone())), SECRET)
         .unwrap()
         .with_sleeper(Box::new(|_| {}))
         .with_clock(Box::new(move || clock.get()));
@@ -240,13 +263,13 @@ fn test_scheduled_message_is_delivered_when_due() {
     assert!(delivered.borrow().is_empty());
 
     // Before its time: nothing is sent and it stays queued.
-    assert_eq!(service.deliver_due().unwrap(), 0);
+    assert_eq!(service.deliver_due(now.get()).unwrap().sent, 0);
     assert!(delivered.borrow().is_empty());
     assert_eq!(service.track_message_status(&resp.message_id).unwrap().status, "queued");
 
     // At its time: sent once, rendered with its vars, under the same message id.
     now.set(fixed_time(2026, 1, 15, 14, 0));
-    assert_eq!(service.deliver_due().unwrap(), 1);
+    assert_eq!(service.deliver_due(now.get()).unwrap().sent, 1);
     {
         let sent = delivered.borrow();
         assert_eq!(sent.len(), 1);
@@ -260,6 +283,163 @@ fn test_scheduled_message_is_delivered_when_due() {
 
     // Nothing is delivered twice.
     now.set(fixed_time(2026, 1, 15, 15, 0));
-    assert_eq!(service.deliver_due().unwrap(), 0);
+    assert_eq!(service.deliver_due(now.get()).unwrap().sent, 0);
     assert_eq!(delivered.borrow().len(), 1);
+}
+
+/// What: a service on its own in-memory database with the test secret, a recording sender and a
+/// movable clock. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+fn recording_service(start: DateTime<Utc>) -> (NotificationService, std::rc::Rc<std::cell::RefCell<Vec<OutgoingMessage>>>, std::rc::Rc<std::cell::Cell<DateTime<Utc>>>) {
+    let delivered = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let now = std::rc::Rc::new(std::cell::Cell::new(start));
+    let clock = now.clone();
+    let service = NotificationService::new(Connection::open_in_memory().unwrap(), Box::new(RecordingSender(delivered.clone())), SECRET)
+        .unwrap()
+        .with_sleeper(Box::new(|_| {}))
+        .with_base_url("https://app.example.test")
+        .with_clock(Box::new(move || clock.get()));
+    (service, delivered, now)
+}
+
+/// What: NOTIF-02 / NOTIF-10 defaults: a user who set nothing has no quiet hours, do-not-disturb off and
+/// channels {email: true, sms: false, in_app: true}; an SMS to them is skipped (channel_disabled) until
+/// they turn SMS on, then it is sent. In: none. Out: panics on a wrong answer.
+/// Why: 2026-11-10 amendment (NOTIF-02: SMS is opt-in). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+/// Touches: memory only.
+// NOTIF-02
+#[test]
+fn test_default_preferences_sms_is_opt_in() {
+    let (service, delivered, _) = recording_service(fixed_time(2026, 1, 15, 12, 0));
+    let p = service.get_user_preferences(42).unwrap();
+    assert_eq!((p.do_not_disturb, p.quiet_hours_start.clone(), p.quiet_hours_end.clone()), (false, None, None));
+    assert_eq!(p.channels_enabled, default_channels());
+    assert_eq!((p.channels_enabled["email"], p.channels_enabled["sms"], p.channels_enabled["in_app"]), (true, false, true));
+    let vars: HashMap<String, String> = [("days_left".to_string(), "3".to_string())].into_iter().collect();
+    assert_eq!(service.send_single_notification(42, "trial_ending_soon", Some("sms"), &vars, None).unwrap().status, "skipped");
+    assert!(delivered.borrow().is_empty());
+    service
+        .update_user_preferences(42, &UserNotificationPreferencesUpdate {
+            do_not_disturb: None,
+            quiet_hours_start: None,
+            quiet_hours_end: None,
+            channels_enabled: Some([("sms".to_string(), true)].into_iter().collect()),
+        })
+        .unwrap();
+    assert_eq!(service.send_single_notification(42, "trial_ending_soon", Some("sms"), &vars, None).unwrap().status, "sent");
+    assert_eq!(delivered.borrow()[0].channel, "sms");
+}
+
+/// What: NOTIF-11: the email carries the signed unsubscribe link; GET with its token confirms and
+/// changes nothing; POST sets channels_enabled.email = false (later emails are skipped); a missing,
+/// short, non-hex, upper-case or altered token, another user's token, or an unknown channel all get
+/// 403 invalid_unsubscribe_token and the user stays subscribed; a secret under 32 bytes is refused at
+/// start. In: none. Out: panics on a wrong answer. Why: 2026-11-10 amendment (NOTIF-11).
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+// NOTIF-11
+#[test]
+fn test_unsubscribe_link_is_signed_and_post_only() {
+    assert!(NotificationService::new(Connection::open_in_memory().unwrap(), Box::new(FakeSender::default()), &[7u8; 31]).is_err());
+    let (service, delivered, _) = recording_service(fixed_time(2026, 1, 15, 12, 0));
+    let vars: HashMap<String, String> = [("app_name".to_string(), "TestApp".to_string())].into_iter().collect();
+    service.send_single_notification(7, "welcome_email", Some("email"), &vars, None).unwrap();
+    let token = service.unsubscribe_token(7, "email");
+    assert_eq!(token.len(), 64);
+    let link = format!("https://app.example.test/unsubscribe?user_id=7&channel=email&token={}", token);
+    assert!(delivered.borrow()[0].body_text.contains(&link));
+
+    let email_on = || service.get_user_preferences(7).unwrap().channels_enabled["email"];
+    let refused = serde_json::json!({ "error": "invalid_unsubscribe_token" });
+    let mut altered = token.clone().into_bytes();
+    altered[10] = if altered[10] == b'0' { b'1' } else { b'0' };
+    let altered = String::from_utf8(altered).unwrap();
+    let other_user = service.unsubscribe_token(8, "email");
+    for (channel, bad) in [
+        ("email", None),
+        ("email", Some("abc123")),
+        ("email", Some(&"z".repeat(64)[..])),
+        ("email", Some(&token.to_uppercase()[..])),
+        ("email", Some(&altered[..])),
+        ("email", Some(&other_user[..])),
+        ("fax", Some(&token[..])),
+    ] {
+        for method in ["GET", "POST"] {
+            assert_eq!(service.handle_unsubscribe(method, 7, channel, bad).unwrap(), (403, refused.clone()), "{} {:?} {:?}", method, channel, bad);
+        }
+    }
+    assert!(email_on());
+    let (status, body) = service.handle_unsubscribe("GET", 7, "email", Some(&token)).unwrap();
+    assert_eq!((status, body["confirm"].as_bool()), (200, Some(true)));
+    assert!(email_on(), "GET changes nothing");
+    let (status, body) = service.handle_unsubscribe("POST", 7, "email", Some(&token)).unwrap();
+    assert_eq!((status, body["unsubscribed"].as_bool()), (200, Some(true)));
+    assert!(!email_on());
+    assert_eq!(service.send_single_notification(7, "welcome_email", Some("email"), &vars, None).unwrap().status, "skipped");
+}
+
+/// What: NOTIF-12: a send 30 days ahead is queued and not sent now; deliver_due sends it once it is
+/// due, exactly once (a second run sends nothing); a message whose user unsubscribed meanwhile is
+/// skipped at delivery; a row stuck at 'sending' for over 300 s is re-queued and delivered, one stuck
+/// for exactly 300 s is not. In: none. Out: panics on a wrong answer. Why: 2026-11-10 amendment
+/// (NOTIF-12). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+// NOTIF-12
+#[test]
+fn test_scheduled_send_delivery_rules() {
+    let t0 = fixed_time(2026, 1, 15, 12, 0);
+    let (service, delivered, _) = recording_service(t0);
+    let vars: HashMap<String, String> = [("app_name".to_string(), "TestApp".to_string())].into_iter().collect();
+    let later = t0 + chrono::Duration::days(30);
+    let a = service.send_single_notification(1, "welcome_email", Some("email"), &vars, Some(later)).unwrap();
+    let b = service.send_single_notification(2, "welcome_email", Some("email"), &vars, Some(later)).unwrap();
+    assert_eq!((a.status.as_str(), b.status.as_str()), ("queued", "queued"));
+    assert_eq!(service.deliver_due(t0).unwrap(), DeliverCounts::default());
+    assert!(delivered.borrow().is_empty());
+
+    // user 2 unsubscribes through the signed link before the message is due
+    let token = service.unsubscribe_token(2, "email");
+    assert_eq!(service.handle_unsubscribe("POST", 2, "email", Some(&token)).unwrap().0, 200);
+
+    let counts = service.deliver_due(later).unwrap();
+    assert_eq!((counts.sent, counts.skipped), (1, 1));
+    assert_eq!(service.track_message_status(&a.message_id).unwrap().status, "sent");
+    assert_eq!(service.track_message_status(&b.message_id).unwrap().status, "skipped");
+    assert_eq!(service.deliver_due(later + chrono::Duration::hours(1)).unwrap(), DeliverCounts::default());
+    assert_eq!(delivered.borrow().len(), 1);
+    assert_eq!(delivered.borrow()[0].message_id, a.message_id);
+
+    // a worker crashed after claiming a row (its sender panicked mid-send): the row stays 'sending'
+    // until its claim is over 300 s old, then it is re-queued and delivered
+    let crashes = std::rc::Rc::new(std::cell::Cell::new(1));
+    let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let crashing = NotificationService::new(Connection::open_in_memory().unwrap(), Box::new(CrashOnceSender(crashes, sent.clone())), SECRET)
+        .unwrap()
+        .with_sleeper(Box::new(|_| {}))
+        .with_clock(Box::new(move || t0));
+    let c = crashing.send_single_notification(1, "welcome_email", Some("email"), &vars, Some(later)).unwrap();
+    let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crashing.deliver_due(later)));
+    assert!(crash.is_err());
+    assert_eq!(crashing.track_message_status(&c.message_id).unwrap().status, "sending");
+    assert_eq!(crashing.deliver_due(later + chrono::Duration::seconds(300)).unwrap(), DeliverCounts::default());
+    assert_eq!(crashing.track_message_status(&c.message_id).unwrap().status, "sending");
+    let counts = crashing.deliver_due(later + chrono::Duration::seconds(301)).unwrap();
+    assert_eq!((counts.requeued, counts.sent), (1, 1));
+    assert_eq!(crashing.track_message_status(&c.message_id).unwrap().status, "sent");
+    assert_eq!(sent.borrow().len(), 1);
+}
+
+/// What: a provider that panics on its first `crashes` sends (a worker crash) and then records and
+/// accepts. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-12). Touches: memory.
+struct CrashOnceSender(std::rc::Rc<std::cell::Cell<u32>>, std::rc::Rc<std::cell::RefCell<Vec<OutgoingMessage>>>);
+
+/// What: `Sender` for the crashing provider. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+impl Sender for CrashOnceSender {
+    /// What: panic while crashes remain, else record and accept. 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
+    fn send(&self, message: &OutgoingMessage) -> Result<(), String> {
+        if self.0.get() > 0 {
+            self.0.set(self.0.get() - 1);
+            panic!("worker crashed mid-send");
+        }
+        self.1.borrow_mut().push(message.clone());
+        Ok(())
+    }
 }

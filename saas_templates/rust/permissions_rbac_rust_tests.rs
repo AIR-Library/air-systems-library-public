@@ -17,6 +17,7 @@ async fn setup_db() -> SqlitePool {
     pool
 }
 
+// RBAC-01
 #[tokio::test]
 async fn test_require_owner_non_owner() {
     let pool = setup_db().await;
@@ -30,6 +31,7 @@ async fn test_require_owner_non_owner() {
     assert_eq!(resp["code"], 403);
 }
 
+// RBAC-02
 #[tokio::test]
 async fn test_require_admin_member() {
     let pool = setup_db().await;
@@ -43,6 +45,7 @@ async fn test_require_admin_member() {
     assert_eq!(resp["code"], 403);
 }
 
+// RBAC-03
 #[tokio::test]
 async fn test_require_authenticated_public() {
     let pool = setup_db().await;
@@ -55,6 +58,7 @@ async fn test_require_authenticated_public() {
     assert_eq!(resp["code"], 401);
 }
 
+// RBAC-04
 #[tokio::test]
 async fn test_cascade_delete_user() {
     let pool = setup_db().await;
@@ -111,6 +115,7 @@ async fn test_cascade_delete_user() {
     assert!(user.is_none());
 }
 
+// RBAC-05
 #[tokio::test]
 async fn test_cascade_delete_deployment() {
     let pool = setup_db().await;
@@ -161,60 +166,112 @@ async fn test_cascade_delete_deployment() {
     assert!(deployment.is_none());
 }
 
+/// What: RBAC-06 as amended 2026-11-10: only an owner of the org may delete it (an admin member, the
+/// owner of another org and a global Owner-tier user who is not a member all get 404 and nothing
+/// changes); the owner's call deletes its deployments (with their DNS rows), its org API keys,
+/// invitations and memberships; every member's user account, sessions and personal API keys stay, and a
+/// member's membership of another org is untouched. In: none. Out: panics on a wrong answer.
+/// Why: changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the old test asserted that the cascade
+/// deleted every member's user account and sessions, which the amended spec forbids (a user may belong
+/// to several orgs). Touches: in-memory SQLite.
+// RBAC-06
 #[tokio::test]
 async fn test_cascade_delete_organization() {
     let pool = setup_db().await;
     let rbac = RbacSystem { db: pool.clone() };
-    sqlx::query("INSERT INTO organizations (id) VALUES (1)")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO deployments (id, organization_id) VALUES (1, 1), (2, 1)")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO users (id, tier, organization_id) VALUES (1, 'member', 1), (2, 'admin', 1)")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO api_keys (id, user_id) VALUES (1, 1), (2, 2)")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO sessions (id, user_id) VALUES (1, 1), (2, 2)")
-        .execute(&pool)
-        .await
-        .unwrap();
-    rbac.delete_organization(1).await.unwrap();
-    let deployments: i64 = sqlx::query_scalar::<_, Option<i64>>("SELECT COUNT(*) FROM deployments")
-        .fetch_one(&pool)
-        .await
-        .unwrap()
-        .unwrap_or(0);
-    let users: i64 = sqlx::query_scalar::<_, Option<i64>>("SELECT COUNT(*) FROM users")
-        .fetch_one(&pool)
-        .await
-        .unwrap()
-        .unwrap_or(0);
-    let api_keys: i64 = sqlx::query_scalar::<_, Option<i64>>("SELECT COUNT(*) FROM api_keys")
-        .fetch_one(&pool)
-        .await
-        .unwrap()
-        .unwrap_or(0);
-    let sessions: i64 = sqlx::query_scalar::<_, Option<i64>>("SELECT COUNT(*) FROM sessions")
-        .fetch_one(&pool)
-        .await
-        .unwrap()
-        .unwrap_or(0);
-    assert_eq!(deployments, 0);
-    assert_eq!(users, 0);
-    assert_eq!(api_keys, 0);
-    assert_eq!(sessions, 0);
-    let org: Option<(i32,)> = sqlx::query_as("SELECT id FROM organizations WHERE id = 1")
-        .fetch_optional(&pool)
-        .await
-        .unwrap();
-    assert!(org.is_some());
+    for sql in [
+        "INSERT INTO organizations (id) VALUES (1), (2)",
+        "INSERT INTO deployments (id, organization_id) VALUES (1, 1), (2, 1), (3, 2)",
+        "INSERT INTO dns_records (id, deployment_id) VALUES (1, 1), (2, 3)",
+        "INSERT INTO users (id, tier) VALUES (1, 'member'), (2, 'admin'), (3, 'owner'), (4, 'owner')",
+        // user 1 owns org 1; user 2 is an admin of org 1 and a member of org 2; user 3 owns org 2;
+        // user 4 has the global Owner tier but no membership of org 1
+        "INSERT INTO memberships (org_id, user_id, role) VALUES (1, 1, 'owner'), (1, 2, 'admin'), (2, 2, 'member'), (2, 3, 'owner')",
+        "INSERT INTO invitations (id, org_id, email) VALUES (1, 1, 'a@example.test'), (2, 1, 'b@example.test'), (3, 2, 'c@example.test')",
+        // keys 1 and 2 belong to org 1; key 3 is user 1's personal key; key 4 belongs to org 2
+        "INSERT INTO api_keys (id, user_id, org_id) VALUES (1, 1, 1), (2, 2, 1), (3, 1, NULL), (4, 3, 2)",
+        "INSERT INTO sessions (id, user_id) VALUES (1, 1), (2, 2)",
+    ] {
+        sqlx::query(sql).execute(&pool).await.unwrap();
+    }
+    let count = |sql: &'static str| {
+        let pool = pool.clone();
+        async move { sqlx::query_scalar::<_, i64>(sql).fetch_one(&pool).await.unwrap() }
+    };
+
+    for not_owner in [User { id: 2, tier: Tier::Admin }, User { id: 3, tier: Tier::Owner }, User { id: 4, tier: Tier::Owner }] {
+        let err = rbac.delete_organization(&not_owner, 1).await.unwrap_err();
+        assert_eq!(err, RbacError::NotFound);
+        assert_eq!(err.to_response().1, 404);
+    }
+    assert_eq!(count("SELECT COUNT(*) FROM deployments WHERE organization_id = 1").await, 2);
+    assert_eq!(count("SELECT COUNT(*) FROM memberships WHERE org_id = 1").await, 2);
+
+    let deleted = rbac.delete_organization(&User { id: 1, tier: Tier::Member }, 1).await.unwrap();
+    assert_eq!(
+        (deleted["deployments"].as_i64(), deleted["api_keys"].as_i64(), deleted["invitations"].as_i64(), deleted["memberships"].as_i64()),
+        (Some(2), Some(2), Some(2), Some(2))
+    );
+    // org 1's records are gone
+    assert_eq!(count("SELECT COUNT(*) FROM deployments WHERE organization_id = 1").await, 0);
+    assert_eq!(count("SELECT COUNT(*) FROM dns_records WHERE deployment_id IN (1, 2)").await, 0);
+    assert_eq!(count("SELECT COUNT(*) FROM api_keys WHERE org_id = 1").await, 0);
+    assert_eq!(count("SELECT COUNT(*) FROM invitations WHERE org_id = 1").await, 0);
+    assert_eq!(count("SELECT COUNT(*) FROM memberships WHERE org_id = 1").await, 0);
+    // every member's account, sessions and personal key stay
+    assert_eq!(count("SELECT COUNT(*) FROM users").await, 4);
+    assert_eq!(count("SELECT COUNT(*) FROM sessions").await, 2);
+    assert_eq!(count("SELECT COUNT(*) FROM api_keys WHERE id = 3").await, 1);
+    // org 2 is untouched, including user 2's membership in it
+    assert_eq!(count("SELECT COUNT(*) FROM deployments WHERE organization_id = 2").await, 1);
+    assert_eq!(count("SELECT COUNT(*) FROM dns_records WHERE deployment_id = 3").await, 1);
+    assert_eq!(count("SELECT COUNT(*) FROM api_keys WHERE org_id = 2").await, 1);
+    assert_eq!(count("SELECT COUNT(*) FROM invitations WHERE org_id = 2").await, 1);
+    assert_eq!(count("SELECT COUNT(*) FROM memberships WHERE org_id = 2 AND user_id = 2 AND role = 'member'").await, 1);
+    // the cascade is audited with its actor
+    assert_eq!(count("SELECT COUNT(*) FROM audit_log WHERE action = 'org_deleted_cascade' AND user_id = 1").await, 1);
+    // a second call finds nothing to delete: 404
+    assert_eq!(rbac.delete_organization(&User { id: 1, tier: Tier::Member }, 1).await.unwrap_err(), RbacError::NotFound);
+}
+
+/// What: RBAC-07 for the organization cascade: with the invitations table missing, the owner's delete
+/// fails part way and nothing is deleted (no partial deletes). In: none. Out: panics on a wrong answer.
+/// Why: 2026-11-10 RBAC-06 amendment moved the org cascade to new tables. 2026-11-10,
+/// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite.
+// RBAC-07
+#[tokio::test]
+async fn test_org_cascade_rolls_back_when_a_step_fails() {
+    let pool = setup_db().await;
+    let rbac = RbacSystem { db: pool.clone() };
+    sqlx::query("INSERT INTO organizations (id) VALUES (1)").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO deployments (id, organization_id) VALUES (1, 1)").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO users (id, tier) VALUES (1, 'owner')").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO memberships (org_id, user_id, role) VALUES (1, 1, 'owner')").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO api_keys (id, user_id, org_id) VALUES (1, 1, 1)").execute(&pool).await.unwrap();
+    sqlx::query("DROP TABLE invitations").execute(&pool).await.unwrap();
+    assert_eq!(rbac.delete_organization(&User { id: 1, tier: Tier::Owner }, 1).await.unwrap_err(), RbacError::Internal);
+    let deployments: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM deployments").fetch_one(&pool).await.unwrap();
+    let keys: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys").fetch_one(&pool).await.unwrap();
+    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memberships").fetch_one(&pool).await.unwrap();
+    assert_eq!((deployments, keys, members), (1, 1, 1));
+}
+
+/// What: RBAC-09: a member is refused an admin action (admin_only) and an admin is refused an owner
+/// action (owner_only); an admin passes the admin check and an owner passes both. In: none. Out: panics
+/// on a wrong answer. Why: the spec's required test RBAC-09 compared enum values only.
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite (audit_log).
+// RBAC-09
+#[tokio::test]
+async fn test_tier_hierarchy_enforced_on_actions() {
+    let rbac = RbacSystem { db: setup_db().await };
+    let member = User { id: 1, tier: Tier::Member };
+    let admin = User { id: 2, tier: Tier::Admin };
+    let owner = User { id: 3, tier: Tier::Owner };
+    assert_eq!(rbac.require_admin(Some(&member)).await.unwrap_err(), RbacError::AdminOnly);
+    assert_eq!(rbac.require_owner(Some(&admin)).await.unwrap_err(), RbacError::OwnerOnly);
+    assert!(rbac.require_admin(Some(&admin)).await.is_ok());
+    assert!(rbac.require_admin(Some(&owner)).await.is_ok());
+    assert!(rbac.require_owner(Some(&owner)).await.is_ok());
 }
 
 #[tokio::test]
@@ -241,6 +298,7 @@ async fn test_cascade_rollback_on_error() {
     assert_eq!(sessions, 1);
 }
 
+// RBAC-08
 #[tokio::test]
 async fn test_permission_audit_logged() {
     let pool = setup_db().await;
@@ -392,6 +450,7 @@ async fn test_cascade_delete_user_audit_log() {
     assert!(details.get("preferences").is_some());
 }
 
+// RBAC-10
 #[tokio::test]
 async fn test_permission_check_response_time() {
     let pool = setup_db().await;
@@ -427,6 +486,7 @@ async fn test_error_response_fields() {
     assert_eq!(code, 403);
 }
 
+// RBAC-08
 #[tokio::test]
 async fn test_audit_log_fields() {
     let pool = setup_db().await;
@@ -457,6 +517,7 @@ async fn test_audit_log_fields() {
 
 /// Added 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP), spec "cascade on error -> rollback (no partial
 /// deletes)": with the preferences table missing, delete_user fails part way and nothing is deleted.
+// RBAC-07
 #[tokio::test]
 async fn test_cascade_delete_rolls_back_when_a_step_fails() {
     let pool = setup_db().await;
