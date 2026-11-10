@@ -384,7 +384,12 @@ public static class IdempotencyKeysTests
         {
             var key = "race-" + i;
             try { keys.Handle("client-a", key, "POST", "/charges", "{}", TimeoutOp); }
-            catch (TimeoutException) { }
+            catch (TimeoutException)
+            {
+                // Expected: Handle re-throws the operation's timeout after marking the key 'uncertain', which is the
+                // state this race test needs (IDEM-10). Code-quality review on PR 20, 2026-11-10,
+                // session_012zDydZCZ4AChqhEZ4oVtaP.
+            }
             var wins = 0;
             using var start = new ManualResetEventSlim(false);
             var threads = Enumerable.Range(0, 2).Select(_ => new Thread(() =>

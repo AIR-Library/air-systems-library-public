@@ -29,7 +29,7 @@ namespace TrialAbusePreventionTests
         }
 
         /// <summary>The service's clock (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): tests set it to exact boundaries.</summary>
-        private DateTime _now = DateTime.UtcNow;
+        private readonly DateTime _now = DateTime.UtcNow;
 
         /// <summary>Adds a user whose trial (14 days) ended exactly <paramref name="daysAfterTrial"/> days before _now. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.</summary>
         private async Task<string> UserWithTrialEndedDaysAgo(string userId, double daysAfterTrial, DateTime? earlierPayment = null)
