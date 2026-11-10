@@ -700,7 +700,14 @@ namespace BackgroundJobs
                     {
                         await repo.RequeueInterruptedAsync(job.Id, DateTime.UtcNow);
                     }
-                    catch (Exception requeueError)
+                    // Only database failures are caught (ExecuteUpdate raises the provider's DbException, SaveChanges a
+                    // DbUpdateException); the cancellation is rethrown either way. Narrowed from a catch-all for code
+                    // scanning on PR 19, 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.
+                    catch (System.Data.Common.DbException requeueError)
+                    {
+                        _logger.LogError(requeueError, "Job {JobId} was interrupted and could not be re-enqueued", job.Id);
+                    }
+                    catch (DbUpdateException requeueError)
                     {
                         _logger.LogError(requeueError, "Job {JobId} was interrupted and could not be re-enqueued", job.Id);
                     }
