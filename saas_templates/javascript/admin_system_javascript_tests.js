@@ -9,7 +9,7 @@ const { createAdminSystem, InMemoryMailer } = require('./admin_system_javascript
 // (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: replaces X-User-Id/X-User-Role headers, which any client can set,
 // and jest.mock('stripe'), whose automock has no `subscriptions` property, so the change_plan test could not run.)
 const JWT_SECRET = crypto.randomBytes(32).toString('hex');
-const stripe = { subscriptions: { update: jest.fn() } };
+const stripe = { subscriptions: { retrieve: jest.fn(), update: jest.fn() } };
 const mailer = new InMemoryMailer();
 const { app, knex, runMigrations, csrfTokenFor } = createAdminSystem({
   jwtSecret: JWT_SECRET,
@@ -81,6 +81,7 @@ describe('Admin System Tests', () => {
     'X-CSRF-Token': csrfTokenFor(userId),
   });
 
+  // ADMIN-01
   test('create user happy path → user created + invite sent', async () => {
     const res = await agent
       .post('/admin/users/action')
@@ -96,6 +97,7 @@ describe('Admin System Tests', () => {
     expect(invite.text).toMatch(/token=[a-f0-9]{64}/);
   });
 
+  // ADMIN-02
   test('create user duplicate email → 409 {error: "email_exists"}', async () => {
     const res = await agent
       .post('/admin/users/action')
@@ -105,6 +107,7 @@ describe('Admin System Tests', () => {
     expect(res.body.error).toBe('email_exists');
   });
 
+  // ADMIN-03
   test('create user non-owner → 403 {error: "owner_only"}', async () => {
     const res = await agent
       .post('/admin/users/action')
@@ -114,6 +117,7 @@ describe('Admin System Tests', () => {
     expect(res.body.error).toBe('owner_only');
   });
 
+  // ADMIN-04
   test('reset_password happy path → email sent', async () => {
     const res = await agent
       .post('/admin/users/action')
@@ -129,6 +133,7 @@ describe('Admin System Tests', () => {
     expect(stored.token_hash).toBe(crypto.createHash('sha256').update(token).digest('hex'));
   });
 
+  // ADMIN-05
   test('reset_password own account → 400 {error: "cannot_reset_own_password"}', async () => {
     const res = await agent
       .post('/admin/users/action')
@@ -138,6 +143,7 @@ describe('Admin System Tests', () => {
     expect(res.body.error).toBe('cannot_reset_own_password');
   });
 
+  // ADMIN-06
   test('change_role happy path → role changed + audit logged', async () => {
     const res = await agent
       .post('/admin/users/action')
@@ -147,8 +153,12 @@ describe('Admin System Tests', () => {
     expect(res.body.success).toBe(true);
     const user = await knex('users').where({ id: 3 }).first();
     expect(user.tier).toBe('admin');
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: ADMIN-06 also requires the audit row; it was not checked.
+    const audit = await knex('audit_logs').where({ action: 'role_changed', resource_id: 3 }).first();
+    expect(audit).toBeDefined();
   });
 
+  // ADMIN-07
   test('change_role last_owner → 400 {error: "cannot_demote_last_owner"}', async () => {
     const res = await agent
       .post('/admin/users/action')
@@ -158,6 +168,7 @@ describe('Admin System Tests', () => {
     expect(res.body.error).toBe('cannot_demote_last_owner');
   });
 
+  // ADMIN-08
   test('suspend_user happy path → status changed', async () => {
     const res = await agent
       .post('/admin/users/action')
@@ -169,6 +180,7 @@ describe('Admin System Tests', () => {
     expect(user.status).toBe('suspended');
   });
 
+  // ADMIN-09
   test('suspend_own_account → 400 {error: "cannot_suspend_yourself"}', async () => {
     const res = await agent
       .post('/admin/users/action')
@@ -178,6 +190,7 @@ describe('Admin System Tests', () => {
     expect(res.body.error).toBe('cannot_suspend_yourself');
   });
 
+  // ADMIN-10
   test('customers list → pagination works, all fields present', async () => {
     const res = await agent
       .get('/admin/customers')
@@ -195,6 +208,7 @@ describe('Admin System Tests', () => {
     expect(cust).toHaveProperty('status');
   });
 
+  // ADMIN-11
   test('customers detail → all fields present', async () => {
     const res = await agent
       .get('/admin/customers/1')
@@ -211,7 +225,11 @@ describe('Admin System Tests', () => {
     expect(cust).toHaveProperty('notes');
   });
 
-  test('change_plan → stripe.subscriptions.update called, audit logged', async () => {
+  // ADMIN-12
+  // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the update now names the existing item (spec amended); a bare
+  // {price} adds a second item and bills both plans, so the expected call changed.
+  test('change_plan → stripe.subscriptions.update called with the existing item id, audit logged', async () => {
+    stripe.subscriptions.retrieve.mockResolvedValue({ id: 'sub_123', items: { data: [{ id: 'si_current', price: { id: 'price_user' } }] } });
     stripe.subscriptions.update.mockResolvedValue({ id: 'sub_123' });
     const res = await agent
       .post('/admin/customers/1/action')
@@ -222,11 +240,37 @@ describe('Admin System Tests', () => {
     const customer = await knex('customers').where({ id: 1 }).first();
     expect(customer.tier).toBe('admin');
     expect(stripe.subscriptions.update).toHaveBeenCalled();
-    expect(stripe.subscriptions.update).toHaveBeenCalledWith('sub_123', { items: [{ price: 'price_admin' }] });
+    expect(stripe.subscriptions.retrieve).toHaveBeenCalledWith('sub_123');
+    expect(stripe.subscriptions.update).toHaveBeenCalledTimes(1);
+    expect(stripe.subscriptions.update).toHaveBeenCalledWith('sub_123', {
+      items: [{ id: 'si_current', price: 'price_admin' }],
+      proration_behavior: 'create_prorations',
+    });
     const audit = await knex('audit_logs').where({ action: 'plan_changed', resource_id: 1 }).first();
     expect(audit).toBeDefined();
   });
 
+  /**
+   * ADMIN-12: a subscription with two items is 409 subscription_item_ambiguous and Stripe is never updated; the tier
+   * stays as it was. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches the test database and the Stripe fake.
+   */
+  // ADMIN-12
+  test('change_plan on a subscription with two items → 409 subscription_item_ambiguous, no update', async () => {
+    stripe.subscriptions.retrieve.mockResolvedValue({ id: 'sub_123', items: { data: [{ id: 'si_a' }, { id: 'si_b' }] } });
+    stripe.subscriptions.update.mockClear();
+    const before = await knex('customers').where({ id: 1 }).first();
+    const res = await agent
+      .post('/admin/customers/1/action')
+      .set(authHeaders(1, 'owner'))
+      .send({ action: 'change_plan', new_tier: 'owner' });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe('subscription_item_ambiguous');
+    expect(stripe.subscriptions.update).not.toHaveBeenCalled();
+    const after = await knex('customers').where({ id: 1 }).first();
+    expect(after.tier).toBe(before.tier);
+  });
+
+  // ADMIN-13
   test('queue_refund → refund record created with status=\'queued\'', async () => {
     const res = await agent
       .post('/admin/customers/1/action')
@@ -239,6 +283,7 @@ describe('Admin System Tests', () => {
     expect(refund.status).toBe('queued');
   });
 
+  // ADMIN-14
   test('create_deployment → deployment created + config initialized', async () => {
     const res = await agent
       .post('/admin/deployments/action')
@@ -251,6 +296,7 @@ describe('Admin System Tests', () => {
     expect(deployment.domain).toBe('newdomain.com');
   });
 
+  // ADMIN-15
   test('publish_deployment → double-gate checked, status changed to \'live\'', async () => {
     const res = await agent
       .post('/admin/deployments/action')
@@ -262,6 +308,7 @@ describe('Admin System Tests', () => {
     expect(deployment.status).toBe('live');
   });
 
+  // ADMIN-16
   test('governance approve → action executed + status changed', async () => {
     const res = await agent
       .post('/admin/governance/actions/1/decide')
@@ -276,6 +323,7 @@ describe('Admin System Tests', () => {
     expect(JSON.parse(action.execution_result)).toEqual({ user_id: 3, suspended: true });
   });
 
+  // ADMIN-17
   test('governance reject → action rejected + reason logged', async () => {
     // Insert a new pending action
     await knex('governance_actions').insert({
@@ -297,6 +345,7 @@ describe('Admin System Tests', () => {
     expect(action.rejection_reason).toBe('Not valid');
   });
 
+  // ADMIN-18
   test('audit_log search → correct filters applied, pagination works', async () => {
     const res = await agent
       .get('/admin/governance/audit-log')

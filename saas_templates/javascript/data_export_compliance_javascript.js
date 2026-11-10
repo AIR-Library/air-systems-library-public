@@ -42,6 +42,21 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const GRACE_PERIOD_MS = 30 * DAY_MS;
 const DOWNLOAD_TTL_SECONDS = 7 * 24 * 60 * 60;
 const DELETION_REASONS = ['user_requested', 'gdpr_request', 'gdpr_right_to_be_forgotten', 'other'];
+// Statutory erasure reasons get no grace period (EXPORT-12, spec amended 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
+const STATUTORY_REASONS = ['gdpr_request', 'gdpr_right_to_be_forgotten'];
+// A deletion confirmation token is valid for 24 hours (EXPORT-14).
+const CONFIRM_TOKEN_TTL_MS = DAY_MS;
+
+/**
+ * The audit eraser used when none is injected: it refuses, so a deletion cascade rolls back instead of completing
+ * without erasing the user's audit personal data. Inject the audit system's erase_subject (audit_logging.md).
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-13). Touches nothing.
+ */
+class UnconfiguredAuditEraser {
+  async erase_subject() {
+    throw new Error("no audit eraser is configured; inject the audit system's erase_subject");
+  }
+}
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS users (
@@ -101,6 +116,7 @@ CREATE TABLE IF NOT EXISTS deletion_requests (
     status TEXT CHECK(status IN ('pending','approved','completed','cancelled')),
     reason TEXT,
     confirmation_token_hash TEXT,
+    token_expires_at TEXT,
     will_delete_at TEXT,
     confirmed_at TEXT,
     cancelled_at TEXT,
@@ -266,6 +282,8 @@ class S3ExportStorage {
  *   emailFrom    sender address (default env EMAIL_FROM or no-reply@example.com)
  *   dbFile       SQLite file (default ':memory:')
  *   autoRunJobs  run export jobs as soon as they are queued (default true; tests pass false and call runPendingJobs)
+ *   auditEraser  the audit system's eraser, { erase_subject(user_id) } (may be async). Called LAST in every deletion
+ *                cascade (EXPORT-13). Default UnconfiguredAuditEraser refuses, so the cascade rolls back.
  * Out: { app, db, run, all, get, ready, storage, transporter, runPendingJobs, processDueDeletions, close }.
  *
  * Why: the old module ran its export job against real S3, scheduled deletions with an overflowing setTimeout and
@@ -281,12 +299,17 @@ function createComplianceService(options = {}) {
   const baseUrl = options.baseUrl || process.env.BASE_URL || 'http://localhost:3000';
   const emailFrom = options.emailFrom || process.env.EMAIL_FROM || 'no-reply@example.com';
   const autoRunJobs = options.autoRunJobs !== false;
+  const auditEraser = options.auditEraser || new UnconfiguredAuditEraser();
 
   const db = new sqlite3.Database(options.dbFile || ':memory:');
   const run = util.promisify(db.run.bind(db));
   const all = util.promisify(db.all.bind(db));
   const get = util.promisify(db.get.bind(db));
   const ready = util.promisify(db.exec.bind(db))(SCHEMA_SQL);
+  /** db.run that resolves to the number of rows changed. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+  const runChanges = (sql, params) => new Promise((resolve, reject) => {
+    db.run(sql, params, function onRun(err) { if (err) reject(err); else resolve(this.changes); });
+  });
 
   const iso = (ms) => new Date(ms).toISOString();
 
@@ -384,34 +407,52 @@ function createComplianceService(options = {}) {
   }
 
   /**
-   * Carries out every confirmed deletion whose grace period has ended: deletes the user's export files from storage,
-   * then, in one transaction, every row about the user (sessions, activity, files, preferences, transactions, API
-   * keys, export requests, the user) except the audit log, and marks the request completed.
+   * The deletion cascade for one confirmed request (EXPORT-07/08/13, amended 2026-11-10). First the user's export
+   * files are removed from storage; then ONE transaction, in this order: (1) delete every row about the user (sessions,
+   * activity, files, preferences, transactions, API keys, export requests, the user), never the audit log;
+   * (2) mark this request completed (deleted_at = now), cancel the user's other open requests and set user_id NULL on
+   * every deletion request of the user, so no request row can re-identify erased audit entries by its timestamp;
+   * (3) log 'user_deleted_cascade' with the user as subject; (4) call auditEraser.erase_subject(user_id) LAST. Nothing
+   * logs this user afterwards. If any step throws (including an unconfigured eraser) everything rolls back.
+   * In: the deletion_requests row. Out: a promise of the deleted counts per table.
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (deletes personal data), storage, the audit eraser.
+   */
+  async function cascadeDelete(d) {
+    const userId = d.user_id;
+    const exportsToRemove = await all('SELECT storage_key FROM export_requests WHERE user_id = ? AND storage_key IS NOT NULL', [userId]);
+    for (const e of exportsToRemove) await storage.delete(e.storage_key);
+    return inTransaction(async () => {
+      const c = {};
+      for (const table of ['sessions', 'activity', 'files', 'preferences', 'transactions', 'api_keys', 'export_requests']) {
+        const before = await get(`SELECT COUNT(*) AS n FROM ${table} WHERE user_id = ?`, [userId]);
+        await run(`DELETE FROM ${table} WHERE user_id = ?`, [userId]);
+        c[table] = before.n;
+      }
+      await run('DELETE FROM users WHERE id = ?', [userId]);
+      const at = iso(now());
+      await run(`UPDATE deletion_requests SET status = 'completed', deleted_at = ? WHERE id = ?`, [at, d.id]);
+      await run(`UPDATE deletion_requests SET status = 'cancelled', cancelled_at = ?
+        WHERE user_id = ? AND status IN ('pending','approved') AND id != ?`, [at, userId, d.id]);
+      await run('UPDATE deletion_requests SET user_id = NULL WHERE user_id = ?', [userId]);
+      await audit(userId, 'user_deleted_cascade', { deletion_id: d.id, deleted_items: c });
+      await auditEraser.erase_subject(userId);
+      return c;
+    });
+  }
+
+  /**
+   * Carries out every confirmed deletion whose grace period has ended, through cascadeDelete.
    * Out: a promise of the deletion ids completed. Call it on a schedule (start() does, hourly).
    * Why: replaces a 30-day setTimeout that Node fired after 1 ms (32-bit overflow) and that was lost on restart
-   * (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). Touches: database (deletes personal data), storage.
+   * (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP; the cascade moved to cascadeDelete the same day, EXPORT-13).
+   * Touches: database (deletes personal data), storage, the audit eraser.
    */
   async function processDueDeletions() {
     const due = await all(`SELECT * FROM deletion_requests WHERE status = 'approved' AND will_delete_at <= ?
       ORDER BY will_delete_at, rowid`, [iso(now())]);
     const done = [];
     for (const d of due) {
-      const exportsToRemove = await all('SELECT storage_key FROM export_requests WHERE user_id = ? AND storage_key IS NOT NULL', [d.user_id]);
-      for (const e of exportsToRemove) await storage.delete(e.storage_key);
-      const counts = await inTransaction(async () => {
-        const c = {};
-        for (const table of ['sessions', 'activity', 'files', 'preferences', 'transactions', 'api_keys', 'export_requests']) {
-          const before = await get(`SELECT COUNT(*) AS n FROM ${table} WHERE user_id = ?`, [d.user_id]);
-          await run(`DELETE FROM ${table} WHERE user_id = ?`, [d.user_id]);
-          c[table] = before.n;
-        }
-        await run('DELETE FROM users WHERE id = ?', [d.user_id]);
-        await run(`UPDATE deletion_requests SET status = 'completed', deleted_at = ? WHERE id = ?`, [iso(now()), d.id]);
-        await run(`UPDATE deletion_requests SET status = 'cancelled', cancelled_at = ?
-          WHERE user_id = ? AND status IN ('pending','approved') AND id != ?`, [iso(now()), d.user_id, d.id]);
-        return c;
-      });
-      await audit(d.user_id, 'account_deleted', { deletion_id: d.id, deleted_items: counts });
+      await cascadeDelete(d);
       done.push(d.id);
     }
     return done;
@@ -516,61 +557,85 @@ function createComplianceService(options = {}) {
   }));
 
   /**
-   * POST /compliance/delete { reason }: records a pending deletion and e-mails a confirmation link; the account
-   * is deleted 30 days after the request if confirmed. Out: { success, deletion_id, status, will_delete_at }.
-   * Why: spec endpoint; rebuilt 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP behind the token gate (see module header). Touches: database, e-mail.
+   * POST /compliance/delete { reason }: records a pending deletion of the caller's account and e-mails a confirmation
+   * link. will_delete_at = requested_at + 30 days for user_requested / other (the user can cancel), and = requested_at
+   * for a statutory reason (gdpr_request, gdpr_right_to_be_forgotten: no grace period, EXPORT-12). The confirmation
+   * token is 32 random bytes; only its SHA-256 is stored, with token_expires_at = requested_at + 24 h (EXPORT-14).
+   * Nothing is deleted here. Out: { success, deletion_id, status: 'pending', will_delete_at }.
+   * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-05/12/14). Touches: database, e-mail.
    */
   app.post('/compliance/delete', route(async (req, res) => {
     const { reason } = req.body || {};
     if (!DELETION_REASONS.includes(reason)) return res.status(400).json({ error: 'invalid_reason' });
     const deletionId = crypto.randomUUID();
-    const token = crypto.randomBytes(20).toString('hex');
+    const token = crypto.randomBytes(32).toString('hex');
     const requestedMs = now();
-    const willDeleteAt = iso(requestedMs + GRACE_PERIOD_MS);
+    const statutory = STATUTORY_REASONS.includes(reason);
+    const willDeleteAt = iso(statutory ? requestedMs : requestedMs + GRACE_PERIOD_MS);
     await run(`INSERT INTO deletion_requests (id, user_id, requested_at, status, reason, confirmation_token_hash,
-      will_delete_at) VALUES (?,?,?,'pending',?,?,?)`, [deletionId, req.user.id, iso(requestedMs), reason, sha256(token), willDeleteAt]);
+      token_expires_at, will_delete_at) VALUES (?,?,?,'pending',?,?,?,?)`,
+    [deletionId, req.user.id, iso(requestedMs), reason, sha256(token), iso(requestedMs + CONFIRM_TOKEN_TTL_MS), willDeleteAt]);
     await audit(req.user.id, 'deletion_requested', { deletion_id: deletionId, reason });
     await transporter.sendMail({
       from: emailFrom,
       to: req.user.email,
       subject: 'Confirm your account deletion',
       text: `Please confirm deletion by visiting: ${baseUrl}/compliance/delete/${deletionId}/confirm?token=${token}\n`
-        + `Your account will be deleted on ${willDeleteAt}. Until then you can cancel.`,
+        + `The link is valid for 24 hours. `
+        + (statutory ? 'Your account will be deleted as soon as you confirm.'
+          : `Your account will be deleted on ${willDeleteAt}. Until then you can cancel.`),
     });
     return res.json({ success: true, deletion_id: deletionId, status: 'pending', will_delete_at: willDeleteAt });
   }));
 
   /**
-   * POST /compliance/delete/:id/confirm { confirmation_token }: approves the caller's pending request.
-   * Out: { success, deletion_scheduled_for }; 400 wrong token, 409 not pending, 410 past its date.
-   * Why: spec endpoint; rebuilt 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP behind the token gate (see module header). Touches: database.
+   * POST /compliance/delete/:id/confirm { confirmation_token }: approves the caller's own pending request (anyone
+   * else's is 404). The token must hash (SHA-256, constant-time compare) to this request's stored hash and be within
+   * its 24 h; it is single-use (the hash is cleared on use, and a request that is no longer pending answers 409).
+   * A statutory request runs the cascade before returning: status 'completed', deleted_at = deletion_scheduled_for =
+   * now. Out: { success, deletion_scheduled_for, status }; 400 wrong token, 409 not pending, 410 token expired.
+   * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-09/12/13/14). Touches: database; for a statutory
+   * reason also storage and the audit eraser.
    */
   app.post('/compliance/delete/:deletion_id/confirm', route(async (req, res) => {
     const token = (req.body && req.body.confirmation_token) || '';
     const d = await get('SELECT * FROM deletion_requests WHERE id = ? AND user_id = ?', [req.params.deletion_id, req.user.id]);
     if (!d) return res.status(404).json({ error: 'deletion_not_found' });
-    if (d.status !== 'pending') return res.status(409).json({ error: 'deletion_not_pending' });
-    if (Date.parse(d.will_delete_at) <= now()) return res.status(410).json({ error: 'deletion_request_expired' });
+    if (d.status !== 'pending' || !d.confirmation_token_hash) return res.status(409).json({ error: 'deletion_not_pending' });
     if (typeof token !== 'string' || !safeEqual(sha256(token), d.confirmation_token_hash)) {
       return res.status(400).json({ error: 'invalid_confirmation_token' });
     }
-    await run(`UPDATE deletion_requests SET status = 'approved', confirmed_at = ? WHERE id = ? AND status = 'pending'`,
-      [iso(now()), d.id]);
+    if (!d.token_expires_at || Date.parse(d.token_expires_at) <= now()) {
+      return res.status(410).json({ error: 'confirmation_token_expired' });
+    }
+    const confirmedAt = iso(now());
+    const statutory = STATUTORY_REASONS.includes(d.reason);
+    // One conditional write consumes the token: of two concurrent confirms, only one proceeds.
+    const changed = await runChanges(`UPDATE deletion_requests SET status = 'approved', confirmed_at = ?,
+      confirmation_token_hash = NULL, will_delete_at = ? WHERE id = ? AND status = 'pending'
+      AND confirmation_token_hash = ?`,
+    [confirmedAt, statutory ? confirmedAt : d.will_delete_at, d.id, d.confirmation_token_hash]);
+    if (changed !== 1) return res.status(409).json({ error: 'deletion_not_pending' });
     await audit(req.user.id, 'deletion_confirmed', { deletion_id: d.id });
-    return res.json({ success: true, deletion_scheduled_for: d.will_delete_at });
+    if (statutory) {
+      await cascadeDelete({ ...d, status: 'approved', will_delete_at: confirmedAt });
+      return res.json({ success: true, deletion_scheduled_for: confirmedAt, status: 'completed' });
+    }
+    return res.json({ success: true, deletion_scheduled_for: d.will_delete_at, status: 'approved' });
   }));
 
   /**
-   * DELETE /compliance/delete/:id: cancels the caller's pending or approved request before its date.
-   * Out: { success, status: 'cancelled' }; 409 otherwise.
+   * DELETE /compliance/delete/:id: cancels the caller's own pending or approved request before its date (anyone
+   * else's is 404). Out: { success, status: 'cancelled' }; 409 otherwise.
    * Why: spec endpoint; rebuilt 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP behind the token gate (see module header). Touches: database.
    */
   app.delete('/compliance/delete/:deletion_id', route(async (req, res) => {
     const d = await get('SELECT * FROM deletion_requests WHERE id = ? AND user_id = ?', [req.params.deletion_id, req.user.id]);
     if (!d) return res.status(404).json({ error: 'deletion_not_found' });
     if (d.status !== 'pending' && d.status !== 'approved') return res.status(409).json({ error: 'cannot_cancel' });
-    if (Date.parse(d.will_delete_at) <= now()) return res.status(409).json({ error: 'grace_period_over' });
-    await run(`UPDATE deletion_requests SET status = 'cancelled', cancelled_at = ? WHERE id = ?`, [iso(now()), d.id]);
+    if (d.status === 'approved' && Date.parse(d.will_delete_at) <= now()) return res.status(409).json({ error: 'grace_period_over' });
+    await run(`UPDATE deletion_requests SET status = 'cancelled', cancelled_at = ?, confirmation_token_hash = NULL
+      WHERE id = ?`, [iso(now()), d.id]);
     await audit(req.user.id, 'deletion_cancelled', { deletion_id: d.id });
     return res.json({ success: true, status: 'cancelled' });
   }));
@@ -666,6 +731,8 @@ if (require.main === module) {
 
 module.exports = {
   createComplianceService,
+  UnconfiguredAuditEraser,
+  STATUTORY_REASONS,
   InMemoryExportStorage,
   S3ExportStorage,
   toCsv,

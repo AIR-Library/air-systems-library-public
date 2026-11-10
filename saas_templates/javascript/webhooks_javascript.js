@@ -22,7 +22,7 @@ class InMemoryStore {
       event_types: Array.isArray(event_types) ? event_types : [],
       active: true,
       failure_count: 0,
-      created_at: Date.now(),
+      created_at: clock(),
     };
     this.endpoints.set(id, endpoint);
     return { id, secret };
@@ -42,7 +42,7 @@ class InMemoryStore {
       org_id,
       event_type,
       payload,
-      created_at: Date.now(),
+      created_at: clock(),
     };
     this.messages.set(id, message);
     return message;
@@ -61,7 +61,7 @@ class InMemoryStore {
       status_code: null,
       success: false,
       error: null,
-      next_attempt_at: Math.floor(Date.now() / 1000),
+      next_attempt_at: Math.floor(clock() / 1000),
       delivered_at: null,
     };
     this.deliveries.set(id, delivery);
@@ -78,6 +78,19 @@ class InMemoryStore {
 
 /* Singleton store ---------------------------------------------------------- */
 const crypto = require('crypto');
+
+/* Clock --------------------------------------------------------------------- */
+// [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Time comes from an injectable clock (epoch ms), so signing, the
+// tolerance check and retry scheduling can be tested at a fixed instant (docs/specs/README.md "Deterministic").
+let clock = () => Date.now();
+
+/**
+ * setClock(fn): replaces the clock (fn() -> epoch milliseconds); setClock() restores Date.now.
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches module state only.
+ */
+function setClock(fn) {
+  clock = typeof fn === 'function' ? fn : () => Date.now();
+}
 const store = new InMemoryStore();
 
 /* Helper: constant‑time compare ------------------------------------------- */
@@ -115,12 +128,21 @@ function send_event(org_id, event_type, payload) {
   return message.id;
 }
 
-/* sign(secret, msg_id, timestamp, body) -> "v1,<base64>" */
+/**
+ * sign(secret, msg_id, timestamp, body) -> "v1,<base64 HMAC-SHA256>".
+ * In: a "whsec_" secret, the message id, the unix timestamp in seconds and the raw body string.
+ * Out: the webhook-signature value for one key. Why: Standard Webhooks signing (HOOK-01/02).
+ * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] fixed the key decoding (prefix is 6 characters).
+ * Touches nothing (pure crypto).
+ */
 function sign(secret, msg_id, timestamp, body) {
   if (!secret.startsWith('whsec_')) {
     throw new Error('Invalid secret format');
   }
-  const key = Buffer.from(secret.slice(5), 'base64');
+  // [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] The key is the base64 AFTER the 6-character "whsec_" prefix
+  // (spec: "Key = base64-decode of the secret with its 'whsec_' prefix removed"). slice(5) kept the "_", which
+  // Node decodes as a url-safe digit, so the key differed from every other language and signatures never interoperated.
+  const key = Buffer.from(secret.slice(6), 'base64');
   const content = `${msg_id}.${timestamp}.${body}`;
   const hmac = crypto.createHmac('sha256', key).update(content).digest();
   const sig = hmac.toString('base64');
@@ -139,7 +161,7 @@ function verify(secret, headers, raw_body, tolerance_seconds = 300) {
   if (Number.isNaN(timestamp)) {
     return 'invalid timestamp';
   }
-  const now = Math.floor(Date.now() / 1000);
+  const now = Math.floor(clock() / 1000);
   if (Math.abs(now - timestamp) > tolerance_seconds) {
     return 'timestamp outside tolerance';
   }
@@ -178,7 +200,7 @@ async function deliver(delivery, sender) {
   if (!endpoint || !message) throw new Error('invalid delivery data');
 
   const body = JSON.stringify(message.payload);
-  const timestamp = Math.floor(Date.now() / 1000);
+  const timestamp = Math.floor(clock() / 1000);
   const signature = sign(endpoint.secret, message.id, timestamp, body);
   const headers = {
     'webhook-id': message.id,
@@ -204,11 +226,11 @@ async function deliver(delivery, sender) {
     status_code: status,
     success,
     error: success ? null : (response.error?.message || `status ${status}`),
-    delivered_at: success ? Date.now() : null,
+    delivered_at: success ? clock() : null,
   };
   if (!success) {
     const delay = backoff[Math.min(attempt - 1, backoff.length - 1)];
-    updates.next_attempt_at = Math.floor(Date.now() / 1000) + delay;
+    updates.next_attempt_at = Math.floor(clock() / 1000) + delay;
     // update endpoint failure count
     const newFailCount = endpoint.failure_count + 1;
     const epUpdates = { failure_count: newFailCount };
@@ -230,6 +252,7 @@ module.exports = {
   verify,
   rotate_secret,
   deliver,
+  setClock,
   // expose store for tests (read‑only)
   _store: store,
 };

@@ -53,17 +53,25 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 `;
 
-function createBillingSystem({ stripeSecretKey, webhookSecret, db }) {
+/**
+ * createBillingSystem({stripeSecretKey, webhookSecret, db, priceIds?}) -> the billing flows of billing_subscriptions.md.
+ * In: Stripe keys, a db adapter and optionally the tier -> Stripe price id map. Out: {create_subscription, change_plan,
+ * queue_refund, handle_stripe_webhook, __stripeInstance}.
+ * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] priceIds is configurable and the placeholders are distinct per tier:
+ * every tier used to map to the same "price_1UI..." string, so a plan change could not change the price.
+ * Touches: Stripe (network, money) through the client, the db adapter.
+ */
+function createBillingSystem({ stripeSecretKey, webhookSecret, db, priceIds }) {
   if (!stripeSecretKey) throw new Error('STRIPE_SECRET_KEY is required');
   if (!webhookSecret) throw new Error('STRIPE_WEBHOOK_SECRET is required');
   if (!db) throw new Error('Database adapter is required');
 
   const stripeInstance = stripe(stripeSecretKey);
-  const PRICE_IDS = {
-    solo: "price_1UI...",
-    team: "price_1UI...",
-    enterprise: "price_1UI..."
-  };
+  const PRICE_IDS = Object.freeze(Object.assign(Object.create(null), priceIds || {
+    solo: "price_solo_placeholder",
+    team: "price_team_placeholder",
+    enterprise: "price_enterprise_placeholder"
+  }));
 
   async function create_subscription(customer_id, tier) {
     if (!PRICE_IDS[tier]) {
@@ -110,21 +118,43 @@ function createBillingSystem({ stripeSecretKey, webhookSecret, db }) {
     }
   }
 
+  /**
+   * change_plan(subscription_id, new_tier) -> {success, subscription_id, old_tier, new_tier, effective_date,
+   * proration_credit} | {error, status, message}.
+   * Order (billing_subscriptions.md flow 2, BILL-03, amended 2026-11-10): an unknown tier -> 400 invalid_tier;
+   * an unknown subscription -> 404 subscription_not_found; stripe.subscriptions.retrieve, and a subscription
+   * without exactly one item -> 409 subscription_item_ambiguous; all before any update. Then
+   * stripe.subscriptions.update(id, {items: [{id: current_item_id, price}], proration_behavior: 'create_prorations'}).
+   * Sending only {price} made Stripe ADD a second item and bill both plans.
+   * proration_credit: the credit (in the invoice's minor units, as a string) from the negative proration lines of
+   * the update's latest_invoice when Stripe returns it, else "0".
+   * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: Stripe (network, money), subscriptions, audit_log.
+   */
   async function change_plan(subscription_id, new_tier) {
-    if (!PRICE_IDS[new_tier]) {
-      return { error: "invalid_tier", message: `Invalid tier: ${new_tier}` };
+    if (typeof new_tier !== 'string' || !Object.prototype.hasOwnProperty.call(PRICE_IDS, new_tier)) {
+      return { error: "invalid_tier", status: 400, message: `Invalid tier: ${new_tier}` };
     }
 
     try {
-      // Get old tier from DB — spec calls only stripe.subscriptions.update, not retrieve
       const existingSub = await db.getSubscriptionByStripeId(subscription_id);
       if (!existingSub) {
-        return { error: "subscription_not_found", message: `Subscription ${subscription_id} not found` };
+        return { error: "subscription_not_found", status: 404, message: `Subscription ${subscription_id} not found` };
       }
       const old_tier = existingSub.tier;
 
+      const current = await stripeInstance.subscriptions.retrieve(subscription_id);
+      const items = current && current.items && Array.isArray(current.items.data) ? current.items.data : [];
+      if (items.length !== 1 || !items[0] || !items[0].id) {
+        return {
+          error: "subscription_item_ambiguous",
+          status: 409,
+          message: `Subscription ${subscription_id} must have exactly one item to change plan`
+        };
+      }
+
       const updatedSubscription = await stripeInstance.subscriptions.update(subscription_id, {
-        items: [{ price: PRICE_IDS[new_tier] }]
+        items: [{ id: items[0].id, price: PRICE_IDS[new_tier] }],
+        proration_behavior: 'create_prorations'
       });
 
       const now = new Date().toISOString();
@@ -134,8 +164,7 @@ function createBillingSystem({ stripeSecretKey, webhookSecret, db }) {
         updated_at: now
       });
 
-      // Calculate proration credit (simplified — actual calculation would be more complex)
-      const proration_credit = 0; // Placeholder - in reality would come from Stripe invoice
+      const proration_credit = prorationCredit(updatedSubscription.latest_invoice);
 
       await db.createAuditLog({
         action: "plan_changed",
@@ -158,6 +187,22 @@ function createBillingSystem({ stripeSecretKey, webhookSecret, db }) {
     } catch (error) {
       return { error: "stripe_error", message: error.message };
     }
+  }
+
+  /**
+   * prorationCredit(invoice) -> integer credit in minor units (>= 0).
+   * In: a Stripe invoice object (or an id string / null when not expanded). Out: minus the sum of the negative
+   * proration line amounts, 0 when the lines are not present. Why: BILL-03 "proration calculated".
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+   */
+  function prorationCredit(invoice) {
+    const lines = invoice && typeof invoice === 'object' && invoice.lines && Array.isArray(invoice.lines.data)
+      ? invoice.lines.data : [];
+    let credit = 0;
+    for (const line of lines) {
+      if (line && line.proration && typeof line.amount === 'number' && line.amount < 0) credit += -line.amount;
+    }
+    return credit;
   }
 
   async function queue_refund(invoice_id, amount, reason) {

@@ -58,6 +58,7 @@ function expectQuotaError(fn, expectedStatus, expectedErrorKey) {
 console.log('Quotas & Rate Limiting - Test Suite\n');
 
 // 1. api_quota PASS
+// QUOTA-01
 test('api_quota PASS → call succeeds, usage incremented', () => {
   const { manager, store } = makeManager();
   store.upsertUser({ user_id: 'u1', tier: 'solo' });
@@ -69,6 +70,7 @@ test('api_quota PASS → call succeeds, usage incremented', () => {
 });
 
 // 2. api_quota FAIL
+// QUOTA-02
 test('api_quota FAIL → call rejected 429', () => {
   const { manager, store } = makeManager();
   store.upsertUser({ user_id: 'u1', tier: 'solo' });
@@ -84,6 +86,7 @@ test('api_quota FAIL → call rejected 429', () => {
 });
 
 // 3. storage_quota PASS
+// QUOTA-03
 test('storage_quota PASS → file stored', () => {
   const { manager, store } = makeManager();
   store.upsertUser({ user_id: 'u1', tier: 'solo' });
@@ -99,6 +102,7 @@ test('storage_quota PASS → file stored', () => {
 });
 
 // 4. storage_quota FAIL
+// QUOTA-04
 test('storage_quota FAIL → upload rejected 413', () => {
   const { manager, store } = makeManager();
   store.upsertUser({ user_id: 'u1', tier: 'solo' });
@@ -118,6 +122,7 @@ test('storage_quota FAIL → upload rejected 413', () => {
 });
 
 // 5. rate_limit_per_user PASS
+// QUOTA-05
 test('rate_limit_per_user PASS → < 100/min allowed', () => {
   const { manager } = makeManager();
   for (let i = 0; i < 99; i++) {
@@ -129,6 +134,7 @@ test('rate_limit_per_user PASS → < 100/min allowed', () => {
 });
 
 // 6. rate_limit_per_user FAIL
+// QUOTA-06
 test('rate_limit_per_user FAIL → 100+/min rejected 429', () => {
   const { manager } = makeManager();
   for (let i = 0; i < 100; i++) {
@@ -143,6 +149,7 @@ test('rate_limit_per_user FAIL → 100+/min rejected 429', () => {
 });
 
 // 7. rate_limit_per_ip PASS
+// QUOTA-07
 test('rate_limit_per_ip PASS → < 10/sec allowed', () => {
   const { manager } = makeManager();
   for (let i = 0; i < 9; i++) {
@@ -154,6 +161,7 @@ test('rate_limit_per_ip PASS → < 10/sec allowed', () => {
 });
 
 // 8. rate_limit_per_ip FAIL
+// QUOTA-08
 test('rate_limit_per_ip FAIL → 10+/sec rejected 429', () => {
   const { manager } = makeManager();
   for (let i = 0; i < 10; i++) {
@@ -168,6 +176,7 @@ test('rate_limit_per_ip FAIL → 10+/sec rejected 429', () => {
 });
 
 // 9. feature_gate PASS
+// QUOTA-09
 test('feature_gate PASS → feature available in tier', () => {
   const { manager } = makeManager();
   const result = manager.checkFeatureGate('u1', 'team', 'feature_a');
@@ -176,6 +185,7 @@ test('feature_gate PASS → feature available in tier', () => {
 });
 
 // 10. feature_gate FAIL
+// QUOTA-10
 test('feature_gate FAIL → feature unavailable, 403 with upgrade hint', () => {
   const { manager } = makeManager();
   const err = expectQuotaError(
@@ -189,6 +199,7 @@ test('feature_gate FAIL → feature unavailable, 403 with upgrade hint', () => {
 });
 
 // 11. month rollover
+// QUOTA-11
 test('month rollover → usage_metrics reset for new month', () => {
   const store = new InMemoryStore();
   const manager = new QuotaManager({
@@ -213,6 +224,7 @@ test('month rollover → usage_metrics reset for new month', () => {
 });
 
 // 12. tier upgrade
+// QUOTA-12
 test('tier upgrade → limits updated immediately', () => {
   const { manager, store } = makeManager();
   store.upsertUser({ user_id: 'u1', tier: 'solo' });
@@ -238,7 +250,31 @@ test('enterprise tier has unlimited API calls', () => {
   store.incrementCalls('u1', '2025-01', 999999);
   const result = manager.checkApiCallQuota('u1', 'enterprise');
   assert.strictEqual(result.pass, true);
-  assert.strictEqual(result.limit, Infinity);
+  // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the spec's unlimited is -1 in every quota (QUOTA-13), not Infinity.
+  assert.strictEqual(result.limit, -1);
+});
+
+/**
+ * QUOTA-13: a limit of -1 is unlimited. An enterprise upload far past every other tier's storage limit is stored,
+ * and enterprise API calls past every other tier's monthly limit (team: 10000) never get 429 from the quota.
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches the in-memory store only.
+ */
+// QUOTA-13
+test('a limit of -1 is unlimited for enterprise storage and API calls', () => {
+  const { manager, store } = makeManager();
+  store.upsertUser({ user_id: 'ent', tier: 'enterprise' });
+  assert.strictEqual(API_CALL_LIMITS.enterprise, -1);
+  assert.strictEqual(STORAGE_LIMITS.enterprise, -1);
+  const huge = 500e12;
+  const up = manager.handleFileUpload({ userId: 'ent', tier: 'enterprise', fileName: 'huge.bin', size: huge });
+  assert.strictEqual(up.status, 200);
+  assert.strictEqual(store.getUsage('ent', '2025-01').storage_bytes, huge);
+  const calls = API_CALL_LIMITS.team + 5;
+  for (let i = 0; i < calls; i++) {
+    const r = manager.checkApiCallQuota('ent', 'enterprise');
+    assert.strictEqual(r.pass, true);
+  }
+  assert.strictEqual(store.getUsage('ent', '2025-01').call_count, calls);
 });
 
 // Additional: enterprise unlimited storage

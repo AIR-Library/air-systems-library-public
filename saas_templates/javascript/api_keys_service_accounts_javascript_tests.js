@@ -60,6 +60,7 @@ async function main() {
     assert.ok(SCHEMA_SQL.includes('rate_limit'));
   });
 
+  // KEYS-01
   await test('create key with scopes returns key shown once and metadata', async () => {
     const { svc } = makeService();
     const res = await svc.createKey('user_1', {
@@ -86,6 +87,7 @@ async function main() {
     await expectStatus(svc.createKey(null, { name: 'x', scopes: ['read:users'] }), 400);
   });
 
+  // KEYS-02
   await test('use key: request succeeds with Authorization header', async () => {
     const { svc } = makeService();
     const created = await svc.createKey('user_1', {
@@ -97,21 +99,26 @@ async function main() {
     assert.ok(auth.record, 'authenticated record returned');
     assert.strictEqual(auth.record.id, created.api_key_id);
     svc.logSuccess(created.api_key_id, 'GET', '/deployments', 200);
-    const stats = svc.getUsageStats(created.api_key_id);
+    const stats = svc.getUsageStats(created.api_key_id, undefined, undefined, 'user_1');
     assert.strictEqual(stats.total_requests, 1);
     assert.strictEqual(stats.requests_by_endpoint['GET /deployments'], 1);
   });
 
+  // KEYS-03
   await test('revoke key: subsequent requests return 401', async () => {
     const { svc } = makeService();
     const created = await svc.createKey('user_1', { name: 'Int', scopes: [SCOPES.READ_DEPLOYMENTS] });
     await svc.authenticate(created.key, 'GET', '/deployments');
-    const rev = svc.revokeKey(created.api_key_id);
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: revoke acts for the verified caller; another user gets 404.
+    assert.throws(() => svc.revokeKey(created.api_key_id, 'user_2'), (e) => e.status === 404);
+    await svc.authenticate(created.key, 'GET', '/deployments');
+    const rev = svc.revokeKey(created.api_key_id, 'user_1');
     assert.strictEqual(rev.success, true);
     assert.ok(rev.revoked_at);
     await expectStatus(svc.authenticate(created.key, 'GET', '/deployments'), 401);
   });
 
+  // KEYS-04
   await test('rate limit: 1001st request in hour returns 429', async () => {
     const { svc } = makeService();
     const created = await svc.createKey('user_1', {
@@ -125,6 +132,7 @@ async function main() {
     await expectStatus(svc.authenticate(created.key, 'GET', '/deployments'), 429);
   });
 
+  // KEYS-05
   await test('scope check: read:deployments key cannot write deployments (403)', async () => {
     const { svc } = makeService();
     const created = await svc.createKey('user_1', {
@@ -143,6 +151,7 @@ async function main() {
     assert.ok(true);
   });
 
+  // KEYS-06
   await test('rotate: new key works, old key stops after grace period', async () => {
     const { svc } = makeService();
     const created = await svc.createKey('user_1', {
@@ -157,7 +166,8 @@ async function main() {
       env: 'live',
       now: () => new Date(t).toISOString(),
     });
-    const rot = await svc2.rotateKey(created.api_key_id);
+    await expectStatus(svc2.rotateKey(created.api_key_id, 'user_2'), 404);
+    const rot = await svc2.rotateKey(created.api_key_id, 'user_1');
     assert.ok(rot.new_key.startsWith('sk_live_'));
     assert.ok(rot.old_key_revoked_at);
     assert.ok(rot.grace_period_ends_at);
@@ -186,7 +196,7 @@ async function main() {
       env: 'live',
       now: () => new Date(t).toISOString(),
     });
-    await svc2.rotateKey(created.api_key_id);
+    await svc2.rotateKey(created.api_key_id, 'user_1');
     t = base.getTime() + 12 * 60 * 60 * 1000;
     const svc3 = new ApiKeyService({
       store: svc.store,
@@ -203,6 +213,7 @@ async function main() {
     await expectStatus(svc4.authenticate(created.key, 'GET', '/deployments'), 401);
   });
 
+  // KEYS-07
   await test('expired key: after expires_at, request returns 401', async () => {
     const { svc } = makeService();
     const created = await svc.createKey('user_1', {
@@ -245,6 +256,7 @@ async function main() {
     assert.strictEqual(neu.is_active, true);
   });
 
+  // KEYS-08
   await test('usage stats: requests counted per endpoint with errors and rate hits', async () => {
     const fixedNow = () => '2026-09-15T12:00:00.000Z';
     const { svc } = makeService({ now: fixedNow });
@@ -264,7 +276,8 @@ async function main() {
     svc._logUsage(created.api_key_id, 'GET', '/deployments', 404);
     svc._logUsage(created.api_key_id, 'GET', '/deployments', 500);
     svc._logUsage(created.api_key_id, 'GET', '/deployments', 429);
-    const stats = svc.getUsageStats(created.api_key_id, '2026-09-01', '2026-09-24');
+    const stats = svc.getUsageStats(created.api_key_id, '2026-09-01', '2026-09-24', 'user_1');
+    assert.throws(() => svc.getUsageStats(created.api_key_id, '2026-09-01', '2026-09-24', 'user_2'), (e) => e.status === 404);
     assert.strictEqual(stats.api_key_id, created.api_key_id);
     assert.strictEqual(stats.total_requests, 53);
     assert.strictEqual(stats.requests_by_endpoint['GET /deployments'], 43);
@@ -275,19 +288,24 @@ async function main() {
     assert.strictEqual(stats.errors['429'], 1);
   });
 
+  // KEYS-09
   await test('admin audit: all keys visible to admin with filters', async () => {
     const { svc } = makeService();
     await svc.createKey('user_1', { name: 'A', scopes: [SCOPES.READ_DEPLOYMENTS] });
     await svc.createKey('user_2', { name: 'B', scopes: [SCOPES.READ_USERS] });
     await svc.createKey('user_1', { name: 'C', scopes: [SCOPES.READ_INVOICES] });
-    const all = svc.adminListKeys();
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the listing is admin-only now; a plain user gets 403.
+    const ADMIN = { id: 'admin_1', role: 'admin' };
+    assert.throws(() => svc.adminListKeys({}, { id: 'user_1' }), (e) => e.status === 403);
+    assert.throws(() => svc.adminListKeys({}), (e) => e.status === 403);
+    const all = svc.adminListKeys({}, ADMIN);
     assert.strictEqual(all.total, 3);
-    const forUser = svc.adminListKeys({ userId: 'user_1' });
+    const forUser = svc.adminListKeys({ userId: 'user_1' }, ADMIN);
     assert.strictEqual(forUser.total, 2);
-    const active = svc.adminListKeys({ status: 'active' });
+    const active = svc.adminListKeys({ status: 'active' }, ADMIN);
     assert.strictEqual(active.total, 3);
-    svc.revokeKey(forUser.keys[0].api_key_id);
-    const activeAfter = svc.adminListKeys({ status: 'active' });
+    svc.revokeKey(forUser.keys[0].api_key_id, 'user_1');
+    const activeAfter = svc.adminListKeys({ status: 'active' }, ADMIN);
     assert.strictEqual(activeAfter.total, 2);
   });
 

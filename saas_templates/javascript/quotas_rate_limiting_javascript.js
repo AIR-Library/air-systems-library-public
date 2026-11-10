@@ -8,16 +8,22 @@ const TIERS = Object.freeze({
   ENTERPRISE: 'enterprise',
 });
 
+/**
+ * Monthly API call limit per tier. -1 means unlimited, as in every quota (QUOTA-13, spec amended 2026-11-10;
+ * enterprise was Infinity here, which no other language returns). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+ */
+const UNLIMITED = -1;
+
 const API_CALL_LIMITS = Object.freeze({
   solo: 1000,
   team: 10000,
-  enterprise: Infinity,
+  enterprise: UNLIMITED,
 });
 
 const STORAGE_LIMITS = Object.freeze({
   solo: 1e9,
   team: 100e9,
-  enterprise: -1,
+  enterprise: UNLIMITED,
 });
 
 const RATE_LIMIT_PER_USER = 100;
@@ -180,13 +186,19 @@ class QuotaManager {
     this.log({ gate, ...payload });
   }
 
+  /**
+   * checkApiCallQuota(userId, tier) -> {pass: true, current, limit}; throws QuotaError 429 quota_exceeded.
+   * PASS when the tier's limit is -1 (unlimited), else when current + 1 <= limit; a PASS increments the month's
+   * call_count. [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] unlimited is -1 (QUOTA-13), not Infinity.
+   * Touches the usage store and the why_chain log.
+   */
   checkApiCallQuota(userId, tier) {
     const now = this.now();
     const month = this._monthKey(now);
     const usage = this.store.getUsage(userId, month);
     const limit = API_CALL_LIMITS[tier];
     const current = usage.call_count;
-    const pass = limit === Infinity || current + 1 <= limit;
+    const pass = limit === UNLIMITED || current + 1 <= limit;
 
     this._logWhyChain('api_quota_check', {
       user_id: userId,
@@ -215,7 +227,7 @@ class QuotaManager {
     const usage = this.store.getUsage(userId, month);
     const limit = STORAGE_LIMITS[tier];
     const current = usage.storage_bytes;
-    const pass = limit === -1 || current + incomingBytes <= limit;
+    const pass = limit === UNLIMITED || current + incomingBytes <= limit;
 
     this._logWhyChain('storage_quota_check', {
       user_id: userId,

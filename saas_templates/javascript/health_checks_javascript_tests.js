@@ -9,6 +9,7 @@ function makeChecker() {
   return new HealthChecker(new InMemoryCheckStore(), { clock: FIXED_CLOCK });
 }
 
+// HEALTH-01
 test('all checks pass returns 200 pass', async () => {
   const checker = makeChecker();
   checker.registerCheck('db', 'datastore', () => true, true, 5000);
@@ -20,6 +21,7 @@ test('all checks pass returns 200 pass', async () => {
   assert.strictEqual(res.body, expected);
 });
 
+// HEALTH-02
 test('critical check fails returns 503 fail', async () => {
   const checker = makeChecker();
   checker.registerCheck('db', 'datastore', () => false, true, 5000);
@@ -31,6 +33,7 @@ test('critical check fails returns 503 fail', async () => {
   assert.strictEqual(res.body, expected);
 });
 
+// HEALTH-03
 test('only non-critical check fails returns 200 warn', async () => {
   const checker = makeChecker();
   checker.registerCheck('db', 'datastore', () => true, true, 5000);
@@ -42,6 +45,7 @@ test('only non-critical check fails returns 200 warn', async () => {
   assert.strictEqual(res.body, expected);
 });
 
+// HEALTH-04
 test('slow check past timeout fails that check', async () => {
   const checker = makeChecker();
   checker.registerCheck('fast', 'component', () => true, false, 5000);
@@ -56,6 +60,7 @@ test('slow check past timeout fails that check', async () => {
   assert.strictEqual(res.body, expected);
 });
 
+// HEALTH-05
 test('liveness stays pass when dependency would fail', async () => {
   let counter = 0;
   const checker = makeChecker();
@@ -70,6 +75,7 @@ test('liveness stays pass when dependency would fail', async () => {
   assert.strictEqual(counter, 1);
 });
 
+// HEALTH-06
 test('output contains no connection string', async () => {
   const checker = makeChecker();
   const connStr = 'postgres://admin:s3cret@db.internal:5432/app';

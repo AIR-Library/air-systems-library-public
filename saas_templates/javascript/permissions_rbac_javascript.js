@@ -9,6 +9,8 @@ const db = {
   themeConfigs: [],
   deploymentLogs: [],
   organizations: [],
+  memberships: [],   // { orgId, userId, role } as in organizations_teams.md (2026-11-10, RBAC-06)
+  invitations: [],   // { id, orgId, email, ... } (2026-11-10, RBAC-06)
   auditLog: []
 };
 
@@ -28,6 +30,7 @@ CREATE TABLE sessions (
 CREATE TABLE api_keys (
   id SERIAL PRIMARY KEY,
   user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  org_id INTEGER NULL REFERENCES organizations(id),  -- NULL = a personal key (kept when an org is deleted)
   key VARCHAR(255) UNIQUE NOT NULL,
   name VARCHAR(255),
   created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
@@ -50,6 +53,18 @@ CREATE TABLE organizations (
   id SERIAL PRIMARY KEY,
   name VARCHAR(255) NOT NULL,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE memberships (
+  org_id INTEGER REFERENCES organizations(id) ON DELETE CASCADE,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  role VARCHAR(20) NOT NULL CHECK (role IN ('owner', 'admin', 'member')),
+  PRIMARY KEY (org_id, user_id)
+);
+CREATE TABLE invitations (
+  id SERIAL PRIMARY KEY,
+  org_id INTEGER REFERENCES organizations(id) ON DELETE CASCADE,
+  email VARCHAR(255) NOT NULL,
+  token_hash CHAR(64) NOT NULL
 );
 CREATE TABLE deployments (
   id SERIAL PRIMARY KEY,
@@ -290,75 +305,66 @@ function deleteDeployment(deploymentId) {
   }
 }
 
-function deleteOrganization(orgId) {
-  const deploymentsToDelete = db.deployments.filter(d => d.orgId === orgId);
-  const usersToDelete = db.users.filter(u => u.organizationId === orgId);
-  const apiKeysToDelete = db.apiKeys.filter(k => {
-    return db.users.some(u => u.id === k.userId && u.organizationId === orgId);
-  });
-
-  let deletedDeployments = [];
-  let deletedUsers = [];
-  let deletedApiKeys = [];
-
+/**
+ * Run fn as one transaction over the in-memory tables: every table array is copied first and, if fn throws, every
+ * table is put back as it was (no partial deletes, RBAC-07) and the error is rethrown.
+ * In: fn() -> result. Out: fn's result. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches every in-memory table.
+ */
+function inTransaction(fn) {
+  const snapshot = {};
+  for (const name of Object.keys(db)) snapshot[name] = db[name].slice();
   try {
-    deploymentsToDelete.forEach(deployment => {
-      const index = db.deployments.indexOf(deployment);
-      if (index !== -1) {
-        db.deployments.splice(index, 1);
-        deletedDeployments.push(deployment);
-      }
-    });
+    return fn();
+  } catch (error) {
+    for (const name of Object.keys(snapshot)) db[name] = snapshot[name];
+    throw error;
+  }
+}
 
-    usersToDelete.forEach(user => {
-      const index = db.users.indexOf(user);
-      if (index !== -1) {
-        db.users.splice(index, 1);
-        deletedUsers.push(user);
-      }
-    });
-
-    apiKeysToDelete.forEach(key => {
-      const index = db.apiKeys.indexOf(key);
-      if (index !== -1) {
-        db.apiKeys.splice(index, 1);
-        deletedApiKeys.push(key);
-      }
-    });
-
-    const orgToDelete = db.organizations.find(o => o.id === orgId);
-    let deletedOrganization = null;
-    if (orgToDelete) {
-      const index = db.organizations.indexOf(orgToDelete);
-      if (index !== -1) {
-        db.organizations.splice(index, 1);
-        deletedOrganization = orgToDelete;
-      }
-    }
-
-    const deletedItems = {
-      deployments: deletedDeployments.length,
-      users: deletedUsers.length,
-      apiKeys: deletedApiKeys.length,
-      organization: deletedOrganization ? 1 : 0
+/**
+ * deleteOrganization(caller, orgId) -> { success: true, deletedItems } | { success: false, error: 'not_found', code: 404 }.
+ * In: caller is the VERIFIED user (req.user from the auth layer, never a request field) and the org id.
+ * Gate: the caller must have a membership row (orgId, caller.id) with role 'owner'; anyone else, including a global
+ * owner/admin tier, an owner of another org, or no caller, gets 404 so the org's existence is not revealed.
+ * Deletes in one transaction: the org's deployments with their dns records, theme configs and logs; API keys whose
+ * orgId is this org; all its invitations and membership rows; then the org; logs 'org_deleted_cascade' with
+ * {deployments, api_keys, invitations, memberships}. Never deletes a user account, a session, a personal API key
+ * (no orgId) or another org's membership. A failure rolls everything back and is rethrown.
+ * Why: RBAC-06 amended 2026-11-10 after review on PR 19 (the old cascade deleted every member's user account and all
+ * their keys, and anyone could call it). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+ * Touches: organizations, deployments and their child tables, apiKeys, invitations, memberships, auditLog.
+ */
+function deleteOrganization(caller, orgId) {
+  const callerId = caller && caller.id !== undefined && caller.id !== null ? caller.id : null;
+  const isOwner = callerId !== null &&
+    db.memberships.some(m => m.orgId === orgId && m.userId === callerId && m.role === 'owner');
+  if (!isOwner) {
+    return { success: false, error: 'not_found', message: 'Organization not found', code: 404 };
+  }
+  return inTransaction(() => {
+    const depIds = new Set(db.deployments.filter(d => d.orgId === orgId).map(d => d.id));
+    const counts = {
+      deployments: depIds.size,
+      api_keys: db.apiKeys.filter(k => k.orgId === orgId).length,
+      invitations: db.invitations.filter(i => i.orgId === orgId).length,
+      memberships: db.memberships.filter(m => m.orgId === orgId).length
     };
-
+    db.dnsRecords = db.dnsRecords.filter(r => !depIds.has(r.deploymentId));
+    db.themeConfigs = db.themeConfigs.filter(c => !depIds.has(c.deploymentId));
+    db.deploymentLogs = db.deploymentLogs.filter(l => !depIds.has(l.deploymentId));
+    db.deployments = db.deployments.filter(d => !depIds.has(d.id));
+    db.apiKeys = db.apiKeys.filter(k => k.orgId !== orgId);
+    db.invitations = db.invitations.filter(i => i.orgId !== orgId);
+    db.memberships = db.memberships.filter(m => m.orgId !== orgId);
+    db.organizations = db.organizations.filter(o => o.id !== orgId);
     auditLog({
       action: 'org_deleted_cascade',
       orgId,
-      deletedItems
+      userId: callerId,
+      deletedItems: counts
     });
-
-    return { success: true, deletedItems };
-  } catch (error) {
-    if (deletedOrganization) {
-      db.organizations.push(deletedOrganization);
-    }
-    deletedApiKeys.forEach(key => db.apiKeys.push(key));
-    deletedUsers.forEach(user => db.users.push(user));
-    deletedDeployments.forEach(deployment => db.deployments.push(deployment));
-    throw error;
-  }
+    return { success: true, deletedItems: counts };
+  });
 }
 
 function getUserById(id) {
@@ -398,6 +404,8 @@ module.exports = {
     db.themeConfigs = [];
     db.deploymentLogs = [];
     db.organizations = [];
+    db.memberships = [];
+    db.invitations = [];
     db.auditLog = [];
   }
 };

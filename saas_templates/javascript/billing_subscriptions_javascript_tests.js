@@ -84,6 +84,7 @@ describe('Billing System', function() {
   });
 
   describe('create_subscription', () => {
+    // BILL-01
     it('should create subscription successfully', async () => {
       const stripeStub = sinon.stub(billingSystem.__stripeInstance.subscriptions, 'create').resolves({
         id: 'sub_123',
@@ -113,6 +114,7 @@ describe('Billing System', function() {
       stripeStub.restore();
     });
 
+    // BILL-02
     it('should return invalid_tier for invalid tier', async () => {
       const result = await billingSystem.create_subscription('cus_123', 'invalid');
       assert.strictEqual(result.error, 'invalid_tier');
@@ -120,54 +122,113 @@ describe('Billing System', function() {
   });
 
   describe('change_plan', () => {
-    it('should change plan successfully', async () => {
-      // Setup existing subscription
-      await db.createSubscription({
-        stripe_subscription_id: 'sub_123',
-        customer_id: 'cus_123',
-        tier: 'solo',
-        status: 'active',
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-        cancelled_at: null
-      });
+    /** Seeds one solo subscription 'sub_123' in the mock db. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+    const seedSolo = () => db.createSubscription({
+      stripe_subscription_id: 'sub_123',
+      customer_id: 'cus_123',
+      tier: 'solo',
+      status: 'active',
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      cancelled_at: null
+    });
 
+    // BILL-03
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the update must carry the existing item id (spec amended);
+    // a bare {price} adds a second item and bills both plans. The test now checks the exact update arguments.
+    it('should change plan successfully, updating the existing item with proration', async () => {
+      await seedSolo();
+      const retrieveStub = sinon.stub(billingSystem.__stripeInstance.subscriptions, 'retrieve').resolves({
+        id: 'sub_123',
+        items: { data: [{ id: 'si_existing', price: { id: 'price_solo_placeholder' } }] }
+      });
       const stripeStub = sinon.stub(billingSystem.__stripeInstance.subscriptions, 'update').resolves({
         id: 'sub_123',
         status: 'active',
-        billing_cycle_anchor: Math.floor(Date.now() / 1000) + 86400, // 1 day from now
-        items: { data: [{ price: { lookup_key: 'team', id: 'price_team' } }] }
+        billing_cycle_anchor: 1767225600,
+        items: { data: [{ id: 'si_existing', price: { lookup_key: 'team', id: 'price_team_placeholder' } }] },
+        latest_invoice: { lines: { data: [
+          { proration: true, amount: -450 },
+          { proration: true, amount: 2900 },
+          { proration: false, amount: -100 }
+        ] } }
       });
 
       const result = await billingSystem.change_plan('sub_123', 'team');
-      
+
       assert.strictEqual(result.success, true);
       assert.strictEqual(result.old_tier, 'solo');
       assert.strictEqual(result.new_tier, 'team');
-      assert.ok(result.effective_date);
-      assert.strictEqual(result.proration_credit, '0');
-      
+      assert.strictEqual(result.effective_date, '2026-01-01T00:00:00.000Z');
+      assert.strictEqual(result.proration_credit, '450');
+
+      assert.ok(retrieveStub.calledOnceWith('sub_123'));
+      assert.ok(stripeStub.calledOnce);
+      assert.ok(retrieveStub.calledBefore(stripeStub));
+      assert.deepStrictEqual(stripeStub.firstCall.args, ['sub_123', {
+        items: [{ id: 'si_existing', price: 'price_team_placeholder' }],
+        proration_behavior: 'create_prorations'
+      }]);
+
       const sub = await db.getSubscriptionByStripeId('sub_123');
       assert.strictEqual(sub.tier, 'team');
       assert.strictEqual(sub.status, 'active');
-      
+
       const auditLog = db.getAuditLog();
       const planChangedLog = auditLog.find(log => log.action === 'plan_changed');
       assert.ok(planChangedLog);
-      assert.strictEqual(planChangedLog.action, 'plan_changed');
       assert.strictEqual(planChangedLog.old_tier, 'solo');
       assert.strictEqual(planChangedLog.new_tier, 'team');
-      
+      assert.strictEqual(planChangedLog.proration_credits, 450);
+
+      retrieveStub.restore();
       stripeStub.restore();
     });
 
-    it('should return invalid_tier for invalid new tier', async () => {
-      const result = await billingSystem.change_plan('sub_123', 'invalid');
-      assert.strictEqual(result.error, 'invalid_tier');
+    // BILL-03
+    it('should return invalid_tier for invalid new tier before any Stripe call', async () => {
+      await seedSolo();
+      const retrieveStub = sinon.stub(billingSystem.__stripeInstance.subscriptions, 'retrieve').resolves({});
+      const updateStub = sinon.stub(billingSystem.__stripeInstance.subscriptions, 'update').resolves({});
+      for (const tier of ['invalid', 'constructor', '__proto__']) {
+        const result = await billingSystem.change_plan('sub_123', tier);
+        assert.strictEqual(result.error, 'invalid_tier');
+        assert.strictEqual(result.status, 400);
+      }
+      assert.strictEqual(retrieveStub.callCount, 0);
+      assert.strictEqual(updateStub.callCount, 0);
+      retrieveStub.restore();
+      updateStub.restore();
+    });
+
+    /**
+     * BILL-03: a subscription with zero or two items is 409 subscription_item_ambiguous and Stripe is never updated,
+     * so a plan change can never leave a customer billed for two plans. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches only stubs and the mock db.
+     */
+    // BILL-03
+    it('should return subscription_item_ambiguous unless the subscription has exactly one item', async () => {
+      await seedSolo();
+      const updateStub = sinon.stub(billingSystem.__stripeInstance.subscriptions, 'update').resolves({});
+      for (const data of [[], [{ id: 'si_a' }, { id: 'si_b' }]]) {
+        const retrieveStub = sinon.stub(billingSystem.__stripeInstance.subscriptions, 'retrieve').resolves({
+          id: 'sub_123', items: { data }
+        });
+        const result = await billingSystem.change_plan('sub_123', 'team');
+        assert.strictEqual(result.error, 'subscription_item_ambiguous');
+        assert.strictEqual(result.status, 409);
+        retrieveStub.restore();
+      }
+      assert.strictEqual(updateStub.callCount, 0);
+      const sub = await db.getSubscriptionByStripeId('sub_123');
+      assert.strictEqual(sub.tier, 'solo');
+      assert.ok(!db.getAuditLog().some(log => log.action === 'plan_changed'));
+      updateStub.restore();
     });
   });
 
   describe('queue_refund', () => {
+    // BILL-04
     it('should queue refund successfully', async () => {
       // Setup invoice
       await db.createInvoice({
@@ -200,6 +261,7 @@ describe('Billing System', function() {
       assert.strictEqual(refundQueuedLog.reason, 'Customer request');
     });
 
+    // BILL-05
     it('should return refund_exceeds_invoice when amount exceeds invoice', async () => {
       await db.createInvoice({
         stripe_invoice_id: 'in_123',
@@ -228,6 +290,7 @@ describe('Billing System', function() {
   });
 
   describe('handle_stripe_webhook', () => {
+    // BILL-06
     it('should handle payment_succeeded event', async () => {
       const payload = JSON.stringify({
         type: 'invoice.payment_succeeded',
@@ -272,6 +335,7 @@ describe('Billing System', function() {
       stripeStub.restore();
     });
 
+    // BILL-07
     it('should handle duplicate event with idempotency', async () => {
       const payload = JSON.stringify({
         type: 'invoice.payment_succeeded',
@@ -281,6 +345,7 @@ describe('Billing System', function() {
 
       // First call
       const stripeStub = sinon.stub(billingSystem.__stripeInstance.webhooks, 'constructEvent').returns({
+        id: 'evt_dup_1',
         type: 'invoice.payment_succeeded',
         data: { object: { id: 'in_123', customer: 'cus_123', amount_paid: 999, status: 'paid' } }
       });
@@ -294,10 +359,13 @@ describe('Billing System', function() {
       // Should only have one invoice record
       const invoices = await db.getInvoiceByStripeId('in_123');
       assert.ok(invoices);
+      // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: prove the second delivery was not processed again (one audit row).
+      assert.strictEqual(db.getAuditLog().filter(log => log.action === 'payment_succeeded').length, 1);
       
       stripeStub.restore();
     });
 
+    // BILL-08
     it('should handle subscription_updated event', async () => {
       const payload = JSON.stringify({
         type: 'customer.subscription.updated',
@@ -353,6 +421,7 @@ describe('Billing System', function() {
       stripeStub.restore();
     });
 
+    // BILL-09
     it('should return invalid_signature for bad signature', async () => {
       const payload = '{}';
       const signature = 'bad_signature';
@@ -367,6 +436,7 @@ describe('Billing System', function() {
       stripeStub.restore();
     });
 
+    // BILL-10
     it('should respond within 3 seconds (simulated by quick processing)', async () => {
       const start = Date.now();
       const payload = JSON.stringify({

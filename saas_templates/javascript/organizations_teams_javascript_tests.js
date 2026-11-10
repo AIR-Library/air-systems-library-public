@@ -6,6 +6,7 @@ function makeUser(id, email) {
   return { id, email };
 }
 
+// ORG-01
 test('a non-member cannot read members of another org (IDOR attempt by id)', () => {
   const store = new InMemoryStore();
   const system = new OrganizationsTeams(store);
@@ -23,6 +24,7 @@ test('a non-member cannot read members of another org (IDOR attempt by id)', () 
   assert.strictEqual(getResult.status, 404);
 });
 
+// ORG-02
 test('a member cannot invite; an admin can', () => {
   const store = new InMemoryStore();
   const system = new OrganizationsTeams(store);
@@ -49,6 +51,7 @@ test('a member cannot invite; an admin can', () => {
   assert.strictEqual(adminInvite.status, 201);
 });
 
+// ORG-03
 test('an admin cannot remove the owner; the last owner cannot leave', () => {
   const store = new InMemoryStore();
   const system = new OrganizationsTeams(store);
@@ -71,6 +74,7 @@ test('an admin cannot remove the owner; the last owner cannot leave', () => {
   assert.strictEqual(leaveOwner.status, 400);
 });
 
+// ORG-04
 test('an invitation works once; the second use fails', () => {
   const store = new InMemoryStore();
   const system = new OrganizationsTeams(store);
@@ -92,6 +96,7 @@ test('an invitation works once; the second use fails', () => {
   assert.strictEqual(secondAccept.status, 410);
 });
 
+// ORG-05
 test('an expired invitation fails; accepting with a different email fails', () => {
   const store = new InMemoryStore();
   const system = new OrganizationsTeams(store);
@@ -123,6 +128,7 @@ test('an expired invitation fails; accepting with a different email fails', () =
   assert.strictEqual(wrongResult.status, 403);
 });
 
+// ORG-06
 test('the raw token is not stored anywhere in the database', () => {
   const store = new InMemoryStore();
   const system = new OrganizationsTeams(store);
