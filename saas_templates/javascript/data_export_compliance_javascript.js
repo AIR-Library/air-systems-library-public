@@ -33,6 +33,7 @@
 const crypto = require('crypto');
 const express = require('express');
 const jwt = require('jsonwebtoken');
+const { rateLimit } = require('express-rate-limit');
 const nodemailer = require('nodemailer');
 const sqlite3 = require('sqlite3');
 const util = require('util');
@@ -417,6 +418,24 @@ function createComplianceService(options = {}) {
   }
 
   const app = express();
+  /**
+   * Limits how often one address can call the compliance API, before the token check or any database read runs.
+   * In: options.rateLimit (requests per 15 minutes; default COMPLIANCE_RATE_LIMIT or 300). Out: 429 past the limit.
+   * Why: code scanning alert js/missing-rate-limiting on PR 19 (the authorization middleware reads the database for
+   * every request, so one client could flood it or guess tokens). Same limiter as admin_system. 2026-11-10,
+   * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only, one counter per address; with more than one server, give
+   * it a shared store such as Redis. Behind a proxy set TRUST_PROXY to the number of proxies, as in admin_system.
+   */
+  const complianceLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: Number(options.rateLimit) || Number(process.env.COMPLIANCE_RATE_LIMIT) || 300,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+  });
+  if (process.env.TRUST_PROXY) {
+    app.set('trust proxy', Number(process.env.TRUST_PROXY) || process.env.TRUST_PROXY);
+  }
+  app.use(complianceLimiter);
   app.use(express.json({ limit: '10kb' }));
 
   /**
