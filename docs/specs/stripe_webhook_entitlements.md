@@ -103,6 +103,9 @@ ENDPOINTS / FUNCTIONS (the checks run in the order written; the first that fails
          count, because parsers do not tell them from 1700000000. 1700000000.5, -1, 1e400 and 100000000000 do
          not. Read it as the language's number and test: it is finite, it equals its floor, it is in range.
          (Python: the type is int or float and not bool.)
+         A body holding any number that is not finite in the language's double (1e400 anywhere, not only in a
+         TIME field) is 400 invalid_payload as a whole: some parsers refuse it while parsing, so every language
+         refuses it. Amended 2026-11-10 (Phase B.4, found by the Rust implementer).
       7. CLAIM: insert stripe_events (event_id, type, created, received_at = now). The id is already there
                                                             -> {status: 200, received: true, result: "duplicate"}
       8. result = APPLY(event). Store it in the event's row -> {status: 200, received: true, result}
