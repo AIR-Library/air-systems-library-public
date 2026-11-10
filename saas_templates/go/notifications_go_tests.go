@@ -35,13 +35,20 @@ func (f *failingEmailProvider) Send(ctx context.Context, to, subject, bodyText, 
 	return nil
 }
 
+// testNoon is the fixed instant the service clock reads in tests: midday, outside the default
+// 22:00-08:00 quiet hours. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: with the wall
+// clock every send was "queued" whenever the suite ran at night (it failed at 04:25).
+func testNoon() time.Time { return time.Date(2026, time.January, 15, 12, 0, 0, 0, time.Local) }
+
 func setupService(t *testing.T) (*Service, *sql.DB) {
 	t.Helper()
 	db, err := sql.Open("sqlite3", ":memory:")
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
+	db.SetMaxOpenConns(1) // every new connection to :memory: would be a separate, empty database
 	s := NewService(db, NullEmailProvider{}, NullSMSProvider{})
+	s.SetClock(testNoon)
 	if err := s.InitDB(context.Background()); err != nil {
 		t.Fatalf("init db: %v", err)
 	}
@@ -166,8 +173,8 @@ func TestQuietHoursSkip(t *testing.T) {
 	s, _ := setupService(t)
 	ctx := context.Background()
 
-	// Set quiet hours to cover current time
-	now := time.Now()
+	// Set quiet hours to cover the service's current time
+	now := s.now()
 	start := now.Add(-1 * time.Hour).Format("15:04")
 	end := now.Add(1 * time.Hour).Format("15:04")
 
@@ -259,8 +266,10 @@ func TestRetryFailedEmail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
+	db.SetMaxOpenConns(1) // every new connection to :memory: would be a separate, empty database
 	provider := &failingEmailProvider{failures: 2}
 	s := NewService(db, provider, NullSMSProvider{})
+	s.SetClock(testNoon) // outside the default quiet hours, whatever the time of day
 	if err := s.InitDB(context.Background()); err != nil {
 		t.Fatalf("init db: %v", err)
 	}

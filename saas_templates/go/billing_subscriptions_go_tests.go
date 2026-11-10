@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,10 +15,38 @@ import (
 	"time"
 
 	"github.com/stripe/stripe-go/v76"
-	"github.com/stripe/stripe-go/v76/invoice"
-	"github.com/stripe/stripe-go/v76/subscription"
 	_ "github.com/mattn/go-sqlite3"
 )
+
+// fakeStripe is the in-memory StripeAPI the tests use: it records calls and never touches the
+// network. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (the tests called
+// stripe.GetClient(), which does not exist in any stripe-go release).
+type fakeStripe struct {
+	created []string // "customer|price"
+	changed []string // "subscription|price"
+	credit  int64
+}
+
+// CreateSubscription records the call and returns a subscription with a sequential fake id.
+func (f *fakeStripe) CreateSubscription(_ context.Context, customerID, priceID string) (*stripe.Subscription, error) {
+	f.created = append(f.created, customerID+"|"+priceID)
+	return &stripe.Subscription{ID: fmt.Sprintf("sub_fake_%d", len(f.created)), Status: "active"}, nil
+}
+
+// ChangeSubscriptionPrice records the call and returns the configured proration credit.
+func (f *fakeStripe) ChangeSubscriptionPrice(_ context.Context, subscriptionID, priceID string) (int64, error) {
+	f.changed = append(f.changed, subscriptionID+"|"+priceID)
+	return f.credit, nil
+}
+
+// signed configures a webhook secret for this test and returns a valid Stripe-Signature header for
+// payload. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: the spec requires every webhook
+// to be verified with STRIPE_WEBHOOK_SECRET before processing, so unsigned calls are now rejected.
+func signed(t *testing.T, payload []byte) string {
+	t.Helper()
+	t.Setenv("STRIPE_WEBHOOK_SECRET", "whsec_unit")
+	return sign(payload, "whsec_unit")
+}
 
 func newTestService(t *testing.T) *BillingService {
 	t.Helper()
@@ -25,7 +54,8 @@ func newTestService(t *testing.T) *BillingService {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := NewBillingServiceWithClient(db, stripe.GetClient())
+	db.SetMaxOpenConns(1) // every new connection to :memory: would be a separate, empty database
+	svc := NewBillingServiceWithClient(db, &fakeStripe{credit: 250})
 	if err := svc.Migrate(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -52,6 +82,9 @@ func TestCreateSubscriptionHappyPath(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("expected 1 subscription row, got %d", count)
+	}
+	if f := svc.stripe.(*fakeStripe); len(f.created) != 1 || f.created[0] != "cus_123|"+PriceID["solo"] {
+		t.Fatalf("expected one Stripe create for cus_123 at the solo price, got %v", f.created)
 	}
 }
 
@@ -93,6 +126,12 @@ func TestChangePlanHappyPath(t *testing.T) {
 	}
 	if tier != "team" {
 		t.Fatalf("expected tier team, got %s", tier)
+	}
+	if f := svc.stripe.(*fakeStripe); len(f.changed) != 1 || f.changed[0] != "sub_abc|"+PriceID["team"] {
+		t.Fatalf("expected one Stripe update of sub_abc to the team price, got %v", f.changed)
+	}
+	if res["proration_credit"] != int64(250) {
+		t.Fatalf("expected the proration credit from Stripe (250), got %v", res["proration_credit"])
 	}
 }
 
@@ -146,7 +185,7 @@ func buildEvent(t *testing.T, id, typ string, raw interface{}) []byte {
 	event := stripe.Event{
 		ID:   id,
 		Type: stripe.EventType(typ),
-		Data: stripe.EventData{Raw: rawBytes},
+		Data: &stripe.EventData{Raw: rawBytes},
 	}
 	b, _ := json.Marshal(event)
 	return b
@@ -155,9 +194,9 @@ func buildEvent(t *testing.T, id, typ string, raw interface{}) []byte {
 func TestHandleWebhookPaymentSucceeded(t *testing.T) {
 	svc := newTestService(t)
 	ctx := context.Background()
-	inv := invoice.Invoice{ID: "in_100", Customer: &stripe.Customer{ID: "cus_9"}, AmountPaid: 999}
+	inv := stripe.Invoice{ID: "in_100", Customer: &stripe.Customer{ID: "cus_9"}, AmountPaid: 999}
 	payload := buildEvent(t, "evt_1", "invoice.payment_succeeded", inv)
-	res, err := svc.HandleStripeWebhook(ctx, payload, "")
+	res, err := svc.HandleStripeWebhook(ctx, payload, signed(t, payload))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -183,12 +222,13 @@ func TestHandleWebhookPaymentSucceeded(t *testing.T) {
 func TestHandleWebhookDuplicateEvent(t *testing.T) {
 	svc := newTestService(t)
 	ctx := context.Background()
-	inv := invoice.Invoice{ID: "in_200", Customer: &stripe.Customer{ID: "cus_9"}, AmountPaid: 500}
+	inv := stripe.Invoice{ID: "in_200", Customer: &stripe.Customer{ID: "cus_9"}, AmountPaid: 500}
 	payload := buildEvent(t, "evt_dup", "invoice.payment_succeeded", inv)
-	if _, err := svc.HandleStripeWebhook(ctx, payload, ""); err != nil {
+	sig := signed(t, payload)
+	if _, err := svc.HandleStripeWebhook(ctx, payload, sig); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.HandleStripeWebhook(ctx, payload, ""); err != nil {
+	if _, err := svc.HandleStripeWebhook(ctx, payload, sig); err != nil {
 		t.Fatal(err)
 	}
 	var auditCount int
@@ -210,14 +250,14 @@ func TestHandleWebhookSubscriptionUpdated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sub := subscription.Subscription{
+	sub := stripe.Subscription{
 		ID:       "sub_upd",
 		Customer: &stripe.Customer{ID: "cus_9"},
 		Status:   "active",
-		Items:    &stripe.SubscriptionItemList{Data: []stripe.SubscriptionItem{{Price: &stripe.Price{LookupKey: "team"}}}},
+		Items:    &stripe.SubscriptionItemList{Data: []*stripe.SubscriptionItem{{Price: &stripe.Price{LookupKey: "team"}}}},
 	}
 	payload := buildEvent(t, "evt_upd", "customer.subscription.updated", sub)
-	if _, err := svc.HandleStripeWebhook(ctx, payload, ""); err != nil {
+	if _, err := svc.HandleStripeWebhook(ctx, payload, signed(t, payload)); err != nil {
 		t.Fatal(err)
 	}
 	var tier, status string
@@ -233,7 +273,7 @@ func TestWebhookInvalidSignature(t *testing.T) {
 	svc := newTestService(t)
 	os.Setenv("STRIPE_WEBHOOK_SECRET", "whsec_test")
 	defer os.Unsetenv("STRIPE_WEBHOOK_SECRET")
-	inv := invoice.Invoice{ID: "in_300", Customer: &stripe.Customer{ID: "cus_9"}, AmountPaid: 100}
+	inv := stripe.Invoice{ID: "in_300", Customer: &stripe.Customer{ID: "cus_9"}, AmountPaid: 100}
 	payload := buildEvent(t, "evt_sig", "invoice.payment_succeeded", inv)
 	_, err := svc.HandleStripeWebhook(context.Background(), payload, "t=123,v1=deadbeef")
 	if err == nil {
@@ -247,10 +287,11 @@ func TestWebhookInvalidSignature(t *testing.T) {
 
 func TestWebhookResponseTime(t *testing.T) {
 	svc := newTestService(t)
-	inv := invoice.Invoice{ID: "in_400", Customer: &stripe.Customer{ID: "cus_9"}, AmountPaid: 100}
+	inv := stripe.Invoice{ID: "in_400", Customer: &stripe.Customer{ID: "cus_9"}, AmountPaid: 100}
 	payload := buildEvent(t, "evt_fast", "invoice.payment_succeeded", inv)
+	sig := signed(t, payload)
 	start := time.Now()
-	res, err := svc.HandleStripeWebhook(context.Background(), payload, "")
+	res, err := svc.HandleStripeWebhook(context.Background(), payload, sig)
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatal(err)
@@ -277,7 +318,7 @@ func TestWebhookValidSignature(t *testing.T) {
 	svc := newTestService(t)
 	os.Setenv("STRIPE_WEBHOOK_SECRET", "whsec_ok")
 	defer os.Unsetenv("STRIPE_WEBHOOK_SECRET")
-	inv := invoice.Invoice{ID: "in_500", Customer: &stripe.Customer{ID: "cus_9"}, AmountPaid: 100}
+	inv := stripe.Invoice{ID: "in_500", Customer: &stripe.Customer{ID: "cus_9"}, AmountPaid: 100}
 	payload := buildEvent(t, "evt_ok", "invoice.payment_succeeded", inv)
 	sig := sign(payload, "whsec_ok")
 	res, err := svc.HandleStripeWebhook(context.Background(), payload, sig)
@@ -294,7 +335,7 @@ func TestHTTPHandler(t *testing.T) {
 	svc := newTestService(t)
 	os.Setenv("STRIPE_WEBHOOK_SECRET", "whsec_http")
 	defer os.Unsetenv("STRIPE_WEBHOOK_SECRET")
-	inv := invoice.Invoice{ID: "in_600", Customer: &stripe.Customer{ID: "cus_9"}, AmountPaid: 100}
+	inv := stripe.Invoice{ID: "in_600", Customer: &stripe.Customer{ID: "cus_9"}, AmountPaid: 100}
 	payload := buildEvent(t, "evt_http", "invoice.payment_succeeded", inv)
 	sig := sign(payload, "whsec_http")
 
@@ -355,7 +396,7 @@ type stringsReaderType struct {
 
 func (r *stringsReaderType) Read(p []byte) (int, error) {
 	if r.pos >= len(r.b) {
-		return 0, fmt.Errorf("EOF")
+		return 0, io.EOF // the io.Reader contract: a custom "EOF" error makes net/http abort the request
 	}
 	n := copy(p, r.b[r.pos:])
 	r.pos += n

@@ -2,13 +2,27 @@ package admin
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strconv"
 	"testing"
+	"time"
 )
+
+// fakeBilling is the in-memory PlanChanger the tests install instead of Stripe: it records each
+// call and never touches the network. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.
+type fakeBilling struct {
+	calls []string // "subscriptionID->tier"
+}
+
+// ChangePlan records the call and succeeds. Inputs: subscription id, tier. Output: nil.
+// Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+func (f *fakeBilling) ChangePlan(_ context.Context, subscriptionID, tier string) error {
+	f.calls = append(f.calls, subscriptionID+"->"+tier)
+	return nil
+}
 
 func setupTestEnv(t *testing.T) *http.ServeMux {
 	if err := InitDB(":memory:"); err != nil {
@@ -98,7 +112,7 @@ func TestCreateUserDuplicateEmail(t *testing.T) {
 
 func TestCreateUserNonOwner(t *testing.T) {
 	mux := setupTestEnv(t)
-	ownerID := seedOwner(t)
+	seedOwner(t) // an owner exists; the caller below is an admin
 	// create a non-owner user
 	_, _ = db.Exec(`INSERT INTO users (email,name,role,status,created_at) VALUES (?,?,?,?,?)`,
 		"admin@example.com", "Admin", "admin", "active", time.Now().UTC())
@@ -302,8 +316,12 @@ func TestCustomersDetail(t *testing.T) {
 }
 
 func TestChangePlanStripeCalled(t *testing.T) {
-	// Use a mock stripe client by setting env var to dummy key (stripe lib will error if called)
-	os.Setenv("STRIPE_SECRET_KEY", "sk_test_dummy")
+	// Stripe sits behind the PlanChanger interface; the in-memory fake proves it was called without
+	// any network call (a dummy key against the real API can only fail).
+	fake := &fakeBilling{}
+	prev := Billing
+	Billing = fake
+	defer func() { Billing = prev }()
 	mux := setupTestEnv(t)
 	ownerID := seedOwner(t)
 	_, _ = db.Exec(`INSERT INTO customers (email,name,tier,signup_date,invoice_count,status,stripe_subscription_id) VALUES (?,?,?,?,?,?,?)`,
@@ -324,6 +342,9 @@ func TestChangePlanStripeCalled(t *testing.T) {
 	_ = json.NewDecoder(resp.Body).Decode(&out)
 	if out["new_tier"] != "admin" {
 		t.Fatalf("plan not changed")
+	}
+	if len(fake.calls) != 1 || fake.calls[0] != "sub_123->admin" {
+		t.Fatalf("expected one Stripe plan change for sub_123 to admin, got %v", fake.calls)
 	}
 }
 
