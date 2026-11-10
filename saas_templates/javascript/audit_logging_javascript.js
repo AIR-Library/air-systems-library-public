@@ -171,7 +171,9 @@ class AuditLogger {
 
   /**
    * log(entry) -> { success: true, log_id }. Throws AuditError 400 on invalid input. Spec endpoint 1, rules:
-   *   - action and resource_type are required; actor_type is 'user' | 'service' | 'api_key' (default 'user');
+   *   - action and resource_type are required; actor_type must be 'user' | 'service' | 'api_key' (missing or
+   *     anything else: 400 invalid_actor_type); a 'user' actor needs actor_id (400 actor_required); a 'service'
+   *     actor needs actor_service (400 actor_service_required);
    *   - metadata may hold only feature_flag and erased_rows (400 metadata_key_not_allowed);
    *   - the data subject: for resource_type 'user' the resource_id (a different subject_user_id is 400
    *     subject_mismatch); for every other resource_type subject_user_id is REQUIRED, a user id or 'none'
@@ -179,18 +181,28 @@ class AuditLogger {
    *   - an 'api_key' entry requires actor_user_id, the key's owner (400 actor_user_required);
    *   - with a subject, resource_id, old_value, new_value and why_chain_id go in its 'subject' row, not in audit_log;
    *     for a 'user' or 'api_key' actor, {actor_id, ip, user_agent, request_id} go in its 'actor' row;
-   *     a 'service' actor is named in actor_service (entry.actor_service, else entry.actor_id).
+   *     a 'service' actor is named in actor_service.
    * Subject, entry and personal rows are written in one synchronous step.
    * In: { actor_id, actor_type, actor_service, actor_user_id, subject_user_id, action, resource_type, resource_id,
    * old_value, new_value, why_chain_id, ip, user_agent, request_id, metadata }.
-   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUDIT-08/10). Touches memory.
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUDIT-08/10). Changed the same day (Phase B.2, audit spec "Refusals
+   * by log()"): a missing actor_type is refused instead of defaulting to 'user', a 'user' actor without actor_id is
+   * actor_required, and a 'service' actor without actor_service is actor_service_required (it fell back to actor_id,
+   * then to 'unknown'). Touches memory.
    */
   async log(entry) {
     const e = entry || {};
     if (!e.action) throw new AuditError(400, 'action_required', 'action is required');
     if (!e.resource_type) throw new AuditError(400, 'resource_type_required', 'resource_type is required');
-    const actorType = e.actor_type == null ? 'user' : e.actor_type;
-    if (!ACTOR_TYPES.includes(actorType)) throw new AuditError(400, 'invalid_actor_type', 'invalid actor_type');
+    const actorType = e.actor_type;
+    if (!ACTOR_TYPES.includes(actorType)) {
+      throw new AuditError(400, 'invalid_actor_type', "actor_type must be 'user', 'service' or 'api_key'");
+    }
+    const blank = (v) => v == null || String(v).trim() === '';
+    if (actorType === 'user' && blank(e.actor_id)) throw new AuditError(400, 'actor_required', 'a user actor needs actor_id');
+    if (actorType === 'service' && blank(e.actor_service)) {
+      throw new AuditError(400, 'actor_service_required', 'a service actor needs actor_service');
+    }
     let metadata = null;
     if (e.metadata != null) {
       if (typeof e.metadata !== 'object' || Array.isArray(e.metadata)) {
@@ -224,7 +236,7 @@ class AuditLogger {
         throw new AuditError(400, 'actor_user_required', 'an api_key entry needs actor_user_id (the key owner)');
       }
       actorUser = String(e.actor_user_id);
-    } else if (actorType === 'user' && e.actor_id != null) {
+    } else if (actorType === 'user') {
       actorUser = String(e.actor_id);
     }
 
@@ -238,7 +250,7 @@ class AuditLogger {
       id: logId,
       timestamp,
       actor_type: actorType,
-      actor_service: actorType === 'service' ? String(e.actor_service != null ? e.actor_service : (e.actor_id != null ? e.actor_id : 'unknown')) : null,
+      actor_service: actorType === 'service' ? String(e.actor_service) : null,
       action: String(e.action),
       resource_type: String(e.resource_type),
       resource_id: subjectUser === null && e.resource_id != null ? String(e.resource_id) : null,
@@ -510,11 +522,13 @@ class AuditLogger {
   }
 
   /**
-   * replay(logId, currentState, caller) -> { log_id, timestamp, resource_state_at_time, has_diverged }. Admin-only.
-   * has_diverged: a later entry on the same resource exists (later time, or same time written after), or
-   * currentState differs from the entry's new_value. An entry whose subject row is erased returns
-   * { log_id, timestamp, erased: true, resource_state_at_time: null, has_diverged: null }. Throws for an unknown id.
-   * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] admin gate, erased replay. Touches memory (read).
+   * replay(logId, currentState, caller) -> { log_id, timestamp, erased, resource_state_at_time, has_diverged }.
+   * Admin-only. has_diverged: a later entry on the same resource exists (later time, or same time written after), or
+   * currentState differs from the entry's new_value. erased reflects the entry's own 'subject' row: an entry whose
+   * subject row is gone returns { log_id, timestamp, erased: true, resource_state_at_time: null, has_diverged: null };
+   * an entry with no subject ('none'), or whose actor row alone was erased, replays with erased: false. Throws for an
+   * unknown id. [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] admin gate, erased replay; Phase B.2 the same day:
+   * erased is always present (it was omitted when false). Touches memory (read).
    */
   async replay(logId, currentState = null, caller) {
     this._requireAdmin(caller);
@@ -542,6 +556,7 @@ class AuditLogger {
     return {
       log_id: row.id,
       timestamp: row.timestamp,
+      erased: false,
       resource_state_at_time: view.old_value,
       has_diverged: hasDiverged,
     };

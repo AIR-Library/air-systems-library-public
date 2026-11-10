@@ -34,7 +34,11 @@ const knexLib = require('knex');
 const jwt = require('jsonwebtoken');
 const { rateLimit } = require('express-rate-limit');
 
+// Two different things share the word "tier" (admin spec TIERS, Phase B.2, 2026-11-10,
+// session_012zDydZCZ4AChqhEZ4oVtaP): users.tier is the STAFF ROLE, a customer's or deployment's tier is the PLAN.
+// A value from one list given where the other is expected is 400 invalid_tier.
 const VALID_TIERS = ['owner', 'admin', 'user'];
+const PLAN_TIERS = ['solo', 'team', 'enterprise'];
 const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // one hour
 const MAX_PAGE_SIZE = 100;
 
@@ -73,7 +77,8 @@ function createDatabase(filename = ':memory:') {
  * checked against a succeeded invoice, as the spec says), `password_resets` (reset and invite tokens are stored only
  * as hashes) and `governance_actions.payload` (approval executes the original action, which needs its parameters),
  * and stopped dropping every table on each start, which would have wiped a real database when run as a server.
- * Touches: database (creates tables; drops them only with reset).
+ * Phase B.2 (2026-11-10): deployments.domain_verified (boolean, default false), added to an older table as well.
+ * Touches: database (creates tables, adds a column; drops them only with reset).
  */
 async function runMigrations(knex, { reset = false } = {}) {
   if (reset) {
@@ -101,7 +106,7 @@ async function runMigrations(knex, { reset = false } = {}) {
     t.increments('id').primary();
     t.string('email').notNullable();
     t.string('name').notNullable();
-    t.string('tier').notNullable();
+    t.string('tier').notNullable(); // the PLAN: solo, team, enterprise
     t.date('signup_date').notNullable();
     t.integer('invoice_count').defaultTo(0);
     t.string('status').defaultTo('active');
@@ -124,9 +129,11 @@ async function runMigrations(knex, { reset = false } = {}) {
     t.increments('id').primary();
     t.integer('customer_id').unsigned().references('id').inTable('customers');
     t.string('domain').notNullable();
-    t.string('tier').notNullable();
+    t.string('tier').notNullable(); // the PLAN: solo, team, enterprise
     t.string('status').defaultTo('draft'); // draft, live, suspended, archived
     t.string('theme').notNullable();
+    // Publishing needs a verified domain (admin spec, Phase B.2, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
+    t.boolean('domain_verified').notNullable().defaultTo(false);
     t.timestamp('published_at');
     t.string('suspend_reason');
     t.timestamp('archived_at');
@@ -178,6 +185,14 @@ async function runMigrations(knex, { reset = false } = {}) {
     t.bigInteger('expires_at_ms').notNullable();
     t.timestamp('used_at');
   });
+
+  // A deployments table made before Phase B.2 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP) has no domain_verified;
+  // add it, false for every row, so publish can require it.
+  if (!(await knex.schema.hasColumn('deployments', 'domain_verified'))) {
+    await knex.schema.alterTable('deployments', (t) => {
+      t.boolean('domain_verified').notNullable().defaultTo(false);
+    });
+  }
 }
 
 /**
@@ -206,11 +221,22 @@ function validateName(name) {
 }
 
 /**
- * Checks a tier against the allowed list (owner, admin, user). In: any value. Out: true or false.
- * Why: spec "role in allowed_roles". 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (documented only). Touches: nothing.
+ * Checks a STAFF ROLE (users.tier) against the allowed list (owner, admin, user). In: any value. Out: true or false.
+ * A plan value ('solo', 'team', 'enterprise') is not a role and fails.
+ * Why: spec "role in allowed_roles"; TIERS (Phase B.2). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
  */
 function validateTier(tier) {
   return VALID_TIERS.includes(tier);
+}
+
+/**
+ * Checks a PLAN (a customer's or deployment's tier) against solo, team, enterprise. In: any value. Out: true or false.
+ * A staff role ('owner', 'admin', 'user') is not a plan and fails.
+ * Why: admin spec TIERS (Phase B.2): change_plan and create_deployment checked plans against the role list, so a
+ * customer could be put on the "admin" plan. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+ */
+function validatePlan(tier) {
+  return PLAN_TIERS.includes(tier);
 }
 
 /**
@@ -270,7 +296,8 @@ class AdminError extends Error {
  *   stripe      Stripe client (default: `require('stripe')(STRIPE_SECRET_KEY)` when that env var is set, else none, and
  *               plan changes answer 503 billing_not_configured)
  *   mailer      `{ send({to, subject, text}) }` (default InMemoryMailer)
- *   priceIds    tier -> Stripe price id (default env STRIPE_PRICE_<TIER>, else price_<tier>)
+ *   priceIds    plan (solo, team, enterprise) -> Stripe price id (default env STRIPE_PRICE_<PLAN>, else price_<plan>;
+ *               keyed by plan, not by role, since Phase B.2 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
  *   safetyFlags `{ can_publish }`, the second gate on publishing (default `{ can_publish: true }`)
  *   themes      the theme ids a deployment may be created with (default `['default']`); themes have no table of their
  *               own in this template, so this list is the catalogue. Added 2026-11-10, session
@@ -294,7 +321,7 @@ function createAdminSystem(options = {}) {
   const baseUrl = options.baseUrl || process.env.APP_BASE_URL || 'https://example.com';
   const now = options.now || Date.now;
   const priceIds = options.priceIds || Object.fromEntries(
-    VALID_TIERS.map((t) => [t, process.env[`STRIPE_PRICE_${t.toUpperCase()}`] || `price_${t}`]),
+    PLAN_TIERS.map((t) => [t, process.env[`STRIPE_PRICE_${t.toUpperCase()}`] || `price_${t}`]),
   );
   let stripe = options.stripe || null;
   if (!stripe && process.env.STRIPE_SECRET_KEY) {
@@ -360,10 +387,13 @@ function createAdminSystem(options = {}) {
 
   /**
    * Express middleware: identifies the caller from `Authorization: Bearer <access token>`, then loads their tier and
-   * status from the database. Sets `req.user = { id, tier, email }`.
-   * Out: 401 authentication_required / invalid_token, 403 account_inactive, or next().
+   * status from the database. Sets `req.user = { id, tier, email }`. It runs before every other gate (CSRF, owner,
+   * admin), so a suspended caller is refused first: 403 account_suspended (ADMIN-19); any other non-active status is
+   * 403 account_inactive.
+   * Out: 401 authentication_required / invalid_token, 403 account_suspended / account_inactive, or next().
    * Why: the gate trusted `X-User-Id`/`X-User-Role` headers, so any client could call itself owner (2026-11-10,
-   * session_012zDydZCZ4AChqhEZ4oVtaP). Touches: database (read).
+   * session_012zDydZCZ4AChqhEZ4oVtaP); account_suspended added the same day (Phase B.2, ADMIN-19).
+   * Touches: database (read).
    */
   async function authenticate(req, res, next) {
     try {
@@ -381,6 +411,9 @@ function createAdminSystem(options = {}) {
       const user = id ? await knex('users').where({ id }).first() : null;
       if (!user) {
         return res.status(401).json({ error: 'invalid_token', message: 'Access token is invalid or expired' });
+      }
+      if (user.status === 'suspended') {
+        return res.status(403).json({ error: 'account_suspended', message: 'Account is suspended' });
       }
       if (user.status !== 'active') {
         return res.status(403).json({ error: 'account_inactive', message: 'Account is not active' });
@@ -640,7 +673,8 @@ function createAdminSystem(options = {}) {
   /**
    * POST /admin/customers/:id/action (owner): change_plan (Stripe subscription update) | queue_refund (against
    * a succeeded invoice of this customer, never more than its amount). Out: { success: true, ... } or { error, message }.
-   * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] change_plan follows billing flow 2 (ADMIN-12 amended): 400 invalid_tier,
+   * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] change_plan follows billing flow 2 (ADMIN-12 amended): 400 invalid_tier
+   * unless new_tier is a PLAN (solo, team, enterprise; a staff role is refused, Phase B.2),
    * then stripe.subscriptions.retrieve and 409 subscription_item_ambiguous unless exactly one item, then
    * update({items: [{id: current_item_id, price}], proration_behavior: 'create_prorations'}).
    * Why: spec endpoint; rebuilt 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP behind the token gate (see module header). Touches: database, Stripe (money).
@@ -655,7 +689,7 @@ function createAdminSystem(options = {}) {
     if (action === 'change_plan') {
       const newTier = req.body.new_tier;
       if (!newTier) throw new AdminError(400, 'missing_params', 'new_tier required');
-      if (!validateTier(newTier)) throw new AdminError(400, 'invalid_tier', 'Invalid tier');
+      if (!validatePlan(newTier)) throw new AdminError(400, 'invalid_tier', 'new_tier must be solo, team or enterprise');
       if (!stripe) throw new AdminError(503, 'billing_not_configured', 'Billing provider is not configured');
       // [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] ADMIN-12 / billing flow 2: read the subscription's one item and
       // update THAT item to the new price. A bare {price} makes Stripe add a second item and bill both plans. Zero or
@@ -734,12 +768,15 @@ function createAdminSystem(options = {}) {
 
   /**
    * POST /admin/deployments/action (owner): create | publish (also needs safetyFlags.can_publish) | suspend | retire.
-   * In: { action, ... }; create takes { customer_id, domain, tier, theme_id }, and theme_id must be one of the
-   * configured `themes` (createAdminSystem option, default ['default']), else 404 theme_not_found.
+   * In: { action, ... }; create takes { customer_id, domain, tier, theme_id }: tier is the PLAN (solo, team,
+   * enterprise; a staff role is 400 invalid_tier), and theme_id must be one of the configured `themes`
+   * (createAdminSystem option, default ['default']), else 404 theme_not_found. A new deployment has
+   * domain_verified false; publish needs status 'draft', domain_verified (else 400 domain_not_verified) and a theme.
    * Out: { success: true, ... } or { error, message }.
    * Why: spec endpoint; rebuilt 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP behind the token gate (see module header).
    * Changed the same day (CodeRabbit review on PR 19): create checks theme_id against the configured theme list
    * instead of requiring an existing deployment to use it, so a fresh database can create its first deployment.
+   * Phase B.2 the same day: the tier is checked as a plan, and publish requires domain_verified.
    * Touches: database.
    */
   app.post('/admin/deployments/action', requireOwner, route(async (req) => {
@@ -751,7 +788,7 @@ function createAdminSystem(options = {}) {
       if (!customerId || !domain || !tier || !themeId) {
         throw new AdminError(400, 'missing_params', 'customer_id, domain, tier, theme_id required');
       }
-      if (!validateTier(tier)) throw new AdminError(400, 'invalid_tier', 'Invalid tier');
+      if (!validatePlan(tier)) throw new AdminError(400, 'invalid_tier', 'tier must be solo, team or enterprise');
       return knex.transaction(async (trx) => {
         if (!(await trx('customers').where({ id: customerId }).first())) {
           throw new AdminError(404, 'customer_not_found', 'Customer not found');
@@ -788,6 +825,9 @@ function createAdminSystem(options = {}) {
         }
         if (deployment.status !== 'draft') {
           throw new AdminError(400, 'invalid_status', 'Only draft deployments can be published');
+        }
+        if (!deployment.domain_verified) {
+          throw new AdminError(400, 'domain_not_verified', 'The deployment\'s domain is not verified');
         }
         if (!deployment.theme) throw new AdminError(400, 'theme_not_set', 'Theme must be set before publishing');
         await trx('deployments').where({ id: deploymentId })
@@ -963,4 +1003,5 @@ module.exports = {
   InMemoryMailer,
   validateEmail,
   VALID_TIERS,
+  PLAN_TIERS,
 };

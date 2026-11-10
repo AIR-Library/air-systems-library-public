@@ -73,9 +73,15 @@ function createBillingSystem({ stripeSecretKey, webhookSecret, db, priceIds }) {
     enterprise: "price_enterprise_placeholder"
   }));
 
+  /**
+   * create_subscription(customer_id, tier) -> { success, subscription_id, tier, status, next_billing_date } |
+   * { error, status, message }: 400 invalid_tier (BILL-02), 502 stripe_error when Stripe refuses or is unreachable.
+   * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 bug fix: errors carried no HTTP status).
+   * Touches: Stripe (network, money), the db adapter.
+   */
   async function create_subscription(customer_id, tier) {
     if (!PRICE_IDS[tier]) {
-      return { error: "invalid_tier", message: `Invalid tier: ${tier}` };
+      return { error: "invalid_tier", status: 400, message: `Invalid tier: ${tier}` };
     }
 
     try {
@@ -114,7 +120,7 @@ function createBillingSystem({ stripeSecretKey, webhookSecret, db, priceIds }) {
         next_billing_date
       };
     } catch (error) {
-      return { error: "stripe_error", message: error.message };
+      return { error: "stripe_error", status: 502, message: error.message };
     }
   }
 
@@ -127,8 +133,9 @@ function createBillingSystem({ stripeSecretKey, webhookSecret, db, priceIds }) {
    * stripe.subscriptions.update(id, {items: [{id: current_item_id, price}], proration_behavior: 'create_prorations'}).
    * Sending only {price} made Stripe ADD a second item and bill both plans.
    * proration_credit: the credit (in the invoice's minor units, as a string) from the negative proration lines of
-   * the update's latest_invoice when Stripe returns it, else "0".
-   * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: Stripe (network, money), subscriptions, audit_log.
+   * the update's latest_invoice when Stripe returns it, else "0". A Stripe failure is 502 stripe_error.
+   * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2: stripe_error carries its status too).
+   * Touches: Stripe (network, money), subscriptions, audit_log.
    */
   async function change_plan(subscription_id, new_tier) {
     if (typeof new_tier !== 'string' || !Object.prototype.hasOwnProperty.call(PRICE_IDS, new_tier)) {
@@ -185,7 +192,7 @@ function createBillingSystem({ stripeSecretKey, webhookSecret, db, priceIds }) {
         proration_credit: proration_credit.toString()
       };
     } catch (error) {
-      return { error: "stripe_error", message: error.message };
+      return { error: "stripe_error", status: 502, message: error.message };
     }
   }
 
@@ -205,24 +212,30 @@ function createBillingSystem({ stripeSecretKey, webhookSecret, db, priceIds }) {
     return credit;
   }
 
+  /**
+   * queue_refund(invoice_id, amount, reason) -> { success, refund_id, status: 'queued', amount, reason } |
+   * { error, status, message }: 404 invoice_not_found, 400 invoice_not_succeeded, 400 invalid_amount, 400
+   * refund_exceeds_invoice (BILL-05), 500 database_error. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP
+   * (Phase B.2 bug fix: errors carried no HTTP status). Touches: the db adapter.
+   */
   async function queue_refund(invoice_id, amount, reason) {
     try {
       const invoice = await db.getInvoiceByStripeId(invoice_id);
       if (!invoice) {
-        return { error: "invoice_not_found", message: `Invoice ${invoice_id} not found` };
+        return { error: "invoice_not_found", status: 404, message: `Invoice ${invoice_id} not found` };
       }
       if (invoice.status !== 'succeeded') {
-        return { error: "invoice_not_succeeded", message: `Invoice ${invoice_id} is not succeeded` };
+        return { error: "invoice_not_succeeded", status: 400, message: `Invoice ${invoice_id} is not succeeded` };
       }
       // Number() reads the whole value: parseFloat('1_000') is 1, so the check passed while '1_000' was stored (2026-11-08, session f3daac6e, from review).
       // A whole number of cents: '50', '50.5' or '50.00'. Anything else, such as '0.001' or '1_000', is refused.
       const amountText = String(amount).trim();
       const refundAmount = /^\d+(\.\d{1,2})?$/.test(amountText) ? Number(amountText) : NaN;
       if (!Number.isFinite(refundAmount) || refundAmount <= 0) {
-        return { error: "invalid_amount", message: `Refund amount ${amount} is not a positive number` };
+        return { error: "invalid_amount", status: 400, message: `Refund amount ${amount} is not a positive number` };
       }
       if (refundAmount > Number(invoice.amount)) {
-        return { error: "refund_exceeds_invoice", message: `Refund amount ${amount} exceeds invoice amount ${invoice.amount}` };
+        return { error: "refund_exceeds_invoice", status: 400, message: `Refund amount ${amount} exceeds invoice amount ${invoice.amount}` };
       }
 
       const now = new Date().toISOString();
@@ -251,16 +264,21 @@ function createBillingSystem({ stripeSecretKey, webhookSecret, db, priceIds }) {
         reason
       };
     } catch (error) {
-      return { error: "database_error", message: error.message };
+      return { error: "database_error", status: 500, message: error.message };
     }
   }
 
+  /**
+   * handle_stripe_webhook(payload, signature) -> { received: true } | { error: 'invalid_signature', status: 403,
+   * message } (BILL-09). Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 bug fix: the error carried
+   * no HTTP status). Touches: Stripe signature check, the db adapter.
+   */
   async function handle_stripe_webhook(payload, signature) {
     let event;
     try {
       event = stripeInstance.webhooks.constructEvent(payload, signature, webhookSecret);
     } catch (err) {
-      return { error: "invalid_signature", message: `Webhook Error: ${err.message}` };
+      return { error: "invalid_signature", status: 403, message: `Webhook Error: ${err.message}` };
     }
 
     // Idempotency check

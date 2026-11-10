@@ -147,6 +147,10 @@ const DEFAULT_TEMPLATES = {
   },
 };
 
+// Statuses of a message that reached the user: 'sent', then the tracking statuses 'opened' and 'clicked'
+// (NOTIF-07, Phase B.2, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
+const DELIVERED = ['sent', 'opened', 'clicked'];
+
 /* ============================================================================
  * UTILITIES
  * ========================================================================== */
@@ -156,23 +160,50 @@ function generateId(prefix) {
 }
 
 
+/**
+ * Parses a quiet-hours time "HH:MM" (00:00-23:59, UTC) into minutes after midnight.
+ * In: the string. Out: 0..1439, or null when it is not a valid HH:MM (so "25:00" or "9:7" is refused).
+ * Why: the spec makes quiet hours "HH:MM" in UTC (Phase B.2); the old pattern accepted hours and minutes out of
+ * range. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+ */
 function parseTimeToMinutes(t) {
   if (!t) return null;
-  const m = /^(\d{1,2}):(\d{2})$/.exec(String(t).trim());
+  const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(String(t).trim());
   if (!m) return null;
   return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
 }
 
+/**
+ * True when `date` falls inside the quiet-hours window [start, end), both "HH:MM" in UTC; a window may cross
+ * midnight (22:00-08:00). Equal or missing bounds mean no quiet hours.
+ * In: start, end, date (default now). Out: boolean.
+ * Why: bug fix (Phase B.2): it compared against the SERVER's local time; the spec now says UTC.
+ * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+ */
 function inQuietHours(start, end, date) {
   const s = parseTimeToMinutes(start);
   const e = parseTimeToMinutes(end);
   if (s === null || e === null) return false;
   const d = date || new Date();
-  const cur = d.getHours() * 60 + d.getMinutes();
+  const cur = d.getUTCHours() * 60 + d.getUTCMinutes();
   if (s === e) return false;
   if (s < e) return cur >= s && cur < e;
   // wraps midnight
   return cur >= s || cur < e;
+}
+
+/**
+ * The first moment after `now` whose UTC time is quiet_hours_end: when a message held by quiet hours is released.
+ * In: end ("HH:MM", UTC), now (Date). Out: a Date.
+ * Why: NOTIF-05 (queued with scheduled_at = quiet_hours_end) and deliver_due step 3 (Phase B.2); it used local
+ * time before. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+ */
+function nextQuietHoursEnd(end, now) {
+  const endMin = parseTimeToMinutes(end);
+  const release = new Date(now.getTime());
+  release.setUTCHours(Math.floor(endMin / 60), endMin % 60, 0, 0);
+  if (release <= now) release.setUTCDate(release.getUTCDate() + 1);
+  return release;
 }
 
 function renderTemplate(text, vars) {
@@ -239,7 +270,13 @@ function toDate(value) {
   return d;
 }
 
+/**
+ * The tracking URL put in an e-mail. In: base URL, message id, action ('open' | 'click'). Out: the URL.
+ * The open pixel points at the spec's GET /notifications/open/:message_id (NOTIF-07, Phase B.2); a click still goes
+ * to /track/:message_id/click. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+ */
 function buildTrackUrl(baseUrl, messageId, action) {
+  if (action === 'open') return `${baseUrl}/notifications/open/${messageId}`;
   return `${baseUrl}/track/${messageId}/${action}`;
 }
 
@@ -248,8 +285,9 @@ function buildTrackUrl(baseUrl, messageId, action) {
  * ========================================================================== */
 /**
  * The notification service.
- * In (constructor options): baseUrl, maxRetries (default 3), retryBaseDelayMs (default 100), nowFn (clock returning a
- * Date; quiet hours and timestamps use it), sleep, unsubscribeSecret (else env NOTIFICATIONS_UNSUBSCRIBE_SECRET),
+ * In (constructor options): baseUrl, maxRetries (default 3 retries after the first attempt, so 4 attempts),
+ * retryBaseDelayMs (default 1000: waits of 1 s, 2 s, 4 s; NOTIF-08, Phase B.2 2026-11-10, was 100), nowFn (clock
+ * returning a Date; quiet hours, compared in UTC, and timestamps use it), sleep, unsubscribeSecret (else env NOTIFICATIONS_UNSUBSCRIBE_SECRET),
  * emailSender, smsSender, inAppSender. Events: 'sent', 'failed' (the log entry).
  * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] The constructor throws unless the unsubscribe secret is at least 32
  * bytes (NOTIF-11: an empty or short key makes a forgeable HMAC; a random per-process key broke every link at the
@@ -263,7 +301,7 @@ class NotificationService extends EventEmitter {
     const opts = options || {};
     this.baseUrl = opts.baseUrl || 'http://localhost:3000';
     this.maxRetries = opts.maxRetries != null ? opts.maxRetries : 3;
-    this.retryBaseDelayMs = opts.retryBaseDelayMs != null ? opts.retryBaseDelayMs : 100;
+    this.retryBaseDelayMs = opts.retryBaseDelayMs != null ? opts.retryBaseDelayMs : 1000;
     this.nowFn = opts.nowFn || (() => new Date());
     const secret = opts.unsubscribeSecret != null ? opts.unsubscribeSecret : process.env.NOTIFICATIONS_UNSUBSCRIBE_SECRET;
     if (typeof secret !== 'string' || Buffer.byteLength(secret, 'utf8') < 32) {
@@ -501,14 +539,10 @@ class NotificationService extends EventEmitter {
       }
     }
 
-    // Quiet hours: stored 'queued' with scheduled_at = quiet_hours_end (the next one after now).
+    // Quiet hours (UTC, may cross midnight): stored 'queued' with scheduled_at = quiet_hours_end (the next one after now).
     if (inQuietHours(prefs.quiet_hours_start, prefs.quiet_hours_end, now)) {
       log.status = 'queued';
-      const endMin = parseTimeToMinutes(prefs.quiet_hours_end);
-      const release = new Date(now);
-      release.setHours(Math.floor(endMin / 60), endMin % 60, 0, 0);
-      if (release <= now) release.setDate(release.getDate() + 1);
-      log.scheduled_at = release.toISOString();
+      log.scheduled_at = nextQuietHoursEnd(prefs.quiet_hours_end, now).toISOString();
       return { success: true, message_id: messageId, status: 'queued' };
     }
 
@@ -518,9 +552,10 @@ class NotificationService extends EventEmitter {
   }
 
   /**
-   * Delivers with up to maxRetries retries, waiting retryBaseDelayMs x 2^(n-1) between attempts.
+   * Delivers with up to maxRetries retries after the first attempt (default 3, so at most 4 attempts), waiting
+   * retryBaseDelayMs x 2^(n-1) between attempts (default 1 s, 2 s, 4 s); after the last failure the row is 'failed'.
    * In: message id, channel, template, vars, user id. Out: { success, message_id, status }.
-   * Why: spec "Retry: Email/SMS failures retry 3x with exponential backoff". 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: sent_at from nowFn;
+   * Why: spec "Retry: up to 3 times after the first attempt, 1 s / 2 s / 4 s" (NOTIF-08, Phase B.2 2026-11-10). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: sent_at from nowFn;
    * optional claim (the claimed_at of a deliverDue claim) makes the final write conditional on that claim.
    * Touches: memory, the senders.
    */
@@ -650,33 +685,55 @@ class NotificationService extends EventEmitter {
   }
 
   /**
-   * Records that a message was opened (first time only). In: message id. Out: { success, message_id, status }.
-   * Why: spec tracking. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: time from nowFn. Touches: memory.
+   * Records that a message was opened (the tracking pixel or link; GET /notifications/open/:message_id). The first
+   * open of a sent message sets opened_at and status 'opened'; any later call, or a message that was never sent
+   * (queued, skipped, failed), changes nothing.
+   * In: message id. Out: { success, message_id, status, changed } ({ success: false, error: 'not_found' } for an
+   * unknown id).
+   * Why: NOTIF-07 (Phase B.2): status was left at 'sent'. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (time
+   * from nowFn). Touches: memory.
    */
   markOpened(messageId) {
     const log = this.logs.get(messageId);
     if (!log) return { success: false, error: 'not_found' };
-    if (!log.opened_at) log.opened_at = this.nowFn().toISOString();
-    return { success: true, message_id: messageId, status: 'opened' };
+    let changed = false;
+    if (!log.opened_at && log.status === 'sent') {
+      log.opened_at = this.nowFn().toISOString();
+      log.status = 'opened';
+      changed = true;
+    }
+    return { success: true, message_id: messageId, status: log.status, changed };
   }
 
   /**
-   * Records a click (which implies an open). In: message id. Out: { success, message_id, status }.
-   * Why: spec tracking. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: time from nowFn. Touches: memory.
+   * Records a click (which implies an open) on a delivered message. The first click sets clicked_at and status
+   * 'clicked' (and opened_at if it was not set); later calls, or a message that was never sent, change nothing.
+   * In: message id. Out: { success, message_id, status }.
+   * Why: spec tracking. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (time from nowFn; Phase B.2: the
+   * status follows the tracking, as markOpened's does). Touches: memory.
    */
   markClicked(messageId) {
     const log = this.logs.get(messageId);
     if (!log) return { success: false, error: 'not_found' };
-    if (!log.opened_at) log.opened_at = this.nowFn().toISOString();
-    if (!log.clicked_at) log.clicked_at = this.nowFn().toISOString();
-    return { success: true, message_id: messageId, status: 'clicked' };
+    if (!log.clicked_at && (log.status === 'sent' || log.status === 'opened')) {
+      const at = this.nowFn().toISOString();
+      if (!log.opened_at) log.opened_at = at;
+      log.clicked_at = at;
+      log.status = 'clicked';
+    }
+    return { success: true, message_id: messageId, status: log.status };
   }
 
   /* ---- In-app fetch ---- */
+  /**
+   * The user's delivered in-app messages, read or not. In: user id. Out: [{ message_id, template_key, vars, sent_at,
+   * read }]. Why: spec "In-app: fetch via /notifications"; changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP
+   * (Phase B.2: an opened message now has status 'opened' or 'clicked' and must still be listed). Touches: memory.
+   */
   getInAppNotifications(userId) {
     const out = [];
     for (const log of this.logs.values()) {
-      if (log.user_id === userId && log.channel === 'in_app' && log.status === 'sent') {
+      if (log.user_id === userId && log.channel === 'in_app' && DELIVERED.includes(log.status)) {
         out.push({
           message_id: log.id,
           template_key: log.template_key,
@@ -696,7 +753,8 @@ class NotificationService extends EventEmitter {
    *   1. 'sending' rows whose claimed_at + 300 s < now go back to 'queued' (a crashed worker);
    *   2. 'queued' rows with scheduled_at <= now, by scheduled_at then insertion order, are claimed one by one with a
    *      conditional write (status 'queued' -> 'sending', claimed_at = now); a row claimed first elsewhere is skipped;
-   *   3. preferences are checked NOW: do-not-disturb, unsubscribed or channel off -> 'skipped';
+   *   3. preferences are checked NOW: do-not-disturb, unsubscribed or channel off -> 'skipped'; inside the user's
+   *      quiet hours (UTC) -> back to 'queued' with scheduled_at = quiet_hours_end (Phase B.2, 2026-11-10);
    *   4. the final write is conditional on status 'sending' and the same claimed_at.
    * Each message is sent once when no worker crashes, at least once after a crash. In: now (Date, ms or ISO; default
    * the clock). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (replaces processQueue's in-memory queue).
@@ -733,6 +791,15 @@ class NotificationService extends EventEmitter {
           log.error = skip;
         }
         results.push({ success: true, message_id: id, status: 'skipped' });
+        continue;
+      }
+      if (inQuietHours(prefs.quiet_hours_start, prefs.quiet_hours_end, at)) {
+        if (log.status === 'sending' && log.claimed_at === claim) {
+          log.status = 'queued';
+          log.claimed_at = null;
+          log.scheduled_at = nextQuietHoursEnd(prefs.quiet_hours_end, at).toISOString();
+        }
+        results.push({ success: true, message_id: id, status: 'queued' });
         continue;
       }
       const template = this.getTemplate(log.template_key);
@@ -826,9 +893,18 @@ function createRouter(service) {
     return { status: 200, body: { success: true } };
   });
 
+  // GET /notifications/open/:message_id (NOTIF-07, Phase B.2, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): the
+  // tracking pixel or link. Sets opened_at and status 'opened' the first time only and answers 204 with no body
+  // either way, also for an unknown id, so the pixel says nothing about which messages exist.
+  add('GET', '/notifications/open/:message_id', async (req) => {
+    service.markOpened(req.params.message_id);
+    return { status: 204, body: null };
+  });
+
+  // The old open URL, kept for links already sent; it now answers like the route above.
   add('GET', '/track/:message_id/open', async (req) => {
-    const res = service.markOpened(req.params.message_id);
-    return { status: res.success ? 200 : 404, body: res };
+    service.markOpened(req.params.message_id);
+    return { status: 204, body: null };
   });
 
   add('GET', '/track/:message_id/click', async (req) => {
@@ -877,6 +953,7 @@ module.exports = {
   SCHEMA_SQL,
   renderTemplate,
   inQuietHours,
+  nextQuietHoursEnd,
   generateId,
   buildUnsubscribeUrl,
   unsubscribeToken,

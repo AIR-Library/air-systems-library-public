@@ -215,9 +215,12 @@ describe('AuditLogger', () => {
 
   // AUDIT-06
   test('testImmutabilityUpdateDeleteForbidden', async () => {
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a 'service' actor is named in actor_service now (400
+    // actor_service_required without it); this entry relied on the old fallback to actor_id.
     const log = await logger.logMutation({
       actor_id: 'system',
       actor_type: 'service',
+      actor_service: 'system',
       action: 'system_init',
       resource_type: 'system',
       subject_user_id: 'none',
@@ -358,18 +361,20 @@ describe('AuditLogger', () => {
    */
   // AUDIT-10
   test('log() validation codes and admin-only reads', async () => {
-    await expectAuditError(() => logger.log({ actor_id: 1, action: 'subscription_changed', resource_type: 'subscription',
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): actor_type is required now (it defaulted to 'user'),
+    // so these entries name it; each still asserts the same refusal.
+    await expectAuditError(() => logger.log({ actor_id: 1, actor_type: 'user', action: 'subscription_changed', resource_type: 'subscription',
       resource_id: 5 }), 400, 'subject_required');
-    await expectAuditError(() => logger.log({ actor_id: 1, action: 'flag_set', resource_type: 'flag', subject_user_id: 'none',
+    await expectAuditError(() => logger.log({ actor_id: 1, actor_type: 'user', action: 'flag_set', resource_type: 'flag', subject_user_id: 'none',
       resource_id: 'f', metadata: { feature_flag: 'x', ip: '192.0.2.1' } }), 400, 'metadata_key_not_allowed');
     await expectAuditError(() => logger.log({ actor_id: 'key_1', actor_type: 'api_key', action: 'deployment_created',
       resource_type: 'deployment', subject_user_id: 'none', resource_id: 'd' }), 400, 'actor_user_required');
-    await expectAuditError(() => logger.log({ actor_id: 1, action: 'user_suspended', resource_type: 'user',
+    await expectAuditError(() => logger.log({ actor_id: 1, actor_type: 'user', action: 'user_suspended', resource_type: 'user',
       resource_id: 2, subject_user_id: 3 }), 400, 'subject_mismatch');
     expect(logger.logs).toHaveLength(0);
     expect(logger.subjectsByUser.size).toBe(0);
 
-    const ok = await logger.log({ actor_id: 1, action: 'flag_set', resource_type: 'flag', subject_user_id: 'none',
+    const ok = await logger.log({ actor_id: 1, actor_type: 'user', action: 'flag_set', resource_type: 'flag', subject_user_id: 'none',
       resource_id: 'f', metadata: { feature_flag: 'beta' } });
     expect(ok.success).toBe(true);
     for (const caller of [undefined, null, { id: 1, role: 'member' }, { id: 1 }]) {
@@ -378,5 +383,56 @@ describe('AuditLogger', () => {
       await expectAuditError(() => logger.search('flag', null, 50, caller), 403, 'admin_only');
     }
     expect((await logger.queryLogs({}, ADMIN)).total).toBe(1);
+  });
+
+  /**
+   * AUDIT-10 (Phase B.2 additions to "Refusals by log()"): a missing or unknown actor_type is 400 invalid_actor_type;
+   * a 'user' actor without actor_id is 400 actor_required; a 'service' actor without actor_service is 400
+   * actor_service_required; a refused call writes nothing. In: the logger. Out: assertions.
+   * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches memory only.
+   */
+  // AUDIT-10
+  test('log() refuses invalid_actor_type, actor_required and actor_service_required', async () => {
+    const base = { action: 'user_created', resource_type: 'user', resource_id: 'u2' };
+    await expectAuditError(() => logger.log({ ...base, actor_id: 1 }), 400, 'invalid_actor_type');
+    await expectAuditError(() => logger.log({ ...base, actor_id: 1, actor_type: 'robot' }), 400, 'invalid_actor_type');
+    await expectAuditError(() => logger.log({ ...base, actor_type: 'user' }), 400, 'actor_required');
+    await expectAuditError(() => logger.log({ ...base, actor_type: 'user', actor_id: '  ' }), 400, 'actor_required');
+    await expectAuditError(() => logger.log({ actor_type: 'service', actor_id: 'billing', action: 'invoice_created',
+      resource_type: 'invoice', resource_id: 'i1', subject_user_id: 'none' }), 400, 'actor_service_required');
+    expect(logger.logs).toHaveLength(0);
+    expect(logger.subjectsByUser.size).toBe(0);
+    const ok = await logger.log({ actor_type: 'service', actor_service: 'billing', action: 'invoice_created',
+      resource_type: 'invoice', resource_id: 'i1', subject_user_id: 'none' });
+    expect(ok.success).toBe(true);
+    expect(logger.logs[0].actor_service).toBe('billing');
+  });
+
+  /**
+   * AUDIT-08 (Phase B.2: "replay erased reflects the entry's subject row"; erase_subject's erased_rows = the
+   * audit_personal rows it deleted): erasing only the ACTOR of an entry leaves its subject row, so that entry replays
+   * with erased false and its state; an entry with subject 'none' replays with erased false; erasing the subject makes
+   * the replay erased true. In: the logger. Out: assertions. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * Touches memory only.
+   */
+  // AUDIT-08
+  test('replay erased follows the subject row; erased_rows counts the audit_personal rows deleted', async () => {
+    const entry = await logger.log({ actor_id: 'admin-9', actor_type: 'user', action: 'user_suspended',
+      resource_type: 'user', resource_id: 'target-1', old_value: { status: 'active' }, new_value: { status: 'suspended' } });
+    const noSubject = await logger.log({ actor_id: 'admin-9', actor_type: 'user', subject_user_id: 'none',
+      action: 'flag_set', resource_type: 'flag', resource_id: 'f1', old_value: { on: false }, new_value: { on: true } });
+    expect((await logger.replay(entry.log_id, null, ADMIN)).erased).toBe(false);
+
+    // the actor's two rows (one per entry) go; the entry's subject row stays
+    expect((await logger.eraseSubject('admin-9')).erased_rows).toBe(2);
+    const actorGone = await logger.replay(entry.log_id, null, ADMIN);
+    expect(actorGone).toMatchObject({ erased: false, resource_state_at_time: { status: 'active' }, has_diverged: false });
+    expect(await logger.replay(noSubject.log_id, null, ADMIN)).toMatchObject({ erased: false,
+      resource_state_at_time: { on: false } });
+
+    expect((await logger.eraseSubject('target-1')).erased_rows).toBe(1);
+    expect(await logger.replay(entry.log_id, null, ADMIN)).toEqual({ log_id: entry.log_id,
+      timestamp: actorGone.timestamp, erased: true, resource_state_at_time: null, has_diverged: null });
+    expect((await logger.eraseSubject('nobody')).erased_rows).toBe(0);
   });
 });

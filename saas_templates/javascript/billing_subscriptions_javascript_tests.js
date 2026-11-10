@@ -118,6 +118,7 @@ describe('Billing System', function() {
     it('should return invalid_tier for invalid tier', async () => {
       const result = await billingSystem.create_subscription('cus_123', 'invalid');
       assert.strictEqual(result.error, 'invalid_tier');
+      assert.strictEqual(result.status, 400);  // Phase B.2 bug fix, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: errors carry the spec's HTTP status
     });
   });
 
@@ -273,6 +274,7 @@ describe('Billing System', function() {
 
       const result = await billingSystem.queue_refund('in_123', '150.00', 'Too much');
       assert.strictEqual(result.error, 'refund_exceeds_invoice');
+      assert.strictEqual(result.status, 400);  // Phase B.2 bug fix, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: errors carry the spec's HTTP status
     });
 
     it('should return invoice_not_succeeded for non-succeeded invoice', async () => {
@@ -286,6 +288,44 @@ describe('Billing System', function() {
 
       const result = await billingSystem.queue_refund('in_123', '50.00', 'Reason');
       assert.strictEqual(result.error, 'invoice_not_succeeded');
+      assert.strictEqual(result.status, 400);  // Phase B.2 bug fix, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: errors carry the spec's HTTP status
+    });
+
+    /**
+     * Phase B.2 bug fix: every queue_refund refusal carries its HTTP status: an unknown invoice is 404
+     * invoice_not_found and an amount that is not a positive sum of money is 400 invalid_amount; nothing is queued.
+     * In: the in-memory db. Out: assertions. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches memory only.
+     */
+    // BILL-05
+    it('should return 404 invoice_not_found and 400 invalid_amount', async () => {
+      const missing = await billingSystem.queue_refund('in_missing', '10.00', 'Reason');
+      assert.strictEqual(missing.error, 'invoice_not_found');
+      assert.strictEqual(missing.status, 404);
+      await db.createInvoice({ stripe_invoice_id: 'in_amt', customer_id: 'cus_123', amount: '100.00', status: 'succeeded',
+        paid_at: new Date().toISOString() });
+      for (const amount of ['0', '-5', '0.001', 'abc']) {
+        const bad = await billingSystem.queue_refund('in_amt', amount, 'Reason');
+        assert.strictEqual(bad.error, 'invalid_amount');
+        assert.strictEqual(bad.status, 400);
+      }
+      assert.ok(!db.getAuditLog().some(log => log.action === 'refund_queued' && log.invoice_id === 'in_amt'));
+    });
+
+    /**
+     * Phase B.2 bug fix: a Stripe failure in create_subscription is 502 stripe_error (it carried no status).
+     * In: a stubbed Stripe client that rejects. Out: assertions. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches memory only.
+     */
+    // BILL-01
+    it('should return 502 stripe_error when Stripe fails', async () => {
+      const stub = sinon.stub(billingSystem.__stripeInstance.subscriptions, 'create').rejects(new Error('Stripe is down'));
+      try {
+        const result = await billingSystem.create_subscription('cus_123', 'solo');
+        assert.strictEqual(result.error, 'stripe_error');
+        assert.strictEqual(result.status, 502);
+      } finally {
+        stub.restore();
+      }
     });
   });
 
@@ -431,6 +471,7 @@ describe('Billing System', function() {
       const result = await billingSystem.handle_stripe_webhook(payload, signature);
       
       assert.strictEqual(result.error, 'invalid_signature');
+      assert.strictEqual(result.status, 403);  // Phase B.2 bug fix, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: errors carry the spec's HTTP status
       assert.ok(result.message.includes('Webhook Error'));
       
       stripeStub.restore();

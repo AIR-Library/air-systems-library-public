@@ -276,12 +276,18 @@ async function check_device_fingerprint(device, user_id = null) {
  * rounds toward negative infinity; earlier_payment = a ledger row of this user already has payment_added_date.
  * PASS if days_after_trial < 5; FAIL if >= 90 and no earlier payment (403 trial_ended_no_payment_cannot_retry);
  * CHALLENGE otherwise (flag late_payment_entry). Out: { decision, days_after_trial, earlier_payment, ... }.
- * Why: TRIAL-10/11/15 amended 2026-11-10 (it counted days since the trial START with windows that overlapped).
+ * A user with no users row is FAIL { error: 'user_not_found', code: 403 } (fail closed; it threw before); a user
+ * with no ledger row is judged from users.created_at with no earlier payment.
+ * Why: TRIAL-10/11/15 amended 2026-11-10 (it counted days since the trial START with windows that overlapped);
+ * Phase B.2 the same day (one answer in every language for the missing users row and the missing ledger row).
  * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: reads users and the ledger, writes gate_decisions.
  */
 async function check_trial_payment_timing(user_id) {
   const user = db.prepare(`SELECT created_at FROM users WHERE id = ?`).get(user_id);
-  if (!user) throw new Error('User not found');
+  if (!user) {
+    why_chain({gate: 'trial_payment_timing', user_id, trial_duration: settings.trialDays, reason: 'user_not_found'}, 'FAIL');
+    return { decision: 'FAIL', error: 'user_not_found', message: 'User not found', code: 403 };
+  }
   const startMs = Date.parse(user.created_at);
   if (Number.isNaN(startMs)) throw new Error('User has no valid created_at');
 

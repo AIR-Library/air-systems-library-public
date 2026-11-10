@@ -2,7 +2,7 @@
 
 const assert = require('assert');
 const crypto = require('crypto');
-const { NotificationService, createRouter, inQuietHours, unsubscribeToken } = require('./notifications_javascript.js');
+const { NotificationService, createRouter, inQuietHours, nextQuietHoursEnd, unsubscribeToken } = require('./notifications_javascript.js');
 
 // A fresh 32-byte secret per run (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): the service now refuses a missing or
 // short unsubscribe secret, and no secret is hard-coded.
@@ -118,10 +118,11 @@ async function run() {
   });
 
   // NOTIF-05
-  await test('Quiet hours: skip if in range', async () => {
-    // Fixed clock at 12:00 local time (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): with the real clock this test
+  await test('Quiet hours: a send inside the window is queued with scheduled_at = quiet_hours_end', async () => {
+    // Fixed clock at 12:00 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): with the real clock this test
     // failed during the one minute a day, 23:59, that lies outside 00:00-23:59.
-    const svc = makeService({ nowFn: () => new Date(2024, 0, 1, 12, 0) });
+    // Phase B.2, same day: quiet hours are UTC now, so the clock and the expected time are UTC (they were local).
+    const svc = makeService({ nowFn: () => new Date(Date.UTC(2024, 0, 1, 12, 0)) });
     svc.updatePreferences(11, {
       quiet_hours_start: '00:00',
       quiet_hours_end: '23:59',
@@ -138,7 +139,7 @@ async function run() {
     // stores them with scheduled_at = quiet_hours_end.
     const log = svc.logs.get(res.message_id);
     assert.strictEqual(log.status, 'queued');
-    assert.strictEqual(log.scheduled_at, new Date(2024, 0, 1, 23, 59).toISOString());
+    assert.strictEqual(log.scheduled_at, new Date(Date.UTC(2024, 0, 1, 23, 59)).toISOString());
     assert.strictEqual(log.sent_at, null);
   });
 
@@ -159,8 +160,18 @@ async function run() {
   });
 
   // NOTIF-07
-  await test('Track: message marked as opened when user clicks link', async () => {
-    const svc = makeService();
+  /**
+   * NOTIF-07 (wording changed in Phase B.2): GET /notifications/open/:message_id sets opened_at and status 'opened'
+   * the first time and answers 204; a second call answers 204 and changes nothing; an unknown id is 204 too. The
+   * e-mail's open pixel points at that route. A click then moves the status to 'clicked'.
+   * In: a service with a moving clock. Out: assertions. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (it
+   * called markOpened directly and never checked the stored status or a second open). Touches: memory.
+   */
+  await test('Track: GET /notifications/open/:message_id sets opened_at and status opened once (204)', async () => {
+    let clock = Date.UTC(2024, 0, 1, 9, 0);
+    let mail = null;
+    const svc = makeService({ nowFn: () => new Date(clock), emailSender: async (m) => { mail = m; } });
+    const router = createRouter(svc);
     const res = await svc.send({
       user_id: 33,
       template_key: 'invoice_ready',
@@ -168,7 +179,20 @@ async function run() {
       vars: { month: 'January', download_url: 'http://x' },
     });
     const mid = res.message_id;
-    svc.markOpened(mid);
+    assert.strictEqual(mail.trackOpenUrl, `http://localhost:3000/notifications/open/${mid}`);
+    clock += 60 * 1000;
+    const first = await router.handle('GET', `/notifications/open/${mid}`, {});
+    assert.strictEqual(first.status, 204);
+    const log = svc.logs.get(mid);
+    assert.strictEqual(log.status, 'opened');
+    assert.strictEqual(log.opened_at, new Date(clock).toISOString());
+    const openedAt = log.opened_at;
+    clock += 60 * 1000;
+    const second = await router.handle('GET', `/notifications/open/${mid}`, {});
+    assert.strictEqual(second.status, 204);
+    assert.strictEqual(log.opened_at, openedAt);
+    assert.strictEqual(log.status, 'opened');
+    assert.strictEqual((await router.handle('GET', '/notifications/open/msg_unknown', {})).status, 204);
     let tracked = svc.track(mid);
     assert.strictEqual(tracked.status, 'opened');
     assert.ok(tracked.opened_at);
@@ -179,23 +203,44 @@ async function run() {
   });
 
   // NOTIF-08
-  await test('Retry: failed email retries and eventually succeeds', async () => {
-    let calls = 0;
-    const svc = makeService({
-      emailSender: async () => {
-        calls += 1;
-        if (calls < 3) throw new Error('transient failure');
-      },
-    });
-    const res = await svc.send({
-      user_id: 44,
-      template_key: 'welcome_email',
-      channel: 'email',
-      vars: { app_name: 'Acme' },
-    });
+  /**
+   * NOTIF-08 (wording changed in Phase B.2): with the default settings a failed e-mail is retried at most 3 times
+   * after the first attempt, waiting 1 s, 2 s and 4 s; it is sent when the sender recovers on the 4th attempt, and a
+   * 4th failure marks it 'failed' with no 5th attempt. In: services with the default retry settings and a recording
+   * sleep. Out: assertions. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (it recovered on the 3rd attempt
+   * with a 1 ms base delay and never checked the waits or the limit). Touches: memory.
+   */
+  await test('Retry: a failed email is retried at most 3 times (1 s / 2 s / 4 s); a 4th failure marks it failed', async () => {
+    const withSender = (failures, waits) => {
+      let calls = 0;
+      const svc = new NotificationService({
+        unsubscribeSecret: SECRET,
+        sleep: async (ms) => { waits.push(ms); },
+        emailSender: async () => {
+          calls += 1;
+          if (calls <= failures) throw new Error('transient failure');
+        },
+      });
+      return { svc, calls: () => calls };
+    };
+    const payload = { user_id: 44, template_key: 'welcome_email', channel: 'email', vars: { app_name: 'Acme' } };
+
+    const recoverWaits = [];
+    const recover = withSender(3, recoverWaits);
+    const res = await recover.svc.send(payload);
     assert.strictEqual(res.success, true);
     assert.strictEqual(res.status, 'sent');
-    assert.strictEqual(calls, 3);
+    assert.strictEqual(recover.calls(), 4);
+    assert.deepStrictEqual(recoverWaits, [1000, 2000, 4000]);
+
+    const failWaits = [];
+    const down = withSender(Infinity, failWaits);
+    const failedRes = await down.svc.send(payload);
+    assert.strictEqual(failedRes.success, false);
+    assert.strictEqual(failedRes.status, 'failed');
+    assert.strictEqual(down.calls(), 4);
+    assert.deepStrictEqual(failWaits, [1000, 2000, 4000]);
+    assert.strictEqual(down.svc.logs.get(failedRes.message_id).status, 'failed');
   });
 
   // NOTIF-09
@@ -413,10 +458,60 @@ async function run() {
     assert.ok(['sent', 'bounced', 'opened', 'clicked', 'failed', 'skipped', 'queued'].includes(out.body.status));
   });
 
-  await test('inQuietHours utility handles wrap-around', async () => {
-    assert.strictEqual(inQuietHours('22:00', '08:00', new Date(2024, 0, 1, 23, 0)), true);
-    assert.strictEqual(inQuietHours('22:00', '08:00', new Date(2024, 0, 1, 7, 0)), true);
-    assert.strictEqual(inQuietHours('22:00', '08:00', new Date(2024, 0, 1, 12, 0)), false);
+  // NOTIF-05
+  /**
+   * inQuietHours compares in UTC and handles a window that crosses midnight, whatever the server's time zone (the
+   * bug: it used local time). The process time zone is switched to UTC-5 and UTC+9 for the check and restored.
+   * In: UTC instants. Out: assertions. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2: the dates
+   * were local, which only matched the rule on a UTC server). Touches: process.env.TZ (restored).
+   */
+  await test('inQuietHours utility handles wrap-around, in UTC whatever the server time zone', async () => {
+    const savedTz = process.env.TZ;
+    try {
+      for (const tz of ['UTC', 'America/New_York', 'Asia/Tokyo']) {
+        process.env.TZ = tz;
+        assert.strictEqual(inQuietHours('22:00', '08:00', new Date(Date.UTC(2024, 0, 1, 23, 0))), true, tz);
+        assert.strictEqual(inQuietHours('22:00', '08:00', new Date(Date.UTC(2024, 0, 1, 7, 0))), true, tz);
+        assert.strictEqual(inQuietHours('22:00', '08:00', new Date(Date.UTC(2024, 0, 1, 12, 0))), false, tz);
+        assert.strictEqual(inQuietHours('22:00', '08:00', new Date(Date.UTC(2024, 0, 1, 8, 0))), false, tz);
+        assert.strictEqual(nextQuietHoursEnd('08:00', new Date(Date.UTC(2024, 0, 1, 23, 0))).toISOString(),
+          '2024-01-02T08:00:00.000Z', tz);
+      }
+    } finally {
+      if (savedTz === undefined) delete process.env.TZ; else process.env.TZ = savedTz;
+    }
+    assert.throws(() => makeService().updatePreferences(1, { quiet_hours_start: '25:00' }), /HH:MM/);
+  });
+
+  // NOTIF-05
+  /**
+   * deliver_due step 3 (Phase B.2): a due message whose user is now inside quiet hours (a window crossing midnight,
+   * UTC) is not sent; it goes back to 'queued' with scheduled_at = quiet_hours_end, and is sent by deliverDue once
+   * that time comes. In: a service with a moving UTC clock. Out: assertions. Added 2026-11-10,
+   * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
+   */
+  await test('deliverDue re-queues a due message inside quiet hours with scheduled_at = quiet_hours_end', async () => {
+    let clock = Date.UTC(2024, 0, 1, 12, 0);
+    const sent = [];
+    const svc = makeService({ nowFn: () => new Date(clock), emailSender: async (m) => { sent.push(m.to); } });
+    const due = new Date(Date.UTC(2024, 0, 1, 23, 0)).toISOString();
+    const res = await svc.send({ user_id: 77, template_key: 'welcome_email', channel: 'email', vars: { app_name: 'Acme' }, scheduled_at: due });
+    assert.strictEqual(res.status, 'queued');
+    svc.updatePreferences(77, { quiet_hours_start: '22:00', quiet_hours_end: '08:00' });
+
+    clock = Date.UTC(2024, 0, 1, 23, 30);
+    const out = await svc.deliverDue(new Date(clock));
+    assert.deepStrictEqual(out.map((r) => r.status), ['queued']);
+    const log = svc.logs.get(res.message_id);
+    assert.strictEqual(log.status, 'queued');
+    assert.strictEqual(log.scheduled_at, '2024-01-02T08:00:00.000Z');
+    assert.strictEqual(log.claimed_at, null);
+    assert.deepStrictEqual(sent, []);
+
+    assert.deepStrictEqual(await svc.deliverDue(new Date(Date.UTC(2024, 0, 2, 7, 59))), []);
+    const later = await svc.deliverDue(new Date(Date.UTC(2024, 0, 2, 8, 0)));
+    assert.deepStrictEqual(later.map((r) => r.status), ['sent']);
+    assert.deepStrictEqual(sent, [77]);
   });
 
   console.log(`\nResults: ${passed} passed, ${failed} failed`);

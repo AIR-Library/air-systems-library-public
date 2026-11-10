@@ -243,6 +243,30 @@ test('trial_payment_timing boundaries: 5 and 89 days CHALLENGE; 90 days with an 
 });
 
 /**
+ * Phase B.2 amendment to gate 5: a user with no users row is FAIL { error: 'user_not_found' } (fail closed, and
+ * subscription_created refuses it without touching the ledger); a user with a users row but no ledger row is judged
+ * from users.created_at with no earlier payment. In: the test database. Out: assertions.
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches the test database.
+ */
+// TRIAL-11
+test('trial_payment_timing: no users row FAILs closed with user_not_found; no ledger row is judged from created_at', async () => {
+  const unknown = await check_trial_payment_timing(987654);
+  expect(unknown.decision).toBe('FAIL');
+  expect(unknown.error).toBe('user_not_found');
+  expect(unknown.code).toBe(403);
+  const refused = await subscription_created(987654, 'pm_unknown_user', 'cus_unknown_user');
+  expect(refused.error).toBe('user_not_found');
+  expect(db.prepare('SELECT COUNT(*) AS n FROM trial_abuse_ledger').get().n).toBe(0);
+
+  const noLedger = (daysAfterTrial) => db.prepare('INSERT INTO users (email, created_at) VALUES (?, ?)')
+    .run(`noledger${daysAfterTrial}@x.test`, new Date(NOW - (14 + daysAfterTrial) * DAY).toISOString()).lastInsertRowid;
+  const early = await check_trial_payment_timing(noLedger(2));
+  expect(early).toMatchObject({ decision: 'PASS', days_after_trial: 2, earlier_payment: false });
+  const late = await check_trial_payment_timing(noLedger(90));
+  expect(late).toMatchObject({ decision: 'FAIL', error: 'trial_ended_no_payment_cannot_retry', earlier_payment: false });
+});
+
+/**
  * subscription_created records the gate decisions on the ledger (they were missing) and the payment date from the
  * clock. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches the test database.
  */
