@@ -26,7 +26,7 @@ name or in a comment on the line above it (for example `# AUTH-01`), so a missin
 | `AUTH-13` | mfa_challenge wrong code → 401 {error: "invalid_code"} |
 | `AUTH-14` | token_refresh happy path → new token issued |
 | `AUTH-15` | token_refresh banned user → 403 {error: "user_banned"} |
-| `AUTH-16` | login returns a refresh_token that token_refresh accepts; the sessions table holds only its SHA-256, and a verification code is stored only as its hash |
+| `AUTH-16` | login returns a refresh_token that token_refresh accepts; the sessions table holds only its HMAC-SHA256 under AUTH_SECRET_KEY, a verification code is stored only as its HMAC, and the service refuses to start without a 32-byte key |
 
 ## Contract
 
@@ -126,7 +126,11 @@ IMPLEMENTATION REQUIREMENTS:
   - Database: users table (id, email, password_hash, tier, status, email_verified_at, mfa_secret, mfa_enabled)
   - Database: sessions table (id, user_id, refresh_token_hash, created_at, expires_at, ip, device_id)
   - Secrets at rest: refresh tokens, email/MFA verification codes and OAuth state values are stored only as
-    their SHA-256 and compared in constant time; a database read must not hand out a usable credential.
+    a keyed hash, lowercase hex HMAC-SHA256(secret_key, value), and compared in constant time; a database
+    read must not hand out a usable credential. secret_key comes from configuration (AUTH_SECRET_KEY, at
+    least 32 bytes; the service refuses to start without it; tests pass a fixed test key). A plain SHA-256
+    is not enough: a 6-digit code has a million values, so a leaked table could be reversed by brute force.
+    Amended again 2026-11-10 after a code-scanning finding on PR 21.
     OAuth state is single-use and expires in 10 minutes; the callback exchanges the provider's code through
     an injected provider client (never uses the code itself as an identity). Amended 2026-11-10 (Phase B.2).
   - Database: audit_log table (timestamp, actor_id, action, resource_type, resource_id, old_value, new_value)
@@ -148,5 +152,5 @@ TESTS REQUIRED:
   - **AUTH-13** mfa_challenge wrong code → 401 {error: "invalid_code"}
   - **AUTH-14** token_refresh happy path → new token issued
   - **AUTH-15** token_refresh banned user → 403 {error: "user_banned"}
-  - **AUTH-16** login returns a refresh_token that token_refresh accepts; the sessions table holds only its SHA-256, and a verification code is stored only as its hash
+  - **AUTH-16** login returns a refresh_token that token_refresh accepts; the sessions table holds only its HMAC-SHA256 under AUTH_SECRET_KEY, a verification code is stored only as its HMAC, and the service refuses to start without a 32-byte key
 ```
