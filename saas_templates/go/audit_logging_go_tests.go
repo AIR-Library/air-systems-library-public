@@ -163,7 +163,9 @@ func TestAuditLogger_Filtering(t *testing.T) {
 		{ActorID: strPtr("1"), ActorType: "user", Action: "user_created", ResourceType: "user", ResourceID: "u1", NewValue: json.RawMessage(`{}`)},
 		{ActorID: strPtr("1"), ActorType: "user", Action: "user_suspended", ResourceType: "user", ResourceID: "u2", NewValue: json.RawMessage(`{}`)},
 		{ActorID: strPtr("2"), ActorType: "user", Action: "user_created", ResourceType: "user", ResourceID: "u3", NewValue: json.RawMessage(`{}`)},
-		{ActorID: strPtr("1"), ActorType: "service", SubjectUserID: strPtr("none"), Action: "deployment_created", ResourceType: "deployment", ResourceID: "d1", NewValue: json.RawMessage(`{}`)},
+		// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 follow-up): a service entry names its service in
+		// ActorService; ActorID is no longer taken as the service name (it was ActorID "1").
+		{ActorService: strPtr("1"), ActorType: "service", SubjectUserID: strPtr("none"), Action: "deployment_created", ResourceType: "deployment", ResourceID: "d1", NewValue: json.RawMessage(`{}`)},
 	}
 
 	for _, l := range logs {
@@ -461,7 +463,9 @@ func TestAuditLogger_Search(t *testing.T) {
 	logs := []LogMutationRequest{
 		{ActorID: strPtr("1"), ActorType: "user", Action: "user_created", ResourceType: "user", ResourceID: "u1", NewValue: json.RawMessage(`{"email": "alice@example.com"}`)},
 		{ActorID: strPtr("1"), ActorType: "user", Action: "user_updated", ResourceType: "user", ResourceID: "u2", NewValue: json.RawMessage(`{"email": "bob@example.com"}`)},
-		{ActorID: strPtr("2"), ActorType: "service", SubjectUserID: strPtr("none"), Action: "deployment_created", ResourceType: "deployment", ResourceID: "d1", NewValue: json.RawMessage(`{"name": "prod"}`)},
+		// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 follow-up): the service is named in ActorService
+		// (it was ActorID "2", which no longer stands in for it).
+		{ActorService: strPtr("2"), ActorType: "service", SubjectUserID: strPtr("none"), Action: "deployment_created", ResourceType: "deployment", ResourceID: "d1", NewValue: json.RawMessage(`{"name": "prod"}`)},
 	}
 	for _, l := range logs {
 		_, err := logger.LogMutation(ctx, l)
@@ -892,7 +896,9 @@ func TestAuditLogger_ApplyRetention(t *testing.T) {
 // (400 subject_mismatch), writing nothing; and every read by a non-admin caller gets 403 admin_only.
 // Written 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Extended the same day (Phase B.2, audit spec
 // "Refusals by log()"): an unknown actor_type is 400 invalid_actor_type, a 'user' actor without actor_id is 400
-// actor_required, and a 'service' actor with no service name is 400 actor_service_required. Touches: in-memory SQLite.
+// actor_required, and a 'service' actor with no service name is 400 actor_service_required. Extended again the
+// same day (Phase B.2 follow-up): a 'service' actor with an actor_id but no actor_service is also 400
+// actor_service_required (actor_id is no longer used as the service name). Touches: in-memory SQLite.
 // AUDIT-10
 func TestAuditLogger_Refusals(t *testing.T) {
 	logger, err := NewAuditLogger(":memory:")
@@ -924,6 +930,12 @@ func TestAuditLogger_Refusals(t *testing.T) {
 		}},
 		{"actor_service_required", func(r *LogMutationRequest) {
 			r.SubjectUserID, r.ActorType, r.ActorID, r.ActorService = strPtr("none"), "service", nil, strPtr("")
+		}},
+		// Phase B.2 follow-up, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: an actor_id does not stand in for
+		// actor_service (the base request carries ActorID "1"; the fallback used it as the service name).
+		{"actor_service_required", func(r *LogMutationRequest) { r.SubjectUserID, r.ActorType = strPtr("none"), "service" }},
+		{"actor_service_required", func(r *LogMutationRequest) {
+			r.SubjectUserID, r.ActorType, r.ActorID = strPtr("none"), "service", strPtr("billing-worker")
 		}},
 	}
 	for _, c := range cases {

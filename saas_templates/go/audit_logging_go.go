@@ -397,7 +397,7 @@ func subjectRef(ctx context.Context, tx *sql.Tx, userID, now string) (string, er
 //
 // In: LogMutationRequest. Out: the new log id, or an *AuditError 400: invalid_actor_type (actor_type not
 // user/service/api_key), actor_required (a 'user' actor without ActorID), actor_service_required (a 'service'
-// actor with neither ActorService nor ActorID, which names the service when ActorService is absent),
+// actor without a non-empty ActorService; ActorID never stands in for it),
 // metadata_key_not_allowed, subject_required, subject_mismatch, actor_user_required (an api_key without
 // ActorUserID). Nothing is written on a refusal.
 // Writes in ONE transaction: the subject(s) in audit_subjects, the audit_log event (resource fields only when
@@ -406,7 +406,10 @@ func subjectRef(ctx context.Context, tx *sql.Tx, userID, now string) (string, er
 // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUDIT-01/08/10, amended). Changed again the same day
 // (Phase B.2, audit spec "Refusals by log()"): a user actor without actor_id is actor_required (it was
 // actor_user_required, the api_key code), and a service actor with no name is refused with
-// actor_service_required (it was written with a NULL actor_service). Touches: the database.
+// actor_service_required (it was written with a NULL actor_service). Changed again the same day (Phase B.2
+// follow-up from the coordinator, audit spec: "actor_type 'service' without actor_service ->
+// actor_service_required"): the fallback that used ActorID as the service name is removed, so a service
+// entry must name its service in ActorService. Touches: the database.
 func (a *AuditLogger) LogMutation(ctx context.Context, req LogMutationRequest) (string, error) {
 	if req.ActorType != "user" && req.ActorType != "service" && req.ActorType != "api_key" {
 		return "", &AuditError{Status: 400, Code: "invalid_actor_type", Message: ErrInvalidActorType.Error(), wrapped: ErrInvalidActorType}
@@ -459,14 +462,12 @@ func (a *AuditLogger) LogMutation(ctx context.Context, req LogMutationRequest) (
 	}
 	var service interface{}
 	if req.ActorType == "service" {
-		switch {
-		case req.ActorService != nil && *req.ActorService != "":
-			service = *req.ActorService
-		case req.ActorID != nil && *req.ActorID != "":
-			service = *req.ActorID
-		default:
+		// Only ActorService names a service; ActorID is never used as the name (Phase B.2 follow-up, 2026-11-10,
+		// session_012zDydZCZ4AChqhEZ4oVtaP).
+		if req.ActorService == nil || *req.ActorService == "" {
 			return "", auditErr(400, "actor_service_required", "a service actor needs actor_service")
 		}
+		service = *req.ActorService
 	}
 	var roles []string
 	if actorOwner != "" {
