@@ -23,7 +23,9 @@ import (
 // stripe.GetClient(), which does not exist in any stripe-go release).
 type fakeStripe struct {
 	created []string // "customer|price"
-	changed []string // "subscription|price"
+	changed []string // "subscription|item id|price|proration_behavior" (one per update call)
+	updates int
+	items   map[string][]string // subscription id -> its item ids; a missing id has one item "si_<id>"
 	credit  int64
 }
 
@@ -33,9 +35,39 @@ func (f *fakeStripe) CreateSubscription(_ context.Context, customerID, priceID s
 	return &stripe.Subscription{ID: fmt.Sprintf("sub_fake_%d", len(f.created)), Status: "active"}, nil
 }
 
-// ChangeSubscriptionPrice records the call and returns the configured proration credit.
-func (f *fakeStripe) ChangeSubscriptionPrice(_ context.Context, subscriptionID, priceID string) (int64, error) {
-	f.changed = append(f.changed, subscriptionID+"|"+priceID)
+// RetrieveSubscription returns the subscription with its configured items (default: one item,
+// "si_<subscription id>"). Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (BILL-03). Touches nothing.
+func (f *fakeStripe) RetrieveSubscription(_ context.Context, subscriptionID string) (*stripe.Subscription, error) {
+	ids, ok := f.items[subscriptionID]
+	if !ok {
+		ids = []string{"si_" + subscriptionID}
+	}
+	list := &stripe.SubscriptionItemList{}
+	for _, id := range ids {
+		list.Data = append(list.Data, &stripe.SubscriptionItem{ID: id})
+	}
+	return &stripe.Subscription{ID: subscriptionID, Items: list}, nil
+}
+
+// UpdateSubscription records every item it is sent as "subscription|item id|price|proration" and
+// returns the configured proration credit. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: was
+// ChangeSubscriptionPrice, which hid the item id from the test. Touches nothing.
+func (f *fakeStripe) UpdateSubscription(_ context.Context, subscriptionID string, params *stripe.SubscriptionParams) (int64, error) {
+	f.updates++
+	proration := ""
+	if params.ProrationBehavior != nil {
+		proration = *params.ProrationBehavior
+	}
+	for _, it := range params.Items {
+		id, price := "", ""
+		if it.ID != nil {
+			id = *it.ID
+		}
+		if it.Price != nil {
+			price = *it.Price
+		}
+		f.changed = append(f.changed, subscriptionID+"|"+id+"|"+price+"|"+proration)
+	}
 	return f.credit, nil
 }
 
@@ -62,6 +94,7 @@ func newTestService(t *testing.T) *BillingService {
 	return svc
 }
 
+// BILL-01
 func TestCreateSubscriptionHappyPath(t *testing.T) {
 	svc := newTestService(t)
 	stripe.Key = "sk_test_dummy"
@@ -88,6 +121,7 @@ func TestCreateSubscriptionHappyPath(t *testing.T) {
 	}
 }
 
+// BILL-02
 func TestCreateSubscriptionInvalidTier(t *testing.T) {
 	svc := newTestService(t)
 	_, err := svc.CreateSubscription(context.Background(), "cus_123", "platinum")
@@ -103,6 +137,7 @@ func TestCreateSubscriptionInvalidTier(t *testing.T) {
 	}
 }
 
+// BILL-03
 func TestChangePlanHappyPath(t *testing.T) {
 	svc := newTestService(t)
 	ctx := context.Background()
@@ -127,14 +162,39 @@ func TestChangePlanHappyPath(t *testing.T) {
 	if tier != "team" {
 		t.Fatalf("expected tier team, got %s", tier)
 	}
-	if f := svc.stripe.(*fakeStripe); len(f.changed) != 1 || f.changed[0] != "sub_abc|"+PriceID["team"] {
-		t.Fatalf("expected one Stripe update of sub_abc to the team price, got %v", f.changed)
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: BILL-03 (amended) requires the existing item's id
+	// with the new price, so Stripe swaps the price instead of adding a second item.
+	want := "sub_abc|si_sub_abc|" + PriceID["team"] + "|create_prorations"
+	if f := svc.stripe.(*fakeStripe); f.updates != 1 || len(f.changed) != 1 || f.changed[0] != want {
+		t.Fatalf("expected one Stripe update %q, got %v", want, f.changed)
 	}
 	if res["proration_credit"] != int64(250) {
 		t.Fatalf("expected the proration credit from Stripe (250), got %v", res["proration_credit"])
 	}
+
+	// Unknown tier: 400 invalid_tier, and Stripe is never updated.
+	_, err = svc.ChangePlan(ctx, "sub_abc", "platinum")
+	if e, ok := err.(*APIError); !ok || e.Status != http.StatusBadRequest || e.Code != "invalid_tier" {
+		t.Fatalf("unknown tier: want 400 invalid_tier, got %v", err)
+	}
+	// Not exactly one item (none, or two): 409 subscription_item_ambiguous, and Stripe is never updated.
+	f := svc.stripe.(*fakeStripe)
+	for _, items := range [][]string{{}, {"si_1", "si_2"}} {
+		f.items = map[string][]string{"sub_abc": items}
+		_, err = svc.ChangePlan(ctx, "sub_abc", "enterprise")
+		if e, ok := err.(*APIError); !ok || e.Status != http.StatusConflict || e.Code != "subscription_item_ambiguous" {
+			t.Fatalf("items %v: want 409 subscription_item_ambiguous, got %v", items, err)
+		}
+	}
+	if f.updates != 1 {
+		t.Fatalf("a refused change must not reach stripe.subscriptions.update; updates=%d", f.updates)
+	}
+	if err := svc.db.QueryRow("SELECT tier FROM subscriptions WHERE stripe_subscription_id='sub_abc'").Scan(&tier); err != nil || tier != "team" {
+		t.Fatalf("a refused change must not touch the tier; got %s (%v)", tier, err)
+	}
 }
 
+// BILL-04
 func TestQueueRefundHappyPath(t *testing.T) {
 	svc := newTestService(t)
 	ctx := context.Background()
@@ -160,6 +220,7 @@ func TestQueueRefundHappyPath(t *testing.T) {
 	}
 }
 
+// BILL-05
 func TestQueueRefundExceedsInvoice(t *testing.T) {
 	svc := newTestService(t)
 	ctx := context.Background()
@@ -191,6 +252,7 @@ func buildEvent(t *testing.T, id, typ string, raw interface{}) []byte {
 	return b
 }
 
+// BILL-06
 func TestHandleWebhookPaymentSucceeded(t *testing.T) {
 	svc := newTestService(t)
 	ctx := context.Background()
@@ -219,6 +281,7 @@ func TestHandleWebhookPaymentSucceeded(t *testing.T) {
 	}
 }
 
+// BILL-07
 func TestHandleWebhookDuplicateEvent(t *testing.T) {
 	svc := newTestService(t)
 	ctx := context.Background()
@@ -240,6 +303,7 @@ func TestHandleWebhookDuplicateEvent(t *testing.T) {
 	}
 }
 
+// BILL-08
 func TestHandleWebhookSubscriptionUpdated(t *testing.T) {
 	svc := newTestService(t)
 	ctx := context.Background()
@@ -269,6 +333,7 @@ func TestHandleWebhookSubscriptionUpdated(t *testing.T) {
 	}
 }
 
+// BILL-09
 func TestWebhookInvalidSignature(t *testing.T) {
 	svc := newTestService(t)
 	os.Setenv("STRIPE_WEBHOOK_SECRET", "whsec_test")
@@ -285,6 +350,7 @@ func TestWebhookInvalidSignature(t *testing.T) {
 	}
 }
 
+// BILL-10
 func TestWebhookResponseTime(t *testing.T) {
 	svc := newTestService(t)
 	inv := stripe.Invoice{ID: "in_400", Customer: &stripe.Customer{ID: "cus_9"}, AmountPaid: 100}

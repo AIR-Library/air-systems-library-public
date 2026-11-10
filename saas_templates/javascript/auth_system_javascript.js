@@ -153,6 +153,30 @@ function clearLoginFail(ip, userId) {
   rateLimits.loginFail.delete(key);
 }
 
+/**
+ * checkPasswordStrength(password, email, name) -> null | "too_short" | "too_long" | "blocklisted".
+ * In: the candidate password and the user's own email and name. Out: null when the password is accepted,
+ * otherwise the spec's rejection reason. Checks run too_short (< 15), too_long (> 64), blocklisted (bundled
+ * list, or the user's own email / name / the service name) and the first failure wins, so "password123" is
+ * too_short (auth_system.md PASSWORD RULES, AUTH-03 amended 2026-11-10). An empty email or name never
+ * matches (an empty string is contained in every password).
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+ */
+function checkPasswordStrength(password, email, name) {
+  if (password.length < 15) return 'too_short';
+  if (password.length > 64) return 'too_long';
+  const lower = password.toLowerCase();
+  const own = [email, name, SERVICE_NAME].filter(v => typeof v === 'string' && v.length > 0).map(v => v.toLowerCase());
+  if (BLOCKLIST.includes(lower) || own.some(v => lower.includes(v))) return 'blocklisted';
+  return null;
+}
+
+/**
+ * signup(email, password, name, ip) -> {success, status: "pending_verification", email} | {error, ...}.
+ * Gates in order: rate_limit_ip_24h, email_unique, password_strength. A weak password returns
+ * {error: "password_rejected", reason} (AUTH-03, amended 2026-11-10; was "password_too_weak").
+ * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches the users, verification_codes and audit tables.
+ */
 async function signup(email, password, name, ip) {
   const db = await dbPromise;
   if (isRateLimitedSignup(ip)) {
@@ -162,15 +186,9 @@ async function signup(email, password, name, ip) {
   if (existing) {
     return { error: 'email_already_exists', message: 'Email already registered' };
   }
-  if (password.length < 15) {
-    return { error: 'password_too_weak', message: 'Password too short' };
-  }
-  if (password.length > 64) {
-    return { error: 'password_too_weak', message: 'Password too long' };
-  }
-  const lower = password.toLowerCase();
-  if (BLOCKLIST.includes(lower) || lower.includes(email.toLowerCase()) || lower.includes(name.toLowerCase()) || lower.includes(SERVICE_NAME)) {
-    return { error: 'password_too_weak', message: 'Password blocklisted' };
+  const rejected = checkPasswordStrength(password, email, name);
+  if (rejected) {
+    return { error: 'password_rejected', reason: rejected, message: 'Password rejected' };
   }
   const hash = await hashPassword(password);
   const user_id = uuidv4();

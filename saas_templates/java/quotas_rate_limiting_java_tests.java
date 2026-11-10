@@ -51,6 +51,30 @@ public class QuotaManagerTest {
     }
 
     /** 1,000 solo calls pass, the 1,001st gets quota_exceeded. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: calls 1 s apart so the spec's rate limits do not fire first. */
+    /**
+     * QUOTA-13: -1 is unlimited in every quota. An enterprise upload larger than the team limit (150e9 bytes, given by
+     * size) is stored, a second one on top of it too, and 10,001 enterprise calls in one month (past solo's 1,000 and
+     * team's 10,000) all answer 200. In/out: none. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the
+     * test manager's in-memory H2.
+     */
+    // QUOTA-13
+    @Test
+    public void testMinusOneIsUnlimitedForEnterprise() throws Exception {
+        fixedClock.advance(Duration.ofSeconds(1));
+        assertEquals(200, qm.handleApiCall(enterpriseUser, "/upload", "10.0.0.1", 150_000_000_000L, "feature_c").getStatusCode());
+        fixedClock.advance(Duration.ofSeconds(1));
+        assertEquals(200, qm.handleApiCall(enterpriseUser, "/upload", "10.0.0.1", 150_000_000_000L, "feature_c").getStatusCode());
+        // The same size is refused for a team user, so the pass above is the -1 rule and not a missing check.
+        fixedClock.advance(Duration.ofSeconds(1));
+        assertEquals(413, qm.handleApiCall(teamUser, "/upload", "10.0.0.2", 150_000_000_000L, "feature_c").getStatusCode());
+        for (int i = 0; i < 10_001; i++) {
+            fixedClock.advance(Duration.ofSeconds(1));
+            QuotaManager.Response r = qm.handleApiCall(enterpriseUser, "/test", "10.0.0.1", null, "feature_c");
+            assertEquals(200, r.getStatusCode(), "enterprise call " + (i + 1) + " answered " + r.getBody());
+        }
+    }
+
+    // QUOTA-01
     @Test
     public void testApiQuotaPass() throws Exception {
         for (int i = 0; i < 1000; i++) {
@@ -66,6 +90,7 @@ public class QuotaManagerTest {
     }
 
     /** Past the monthly quota a call gets 429 quota_exceeded. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: calls 1 s apart; asserts the error code too. */
+    // QUOTA-02
     @Test
     public void testApiQuotaFail() throws Exception {
         for (int i = 0; i < 1001; i++) {
@@ -78,6 +103,7 @@ public class QuotaManagerTest {
         assertTrue(r.getBody().contains("quota_exceeded"));
     }
 
+    // QUOTA-03
     @Test
     public void testStorageQuotaPass() throws Exception {
         byte[] file = new byte[500_000_000]; // 500 MB
@@ -85,6 +111,7 @@ public class QuotaManagerTest {
         assertEquals(200, r.getStatusCode());
     }
 
+    // QUOTA-04
     @Test
     public void testStorageQuotaFail() throws Exception {
         byte[] file = new byte[1_200_000_000]; // 1.2 GB
@@ -94,6 +121,7 @@ public class QuotaManagerTest {
     }
 
     /** 99 calls in a minute pass. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: 200 ms apart (5 per second per IP, under the IP limit). */
+    // QUOTA-05
     @Test
     public void testRateLimitPerUserPass() throws Exception {
         for (int i = 0; i < 99; i++) {
@@ -104,6 +132,7 @@ public class QuotaManagerTest {
     }
 
     /** The 101st call within a minute gets rate_limit_exceeded. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: 200 ms apart; each of the first 100 asserted 200. */
+    // QUOTA-06
     @Test
     public void testRateLimitPerUserFail() throws Exception {
         for (int i = 0; i < 100; i++) {
@@ -116,6 +145,7 @@ public class QuotaManagerTest {
         assertTrue(r.getBody().contains("rate_limit_exceeded"));
     }
 
+    // QUOTA-07
     @Test
     public void testRateLimitPerIpPass() throws Exception {
         for (int i = 0; i < 9; i++) {
@@ -124,6 +154,7 @@ public class QuotaManagerTest {
         }
     }
 
+    // QUOTA-08
     @Test
     public void testRateLimitPerIpFail() throws Exception {
         for (int i = 0; i < 10; i++) {
@@ -134,12 +165,14 @@ public class QuotaManagerTest {
         assertTrue(r.getBody().contains("ip_rate_limit_exceeded"));
     }
 
+    // QUOTA-09
     @Test
     public void testFeatureGatePass() throws Exception {
         QuotaManager.Response r = qm.handleApiCall(teamUser, "/feature", "127.0.0.1", null, "feature_a");
         assertEquals(200, r.getStatusCode());
     }
 
+    // QUOTA-10
     @Test
     public void testFeatureGateFail() throws Exception {
         QuotaManager.Response r = qm.handleApiCall(soloUser, "/feature", "127.0.0.1", null, "feature_a");
@@ -148,6 +181,7 @@ public class QuotaManagerTest {
     }
 
     /** Usage resets in a new month. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: exhausts January on one manager, then moves its clock to February. */
+    // QUOTA-11
     @Test
     public void testMonthRollover() throws Exception {
         // Use up January's quota. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: the test made one
@@ -167,6 +201,7 @@ public class QuotaManagerTest {
     }
 
     /** An upgrade lifts the limit immediately. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: calls 1 s apart; asserts the solo limit was reached first. */
+    // QUOTA-12
     @Test
     public void testTierUpgrade() throws Exception {
         // Solo user makes 1000 calls

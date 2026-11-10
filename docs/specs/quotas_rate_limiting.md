@@ -23,6 +23,7 @@ name or in a comment on the line above it (for example `# QUOTA-01`), so a missi
 | `QUOTA-10` | feature_gate FAIL → feature unavailable, 403 with upgrade hint |
 | `QUOTA-11` | month rollover → usage_metrics reset for new month |
 | `QUOTA-12` | tier upgrade → limits updated immediately |
+| `QUOTA-13` | a limit of -1 is unlimited → enterprise storage upload of any size stored, and enterprise API calls past every other tier's limit never get 429 from the quota |
 
 ## Contract
 
@@ -31,8 +32,8 @@ QUOTA CHECKS (on every API request):
 
   1. api_call_quota
      Query: SELECT SUM(call_count) FROM usage_metrics WHERE user_id = ? AND month = CURRENT_MONTH
-     Limit: {solo: 1000, team: 10000, enterprise: unlimited}
-     Decision: PASS if (current_usage + 1) <= limit
+     Limit: {solo: 1000, team: 10000, enterprise: -1}      -- -1 means unlimited, in every quota
+     Decision: PASS if limit == -1 (unlimited), else PASS if (current_usage + 1) <= limit
               REJECT if exceeds limit
      Log: why_chain(gate="api_quota_check", user_id, tier, current_usage, limit)
      Action: if REJECT: return 429 {error: "quota_exceeded", usage, limit, reset_date}
@@ -87,4 +88,5 @@ TESTS REQUIRED:
   - **QUOTA-10** feature_gate FAIL → feature unavailable, 403 with upgrade hint
   - **QUOTA-11** month rollover → usage_metrics reset for new month
   - **QUOTA-12** tier upgrade → limits updated immediately
+  - **QUOTA-13** a limit of -1 is unlimited → enterprise storage upload of any size stored, and enterprise API calls past every other tier's limit never get 429 from the quota
 ```

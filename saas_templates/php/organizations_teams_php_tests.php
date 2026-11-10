@@ -52,6 +52,7 @@ function user(string $id, string $email): array
 }
 
 // T1
+// ORG-01
 function test_non_member_cannot_read_members_of_another_org(): void
 {
     $svc = make_service();
@@ -93,6 +94,7 @@ function test_non_member_cannot_read_members_of_another_org(): void
 }
 
 // T2
+// ORG-02
 function test_member_cannot_invite_admin_can(): void
 {
     $svc = make_service();
@@ -118,6 +120,7 @@ function test_member_cannot_invite_admin_can(): void
 }
 
 // T3
+// ORG-03
 function test_admin_cannot_remove_owner_and_last_owner_cannot_leave(): void
 {
     $svc = make_service();
@@ -148,6 +151,7 @@ function test_admin_cannot_remove_owner_and_last_owner_cannot_leave(): void
 }
 
 // T4
+// ORG-04
 function test_invitation_works_once_second_use_fails(): void
 {
     $svc = make_service();
@@ -166,6 +170,7 @@ function test_invitation_works_once_second_use_fails(): void
 }
 
 // T5
+// ORG-05
 function test_expired_invitation_fails(): void
 {
     $t = 1700000000;
@@ -184,6 +189,7 @@ function test_expired_invitation_fails(): void
 }
 
 // T6
+// ORG-05
 function test_accept_with_different_email_fails(): void
 {
     $svc = make_service();
@@ -200,6 +206,7 @@ function test_accept_with_different_email_fails(): void
 }
 
 // T7
+// ORG-06
 function test_raw_token_not_stored_in_database(): void
 {
     $k = 0;

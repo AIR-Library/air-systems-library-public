@@ -22,7 +22,7 @@ name or in a comment on the line above it (for example `# ADMIN-01`), so a missi
 | `ADMIN-09` | suspend_own_account → 400 {error: "cannot_suspend_yourself"} |
 | `ADMIN-10` | customers list → pagination works, all fields present |
 | `ADMIN-11` | customers detail → all fields present |
-| `ADMIN-12` | change_plan → stripe.subscriptions.update called, audit logged |
+| `ADMIN-12` | change_plan → stripe.subscriptions.update called with the existing item id and the new price (no second item), audit logged |
 | `ADMIN-13` | queue_refund → refund record created with status='queued' |
 | `ADMIN-14` | create_deployment → deployment created + config initialized |
 | `ADMIN-15` | publish_deployment → double-gate checked, status changed to 'live' |
@@ -77,7 +77,8 @@ DOMAINS:
     POST /admin/customers/{customer_id}/action
       action=change_plan → require(new_tier)
         Gate: owner_only
-        Action: stripe.subscriptions.update(stripe_subscription_id, {items: [{price: price_id[new_tier]}]})
+        Action: billing change_plan (billing_subscriptions.md, flow 2): update with {id: current_item_id, price};
+                never a bare {price}, which adds a second item and bills both plans. Amended 2026-11-10.
         Log: audit_log(action="plan_changed", actor_id, customer_id, old_tier, new_tier)
         Return: {success: true, customer_id, old_tier, new_tier, effective_date}
 
@@ -164,7 +165,7 @@ TESTS REQUIRED:
   - **ADMIN-09** suspend_own_account → 400 {error: "cannot_suspend_yourself"}
   - **ADMIN-10** customers list → pagination works, all fields present
   - **ADMIN-11** customers detail → all fields present
-  - **ADMIN-12** change_plan → stripe.subscriptions.update called, audit logged
+  - **ADMIN-12** change_plan → stripe.subscriptions.update called with the existing item id and the new price (no second item), audit logged
   - **ADMIN-13** queue_refund → refund record created with status='queued'
   - **ADMIN-14** create_deployment → deployment created + config initialized
   - **ADMIN-15** publish_deployment → double-gate checked, status changed to 'live'

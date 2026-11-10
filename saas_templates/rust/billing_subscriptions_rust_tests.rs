@@ -47,6 +47,7 @@ fn payment_succeeded() -> Value {
     })
 }
 
+// BILL-01
 #[tokio::test]
 async fn test_create_subscription_happy_path() {
     let provider = FakePaymentProvider::with_subscription_id("sub_123");
@@ -67,6 +68,7 @@ async fn test_create_subscription_happy_path() {
     assert_eq!(count(&service, "audit_log", "action = 'subscription_created'"), 1);
 }
 
+// BILL-02
 #[tokio::test]
 async fn test_create_subscription_invalid_tier() {
     let provider = FakePaymentProvider::default();
@@ -82,6 +84,10 @@ async fn test_create_subscription_invalid_tier() {
     assert!(provider.calls.lock().unwrap().is_empty());
 }
 
+/// What: BILL-03: change_plan retrieves the subscription and updates its existing item with the new price
+/// and create_prorations, leaving one item; tier stored and audited. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP for the
+/// BILL-03 amendment (the provider call used to send a bare price). Touches: memory only.
+// BILL-03
 #[tokio::test]
 async fn test_change_plan_happy_path() {
     let provider = FakePaymentProvider { proration_credit_cents: 500, ..FakePaymentProvider::with_subscription_id("sub_123") };
@@ -98,11 +104,49 @@ async fn test_change_plan_happy_path() {
     assert_eq!(response["new_tier"], "team");
     assert_eq!(response["proration_credit"], 500);
 
-    assert!(provider.calls.lock().unwrap().contains(&"update sub_123 price_team".to_string()));
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (BILL-03 amendment): the update names the existing
+    // item id with the new price and create_prorations, and the subscription still has ONE item
+    assert_eq!(
+        provider.calls.lock().unwrap()[1..].to_vec(),
+        ["retrieve sub_123".to_string(), "update sub_123 si_sub_123=price_team create_prorations".to_string()]
+    );
+    assert_eq!(provider.items.lock().unwrap()["sub_123"], vec![SubscriptionItem { id: "si_sub_123".into(), price: "price_team".into() }]);
     assert_eq!(count(&service, "subscriptions", "stripe_subscription_id = 'sub_123' AND tier = 'team'"), 1);
     assert_eq!(count(&service, "audit_log", "action = 'plan_changed'"), 1);
 }
 
+/// What: BILL-03 refusals, both before any provider update: an unknown tier is 400 invalid_tier (no
+/// provider call at all); a subscription with two items (or none) is 409 subscription_item_ambiguous
+/// after the retrieve, and the tier is unchanged. In: none. Out: panics on a wrong answer.
+/// Why: 2026-11-10 amendment (BILL-03). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+// BILL-03
+#[tokio::test]
+async fn test_change_plan_refusals_before_update() {
+    let provider = FakePaymentProvider::with_subscription_id("sub_123");
+    let service = service(provider.clone());
+    service.create_subscription(CreateSubscriptionRequest { customer_id: "cust_123".into(), tier: "solo".into() }).await.unwrap();
+    provider.calls.lock().unwrap().clear();
+
+    let err = service.change_plan(ChangePlanRequest { subscription_id: "sub_123".into(), new_tier: "platinum".into() }).await.unwrap_err();
+    assert_eq!((err.to_response().0["error"].clone(), err.to_response().1), (serde_json::json!("invalid_tier"), 400));
+    assert!(provider.calls.lock().unwrap().is_empty());
+
+    for items in [2usize, 0] {
+        provider.items.lock().unwrap().insert(
+            "sub_123".into(),
+            (0..items).map(|i| SubscriptionItem { id: format!("si_{}", i), price: "price_solo".into() }).collect(),
+        );
+        provider.calls.lock().unwrap().clear();
+        let err = service.change_plan(ChangePlanRequest { subscription_id: "sub_123".into(), new_tier: "team".into() }).await.unwrap_err();
+        assert_eq!(err, BillingError::SubscriptionItemAmbiguous);
+        assert_eq!((err.to_response().0["error"].clone(), err.to_response().1), (serde_json::json!("subscription_item_ambiguous"), 409));
+        assert_eq!(provider.calls.lock().unwrap().as_slice(), ["retrieve sub_123"]);
+    }
+    assert_eq!(count(&service, "subscriptions", "stripe_subscription_id = 'sub_123' AND tier = 'solo'"), 1);
+    assert_eq!(count(&service, "audit_log", "action = 'plan_changed'"), 0);
+}
+
+// BILL-04
 #[tokio::test]
 async fn test_queue_refund_happy_path() {
     let service = service(FakePaymentProvider::default());
@@ -120,6 +164,7 @@ async fn test_queue_refund_happy_path() {
     assert_eq!(count(&service, "audit_log", "action = 'refund_queued'"), 1);
 }
 
+// BILL-05
 #[tokio::test]
 async fn test_queue_refund_amount_exceeds_invoice() {
     let service = service(FakePaymentProvider::default());
@@ -132,6 +177,7 @@ async fn test_queue_refund_amount_exceeds_invoice() {
     assert_eq!(count(&service, "refunds", "1 = 1"), 0);
 }
 
+// BILL-06
 #[tokio::test]
 async fn test_handle_webhook_payment_succeeded() {
     let service = service(FakePaymentProvider::default());
@@ -145,6 +191,7 @@ async fn test_handle_webhook_payment_succeeded() {
     assert_eq!(count(&service, "events", "stripe_event_id = 'evt_123'"), 1);
 }
 
+// BILL-07
 #[tokio::test]
 async fn test_handle_webhook_duplicate_event() {
     let service = service(FakePaymentProvider::default());
@@ -161,6 +208,7 @@ async fn test_handle_webhook_duplicate_event() {
     assert_eq!(count(&service, "events", "1 = 1"), 1);
 }
 
+// BILL-08
 #[tokio::test]
 async fn test_handle_webhook_subscription_updated() {
     let service = service(FakePaymentProvider::with_subscription_id("sub_123"));
@@ -189,6 +237,7 @@ async fn test_handle_webhook_subscription_updated() {
     assert_eq!(count(&service, "events", "stripe_event_id = 'evt_123'"), 1);
 }
 
+// BILL-10
 #[tokio::test]
 async fn test_webhook_response_time() {
     let service = service(FakePaymentProvider::default());
@@ -204,6 +253,7 @@ async fn test_webhook_response_time() {
     assert_eq!(count(&service, "invoices", "1 = 1"), 1);
 }
 
+// BILL-09
 #[tokio::test]
 async fn test_webhook_signature_invalid() {
     let service = service(FakePaymentProvider::default());

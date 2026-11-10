@@ -13,7 +13,7 @@ name or in a comment on the line above it (for example `# AUTH-01`), so a missin
 |---|---|
 | `AUTH-01` | signup happy path (valid email, strong password) → user created, email sent |
 | `AUTH-02` | signup duplicate email → 409 {error: "email_already_exists"} |
-| `AUTH-03` | signup weak password → 400 {error: "password_too_weak"} |
+| `AUTH-03` | signup weak password → 400 {error: "password_rejected", reason: "too_short"} |
 | `AUTH-04` | signup IP rate limit → 429 {error: "too_many_signups_from_ip"} |
 | `AUTH-05` | verify_email happy path → user status changed to verified |
 | `AUTH-06` | verify_email expired code → 400 {error: "code_expired"} |
@@ -48,6 +48,7 @@ FLOWS TO BUILD (exact sequence — no deviations):
          list, and also reject the user's own email / name / the service name as the password
        - never store a password hint; never force periodic password changes
      On rejection return {error: "password_rejected", reason: "too_short" | "too_long" | "blocklisted"}
+     Checks run in that order and the first failure wins ("password123" is too_short, not blocklisted).
      -- never a message asking for upper-case, digits or symbols.
      Action: create user with status='unverified', hash password, send verification email
      Log: why_chain(flow="signup", decision_points=["email_unique", "password_strength", "rate_limit_ip_24h"])
@@ -127,7 +128,7 @@ IMPLEMENTATION REQUIREMENTS:
 TESTS REQUIRED:
   - **AUTH-01** signup happy path (valid email, strong password) → user created, email sent
   - **AUTH-02** signup duplicate email → 409 {error: "email_already_exists"}
-  - **AUTH-03** signup weak password → 400 {error: "password_too_weak"}
+  - **AUTH-03** signup weak password → 400 {error: "password_rejected", reason: "too_short"}
   - **AUTH-04** signup IP rate limit → 429 {error: "too_many_signups_from_ip"}
   - **AUTH-05** verify_email happy path → user status changed to verified
   - **AUTH-06** verify_email expired code → 400 {error: "code_expired"}

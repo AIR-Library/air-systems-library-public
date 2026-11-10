@@ -13,6 +13,7 @@ function createMembershipChecker(members) {
   return (user, orgId) => members.has(`${user}:${orgId}`);
 }
 
+// UPLOAD-01
 test('a .exe is rejected', () => {
   const tempDir = createTempDir();
   const members = new Set(['user1:org1']);
@@ -27,6 +28,7 @@ test('a .exe is rejected', () => {
   assert.ok(result.error.includes('not allowed'), 'Error should mention extension not allowed');
 });
 
+// UPLOAD-01
 test('a .exe renamed to .png is rejected by its magic bytes', () => {
   const tempDir = createTempDir();
   const members = new Set(['user1:org1']);
@@ -41,6 +43,7 @@ test('a .exe renamed to .png is rejected by its magic bytes', () => {
   assert.ok(result.error.includes('Magic bytes'), 'Error should mention magic bytes');
 });
 
+// UPLOAD-02
 test('a real PNG is accepted and stored under a generated name, not the original', () => {
   const tempDir = createTempDir();
   const members = new Set(['user1:org1']);
@@ -60,6 +63,7 @@ test('a real PNG is accepted and stored under a generated name, not the original
   assert.ok(record.stored_name.endsWith('.png'), 'Stored name should have .png extension');
 });
 
+// UPLOAD-03
 test('../../etc/passwd.png is stored safely; the display name has no path parts', () => {
   const tempDir = createTempDir();
   const members = new Set(['user1:org1']);
@@ -79,6 +83,7 @@ test('../../etc/passwd.png is stored safely; the display name has no path parts'
   assert.ok(!record.original_name.includes('/'), 'Display name should not contain /');
 });
 
+// UPLOAD-04
 test('a file over the size limit is rejected', () => {
   const tempDir = createTempDir();
   const members = new Set(['user1:org1']);
@@ -98,6 +103,7 @@ test('a file over the size limit is rejected', () => {
   assert.ok(result.error.includes('size'), 'Error should mention size');
 });
 
+// UPLOAD-05
 test('a non-member of the org cannot upload or download', () => {
   const tempDir = createTempDir();
   const members = new Set(['user1:org1']);
@@ -115,6 +121,7 @@ test('a non-member of the org cannot upload or download', () => {
   assert.ok(downloadResult.error, 'Invalid token should fail');
 });
 
+// UPLOAD-06
 test('an expired link is rejected; a link with one changed character is rejected', async () => {
   const tempDir = createTempDir();
   const members = new Set(['user1:org1']);
@@ -143,6 +150,7 @@ test('an expired link is rejected; a link with one changed character is rejected
   assert.ok(tamperedResult.error, 'Tampered link should be rejected');
 });
 
+// UPLOAD-07
 test('after delete_file, the file can no longer be linked or downloaded', () => {
   const tempDir = createTempDir();
   const members = new Set(['user1:org1']);

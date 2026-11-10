@@ -8,6 +8,7 @@ import (
 	"time"
 )
 
+// FLAG-01
 func TestUnknownFlagReturnsDefault(t *testing.T) {
 	store := NewMemoryStore()
 	client := NewClient(store)
@@ -26,6 +27,7 @@ func TestUnknownFlagReturnsDefault(t *testing.T) {
 	}
 }
 
+// FLAG-02
 func TestTypeMismatch(t *testing.T) {
 	store := NewMemoryStore()
 	client := NewClient(store)
@@ -49,6 +51,7 @@ func TestTypeMismatch(t *testing.T) {
 	}
 }
 
+// FLAG-03
 func TestDisabledFlagReturnsDefault(t *testing.T) {
 	store := NewMemoryStore()
 	client := NewClient(store)
@@ -69,6 +72,7 @@ func TestDisabledFlagReturnsDefault(t *testing.T) {
 	}
 }
 
+// FLAG-04
 func TestMatchingRuleReturnsValue(t *testing.T) {
 	store := NewMemoryStore()
 	client := NewClient(store)
@@ -117,6 +121,7 @@ func TestMatchingRuleReturnsValue(t *testing.T) {
 	}
 }
 
+// FLAG-05
 func TestRolloutDeterministic(t *testing.T) {
 	store := NewMemoryStore()
 	client := NewClient(store)
@@ -157,6 +162,7 @@ func TestRolloutDeterministic(t *testing.T) {
 	}
 }
 
+// FLAG-06
 func TestRolloutFallsThrough(t *testing.T) {
 	store := NewMemoryStore()
 	client := NewClient(store)
@@ -196,6 +202,7 @@ func TestRolloutFallsThrough(t *testing.T) {
 	}
 }
 
+// FLAG-07
 func TestCorruptRulesReturnsParseError(t *testing.T) {
 	store := NewMemoryStore()
 	client := NewClient(store)
@@ -225,6 +232,7 @@ func TestCorruptRulesReturnsParseError(t *testing.T) {
 	}
 }
 
+// FLAG-08
 func TestSetFlagWritesAudit(t *testing.T) {
 	store := NewMemoryStore()
 	client := NewClient(store)

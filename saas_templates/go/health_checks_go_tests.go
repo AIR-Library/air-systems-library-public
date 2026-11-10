@@ -7,6 +7,7 @@ import (
 	"time"
 )
 
+// HEALTH-01
 func TestAllChecksPass(t *testing.T) {
 	registry := NewRegistry()
 	registry.RegisterCheck("db", "database", func() (string, string, string) {
@@ -30,6 +31,7 @@ func TestAllChecksPass(t *testing.T) {
 	}
 }
 
+// HEALTH-02
 func TestCriticalCheckFails(t *testing.T) {
 	registry := NewRegistry()
 	registry.RegisterCheck("db", "database", func() (string, string, string) {
@@ -47,6 +49,7 @@ func TestCriticalCheckFails(t *testing.T) {
 	}
 }
 
+// HEALTH-03
 func TestNonCriticalCheckFails(t *testing.T) {
 	registry := NewRegistry()
 	registry.RegisterCheck("cache", "redis", func() (string, string, string) {
@@ -64,6 +67,7 @@ func TestNonCriticalCheckFails(t *testing.T) {
 	}
 }
 
+// HEALTH-04
 func TestSlowCheckTimesOut(t *testing.T) {
 	registry := NewRegistry()
 	registry.RegisterCheck("slow", "service", func() (string, string, string) {
@@ -83,6 +87,7 @@ func TestSlowCheckTimesOut(t *testing.T) {
 	}
 }
 
+// HEALTH-05
 func TestLivenessStaysPass(t *testing.T) {
 	registry := NewRegistry()
 	registry.RegisterCheck("db", "database", func() (string, string, string) {
@@ -100,6 +105,7 @@ func TestLivenessStaysPass(t *testing.T) {
 	}
 }
 
+// HEALTH-06
 func TestNoConnectionStringInOutput(t *testing.T) {
 	registry := NewRegistry()
 	registry.RegisterCheck("db", "database", func() (string, string, string) {

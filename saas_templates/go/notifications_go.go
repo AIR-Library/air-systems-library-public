@@ -16,6 +16,14 @@
 // message for quiet_hours_end, ProcessQueued delivers due messages, the batch runs in request order,
 // message ids are random (not guessable row numbers), template variables are HTML-escaped in the HTML
 // body, unsubscribes are stored in the database and the unsubscribe link carries an HMAC token.
+//
+// Phase B, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-02/05/11/12, amended): default preferences
+// have no quiet hours and SMS off (opt-in); the unsubscribe token binds user AND channel
+// (HMAC-SHA256(secret, "unsubscribe:<user_id>:<channel>"), lowercase hex), the secret must be at least 32
+// bytes or the service will not start, a malformed, wrong or unknown-channel token gets one 403
+// invalid_unsubscribe_token before any user lookup, GET only confirms and POST unsubscribes; queued and
+// scheduled messages are delivered by DeliverDue(now) in the spec's four steps (re-queue stale 'sending'
+// claims, claim due rows with a conditional update, re-check preferences, conditional final write).
 // Touches: SQL database; network through the EmailProvider and SMSProvider the host supplies.
 package notifications
 
@@ -32,8 +40,10 @@ import (
 	"html"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -62,6 +72,7 @@ type Status string
 const (
 	StatusSent    Status = "sent"
 	StatusQueued  Status = "queued"
+	StatusSending Status = "sending" // claimed by DeliverDue (added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
 	StatusFailed  Status = "failed"
 	StatusBounced Status = "bounced"
 	StatusOpened  Status = "opened"
@@ -143,16 +154,19 @@ type TrackResponse struct {
 	ClickedAt   *time.Time `json:"clicked_at"`
 }
 
-// PreferencesResponse is a user's notification preferences.
+// PreferencesResponse is a user's notification preferences. Quiet hours are nil (JSON null) when unset.
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: quiet hours are pointers, since the spec's
+// default is "no quiet hours" (null), not 22:00-08:00.
 type PreferencesResponse struct {
 	UserID          int64           `json:"user_id"`
 	DoNotDisturb    bool            `json:"do_not_disturb"`
-	QuietHoursStart string          `json:"quiet_hours_start"`
-	QuietHoursEnd   string          `json:"quiet_hours_end"`
+	QuietHoursStart *string         `json:"quiet_hours_start"`
+	QuietHoursEnd   *string         `json:"quiet_hours_end"`
 	ChannelsEnabled map[string]bool `json:"channels_enabled"`
 }
 
-// UpdatePreferencesRequest is a partial update: nil fields and absent channels keep their value.
+// UpdatePreferencesRequest is a partial update: nil fields and absent channels keep their value; an
+// empty quiet-hours string clears it.
 type UpdatePreferencesRequest struct {
 	DoNotDisturb    *bool           `json:"do_not_disturb"`
 	QuietHoursStart *string         `json:"quiet_hours_start"`
@@ -219,8 +233,7 @@ type Service struct {
 	email     EmailProvider
 	sms       SMSProvider
 	Contacts  ContactResolver
-	// UnsubscribeSecret signs unsubscribe links (NOTIFICATIONS_UNSUBSCRIBE_SECRET, else random per
-	// process, which invalidates links on restart: set it in production).
+	// UnsubscribeSecret signs unsubscribe links (at least 32 bytes, from configuration).
 	UnsubscribeSecret []byte
 	// BaseURL prefixes the unsubscribe link in emails.
 	BaseURL string
@@ -228,30 +241,39 @@ type Service struct {
 	sleep   func(time.Duration)
 }
 
-// NewService builds a service. Inputs: database, email and SMS providers (nil = Null providers).
-// Output: the service with the built-in templates. Call InitDB before use.
-// Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing until used.
-func NewService(db *sql.DB, email EmailProvider, sms SMSProvider) *Service {
+// MinUnsubscribeSecretBytes is the shortest unsubscribe secret the service accepts (spec: an empty or short
+// key makes a forgeable HMAC). Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+const MinUnsubscribeSecretBytes = 32
+
+// NewService builds a service whose unsubscribe secret comes from NOTIFICATIONS_UNSUBSCRIBE_SECRET.
+// Inputs: database, email and SMS providers (nil = Null providers). Output: the service with the built-in
+// templates, or an error when the secret is missing or shorter than 32 bytes (the service refuses to
+// start). Call InitDB before use.
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-11): it fell back to a random per-process
+// secret, which silently broke every link on restart. Touches: the environment.
+func NewService(db *sql.DB, email EmailProvider, sms SMSProvider) (*Service, error) {
+	return NewServiceWithSecret(db, email, sms, []byte(os.Getenv("NOTIFICATIONS_UNSUBSCRIBE_SECRET")))
+}
+
+// NewServiceWithSecret is NewService with the unsubscribe secret passed in (at least 32 bytes).
+// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing until used.
+func NewServiceWithSecret(db *sql.DB, email EmailProvider, sms SMSProvider, secret []byte) (*Service, error) {
+	if len(secret) < MinUnsubscribeSecretBytes {
+		return nil, fmt.Errorf("notifications: the unsubscribe secret must be at least %d bytes", MinUnsubscribeSecretBytes)
+	}
 	if email == nil {
 		email = NullEmailProvider{}
 	}
 	if sms == nil {
 		sms = NullSMSProvider{}
 	}
-	secret := []byte(os.Getenv("NOTIFICATIONS_UNSUBSCRIBE_SECRET"))
-	if len(secret) == 0 {
-		secret = make([]byte, 32)
-		if _, err := rand.Read(secret); err != nil {
-			panic("notifications: crypto/rand failed: " + err.Error())
-		}
-	}
 	s := &Service{
 		db: db, templates: make(map[string]Template), email: email, sms: sms,
-		Contacts: PlaceholderContacts{}, UnsubscribeSecret: secret, BaseURL: os.Getenv("NOTIFICATIONS_BASE_URL"),
+		Contacts: PlaceholderContacts{}, UnsubscribeSecret: append([]byte(nil), secret...), BaseURL: os.Getenv("NOTIFICATIONS_BASE_URL"),
 		now: time.Now, sleep: time.Sleep,
 	}
 	s.seedTemplates()
-	return s
+	return s, nil
 }
 
 // SetClock replaces the clock used for quiet hours, scheduling and timestamps (tests freeze it so
@@ -296,6 +318,7 @@ CREATE TABLE IF NOT EXISTS notification_logs (
 	channel TEXT NOT NULL,
 	vars_used TEXT,
 	scheduled_at DATETIME,
+	claimed_at DATETIME,
 	sent_at DATETIME,
 	opened_at DATETIME,
 	clicked_at DATETIME,
@@ -309,9 +332,9 @@ CREATE INDEX IF NOT EXISTS idx_notification_logs_status ON notification_logs(sta
 CREATE TABLE IF NOT EXISTS user_notification_preferences (
 	user_id INTEGER PRIMARY KEY,
 	do_not_disturb INTEGER NOT NULL DEFAULT 0,
-	quiet_hours_start TEXT NOT NULL DEFAULT '22:00',
-	quiet_hours_end TEXT NOT NULL DEFAULT '08:00',
-	channels_enabled TEXT NOT NULL DEFAULT '{"email":true,"sms":true,"in_app":true}'
+	quiet_hours_start TEXT NULL,
+	quiet_hours_end TEXT NULL,
+	channels_enabled TEXT NOT NULL DEFAULT '{"email":true,"sms":false,"in_app":true}'
 );
 CREATE TABLE IF NOT EXISTS notification_unsubscribes (
 	user_id INTEGER NOT NULL,
@@ -322,7 +345,8 @@ CREATE TABLE IF NOT EXISTS notification_unsubscribes (
 `
 
 // InitDB creates the tables. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (message_id,
-// scheduled_at, attempts, notification_unsubscribes). Touches: database.
+// scheduled_at, attempts, notification_unsubscribes; then claimed_at, and preference defaults of no
+// quiet hours and SMS off, NOTIF-02/12). Touches: database.
 func (s *Service) InitDB(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, schemaSQL)
 	return err
@@ -364,21 +388,22 @@ func newMessageID() string {
 // Preferences
 // ---------------------------------------------------------------------------
 
-// defaultPreferences are used for a user with no stored row: quiet hours 22:00-08:00 and every
-// channel on (as the passing PHP template; SMS is only ever sent to a number the ContactResolver
-// returns, i.e. one the user gave). Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (SMS
-// was off, so an explicit SMS send to a new user was skipped).
+// defaultPreferences are used for a user with no stored row: do_not_disturb false, no quiet hours,
+// channels {email: true, sms: false, in_app: true}. SMS is opt-in: it costs money per message and
+// marketing texts need prior consent in many countries.
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-02/05, amended): the defaults were quiet
+// hours 22:00-08:00 and SMS on.
 func defaultPreferences(userID int64) *PreferencesResponse {
-	return &PreferencesResponse{UserID: userID, QuietHoursStart: "22:00", QuietHoursEnd: "08:00",
-		ChannelsEnabled: map[string]bool{"email": true, "sms": true, "in_app": true}}
+	return &PreferencesResponse{UserID: userID,
+		ChannelsEnabled: map[string]bool{"email": true, "sms": false, "in_app": true}}
 }
 
-// GetPreferences returns a user's preferences, or the defaults (quiet hours 22:00-08:00, every
-// channel on) when none are stored. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.
-// Touches: database.
+// GetPreferences returns a user's preferences, or the defaults when none are stored.
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (nullable quiet hours). Touches: database.
 func (s *Service) GetPreferences(ctx context.Context, userID int64) (*PreferencesResponse, error) {
 	var dnd int
-	var qStart, qEnd, chJSON string
+	var qStart, qEnd sql.NullString
+	var chJSON string
 	err := s.db.QueryRowContext(ctx,
 		"SELECT do_not_disturb, quiet_hours_start, quiet_hours_end, channels_enabled FROM user_notification_preferences WHERE user_id = ?",
 		userID).Scan(&dnd, &qStart, &qEnd, &chJSON)
@@ -389,7 +414,15 @@ func (s *Service) GetPreferences(ctx context.Context, userID int64) (*Preference
 		return nil, err
 	}
 	p := defaultPreferences(userID)
-	p.DoNotDisturb, p.QuietHoursStart, p.QuietHoursEnd = dnd != 0, qStart, qEnd
+	p.DoNotDisturb = dnd != 0
+	if qStart.Valid && qStart.String != "" {
+		v := qStart.String
+		p.QuietHoursStart = &v
+	}
+	if qEnd.Valid && qEnd.String != "" {
+		v := qEnd.String
+		p.QuietHoursEnd = &v
+	}
 	stored := map[string]bool{}
 	if err := json.Unmarshal([]byte(chJSON), &stored); err == nil {
 		for k, v := range stored {
@@ -399,11 +432,20 @@ func (s *Service) GetPreferences(ctx context.Context, userID int64) (*Preference
 	return p, nil
 }
 
+// deref returns *p, or "" for nil. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+func deref(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}
+
 var hhmm = regexp.MustCompile(`^([01]\d|2[0-3]):[0-5]\d$`)
 
 // UpdatePreferences applies a partial update on top of the stored (or default) preferences.
 // Output: an error for malformed quiet hours or unknown channels. Changed 2026-11-10, session
-// session_012zDydZCZ4AChqhEZ4oVtaP: unset fields used to be reset to defaults. Touches: database.
+// session_012zDydZCZ4AChqhEZ4oVtaP: unset fields used to be reset to defaults; quiet hours may be cleared
+// with "" and are stored as NULL when unset. Touches: database.
 func (s *Service) UpdatePreferences(ctx context.Context, userID int64, req *UpdatePreferencesRequest) error {
 	p, err := s.GetPreferences(ctx, userID)
 	if err != nil {
@@ -413,16 +455,16 @@ func (s *Service) UpdatePreferences(ctx context.Context, userID int64, req *Upda
 		p.DoNotDisturb = *req.DoNotDisturb
 	}
 	if req.QuietHoursStart != nil {
-		if !hhmm.MatchString(*req.QuietHoursStart) {
+		if *req.QuietHoursStart != "" && !hhmm.MatchString(*req.QuietHoursStart) {
 			return fmt.Errorf("quiet_hours_start must be HH:MM")
 		}
-		p.QuietHoursStart = *req.QuietHoursStart
+		p.QuietHoursStart = req.QuietHoursStart
 	}
 	if req.QuietHoursEnd != nil {
-		if !hhmm.MatchString(*req.QuietHoursEnd) {
+		if *req.QuietHoursEnd != "" && !hhmm.MatchString(*req.QuietHoursEnd) {
 			return fmt.Errorf("quiet_hours_end must be HH:MM")
 		}
-		p.QuietHoursEnd = *req.QuietHoursEnd
+		p.QuietHoursEnd = req.QuietHoursEnd
 	}
 	for k, v := range req.ChannelsEnabled {
 		switch Channel(k) {
@@ -445,8 +487,16 @@ func (s *Service) UpdatePreferences(ctx context.Context, userID int64, req *Upda
 			quiet_hours_start = excluded.quiet_hours_start,
 			quiet_hours_end = excluded.quiet_hours_end,
 			channels_enabled = excluded.channels_enabled`,
-		userID, dnd, p.QuietHoursStart, p.QuietHoursEnd, string(chJSON))
+		userID, dnd, nullIfEmpty(deref(p.QuietHoursStart)), nullIfEmpty(deref(p.QuietHoursEnd)), string(chJSON))
 	return err
+}
+
+// nullIfEmpty maps "" to SQL NULL. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+func nullIfEmpty(v string) interface{} {
+	if v == "" {
+		return nil
+	}
+	return v
 }
 
 // ---------------------------------------------------------------------------
@@ -573,7 +623,7 @@ func (s *Service) Send(ctx context.Context, req *SendRequest) (*SendResponse, er
 	if req.ScheduledAt != nil && req.ScheduledAt.After(now) {
 		t := *req.ScheduledAt
 		releaseAt = &t
-	} else if end, quiet := quietHoursEnd(now, prefs.QuietHoursStart, prefs.QuietHoursEnd); quiet {
+	} else if end, quiet := quietHoursEnd(now, deref(prefs.QuietHoursStart), deref(prefs.QuietHoursEnd)); quiet {
 		releaseAt = &end
 	}
 	if releaseAt != nil {
@@ -620,7 +670,7 @@ func (s *Service) deliver(ctx context.Context, tmpl Template, req *SendRequest, 
 		if email == "" {
 			return 0, errors.New("no email address on file")
 		}
-		link := s.UnsubscribeURL(req.UserID)
+		link := s.UnsubscribeURL(req.UserID, ChannelEmail)
 		bodyText += "\n\nUnsubscribe: " + link
 		bodyHTML += fmt.Sprintf("<p><a href=\"%s\">Unsubscribe</a></p>", html.EscapeString(link))
 		send = func() error { return s.email.Send(ctx, email, subject, bodyText, bodyHTML) }
@@ -643,29 +693,76 @@ func (s *Service) deliver(ctx context.Context, tmpl Template, req *SendRequest, 
 	return maxAttempts, lastErr
 }
 
-// ProcessQueued delivers queued messages whose release time has passed, in queue order, updating
-// each row in place (same message id). Do-not-disturb, disabled channels and unsubscribes are
-// checked again; a message still inside the user's quiet hours is pushed to their end. Output: how
-// many messages were sent. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: queued messages
-// had no way out of the queue. Touches: database, providers (network).
-func (s *Service) ProcessQueued(ctx context.Context) (int, error) {
+// ClaimTimeout is how long a 'sending' claim may last before DeliverDue re-queues it (spec: a single send
+// must finish in under 300 s). Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+const ClaimTimeout = 300 * time.Second
+
+// DeliverDue sends queued messages that are due, in the spec's four steps (NOTIF-12):
+//  1. 'sending' rows claimed more than 300 s before now go back to 'queued' (a crashed worker);
+//  2. 'queued' rows with scheduled_at <= now, by scheduled_at then insertion order, are claimed one by
+//     one with UPDATE ... SET status = 'sending', claimed_at = now WHERE id = ? AND status = 'queued'
+//     (a row another worker claimed first is skipped);
+//  3. preferences are checked NOW: unsubscribed, channel off or do-not-disturb -> 'skipped' (and a
+//     message that is due inside the user's current quiet hours goes back to 'queued' until they end);
+//  4. the final write is UPDATE ... WHERE id = ? AND status = 'sending' AND claimed_at = <this claim>.
+//
+// Each message is sent exactly once when no worker crashes, at least once after a crash. No in-process
+// timers: a scheduler or cron calls DeliverDue. In: the time to deliver for. Out: how many were sent.
+// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (replaces ProcessQueued, which read and updated rows
+// without a claim, so two workers could send the same message). Touches: database, providers (network).
+func (s *Service) DeliverDue(ctx context.Context, now time.Time) (int, error) {
+	now = now.UTC()
+	// Step 1: re-queue stale claims.
+	stale, err := s.db.QueryContext(ctx, `SELECT id, claimed_at FROM notification_logs WHERE status = ?`, string(StatusSending))
+	if err != nil {
+		return 0, err
+	}
+	type claim struct {
+		id int64
+		at time.Time
+	}
+	var stuck []claim
+	for stale.Next() {
+		var c claim
+		var at sql.NullTime
+		if err := stale.Scan(&c.id, &at); err != nil {
+			stale.Close()
+			return 0, err
+		}
+		if !at.Valid || at.Time.Add(ClaimTimeout).Before(now) {
+			c.at = at.Time
+			stuck = append(stuck, c)
+		}
+	}
+	if err := stale.Close(); err != nil {
+		return 0, err
+	}
+	for _, c := range stuck {
+		if _, err := s.db.ExecContext(ctx, `UPDATE notification_logs SET status = ?, claimed_at = NULL
+			WHERE id = ? AND status = ? AND (claimed_at = ? OR claimed_at IS NULL)`,
+			string(StatusQueued), c.id, string(StatusSending), c.at); err != nil {
+			return 0, err
+		}
+	}
+
+	// Step 2: the due rows, by scheduled_at then insertion order.
 	type queued struct {
+		id        int64
 		messageID string
 		req       SendRequest
 		channel   Channel
 		release   sql.NullTime
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT message_id, user_id, template_key, channel, vars_used, scheduled_at
-		FROM notification_logs WHERE status = ? ORDER BY id`, string(StatusQueued))
+	rows, err := s.db.QueryContext(ctx, `SELECT id, message_id, user_id, template_key, channel, vars_used, scheduled_at
+		FROM notification_logs WHERE status = ?`, string(StatusQueued))
 	if err != nil {
 		return 0, err
 	}
 	var due []queued
-	now := s.now()
 	for rows.Next() {
 		var q queued
 		var vars sql.NullString
-		if err := rows.Scan(&q.messageID, &q.req.UserID, &q.req.TemplateKey, &q.channel, &vars, &q.release); err != nil {
+		if err := rows.Scan(&q.id, &q.messageID, &q.req.UserID, &q.req.TemplateKey, &q.channel, &vars, &q.release); err != nil {
 			rows.Close()
 			return 0, err
 		}
@@ -679,17 +776,45 @@ func (s *Service) ProcessQueued(ctx context.Context) (int, error) {
 	if err := rows.Close(); err != nil {
 		return 0, err
 	}
+	sort.SliceStable(due, func(i, j int) bool {
+		ti, tj := due[i].release.Time, due[j].release.Time
+		if !ti.Equal(tj) {
+			return ti.Before(tj)
+		}
+		return due[i].id < due[j].id
+	})
+
 	sentCount := 0
 	for _, q := range due {
-		update := func(status Status, sentAt, release interface{}, attempts int, errMsg string) error {
+		claimedAt := now
+		res, err := s.db.ExecContext(ctx, `UPDATE notification_logs SET status = ?, claimed_at = ? WHERE id = ? AND status = ?`,
+			string(StatusSending), claimedAt, q.id, string(StatusQueued))
+		if err != nil {
+			return sentCount, err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			continue // another worker claimed it first
+		}
+		// Step 4's conditional write, used by every outcome below.
+		final := func(status Status, sentAt, release interface{}, attempts int, errMsg string) error {
 			var e interface{}
 			if errMsg != "" {
 				e = errMsg
 			}
-			_, err := s.db.ExecContext(ctx, `UPDATE notification_logs SET status = ?, sent_at = ?, scheduled_at = ?, attempts = ?, error = ?
-				WHERE message_id = ? AND status = ?`, string(status), sentAt, release, attempts, e, q.messageID, string(StatusQueued))
+			claimed := interface{}(nil)
+			if status == StatusSending {
+				claimed = claimedAt
+			}
+			_, err := s.db.ExecContext(ctx, `UPDATE notification_logs SET status = ?, sent_at = ?, scheduled_at = ?, attempts = ?, error = ?, claimed_at = ?
+				WHERE id = ? AND status = ? AND claimed_at = ?`,
+				string(status), sentAt, release, attempts, e, claimed, q.id, string(StatusSending), claimedAt)
 			return err
 		}
+		release := interface{}(nil)
+		if q.release.Valid {
+			release = q.release.Time.UTC()
+		}
+		// Step 3: preferences as they are now.
 		tmpl, ok := s.templates[q.req.TemplateKey]
 		prefs, err := s.GetPreferences(ctx, q.req.UserID)
 		if err != nil {
@@ -701,23 +826,24 @@ func (s *Service) ProcessQueued(ctx context.Context) (int, error) {
 		}
 		switch {
 		case !ok:
-			err = update(StatusFailed, nil, q.release.Time, 0, "template_not_found")
-		case prefs.DoNotDisturb:
-			err = update(StatusSkipped, nil, q.release.Time, 0, "do_not_disturb")
-		case !prefs.ChannelsEnabled[string(q.channel)]:
-			err = update(StatusSkipped, nil, q.release.Time, 0, "channel_disabled")
+			err = final(StatusFailed, nil, release, 0, "template_not_found")
 		case unsub:
-			err = update(StatusSkipped, nil, q.release.Time, 0, "unsubscribed")
+			err = final(StatusSkipped, nil, release, 0, "unsubscribed")
+		case !prefs.ChannelsEnabled[string(q.channel)]:
+			err = final(StatusSkipped, nil, release, 0, "channel_disabled")
+		case prefs.DoNotDisturb:
+			err = final(StatusSkipped, nil, release, 0, "do_not_disturb")
 		default:
-			if end, quiet := quietHoursEnd(now, prefs.QuietHoursStart, prefs.QuietHoursEnd); quiet {
-				_, err = s.db.ExecContext(ctx, `UPDATE notification_logs SET scheduled_at = ? WHERE message_id = ?`, end.UTC(), q.messageID)
+			if end, quiet := quietHoursEnd(now, deref(prefs.QuietHoursStart), deref(prefs.QuietHoursEnd)); quiet {
+				_, err = s.db.ExecContext(ctx, `UPDATE notification_logs SET status = ?, scheduled_at = ?, claimed_at = NULL
+					WHERE id = ? AND status = ? AND claimed_at = ?`, string(StatusQueued), end.UTC(), q.id, string(StatusSending), claimedAt)
 				break
 			}
 			attempts, sendErr := s.deliver(ctx, tmpl, &q.req, q.channel)
 			if sendErr != nil {
-				err = update(StatusFailed, nil, q.release.Time, attempts, sendErr.Error())
+				err = final(StatusFailed, nil, release, attempts, sendErr.Error())
 			} else {
-				err = update(StatusSent, s.now().UTC(), q.release.Time, attempts, "")
+				err = final(StatusSent, s.now().UTC(), release, attempts, "")
 				sentCount++
 			}
 		}
@@ -726,6 +852,12 @@ func (s *Service) ProcessQueued(ctx context.Context) (int, error) {
 		}
 	}
 	return sentCount, nil
+}
+
+// ProcessQueued is DeliverDue at the service clock's time. Changed 2026-11-10,
+// session_012zDydZCZ4AChqhEZ4oVtaP: kept for callers of the earlier API. Touches: as DeliverDue.
+func (s *Service) ProcessQueued(ctx context.Context) (int, error) {
+	return s.DeliverDue(ctx, s.now())
 }
 
 // ---------------------------------------------------------------------------
@@ -820,27 +952,80 @@ func (s *Service) MarkClicked(ctx context.Context, messageID string) error {
 // Unsubscribe
 // ---------------------------------------------------------------------------
 
-// Unsubscribe stops future emails to the user (stored in notification_unsubscribes).
-// Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (was an in-memory map). Touches: database.
-func (s *Service) Unsubscribe(ctx context.Context, userID int64) error {
+// Unsubscribe stops future messages to the user on channel: channels_enabled[channel] = false, and a row
+// in notification_unsubscribes. In: user id and channel. Out: an error for an unknown channel.
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-09/11): per channel (email only before), and
+// it now sets channels_enabled[channel] = false as the spec says. Touches: database.
+func (s *Service) Unsubscribe(ctx context.Context, userID int64, ch Channel) error {
+	if !validChannel(string(ch)) {
+		return fmt.Errorf("unknown channel %q", ch)
+	}
+	if err := s.UpdatePreferences(ctx, userID, &UpdatePreferencesRequest{ChannelsEnabled: map[string]bool{string(ch): false}}); err != nil {
+		return err
+	}
 	_, err := s.db.ExecContext(ctx,
 		`INSERT OR IGNORE INTO notification_unsubscribes (user_id, channel, created_at) VALUES (?, ?, ?)`,
-		userID, string(ChannelEmail), s.now().UTC())
+		userID, string(ch), s.now().UTC())
 	return err
 }
 
-// UnsubscribeToken is HMAC-SHA256(UnsubscribeSecret, "unsubscribe:<user_id>") in hex.
-// Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
-func (s *Service) UnsubscribeToken(userID int64) string {
+// validChannel reports a known channel. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+func validChannel(ch string) bool {
+	return ch == string(ChannelEmail) || ch == string(ChannelSMS) || ch == string(ChannelInApp)
+}
+
+// UnsubscribeToken is the lowercase hex HMAC-SHA256(UnsubscribeSecret, "unsubscribe:<user_id>:<channel>").
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-11): the token bound only the user, so an
+// email link could unsubscribe the user from SMS too. Touches: nothing.
+func (s *Service) UnsubscribeToken(userID int64, ch Channel) string {
 	mac := hmac.New(sha256.New, s.UnsubscribeSecret)
-	mac.Write([]byte("unsubscribe:" + strconv.FormatInt(userID, 10)))
+	mac.Write([]byte("unsubscribe:" + strconv.FormatInt(userID, 10) + ":" + string(ch)))
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-// UnsubscribeURL is the signed link put in every email. Added 2026-11-10, session
-// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
-func (s *Service) UnsubscribeURL(userID int64) string {
-	return fmt.Sprintf("%s/unsubscribe/%d?token=%s", s.BaseURL, userID, s.UnsubscribeToken(userID))
+// UnsubscribeURL is the signed link put in every email:
+// <base_url>/unsubscribe?user_id=<id>&channel=<channel>&token=<token>.
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (the spec's query form, with the channel). Touches: nothing.
+func (s *Service) UnsubscribeURL(userID int64, ch Channel) string {
+	q := url.Values{}
+	q.Set("user_id", strconv.FormatInt(userID, 10))
+	q.Set("channel", string(ch))
+	q.Set("token", s.UnsubscribeToken(userID, ch))
+	return s.BaseURL + "/unsubscribe?" + q.Encode()
+}
+
+// isLowerHex64 reports exactly 64 characters of [0-9a-f]. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+func isLowerHex64(t string) bool {
+	if len(t) != 64 {
+		return false
+	}
+	for i := 0; i < len(t); i++ {
+		c := t[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+// VerifyUnsubscribe checks an unsubscribe link's parameters without touching any user: the token must be
+// 64 lowercase hex characters, the channel known, the user id a positive integer and the token equal (in
+// constant time, on equal-length inputs) to the HMAC for that user and channel. Out: the user and channel,
+// or ok=false for every kind of failure. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-11).
+// Touches nothing.
+func (s *Service) VerifyUnsubscribe(userIDParam, channelParam, token string) (int64, Channel, bool) {
+	if !isLowerHex64(token) || !validChannel(channelParam) {
+		return 0, "", false
+	}
+	userID, err := strconv.ParseInt(userIDParam, 10, 64)
+	if err != nil || userID <= 0 {
+		return 0, "", false
+	}
+	ch := Channel(channelParam)
+	if !hmac.Equal([]byte(token), []byte(s.UnsubscribeToken(userID, ch))) {
+		return 0, "", false
+	}
+	return userID, ch, true
 }
 
 // ---------------------------------------------------------------------------
@@ -967,24 +1152,33 @@ func (s *Service) HandleTrack(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// HandleUnsubscribe serves /unsubscribe/{user_id}?token=...; the token must be the HMAC from the
-// email link (compared in constant time). Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP:
-// anyone could unsubscribe any user id. Touches: database.
+// HandleUnsubscribe serves /unsubscribe?user_id=&channel=&token=. Every bad link (missing, short,
+// non-hex or altered token, unknown channel, bad user id) gets the same 403
+// {error: "invalid_unsubscribe_token"} before any user lookup. GET only shows a confirmation and changes
+// nothing (mail scanners follow links); POST unsubscribes (RFC 8058 one-click uses POST).
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-11): GET unsubscribed, the token was per user
+// only, and errors differed by kind. Touches: database (POST only).
 func (s *Service) HandleUnsubscribe(w http.ResponseWriter, r *http.Request) {
-	userID, err := strconv.ParseInt(lastSegment(r.URL.Path, "/unsubscribe/"), 10, 64)
-	if err != nil || userID <= 0 {
-		writeError(w, http.StatusBadRequest, "bad_user_id", nil)
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", nil)
 		return
 	}
-	if !hmac.Equal([]byte(r.URL.Query().Get("token")), []byte(s.UnsubscribeToken(userID))) {
-		writeError(w, http.StatusForbidden, "invalid_token", nil)
+	q := r.URL.Query()
+	userID, ch, ok := s.VerifyUnsubscribe(q.Get("user_id"), q.Get("channel"), q.Get("token"))
+	if !ok {
+		writeError(w, http.StatusForbidden, "invalid_unsubscribe_token", nil)
 		return
 	}
-	if err := s.Unsubscribe(r.Context(), userID); err != nil {
+	if r.Method == http.MethodGet {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"confirm": true, "channel": ch,
+			"message": "Send this form (POST) to unsubscribe."})
+		return
+	}
+	if err := s.Unsubscribe(r.Context(), userID, ch); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{"success": true})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "channel": ch})
 }
 
 // handleMark serves the opened/clicked tracking endpoints. Added 2026-11-10, session
@@ -1020,7 +1214,7 @@ func (s *Service) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/notifications/send-batch", s.HandleSendBatch)
 	mux.HandleFunc("/notifications/track/", s.HandleTrack)
 	mux.HandleFunc("/users/", s.handleUsers)
-	mux.HandleFunc("/unsubscribe/", s.HandleUnsubscribe)
+	mux.HandleFunc("/unsubscribe", s.HandleUnsubscribe)
 	mux.HandleFunc("/notifications/opened/", s.HandleMarkOpened)
 	mux.HandleFunc("/notifications/clicked/", s.HandleMarkClicked)
 }
@@ -1079,9 +1273,13 @@ func NewInMemoryDB() (*sql.DB, error) {
 	return db, nil
 }
 
-// NewServiceWithDB builds a service with Null providers and creates its tables.
+// NewServiceWithDB builds a service with Null providers (secret from NOTIFICATIONS_UNSUBSCRIBE_SECRET)
+// and creates its tables. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: NewService can refuse.
 func NewServiceWithDB(db *sql.DB) (*Service, error) {
-	s := NewService(db, nil, nil)
+	s, err := NewService(db, nil, nil)
+	if err != nil {
+		return nil, err
+	}
 	if err := s.InitDB(context.Background()); err != nil {
 		return nil, err
 	}

@@ -26,6 +26,7 @@ final class BackgroundJobsTaskQueueTest extends TestCase
         $this->jobQueue = new JobQueue($this->pdo);
     }
 
+    // JOBS-01
     public function testEnqueueJobWorkerPicksItUpStatusBecomesRunning(): void
     {
         $data = [
@@ -44,8 +45,20 @@ final class BackgroundJobsTaskQueueTest extends TestCase
         $status = $this->jobQueue->getStatus($jobId);
         $this->assertEquals('completed', $status['status']);
         $this->assertEquals('5/5', $status['progress']);
+
+        // "status becomes running": a handler reads its own job's status while the worker runs it.
+        $seen = null;
+        $this->jobQueue->registerTaskHandler('probe', function (array $params, callable $progress) use (&$seen, &$probeId): array {
+            $seen = $this->jobQueue->getStatus($probeId);
+            return ['ok' => true];
+        });
+        $probeId = $this->jobQueue->enqueue(['task_type' => 'probe', 'params' => []])['job_id'];
+        $this->assertSame([$probeId], $this->jobQueue->runDueJobs());
+        $this->assertEquals('running', $seen['status']);
+        $this->assertNotNull($seen['started_at']);
     }
 
+    // JOBS-02
     public function testJobCompletesStatusBecomesCompletedResultsAvailable(): void
     {
         $data = [
@@ -69,72 +82,118 @@ final class BackgroundJobsTaskQueueTest extends TestCase
         $this->assertEquals('export_generate', $results['result']['task_type']);
     }
 
+    /**
+     * A queue on a settable fixed clock, plus a handler 'always_fails' that counts its runs and throws.
+     * Why: the JOBS-03/04 tests drive the worker through backoff without sleeping. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * @return array{0: JobQueue, 1: Closure(string): void} the queue and a function that sets the clock
+     */
+    private function clockedQueue(int &$runs): array
+    {
+        $now = new DateTimeImmutable('2026-01-01T00:00:00Z');
+        $queue = new JobQueue($this->pdo, function () use (&$now): DateTimeImmutable {
+            return $now;
+        });
+        $queue->registerTaskHandler('always_fails', function (array $params, callable $progress) use (&$runs): array {
+            $runs++;
+            throw new TaskFailedException('boom');
+        });
+        $set = function (string $at) use (&$now): void {
+            $now = new DateTimeImmutable($at);
+        };
+        return [$queue, $set];
+    }
+
+    /**
+     * JOBS-03 as amended: a failing job is retried by the worker on its own: retry 1 after 1s, retry 2 after a
+     * further 2s, retry 3 after 4s; while it waits its status is 'enqueued', retry_count = n, and the worker
+     * skips it until next_retry_at.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the old test expected status 'failed' while waiting and drove the
+     * second attempt through a manual retry; the amended spec keeps a waiting job 'enqueued'.
+     */
+    // JOBS-03
     public function testJobFailsAutoRetriesWithExponentialBackoff(): void
     {
-        $data = [
-            'task_type' => 'webhook_retry',
-            'params' => ['total' => 2, 'failure_points' => [0, 1]], // All fail
-            'max_retries' => 2
+        $runs = 0;
+        [$queue, $setClock] = $this->clockedQueue($runs);
+        $jobId = $queue->enqueue(['task_type' => 'always_fails', 'params' => [], 'max_retries' => 3])['job_id'];
+
+        $expect = [
+            // [run at, retry_count after, next_retry_at after]
+            ['2026-01-01T00:00:00Z', 1, '2026-01-01T00:00:01Z'],
+            ['2026-01-01T00:00:01Z', 2, '2026-01-01T00:00:03Z'],
+            ['2026-01-01T00:00:03Z', 3, '2026-01-01T00:00:07Z'],
         ];
-        $response = $this->jobQueue->enqueue($data);
-        $jobId = $response['job_id'];
-
-        // First attempt
-        // The spec's backoff is 1s, 2s, 4s, ...: the first retry is due exactly 1s after the
-        // failure, so next_retry_at must lie between (before + 1s) and (after + 1s). The old
-        // assertion (> now + 1s, taken after the call) required a first delay above 1s, which
-        // contradicts the spec.
-        $before = new DateTimeImmutable();
-        $this->jobQueue->processJob($jobId);
-        $after = new DateTimeImmutable();
-        $status = $this->jobQueue->getStatus($jobId);
-        $this->assertEquals('failed', $status['status']);
-        $this->assertEquals(1, $status['retry_count']);
-        $this->assertNotNull($status['next_retry_at']);
-        $this->assertGreaterThanOrEqual($before->modify('+1 second'), new DateTimeImmutable($status['next_retry_at']));
-        $this->assertLessThanOrEqual($after->modify('+1 second'), new DateTimeImmutable($status['next_retry_at']));
-
-        // Wait for backoff (simulate by setting time)
-        // In real test, we'd wait or mock time; here we force retry via retryJob
-        $retryResponse = $this->jobQueue->retryJob($jobId);
-        $this->assertTrue($retryResponse['success']);
-        $this->assertEquals('enqueued', $retryResponse['status']);
-        $retryJobId = $retryResponse['new_job_id'];
-
-        // Second attempt: the delay doubles to 2s (same bracketing as above)
-        $before = new DateTimeImmutable();
-        $this->jobQueue->processJob($retryJobId);
-        $after = new DateTimeImmutable();
-        $status = $this->jobQueue->getStatus($retryJobId);
-        $this->assertEquals('failed', $status['status']);
-        $this->assertEquals(2, $status['retry_count']);
-        $this->assertNotNull($status['next_retry_at']);
-        $this->assertGreaterThanOrEqual($before->modify('+2 seconds'), new DateTimeImmutable($status['next_retry_at']));
-        $this->assertLessThanOrEqual($after->modify('+2 seconds'), new DateTimeImmutable($status['next_retry_at']));
-
-        // The manual retry superseded the original's pending automatic retry (no double run)
-        $this->assertNull($this->jobQueue->getStatus($jobId)['next_retry_at']);
+        foreach ($expect as $i => [$at, $retryCount, $nextAt]) {
+            $setClock($at);
+            $this->assertSame([$jobId], $queue->runDueJobs(), "attempt " . ($i + 1) . " runs at $at");
+            $status = $queue->getStatus($jobId);
+            $this->assertEquals('enqueued', $status['status']);
+            $this->assertEquals($retryCount, $status['retry_count']);
+            $this->assertEquals(new DateTimeImmutable($nextAt), new DateTimeImmutable($status['next_retry_at']));
+            // Just before the backoff ends the worker leaves it alone, and processJob does too.
+            $setClock((new DateTimeImmutable($nextAt))->modify('-1 millisecond')->format('Y-m-d\TH:i:s.uP'));
+            $this->assertSame([], $queue->runDueJobs());
+            $queue->processJob($jobId);
+            $this->assertEquals('enqueued', $queue->getStatus($jobId)['status']);
+        }
+        $this->assertSame(3, $runs);
     }
 
+    /**
+     * JOBS-04 as amended: with max_retries = 3 the job runs 4 times (the first attempt plus 3 retries), then
+     * status 'failed', retry_count = 3, next_retry_at null, and the worker never runs it again. max_retries 0
+     * means one run and no retry.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: max_retries used to count attempts (max_retries 1 = no retry).
+     */
+    // JOBS-04
     public function testJobExceedsMaxRetriesStatusBecomesFailed(): void
     {
-        $data = [
-            'task_type' => 'cleanup_old_sessions',
-            'params' => ['session_count' => 1, 'failure_points' => [0]],
-            'max_retries' => 1
-        ];
-        $response = $this->jobQueue->enqueue($data);
-        $jobId = $response['job_id'];
-
-        // First attempt (will fail)
-        $this->jobQueue->processJob($jobId);
-        $status = $this->jobQueue->getStatus($jobId);
+        $runs = 0;
+        [$queue, $setClock] = $this->clockedQueue($runs);
+        $jobId = $queue->enqueue(['task_type' => 'always_fails', 'params' => [], 'max_retries' => 3])['job_id'];
+        foreach (['00:00:00', '00:00:01', '00:00:03', '00:00:07'] as $at) {
+            $setClock("2026-01-01T{$at}Z");
+            $this->assertSame([$jobId], $queue->runDueJobs());
+        }
+        $this->assertSame(4, $runs);
+        $status = $queue->getStatus($jobId);
         $this->assertEquals('failed', $status['status']);
-        $this->assertEquals(1, $status['retry_count']);
-        $this->assertEquals(1, $status['max_retries']);
+        $this->assertEquals(3, $status['retry_count']);
+        $this->assertEquals(3, $status['max_retries']);
         $this->assertNull($status['next_retry_at']); // No more retries
+        $setClock('2026-01-02T00:00:00Z');
+        $this->assertSame([], $queue->runDueJobs());
+        $this->assertSame(4, $runs);
+
+        $runs = 0;
+        $once = $queue->enqueue(['task_type' => 'always_fails', 'params' => [], 'max_retries' => 0])['job_id'];
+        $this->assertSame([$once], $queue->runDueJobs());
+        $status = $queue->getStatus($once);
+        $this->assertSame(['failed', 0, null], [$status['status'], $status['retry_count'], $status['next_retry_at']]);
+        $this->assertSame(1, $runs);
     }
 
+    /**
+     * A failed job (retries used up) can be retried by hand once: a new enqueued job with the same task and
+     * a fresh retry_count; the original keeps no pending retry. Why: the manual-retry part of the old
+     * backoff test, kept as its own test (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). Touches: in-memory SQLite.
+     */
+    public function testManualRetryOfFailedJobCreatesFreshJob(): void
+    {
+        $runs = 0;
+        [$queue, $setClock] = $this->clockedQueue($runs);
+        $jobId = $queue->enqueue(['task_type' => 'always_fails', 'params' => [], 'max_retries' => 0])['job_id'];
+        $queue->runDueJobs();
+        $retry = $queue->retryJob($jobId);
+        $this->assertSame('enqueued', $retry['status']);
+        $new = $queue->getStatus($retry['new_job_id']);
+        $this->assertSame(['enqueued', 0, 0], [$new['status'], $new['retry_count'], $new['max_retries']]);
+        $this->assertNull($queue->getStatus($jobId)['next_retry_at']);
+        $this->expectException(InvalidArgumentException::class);
+        $queue->retryJob($jobId); // only once
+    }
+
+    // JOBS-05
     public function testUserCancelsBeforeJobStartsStatusBecomesCancelled(): void
     {
         $data = [
@@ -153,6 +212,7 @@ final class BackgroundJobsTaskQueueTest extends TestCase
         $this->assertEquals('cancelled', $status['status']);
     }
 
+    // JOBS-06
     public function testProgressTrackingUpdatesInRealTime(): void
     {
         $data = [
@@ -173,8 +233,21 @@ final class BackgroundJobsTaskQueueTest extends TestCase
         $this->jobQueue->processJob($jobId);
         $status = $this->jobQueue->getStatus($jobId);
         $this->assertEquals('100/100', $status['progress']);
+
+        // Real time: a handler that reports 45/100 sees that progress through getStatus while it runs.
+        $midRun = null;
+        $this->jobQueue->registerTaskHandler('progress_probe', function (array $params, callable $progress) use (&$midRun, &$probeId): array {
+            $progress(45, 100);
+            $midRun = $this->jobQueue->getStatus($probeId)['progress'];
+            $progress(100, 100);
+            return ['ok' => true];
+        });
+        $probeId = $this->jobQueue->enqueue(['task_type' => 'progress_probe', 'params' => []])['job_id'];
+        $this->jobQueue->processJob($probeId);
+        $this->assertSame('45/100', $midRun);
     }
 
+    // JOBS-07
     public function testScheduledJobsOnlyRunAfterScheduledAtTime(): void
     {
         $pastTime = (new DateTimeImmutable())->modify('-1 hour')->format('Y-m-d H:i:s');
@@ -204,6 +277,7 @@ final class BackgroundJobsTaskQueueTest extends TestCase
         $this->assertNull($statusFuture['started_at']);
     }
 
+    // JOBS-08
     public function testBulkJobProcessedWithoutBlockingRequest(): void
     {
         // We test that enqueue returns quickly regardless of job size
@@ -221,8 +295,17 @@ final class BackgroundJobsTaskQueueTest extends TestCase
         // Job should be enqueued, not yet processed
         $status = $this->jobQueue->getStatus($response['job_id']);
         $this->assertEquals('enqueued', $status['status']);
+
+        // The worker then processes all 10,000 items (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the
+        // test never ran the bulk job).
+        $this->assertSame([$response['job_id']], $this->jobQueue->runDueJobs());
+        $status = $this->jobQueue->getStatus($response['job_id']);
+        $this->assertEquals('completed', $status['status']);
+        $this->assertEquals('10000/10000', $status['progress']);
+        $this->assertSame(10000, $this->jobQueue->getResults($response['job_id'])['result']['total_deleted']);
     }
 
+    // JOBS-09
     public function testResultsAvailableAfterCompletion(): void
     {
         $data = [
@@ -350,9 +433,12 @@ final class BackgroundJobsTaskQueueTest extends TestCase
     /**
      * Added 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): the spec's "auto-retries with
      * exponential backoff" was only exercised through a manual retry. With a controllable clock,
-     * the worker must leave a failed job alone until next_retry_at, then run it again by itself,
-     * and fail it for good once its attempts are used up.
+     * the worker must leave a waiting job alone until next_retry_at, then run it again by itself,
+     * and fail it for good once its retries are used up. Changed later the same day for the
+     * amended JOBS-03/04: max_retries 2 means 3 runs, a waiting job is 'enqueued', and the final
+     * retry_count is max_retries.
      */
+    // JOBS-03
     public function testWorkerAutoRetriesFailedJobAfterBackoff(): void
     {
         $now = new DateTimeImmutable('2026-01-01T00:00:00Z');
@@ -367,7 +453,7 @@ final class BackgroundJobsTaskQueueTest extends TestCase
 
         $this->assertSame([$jobId], $queue->runDueJobs());
         $status = $queue->getStatus($jobId);
-        $this->assertEquals('failed', $status['status']);
+        $this->assertEquals('enqueued', $status['status']);
         $this->assertEquals(1, $status['retry_count']);
         $this->assertEquals(new DateTimeImmutable('2026-01-01T00:00:01Z'), new DateTimeImmutable($status['next_retry_at']));
 
@@ -375,11 +461,18 @@ final class BackgroundJobsTaskQueueTest extends TestCase
         $this->assertSame([], $queue->runDueJobs()); // backoff not elapsed
 
         $now = $now->modify('+500 milliseconds');
-        $this->assertSame([$jobId], $queue->runDueJobs()); // automatic retry
+        $this->assertSame([$jobId], $queue->runDueJobs()); // automatic retry 1
+        $status = $queue->getStatus($jobId);
+        $this->assertEquals('enqueued', $status['status']);
+        $this->assertEquals(2, $status['retry_count']);
+        $this->assertEquals(new DateTimeImmutable('2026-01-01T00:00:03Z'), new DateTimeImmutable($status['next_retry_at']));
+
+        $now = $now->modify('+2 seconds');
+        $this->assertSame([$jobId], $queue->runDueJobs()); // automatic retry 2, the last
         $status = $queue->getStatus($jobId);
         $this->assertEquals('failed', $status['status']);
         $this->assertEquals(2, $status['retry_count']);
-        $this->assertNull($status['next_retry_at']); // attempts used up
+        $this->assertNull($status['next_retry_at']); // retries used up
 
         $now = $now->modify('+1 hour');
         $this->assertSame([], $queue->runDueJobs());

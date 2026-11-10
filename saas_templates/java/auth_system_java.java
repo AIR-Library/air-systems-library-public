@@ -68,7 +68,43 @@ public class AuthSystem {
     private static final SecureRandom random = new SecureRandom();
     private static final DateTimeFormatter iso = DateTimeFormatter.ISO_INSTANT;
     private static final ObjectMapper mapper = new ObjectMapper();
-    private static final Algorithm jwtAlg = Algorithm.HMAC256("secret");
+    /**
+     * JWT signing key. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec rule "No secret is hard-coded"): it was
+     * the literal "secret", so anyone could mint tokens. It comes from AUTH_JWT_SECRET (environment, or system property for
+     * tests), which must be at least 32 bytes; without one a random 32-byte key is generated per process (tokens then
+     * stop working on restart, which fails safe). Touches: reads the environment.
+     */
+    private static final Algorithm jwtAlg = Algorithm.HMAC256(jwtSecret());
+
+    private static byte[] jwtSecret() {
+        String configured = System.getProperty("AUTH_JWT_SECRET", System.getenv("AUTH_JWT_SECRET"));
+        if (configured != null && !configured.isEmpty()) {
+            byte[] bytes = configured.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            if (bytes.length < 32) {
+                throw new IllegalStateException("AUTH_JWT_SECRET must be at least 32 bytes");
+            }
+            return bytes;
+        }
+        byte[] generated = new byte[32];
+        new SecureRandom().nextBytes(generated);
+        return generated;
+    }
+
+    /**
+     * Where verification codes go. The default sends nothing and never prints the code (it is a secret).
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: sendEmail printed every code to stdout (spec rule
+     * "No secret is ... written to a log"). Replace with a real mailer; tests may install a fake. Touches: email.
+     */
+    public interface EmailSender {
+        void sendVerificationCode(String email, String code);
+    }
+
+    private static volatile EmailSender emailSender = (email, code) -> { };
+
+    /** Installs the email sender (a fake in tests). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing else. */
+    public static void setEmailSender(EmailSender sender) {
+        emailSender = Objects.requireNonNull(sender);
+    }
     private static final int TOTP_TIME_STEP = 30;
     private static final int TOTP_DIGITS = 6;
 
@@ -77,7 +113,10 @@ public class AuthSystem {
             "1234567890", "abc123", "password123", "password123456", "admin", "letmein", "welcome", "monkey", "dragon",
             "master", "hello", "freedom", "whatever", "qazwsx", "trustno1", "654321", "jordan23",
             "harley", "password1", "123123", "superman", "iloveyou", "sunshine", "princess", "football",
-            "baseball", "shadow", "michael", "ninja", "mustang", "jennifer", "hunter", "2000", "tigger"
+            "baseball", "shadow", "michael", "ninja", "mustang", "jennifer", "hunter", "2000", "tigger",
+            // 15+ characters: with length checked first (AUTH-03, 2026-11-10), only these can still be "blocklisted".
+            "123456789012345", "1234567890123456", "passwordpassword", "password1234567", "qwertyuiopasdfgh",
+            "qwertyuiopasdfghjkl", "iloveyouiloveyou", "trustno1trustno1", "aaaaaaaaaaaaaaa", "letmeinletmein1"
     );
 
     /* ---------- Rate Limiter ---------- */
@@ -178,7 +217,9 @@ public class AuthSystem {
             String pwReason = passwordStrengthCheck(password, email, name);
             if (pwReason != null) {
                 decisions.add("password_strength");
-                return error("password_rejected", pwReason);
+                Map<String, Object> rejected = error("password_rejected", pwReason);
+                rejected.put("reason", pwReason);   // AUTH-03: {error: "password_rejected", reason}
+                return rejected;
             }
 
             // Create user
@@ -210,10 +251,18 @@ public class AuthSystem {
             if (userId == null) return error("invalid_email", "Email not found");
             decisions.add("user_exists");
 
-            VerificationCode vc = getVerificationCode(userId, code, "email");
+            // AUTH-06 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): an expired code is "code_expired", not
+            // "code_invalid" as before; the expired row is deleted so it can never be used.
+            VerificationCode any = getVerificationCodeIgnoringExpiry(userId, code, "email");
+            if (any != null && Instant.now().isAfter(any.expiresAt)) {
+                deleteVerificationCode(any.id);
+                decisions.add("code_valid");
+                return error("code_expired", "Code expired");
+            }
+            VerificationCode vc = any;
             if (vc == null) {
                 decisions.add("code_invalid");
-                return error("code_invalid", "Invalid or expired code");
+                return error("code_invalid", "Invalid code");
             }
             decisions.add("code_valid");
 
@@ -637,6 +686,26 @@ public class AuthSystem {
         }
     }
 
+    /**
+     * The user's code row of that type matching code, expired or not (null if none). In: user id, code, type.
+     * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP so verify_email can answer code_expired (AUTH-06).
+     * Touches: reads the database.
+     */
+    private static VerificationCode getVerificationCodeIgnoringExpiry(long userId, String code, String type) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT id, user_id, code, created_at, expires_at, type FROM verification_codes WHERE user_id = ? AND code = ? AND type = ?")) {
+            ps.setLong(1, userId);
+            ps.setString(2, code);
+            ps.setString(3, type);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) {
+                return new VerificationCode(rs.getLong(1), rs.getLong(2), rs.getString(3),
+                        rs.getTimestamp(4).toInstant(), rs.getTimestamp(5).toInstant(), rs.getString(6));
+            }
+            return null;
+        }
+    }
+
     private static VerificationCode getVerificationCode(long userId, String code, String type) throws SQLException {
         try (PreparedStatement ps = conn.prepareStatement(
                 "SELECT id, user_id, code, created_at, expires_at, type FROM verification_codes WHERE user_id = ? AND code = ? AND type = ?")) {
@@ -689,16 +758,24 @@ public class AuthSystem {
         }
     }
 
+    /**
+     * NIST SP 800-63B-4 password check. In: password, the user's email and name. Out: null when accepted, else the
+     * reason "too_short" (< 15 characters), "too_long" (> 64) or "blocklisted" (common value, the user's email or name,
+     * or the service name), checked IN THAT ORDER, first failure wins ("password123" is too_short).
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-03 amendment): length now comes before the blocklist,
+     * length counts Unicode characters (code points), not UTF-16 units, and the blocklist has 15+ character entries.
+     * Touches: nothing.
+     */
     private static String passwordStrengthCheck(String password, String email, String name) {
-        // Check blocklist first (includes common passwords, email, name, service name)
-        String lower = password.toLowerCase();
+        if (password == null) return "too_short";
+        int length = password.codePointCount(0, password.length());
+        if (length < 15) return "too_short";
+        if (length > 64) return "too_long";
+
+        String lower = password.toLowerCase(Locale.ROOT);
         if (commonPasswords.contains(lower)) return "blocklisted";
         if (password.equalsIgnoreCase(email) || password.equalsIgnoreCase(name) || password.equalsIgnoreCase("auth_system"))
             return "blocklisted";
-
-        // Then check length
-        if (password.length() < 15) return "too_short";
-        if (password.length() > 64) return "too_long";
 
         // Allow all printable ASCII, spaces, and Unicode - just reject control characters
         if (password.codePoints().anyMatch(c -> Character.isISOControl(c))) return "invalid_chars";
@@ -706,9 +783,9 @@ public class AuthSystem {
         return null;
     }
 
+    /** Hands the code to the configured EmailSender; never logs it. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: email. */
     private static void sendEmail(String email, String code) {
-        // Simulated email send
-        System.out.println("Sending email to " + email + " with code " + code);
+        emailSender.sendVerificationCode(email, code);
     }
 
     private static void logWhy(String flow, List<String> decisions) {

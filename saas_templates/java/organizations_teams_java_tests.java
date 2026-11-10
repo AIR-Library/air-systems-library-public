@@ -4,6 +4,8 @@ import java.sql.*;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.List;
+import java.util.ArrayList;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -48,15 +50,18 @@ public class OrganizationsTeamsTest {
         assertTrue((Long) org.get("id") > 0);
     }
 
+    // ORG-01
     @Test
     void testNonMemberCannotReadMembers() throws Exception {
         long ownerId = createUser("owner@example.com");
         long outsiderId = createUser("outsider@example.com");
         Map<String, Object> org = ot.createOrg(ownerId, "TestOrg");
         long orgId = (Long) org.get("id");
-        assertThrows(SecurityException.class, () -> ot.listMembers(outsiderId, orgId));
+        SecurityException e = assertThrows(SecurityException.class, () -> ot.listMembers(outsiderId, orgId));
+        assertEquals("not_found", e.getMessage());
     }
 
+    // ORG-02
     @Test
     void testMemberCannotInvite() throws Exception {
         long ownerId = createUser("owner@example.com");
@@ -68,6 +73,7 @@ public class OrganizationsTeamsTest {
         assertThrows(SecurityException.class, () -> ot.invite(memberId, orgId, "test@example.com", "member"));
     }
 
+    // ORG-02
     @Test
     void testAdminCanInvite() throws Exception {
         long ownerId = createUser("owner@example.com");
@@ -81,6 +87,7 @@ public class OrganizationsTeamsTest {
         assertTrue(token.length() > 0);
     }
 
+    // ORG-03
     @Test
     void testAdminCannotRemoveOwner() throws Exception {
         long ownerId = createUser("owner@example.com");
@@ -92,6 +99,7 @@ public class OrganizationsTeamsTest {
         assertThrows(SecurityException.class, () -> ot.removeMember(adminId, orgId, ownerId));
     }
 
+    // ORG-03
     @Test
     void testLastOwnerCannotLeave() throws Exception {
         long ownerId = createUser("owner@example.com");
@@ -100,6 +108,7 @@ public class OrganizationsTeamsTest {
         assertThrows(SecurityException.class, () -> ot.leaveOrg(ownerId, orgId));
     }
 
+    // ORG-04
     @Test
     void testInvitationWorksOnce() throws Exception {
         long ownerId = createUser("owner@example.com");
@@ -112,6 +121,7 @@ public class OrganizationsTeamsTest {
         assertThrows(SecurityException.class, () -> ot.acceptInvitation(newUserId, token));
     }
 
+    // ORG-05
     @Test
     void testExpiredInvitationFails() throws Exception {
         long ownerId = createUser("owner@example.com");
@@ -127,6 +137,7 @@ public class OrganizationsTeamsTest {
         assertThrows(SecurityException.class, () -> ot.acceptInvitation(newUserId, token));
     }
 
+    // ORG-05
     @Test
     void testAcceptingWithDifferentEmailFails() throws Exception {
         long ownerId = createUser("owner@example.com");
@@ -137,6 +148,12 @@ public class OrganizationsTeamsTest {
         assertThrows(SecurityException.class, () -> ot.acceptInvitation(wrongUserId, token));
     }
 
+    /**
+     * ORG-06: the raw invitation token is not stored anywhere in the database. 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP: besides the token_hash column it now reads every text column of every table
+     * (the row says "anywhere"). Touches: the test's in-memory H2 database (reads only).
+     */
+    // ORG-06
     @Test
     void testRawTokenNotStored() throws Exception {
         long ownerId = createUser("owner@example.com");
@@ -149,6 +166,25 @@ public class OrganizationsTeamsTest {
             try (ResultSet rs = ps.executeQuery()) {
                 rs.next();
                 assertEquals(0, rs.getInt(1));
+            }
+        }
+        List<String> tables = new ArrayList<>();
+        try (ResultSet t = db.getMetaData().getTables(null, null, "%", new String[]{"TABLE"})) {
+            while (t.next()) {
+                String schema = t.getString("TABLE_SCHEM");
+                if (!"INFORMATION_SCHEMA".equalsIgnoreCase(schema)) tables.add(schema + "." + t.getString("TABLE_NAME"));
+            }
+        }
+        assertTrue(tables.size() >= 3, "expected the org tables, found " + tables);
+        for (String table : tables) {
+            try (Statement st = db.createStatement(); ResultSet rs = st.executeQuery("SELECT * FROM " + table)) {
+                int cols = rs.getMetaData().getColumnCount();
+                while (rs.next()) {
+                    for (int c = 1; c <= cols; c++) {
+                        String v = rs.getString(c);
+                        assertFalse(v != null && v.contains(token), "raw token found in " + table);
+                    }
+                }
             }
         }
     }

@@ -21,9 +21,17 @@
  * the CSV export broke on the profile section and allowed spreadsheet formula injection, and
  * email, storage and the database were static singletons with no interface to swap.
  *
+ * Amended 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-05/12/13/14): user_requested/other deletions are held until
+ * requested_at + 30 days, statutory ones (gdpr_request, gdpr_right_to_be_forgotten) are not held and
+ * confirm() runs the cascade before it returns; the confirmation token is 32 random bytes, stored as
+ * SHA-256, single-use, valid 24 hours, bound to its deletion id and compared in constant time; confirm,
+ * cancel and export status act only on the caller's own request (else not_found); the cascade deletes the
+ * user's rows, logs 'user_deleted_cascade', then calls the injected AuditEraser's eraseSubject() LAST, in
+ * one transaction, and sets deletion_requests.user_id to NULL.
+ *
  * Touches: the database (users and related tables, export_requests, deletion_requests,
- * audit_log), object storage (export files) and email, each behind an interface; the in-memory
- * implementations here touch no network or files. No money.
+ * audit_log), object storage (export files), email and the audit system's eraser, each behind an
+ * interface; the in-memory implementations here touch no network or files. No money.
  */
 
 declare(strict_types=1);
@@ -159,16 +167,30 @@ CREATE TABLE IF NOT EXISTS export_requests (
 );
 CREATE TABLE IF NOT EXISTS deletion_requests (
     id TEXT PRIMARY KEY,
-    user_id INTEGER NOT NULL,
+    user_id INTEGER NULL,
     requested_at TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'completed', 'cancelled')),
     reason TEXT NOT NULL,
     confirmation_token_hash TEXT,
+    confirmation_expires_at TEXT,
     scheduled_at TEXT,
     deleted_at TEXT
 );
 SQL);
     }
+}
+
+/**
+ * The audit system's erasure entry point (audit_logging.md erase_subject): removes the user's personal
+ * audit data. The deletion cascade calls it LAST, inside its transaction.
+ *
+ * Why: EXPORT-13 (an independent review found nothing erased the user's audit personal data).
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the audit system's tables in real implementations.
+ */
+interface AuditEraser
+{
+    /** Erase the personal audit data of $userId. Throws on failure (the cascade then rolls back). */
+    public function eraseSubject(int $userId): void;
 }
 
 /**
@@ -439,7 +461,10 @@ final class ComplianceService
 {
     public const EXPORT_LINK_TTL = '+7 days';
     public const GRACE_PERIOD = '+30 days';
+    public const CONFIRMATION_TTL = '+24 hours';
     public const DELETION_REASONS = ['user_requested', 'gdpr_request', 'gdpr_right_to_be_forgotten', 'other'];
+    /** Statutory erasure reasons: no grace period (EXPORT-12). */
+    public const STATUTORY_REASONS = ['gdpr_request', 'gdpr_right_to_be_forgotten'];
 
     /** Tables holding the user's data, removed by the cascade (audit_log is kept). */
     private const USER_TABLES = ['sessions', 'activities', 'files', 'preferences', 'transactions', 'export_requests'];
@@ -455,8 +480,11 @@ final class ComplianceService
      * @param JobDispatcher|null $jobs           Default: run inline.
      * @param Closure|null       $clock          Returns now; default the system clock (UTC).
      * @param string             $appBaseUrl     Base of the emailed confirmation link.
+     * @param AuditEraser|null   $auditEraser    The audit system's erase_subject(); without one a deletion
+     *                                           cannot complete (fails closed with audit_eraser_not_configured).
      *
-     * Why: dependencies are injected instead of static singletons. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing (stores dependencies; the default signing key comes from random_bytes).
+     * Why: dependencies are injected instead of static singletons; $auditEraser added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP
+     * (EXPORT-13). Touches: nothing (stores dependencies).
      */
     public function __construct(
         private PDO $pdo,
@@ -465,6 +493,7 @@ final class ComplianceService
         ?JobDispatcher $jobs = null,
         ?Closure $clock = null,
         private string $appBaseUrl = 'https://app.example.com',
+        private ?AuditEraser $auditEraser = null,
     ) {
         $this->jobs = $jobs ?? new InlineJobDispatcher();
         $this->clock = $clock ?? static fn (): DateTimeImmutable => new DateTimeImmutable('now', new DateTimeZone('UTC'));
@@ -560,20 +589,22 @@ final class ComplianceService
     /**
      * Export status (GET /compliance/exports/:export_id).
      *
-     * @param string   $exportId
-     * @param int|null $userId The authenticated user; when given, another user's export is
-     *                         reported as not found.
+     * @param string $exportId
+     * @param int    $userId   The authenticated user (verified session, never request input); another
+     *                         user's export is reported as not found.
      * @return array {export_id, status, file_url, expires_at, requested_at}
      * @throws ComplianceException not_found
      *
-     * Why: optional ownership check so a route cannot show another user's export. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database (read).
+     * Why: ownership check so a route cannot show another user's export; the caller is required since
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (it was optional, so a route that forgot it leaked signed links).
+     * Touches: the database (read).
      */
-    public function getExportStatus(string $exportId, ?int $userId = null): array
+    public function getExportStatus(string $exportId, int $userId): array
     {
         $stmt = $this->pdo->prepare('SELECT * FROM export_requests WHERE id = :id');
         $stmt->execute([':id' => $exportId]);
         $row = $stmt->fetch(PDO::FETCH_ASSOC);
-        if ($row === false || ($userId !== null && (int) $row['user_id'] !== $userId)) {
+        if ($row === false || (int) $row['user_id'] !== $userId) {
             throw new ComplianceException('not_found', 'Export not found');
         }
         return [
@@ -588,16 +619,18 @@ final class ComplianceService
     // ---------- DELETION ----------
 
     /**
-     * Request account deletion (POST /compliance/delete): emails a one-time confirmation link.
-     * Only a hash of the token is stored.
+     * Request account deletion (POST /compliance/delete): emails a one-time confirmation link. Nothing is
+     * deleted until the request is confirmed.
      *
-     * @param int         $userId   The authenticated user.
+     * @param int         $userId   The authenticated user (verified session, never request input).
      * @param string      $reason   One of DELETION_REASONS.
      * @param string|null $whyChain Optional why-chain id for the audit entry.
-     * @return array {success: true, deletion_id, status: 'pending', will_delete_at}
+     * @return array {success: true, deletion_id, status: 'pending', will_delete_at}: requested_at + 30 days
+     *               for user_requested / other, requested_at for a statutory reason (EXPORT-05, EXPORT-12).
      * @throws ComplianceException invalid_reason | user_not_found
      *
-     * Why: the confirmation token was stored in plain text; only its SHA-256 is stored now. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database, email and the audit log.
+     * Why: the token is 32 random bytes, stored only as SHA-256 and valid 24 hours; statutory reasons get
+     * no grace period (amended 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). Touches: the database, email and the audit log.
      */
     public function requestDeletion(int $userId, string $reason, ?string $whyChain = null): array
     {
@@ -606,85 +639,109 @@ final class ComplianceService
         }
         $this->requireUser($userId);
         $deletionId = self::uuid();
-        $token = bin2hex(random_bytes(16));
+        $token = bin2hex(random_bytes(32));
         $now = $this->now();
+        $statutory = in_array($reason, self::STATUTORY_REASONS, true);
+        $willDeleteAt = $statutory ? $now : $now->modify(self::GRACE_PERIOD);
         $this->pdo->prepare(
-            "INSERT INTO deletion_requests (id, user_id, requested_at, status, reason, confirmation_token_hash)
-             VALUES (:id, :user_id, :requested_at, 'pending', :reason, :token_hash)"
+            "INSERT INTO deletion_requests (id, user_id, requested_at, status, reason, confirmation_token_hash,
+                                            confirmation_expires_at, scheduled_at)
+             VALUES (:id, :user_id, :requested_at, 'pending', :reason, :token_hash, :token_expires, :scheduled_at)"
         )->execute([
             ':id' => $deletionId,
             ':user_id' => $userId,
             ':requested_at' => self::format($now),
             ':reason' => $reason,
             ':token_hash' => hash('sha256', $token),
+            ':token_expires' => self::format($now->modify(self::CONFIRMATION_TTL)),
+            ':scheduled_at' => self::format($willDeleteAt),
         ]);
         $this->audit->record($userId, 'deletion_requested', ['reason' => $reason, 'deletion_id' => $deletionId], $whyChain);
 
         $link = rtrim($this->appBaseUrl, '/') . "/compliance/delete/{$deletionId}/confirm?token={$token}";
+        $when = $statutory
+            ? 'Your account is deleted as soon as you confirm.'
+            : 'Your account is deleted 30 days after your request, and you can cancel until then.';
         $this->mailer->send(
             $userId,
             'Confirm your account deletion',
-            "Please confirm your account deletion with the link below. Your account is deleted 30 days "
-            . "after you confirm, and you can cancel until then.\n{$link}\n\nIf you did not ask for this, ignore this email.\n"
+            "Please confirm your account deletion with the link below (it works once, for 24 hours). {$when}\n"
+            . "{$link}\n\nIf you did not ask for this, ignore this email.\n"
         );
 
         return [
             'success' => true,
             'deletion_id' => $deletionId,
             'status' => 'pending',
-            'will_delete_at' => self::format($now->modify(self::GRACE_PERIOD)),
+            'will_delete_at' => self::format($willDeleteAt),
         ];
     }
 
     /**
-     * Confirm deletion with the emailed token (POST /compliance/delete/:id/confirm). Starts the
-     * 30-day grace period; the token works once.
+     * Confirm deletion with the emailed token (POST /compliance/delete/:id/confirm).
      *
-     * @return array {success: true, deletion_scheduled_for}
-     * @throws ComplianceException not_found | not_pending | invalid_token
+     * @param int    $userId     The authenticated user; another user's request is not_found (404).
+     * @param string $deletionId
+     * @param string $token      The emailed token (64 hex characters).
+     * @return array {success: true, deletion_scheduled_for, status}: for user_requested / other the
+     *               request becomes 'approved' and is deleted at requested_at + 30 days by
+     *               processDueDeletions(); for a statutory reason the cascade runs before this returns
+     *               (status 'completed', deleted_at = deletion_scheduled_for = now).
+     * @throws ComplianceException not_found | not_pending (already used) | invalid_token | token_expired |
+     *                             audit_eraser_not_configured
      *
-     * Why: confirming deleted the account at once (no grace period); the token is now single-use and compared in constant time. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database and the audit log.
+     * Why: the token is single-use, valid 24 hours, bound to this deletion id (its hash is on this row)
+     * and compared in constant time; the caller check and the statutory path are amended
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-12, EXPORT-14). Touches: the database, the audit log, storage and
+     * the audit eraser (statutory path).
      */
-    public function confirmDeletion(string $deletionId, string $token): array
+    public function confirmDeletion(int $userId, string $deletionId, string $token): array
     {
-        $row = $this->getDeletion($deletionId);
+        $row = $this->getOwnDeletion($userId, $deletionId);
         if ($row['status'] !== 'pending' || $row['confirmation_token_hash'] === null) {
             throw new ComplianceException('not_pending', 'Deletion request is not awaiting confirmation');
         }
-        if (!hash_equals($row['confirmation_token_hash'], hash('sha256', $token))) {
+        if (!hash_equals((string) $row['confirmation_token_hash'], hash('sha256', $token))) {
             throw new ComplianceException('invalid_token', 'Invalid confirmation token');
         }
-        $scheduledAt = self::format($this->now()->modify(self::GRACE_PERIOD));
+        $now = $this->now();
+        if ($row['confirmation_expires_at'] === null || self::format($now) >= $row['confirmation_expires_at']) {
+            throw new ComplianceException('token_expired', 'The confirmation link has expired');
+        }
+        $statutory = in_array($row['reason'], self::STATUTORY_REASONS, true);
+        $scheduledAt = $statutory ? self::format($now) : (string) $row['scheduled_at'];
         $stmt = $this->pdo->prepare(
-            "UPDATE deletion_requests SET status = 'approved', scheduled_at = :scheduled_at, confirmation_token_hash = NULL
-             WHERE id = :id AND status = 'pending'"
+            "UPDATE deletion_requests SET status = 'approved', scheduled_at = :scheduled_at,
+                    confirmation_token_hash = NULL, confirmation_expires_at = NULL
+             WHERE id = :id AND status = 'pending' AND confirmation_token_hash = :hash"
         );
-        $stmt->execute([':scheduled_at' => $scheduledAt, ':id' => $deletionId]);
+        $stmt->execute([':scheduled_at' => $scheduledAt, ':id' => $deletionId, ':hash' => $row['confirmation_token_hash']]);
         if ($stmt->rowCount() !== 1) {
             throw new ComplianceException('not_pending', 'Deletion request is not awaiting confirmation');
         }
-        $this->audit->record((int) $row['user_id'], 'deletion_confirmed', ['deletion_id' => $deletionId]);
+        $this->audit->record($userId, 'deletion_confirmed', ['deletion_id' => $deletionId]);
 
-        return ['success' => true, 'deletion_scheduled_for' => $scheduledAt];
+        if ($statutory) {
+            $this->executeDeletion($deletionId, $userId);
+            return ['success' => true, 'deletion_scheduled_for' => $scheduledAt, 'status' => 'completed'];
+        }
+        return ['success' => true, 'deletion_scheduled_for' => $scheduledAt, 'status' => 'approved'];
     }
 
     /**
      * Cancel a pending or confirmed deletion within the grace period (DELETE /compliance/delete/:id).
      *
-     * @param string   $deletionId
-     * @param int|null $userId The authenticated user; when given, another user's request is
-     *                         reported as not found.
+     * @param int    $userId     The authenticated user; another user's request is not_found (404).
+     * @param string $deletionId
      * @return array {success: true, status: 'cancelled'}
      * @throws ComplianceException not_found | not_cancellable | grace_period_elapsed
      *
-     * Why: cancelling must stop at the end of the grace period. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database and the audit log.
+     * Why: cancelling must stop at the end of the grace period; the caller is required since
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-14; it was optional). Touches: the database and the audit log.
      */
-    public function cancelDeletion(string $deletionId, ?int $userId = null): array
+    public function cancelDeletion(int $userId, string $deletionId): array
     {
-        $row = $this->getDeletion($deletionId);
-        if ($userId !== null && (int) $row['user_id'] !== $userId) {
-            throw new ComplianceException('not_found', 'Deletion request not found');
-        }
+        $row = $this->getOwnDeletion($userId, $deletionId);
         if (!in_array($row['status'], ['pending', 'approved'], true)) {
             throw new ComplianceException('not_cancellable', 'Deletion can no longer be cancelled');
         }
@@ -693,14 +750,14 @@ final class ComplianceService
             throw new ComplianceException('grace_period_elapsed', 'The grace period has ended');
         }
         $stmt = $this->pdo->prepare(
-            "UPDATE deletion_requests SET status = 'cancelled', confirmation_token_hash = NULL
+            "UPDATE deletion_requests SET status = 'cancelled', confirmation_token_hash = NULL, confirmation_expires_at = NULL
              WHERE id = :id AND status IN ('pending', 'approved')"
         );
         $stmt->execute([':id' => $deletionId]);
         if ($stmt->rowCount() !== 1) {
             throw new ComplianceException('not_cancellable', 'Deletion can no longer be cancelled');
         }
-        $this->audit->record((int) $row['user_id'], 'deletion_cancelled', ['deletion_id' => $deletionId]);
+        $this->audit->record($userId, 'deletion_cancelled', ['deletion_id' => $deletionId]);
         return ['success' => true, 'status' => 'cancelled'];
     }
 
@@ -717,7 +774,8 @@ final class ComplianceService
     public function processDueDeletions(): int
     {
         $stmt = $this->pdo->prepare(
-            "SELECT id, user_id FROM deletion_requests WHERE status = 'approved' AND scheduled_at <= :now ORDER BY rowid"
+            "SELECT id, user_id FROM deletion_requests
+             WHERE status = 'approved' AND user_id IS NOT NULL AND scheduled_at <= :now ORDER BY rowid"
         );
         $stmt->execute([':now' => self::format($this->now())]);
         $done = 0;
@@ -729,26 +787,44 @@ final class ComplianceService
     }
 
     /**
-     * The cascade for one request (see processDueDeletions).
+     * The cascade for one request, in ONE transaction and in this order (EXPORT-13):
+     * (1) delete the user's rows in USER_TABLES and the user row (never audit_log or the audit system's
+     *     tables); mark the request 'completed' with deleted_at and set user_id to NULL on every
+     *     deletion_requests row of the user, so no request row can re-identify erased audit entries;
+     * (2) log 'user_deleted_cascade' with the user as subject;
+     * (3) call the audit eraser's eraseSubject(user_id) LAST. Nothing logs this user afterwards.
+     * Stored export files are removed after the commit. Throws (and rolls back) when no eraser is
+     * configured or the eraser fails.
      *
-     * Why: the old cascade deleted the deletion request it then marked completed, and left export files behind. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database and object storage (deletes personal data).
+     * Why: the old cascade deleted the deletion request it then marked completed, left export files behind,
+     * and (found by an independent review) never erased the user's personal audit data; amended
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database, object storage and the audit system (deletes personal data).
      */
     private function executeDeletion(string $deletionId, int $userId): void
     {
+        if ($this->auditEraser === null) {
+            throw new ComplianceException('audit_eraser_not_configured', 'No audit eraser is configured; the deletion cannot complete');
+        }
         $keys = $this->pdo->prepare('SELECT storage_key FROM export_requests WHERE user_id = :uid AND storage_key IS NOT NULL');
         $keys->execute([':uid' => $userId]);
         $storageKeys = $keys->fetchAll(PDO::FETCH_COLUMN);
 
         $this->pdo->beginTransaction();
         try {
+            $deleted = [];
             foreach (self::USER_TABLES as $table) {
-                $this->pdo->prepare("DELETE FROM {$table} WHERE user_id = :uid")->execute([':uid' => $userId]);
+                $stmt = $this->pdo->prepare("DELETE FROM {$table} WHERE user_id = :uid");
+                $stmt->execute([':uid' => $userId]);
+                $deleted[$table] = $stmt->rowCount();
             }
             $this->pdo->prepare('DELETE FROM users WHERE id = :uid')->execute([':uid' => $userId]);
             $this->pdo->prepare(
                 "UPDATE deletion_requests SET status = 'completed', deleted_at = :now WHERE id = :id"
             )->execute([':now' => self::format($this->now()), ':id' => $deletionId]);
-            $this->audit->record($userId, 'deletion_completed', ['deletion_id' => $deletionId]);
+            $this->pdo->prepare('UPDATE deletion_requests SET user_id = NULL WHERE user_id = :uid')->execute([':uid' => $userId]);
+
+            $this->audit->record($userId, 'user_deleted_cascade', ['deletion_id' => $deletionId, 'deleted_items' => $deleted]);
+            $this->auditEraser->eraseSubject($userId); // LAST: nothing logs this user after it
             $this->pdo->commit();
         } catch (Throwable $e) {
             $this->pdo->rollBack();
@@ -855,16 +931,18 @@ final class ComplianceService
     }
 
     /**
-     * @throws ComplianceException not_found
+     * The caller's own deletion request.
+     * @throws ComplianceException not_found (also for another user's request, so ids cannot be probed)
      *
-     * Why: shared lookup for confirm/cancel. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database (read).
+     * Why: shared lookup for confirm/cancel; the owner check is 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-14).
+     * Touches: the database (read).
      */
-    private function getDeletion(string $deletionId): array
+    private function getOwnDeletion(int $userId, string $deletionId): array
     {
         $stmt = $this->pdo->prepare('SELECT * FROM deletion_requests WHERE id = :id');
         $stmt->execute([':id' => $deletionId]);
         $row = $stmt->fetch(PDO::FETCH_ASSOC);
-        if ($row === false) {
+        if ($row === false || $row['user_id'] === null || (int) $row['user_id'] !== $userId) {
             throw new ComplianceException('not_found', 'Deletion request not found');
         }
         return $row;

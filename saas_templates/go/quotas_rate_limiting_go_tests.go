@@ -18,6 +18,10 @@ func setupTestDB(t *testing.T) *sql.DB {
 	if err := db.Ping(); err != nil {
 		t.Fatalf("ping db: %v", err)
 	}
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: one connection, because every new connection to
+	// :memory: is a separate, empty database (spec README "Storage behind an interface").
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { db.Close() })
 	return db
 }
 
@@ -31,6 +35,7 @@ func newTestLimiter(t *testing.T) *Limiter {
 	return l
 }
 
+// QUOTA-01
 func TestAPIQuotaPASS(t *testing.T) {
 	l := newTestLimiter(t)
 	ctx := context.Background()
@@ -56,6 +61,7 @@ func TestAPIQuotaPASS(t *testing.T) {
 	}
 }
 
+// QUOTA-02
 func TestAPIQuotaFAIL(t *testing.T) {
 	l := newTestLimiter(t)
 	ctx := context.Background()
@@ -73,14 +79,15 @@ func TestAPIQuotaFAIL(t *testing.T) {
 	if ok {
 		t.Fatalf("expected FAIL, got PASS")
 	}
-	if qerr == nil || qerr.Code != "quota_exceeded" {
-		t.Fatalf("expected quota_exceeded error, got %v", qerr)
+	if qerr == nil || qerr.Code != "quota_exceeded" || qerr.Status != 429 {
+		t.Fatalf("expected 429 quota_exceeded error, got %+v", qerr)
 	}
 	if qerr.Details["limit"] != int64(1000) {
 		t.Fatalf("expected limit 1000, got %v", qerr.Details["limit"])
 	}
 }
 
+// QUOTA-03
 func TestStorageQuotaPASS(t *testing.T) {
 	l := newTestLimiter(t)
 	ctx := context.Background()
@@ -106,6 +113,7 @@ func TestStorageQuotaPASS(t *testing.T) {
 	}
 }
 
+// QUOTA-04
 func TestStorageQuotaFAIL(t *testing.T) {
 	l := newTestLimiter(t)
 	ctx := context.Background()
@@ -121,11 +129,12 @@ func TestStorageQuotaFAIL(t *testing.T) {
 	if ok {
 		t.Fatalf("expected FAIL, got PASS")
 	}
-	if qerr == nil || qerr.Code != "storage_quota_exceeded" {
+	if qerr == nil || qerr.Code != "storage_quota_exceeded" || qerr.Status != 413 {
 		t.Fatalf("expected storage_quota_exceeded error, got %v", qerr)
 	}
 }
 
+// QUOTA-05
 func TestRateLimitPerUserPASS(t *testing.T) {
 	l := newTestLimiter(t)
 
@@ -137,6 +146,7 @@ func TestRateLimitPerUserPASS(t *testing.T) {
 	}
 }
 
+// QUOTA-06
 func TestRateLimitPerUserFAIL(t *testing.T) {
 	l := newTestLimiter(t)
 
@@ -151,7 +161,7 @@ func TestRateLimitPerUserFAIL(t *testing.T) {
 	if ok {
 		t.Fatalf("expected FAIL on 101st request, got PASS")
 	}
-	if qerr == nil || qerr.Code != "rate_limit_exceeded" {
+	if qerr == nil || qerr.Code != "rate_limit_exceeded" || qerr.Status != 429 {
 		t.Fatalf("expected rate_limit_exceeded error, got %v", qerr)
 	}
 	if qerr.Details["reset_seconds"] != 60 {
@@ -159,6 +169,7 @@ func TestRateLimitPerUserFAIL(t *testing.T) {
 	}
 }
 
+// QUOTA-07
 func TestRateLimitPerIPPASS(t *testing.T) {
 	l := newTestLimiter(t)
 
@@ -170,6 +181,7 @@ func TestRateLimitPerIPPASS(t *testing.T) {
 	}
 }
 
+// QUOTA-08
 func TestRateLimitPerIPFAIL(t *testing.T) {
 	l := newTestLimiter(t)
 
@@ -184,7 +196,7 @@ func TestRateLimitPerIPFAIL(t *testing.T) {
 	if ok {
 		t.Fatalf("expected FAIL on 11th request, got PASS")
 	}
-	if qerr == nil || qerr.Code != "ip_rate_limit_exceeded" {
+	if qerr == nil || qerr.Code != "ip_rate_limit_exceeded" || qerr.Status != 429 {
 		t.Fatalf("expected ip_rate_limit_exceeded error, got %v", qerr)
 	}
 	if qerr.Details["reset_seconds"] != 1 {
@@ -192,6 +204,7 @@ func TestRateLimitPerIPFAIL(t *testing.T) {
 	}
 }
 
+// QUOTA-09
 func TestFeatureGatePASS(t *testing.T) {
 	l := newTestLimiter(t)
 	ctx := context.Background()
@@ -219,6 +232,7 @@ func TestFeatureGatePASS(t *testing.T) {
 	}
 }
 
+// QUOTA-10
 func TestFeatureGateFAIL(t *testing.T) {
 	l := newTestLimiter(t)
 	ctx := context.Background()
@@ -241,7 +255,7 @@ func TestFeatureGateFAIL(t *testing.T) {
 		if ok {
 			t.Fatalf("tier=%s feature=%s: expected FAIL, got PASS", tc.tier, tc.feature)
 		}
-		if qerr == nil || qerr.Code != "feature_not_available" {
+		if qerr == nil || qerr.Code != "feature_not_available" || qerr.Status != 403 {
 			t.Fatalf("expected feature_not_available error, got %v", qerr)
 		}
 		if qerr.Details["minimum_tier"] != tc.minTier {
@@ -253,6 +267,7 @@ func TestFeatureGateFAIL(t *testing.T) {
 	}
 }
 
+// QUOTA-11
 func TestMonthRollover(t *testing.T) {
 	l := newTestLimiter(t)
 	ctx := context.Background()
@@ -288,10 +303,22 @@ func TestMonthRollover(t *testing.T) {
 	}
 }
 
+// QUOTA-12
 func TestTierUpgrade(t *testing.T) {
 	l := newTestLimiter(t)
 	ctx := context.Background()
 
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the user first uses up the solo quota, so the PASS
+	// after the upgrade proves the new limit applies at once (QUOTA-12); before, usage was zero and
+	// solo would have passed too.
+	for i := 0; i < 1000; i++ {
+		if err := l.IncrementAPIUsage(ctx, "user10"); err != nil {
+			t.Fatalf("IncrementAPIUsage: %v", err)
+		}
+	}
+	if ok, _, _ := l.CheckAPIQuota(ctx, "user10", TierSolo); ok {
+		t.Fatalf("expected the solo quota to be used up before the upgrade")
+	}
 	if err := l.HandleTierUpgrade(ctx, "user10", TierTeam); err != nil {
 		t.Fatalf("HandleTierUpgrade to team: %v", err)
 	}
@@ -317,6 +344,7 @@ func TestTierUpgrade(t *testing.T) {
 	}
 }
 
+// QUOTA-13
 func TestEnterpriseUnlimitedAPI(t *testing.T) {
 	l := newTestLimiter(t)
 	ctx := context.Background()
@@ -336,6 +364,7 @@ func TestEnterpriseUnlimitedAPI(t *testing.T) {
 	}
 }
 
+// QUOTA-13
 func TestEnterpriseUnlimitedStorage(t *testing.T) {
 	l := newTestLimiter(t)
 	ctx := context.Background()
@@ -346,6 +375,18 @@ func TestEnterpriseUnlimitedStorage(t *testing.T) {
 	}
 	if !ok {
 		t.Fatalf("expected PASS for enterprise unlimited storage, got FAIL: %v", qerr)
+	}
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: QUOTA-13 says the upload is stored; record it and
+	// check again past the team limit.
+	if err := l.IncrementStorageUsage(ctx, "user12", 1_000_000_000_000); err != nil {
+		t.Fatalf("IncrementStorageUsage: %v", err)
+	}
+	_, stored, err := l.GetCurrentUsage(ctx, "user12")
+	if err != nil || stored != 1_000_000_000_000 {
+		t.Fatalf("expected 1e12 bytes stored, got %d (%v)", stored, err)
+	}
+	if ok, qerr, err := l.CheckStorageQuota(ctx, "user12", TierEnterprise, 1); err != nil || !ok {
+		t.Fatalf("expected PASS past every other tier's storage limit, got %v %v", qerr, err)
 	}
 }
 
@@ -367,8 +408,15 @@ func TestLogAPICall(t *testing.T) {
 	}
 }
 
+// TestRateLimitWindowExpiry: a full per-user window frees up once the minute has passed.
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the injectable clock replaces a 60 s sleep
+// (spec README: time comes from an injectable clock); the window and the assertion are unchanged.
 func TestRateLimitWindowExpiry(t *testing.T) {
-	l := newTestLimiter(t)
+	now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	l, err := NewLimiter(Config{DB: setupTestDB(t), Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("new limiter: %v", err)
+	}
 
 	for i := 0; i < 100; i++ {
 		ok, _ := l.CheckRateLimitPerUser("user14")
@@ -376,8 +424,11 @@ func TestRateLimitWindowExpiry(t *testing.T) {
 			t.Fatalf("request %d: unexpected FAIL", i)
 		}
 	}
+	if ok, _ := l.CheckRateLimitPerUser("user14"); ok {
+		t.Fatalf("expected FAIL inside the window")
+	}
 
-	time.Sleep(time.Minute + 100*time.Millisecond)
+	now = now.Add(time.Minute + 100*time.Millisecond)
 
 	ok, qerr := l.CheckRateLimitPerUser("user14")
 	if !ok {
@@ -385,8 +436,14 @@ func TestRateLimitWindowExpiry(t *testing.T) {
 	}
 }
 
+// TestIPRateLimitWindowExpiry: a full per-IP window frees up once the second has passed.
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the injectable clock replaces a 1 s sleep.
 func TestIPRateLimitWindowExpiry(t *testing.T) {
-	l := newTestLimiter(t)
+	now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	l, err := NewLimiter(Config{DB: setupTestDB(t), Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("new limiter: %v", err)
+	}
 
 	for i := 0; i < 10; i++ {
 		ok, _ := l.CheckRateLimitPerIP("10.0.0.2")
@@ -394,8 +451,11 @@ func TestIPRateLimitWindowExpiry(t *testing.T) {
 			t.Fatalf("request %d: unexpected FAIL", i)
 		}
 	}
+	if ok, _ := l.CheckRateLimitPerIP("10.0.0.2"); ok {
+		t.Fatalf("expected FAIL inside the window")
+	}
 
-	time.Sleep(time.Second + 100*time.Millisecond)
+	now = now.Add(time.Second + 100*time.Millisecond)
 
 	ok, qerr := l.CheckRateLimitPerIP("10.0.0.2")
 	if !ok {
@@ -420,5 +480,34 @@ func TestUnknownFeature(t *testing.T) {
 	_, _, err := l.CheckFeatureGate(ctx, "user16", TierSolo, "unknown_feature")
 	if err == nil {
 		t.Fatalf("expected error for unknown feature")
+	}
+}
+// TestMonthRolloverKeepsStorage proves a rollover resets API call counts but keeps the bytes a user
+// still stores, so the storage quota still applies in the new month. Why: HandleMonthRollover deleted
+// past rows outright and so zeroed storage every month (found 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
+// Touches: in-memory SQLite.
+func TestMonthRolloverKeepsStorage(t *testing.T) {
+	now := time.Date(2026, 10, 31, 23, 0, 0, 0, time.UTC)
+	l, err := NewLimiter(Config{DB: setupTestDB(t), Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("new limiter: %v", err)
+	}
+	ctx := context.Background()
+	if err := l.IncrementStorageUsage(ctx, "u", 999_999_999); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.IncrementAPIUsage(ctx, "u"); err != nil {
+		t.Fatal(err)
+	}
+	now = time.Date(2026, 11, 1, 0, 0, 1, 0, time.UTC)
+	if err := l.HandleMonthRollover(ctx); err != nil {
+		t.Fatalf("rollover: %v", err)
+	}
+	calls, stored, err := l.GetCurrentUsage(ctx, "u")
+	if err != nil || calls != 0 || stored != 999_999_999 {
+		t.Fatalf("after rollover want calls=0 stored=999999999, got %d %d (%v)", calls, stored, err)
+	}
+	if ok, qerr, _ := l.CheckStorageQuota(ctx, "u", TierSolo, 2); ok || qerr.Status != 413 {
+		t.Fatalf("storage quota must still apply after a rollover, got ok=%v %+v", ok, qerr)
 	}
 }

@@ -211,6 +211,14 @@ pub fn required_scope(endpoint: &str, method: &str) -> Option<String> {
     Some(format!("{}:{}", verb, resource))
 }
 
+/// What: the verified caller of an admin endpoint, built by the server from the authenticated session
+/// (never from request input). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Caller {
+    pub user_id: Uuid,
+    pub is_admin: bool,
+}
+
 /// What: methods of `Database`, each documented below. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
 impl Database {
     /// What: a store on a connection with bcrypt's default cost (production). Creates the tables.
@@ -474,10 +482,15 @@ impl Database {
         Ok(stats)
     }
 
-    /// What: every key, optionally by user and status "active"/"inactive" (spec endpoint 7). The
-    /// caller must already have checked the actor is an admin. 2026-11-10,
-    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (read).
-    pub async fn admin_list_api_keys(&self, user_id: Option<Uuid>, status: Option<String>) -> Result<AdminListApiKeysResponse, ApiKeyError> {
+    /// What: every key, optionally by user and status "active"/"inactive" (spec endpoint 7, admin only).
+    /// In: the verified caller (`Forbidden`, 403, unless admin), filters. Out: keys and total.
+    /// Changed 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): the admin check moved here from "the caller
+    /// must already have checked", so it cannot be forgotten (specs README: identity from the verified
+    /// caller). Touches: database (read).
+    pub async fn admin_list_api_keys(&self, caller: &Caller, user_id: Option<Uuid>, status: Option<String>) -> Result<AdminListApiKeysResponse, ApiKeyError> {
+        if !caller.is_admin {
+            return Err(ApiKeyError::Forbidden("admin".into()));
+        }
         let want = match status.as_deref() {
             None => None,
             Some("active") => Some(true),

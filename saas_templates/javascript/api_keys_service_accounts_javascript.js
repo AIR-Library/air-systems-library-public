@@ -234,9 +234,27 @@ class ApiKeyService {
     };
   }
 
+  /**
+   * The caller's own key record, or a 404 for a key that does not exist or belongs to someone else (the same answer,
+   * so a caller cannot probe other users' key ids). In: key id, the VERIFIED caller's user id (from the auth layer,
+   * never the request body). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: revoke, rotate and usage took any key id
+   * from any caller. Touches: the store (read).
+   */
+  _ownedKey(apiKeyId, callerUserId) {
+    if (callerUserId == null || callerUserId === '') throw new ApiKeyError(401, 'Authentication required', 'AUTH_REQUIRED');
+    const rec = this.store.findKey(apiKeyId);
+    if (!rec || rec.user_id !== callerUserId) throw new ApiKeyError(404, 'API key not found', 'NOT_FOUND');
+    return rec;
+  }
+
+  /**
+   * listKeys(userId) -> { keys }: the keys of ONE user (the verified caller), never the secret.
+   * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] a missing user id is 401; it used to list every user's keys.
+   * Touches: the store (read).
+   */
   listKeys(userId) {
-    const all = this.store.listKeys();
-    const filtered = userId ? all.filter((k) => k.user_id === userId) : all;
+    if (userId == null || userId === '') throw new ApiKeyError(401, 'Authentication required', 'AUTH_REQUIRED');
+    const filtered = this.store.listKeys().filter((k) => k.user_id === userId);
     return {
       keys: filtered.map((k) => ({
         api_key_id: k.id,
@@ -250,17 +268,23 @@ class ApiKeyService {
     };
   }
 
-  revokeKey(apiKeyId) {
-    const rec = this.store.findKey(apiKeyId);
-    if (!rec) throw new ApiKeyError(404, 'API key not found', 'NOT_FOUND');
+  /**
+   * revokeKey(apiKeyId, callerUserId) -> { success, revoked_at }: revokes one of the caller's own keys (KEYS-03).
+   * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] owner check added (404 for anyone else's key). Touches: the store.
+   */
+  revokeKey(apiKeyId, callerUserId) {
+    this._ownedKey(apiKeyId, callerUserId);
     const revokedAt = this.now();
     this.store.updateKey(apiKeyId, { is_active: false, rotated_at: revokedAt, grace_period_ends_at: null });
     return { success: true, revoked_at: revokedAt };
   }
 
-  async rotateKey(apiKeyId) {
-    const rec = this.store.findKey(apiKeyId);
-    if (!rec) throw new ApiKeyError(404, 'API key not found', 'NOT_FOUND');
+  /**
+   * rotateKey(apiKeyId, callerUserId) -> { new_key, old_key_revoked_at, grace_period_ends_at } for one of the caller's
+   * own keys (KEYS-06). [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] owner check added. Touches: the store.
+   */
+  async rotateKey(apiKeyId, callerUserId) {
+    const rec = this._ownedKey(apiKeyId, callerUserId);
     const nowMs = new Date(this.now()).getTime();
     // A revoked key stays revoked, and one grace period at a time: a second rotation would end the first one's early
     // for clients still on the original key (2026-11-08, session f3daac6e, from review).
@@ -364,9 +388,12 @@ class ApiKeyService {
     this._logUsage(keyId, method, path, status || 200);
   }
 
-  getUsageStats(apiKeyId, from, to) {
-    const rec = this.store.findKey(apiKeyId);
-    if (!rec) throw new ApiKeyError(404, 'API key not found', 'NOT_FOUND');
+  /**
+   * getUsageStats(apiKeyId, from, to, callerUserId) -> usage of one of the caller's own keys (KEYS-08).
+   * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] owner check added. Touches: the store (read).
+   */
+  getUsageStats(apiKeyId, from, to, callerUserId) {
+    this._ownedKey(apiKeyId, callerUserId);
     const rows = this.store.listUsage(apiKeyId, from, to);
     const byEndpoint = {};
     const errors = {};
@@ -389,7 +416,15 @@ class ApiKeyService {
     };
   }
 
-  adminListKeys({ userId, status } = {}) {
+  /**
+   * adminListKeys(filters, caller) -> { keys, total }: every key for audit (KEYS-09), admin only.
+   * In: { userId, status: 'active'|'inactive' }, the VERIFIED caller ({ role: 'admin' } or { is_admin: true }).
+   * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] the admin check was missing (403 admin_only now). Touches: the store.
+   */
+  adminListKeys({ userId, status } = {}, caller) {
+    if (!caller || (caller.role !== 'admin' && caller.is_admin !== true)) {
+      throw new ApiKeyError(403, 'Admin only', 'ADMIN_ONLY');
+    }
     let all = this.store.listKeys();
     if (userId) all = all.filter((k) => k.user_id === userId);
     if (status) {

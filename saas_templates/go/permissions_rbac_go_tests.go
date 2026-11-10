@@ -5,6 +5,7 @@ import (
 	"time"
 )
 
+// RBAC-01
 func TestRequireOwnerNonOwner(t *testing.T) {
 	ResetAllData()
 	user := &User{ID: "u1", Tier: TierMember}
@@ -30,6 +31,7 @@ func TestRequireOwnerNonOwner(t *testing.T) {
 	}
 }
 
+// RBAC-02
 func TestRequireAdminMember(t *testing.T) {
 	ResetAllData()
 	user := &User{ID: "u2", Tier: TierMember}
@@ -46,6 +48,7 @@ func TestRequireAdminMember(t *testing.T) {
 	}
 }
 
+// RBAC-03
 func TestRequireAuthenticatedPublic(t *testing.T) {
 	ResetAllData()
 	err := RequireAuthenticated(nil, "some_endpoint")
@@ -61,6 +64,7 @@ func TestRequireAuthenticatedPublic(t *testing.T) {
 	}
 }
 
+// RBAC-04
 func TestCascadeDeleteUser(t *testing.T) {
 	ResetAllData()
 	// create user and related records
@@ -102,6 +106,7 @@ func TestCascadeDeleteUser(t *testing.T) {
 	}
 }
 
+// RBAC-05
 func TestCascadeDeleteDeployment(t *testing.T) {
 	ResetAllData()
 	dep := &Deployment{ID: "d1", OrgID: "org1"}
@@ -127,43 +132,108 @@ func TestCascadeDeleteDeployment(t *testing.T) {
 	}
 }
 
+// TestCascadeDeleteOrganization proves RBAC-06 as amended 2026-11-10: only an owner of the org (by its
+// membership row) may delete it, another org's owner gets 404; the org's deployments (with their DNS,
+// theme and logs), org API keys, invitations and memberships go; every member's user account, session
+// and personal API key stays, and a member's membership of another org is untouched.
+// Rewritten 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the old test asserted that the org's users,
+// their sessions and their keys were deleted, which the amended spec forbids. Touches: in-memory store.
+// RBAC-06
 func TestCascadeDeleteOrganization(t *testing.T) {
 	ResetAllData()
-	org := &Organization{ID: "orgA"}
-	organizations[org.ID] = org
+	organizations["orgA"] = &Organization{ID: "orgA"}
+	organizations["orgB"] = &Organization{ID: "orgB"}
+	owner := &User{ID: "ownerA", Tier: TierOwner}
+	otherOwner := &User{ID: "ownerB", Tier: TierOwner}
+	member := &User{ID: "memberAB", Tier: TierMember}
+	for _, u := range []*User{owner, otherOwner, member} {
+		users[u.ID] = u
+	}
+	AddMembership("orgA", owner.ID, TierOwner)
+	AddMembership("orgA", member.ID, TierMember)
+	AddMembership("orgB", otherOwner.ID, TierOwner)
+	AddMembership("orgB", member.ID, TierAdmin)
 
-	// deployments under org
-	dep := &Deployment{ID: "dA", OrgID: org.ID}
-	deployments[dep.ID] = dep
+	deployments["dA"] = &Deployment{ID: "dA", OrgID: "orgA"}
+	dnsRecords["dnsA"] = &DNSRecord{ID: "dnsA", DeploymentID: "dA"}
+	deployments["dB"] = &Deployment{ID: "dB", OrgID: "orgB"}
+	apiKeys["orgKeyA"] = &APIKey{ID: "orgKeyA", UserID: member.ID, OrgID: "orgA"}
+	apiKeys["orgKeyB"] = &APIKey{ID: "orgKeyB", UserID: member.ID, OrgID: "orgB"}
+	apiKeys["personal"] = &APIKey{ID: "personal", UserID: member.ID}
+	sessions["sM"] = &Session{ID: "sM", UserID: member.ID}
+	invitations["invA"] = &Invitation{ID: "invA", OrgID: "orgA", Email: "x@example.com"}
+	invitations["invB"] = &Invitation{ID: "invB", OrgID: "orgB", Email: "y@example.com"}
 
-	// users under org (id prefixed with orgID-)
-	user := &User{ID: org.ID + "-u1", Tier: TierMember}
-	users[user.ID] = user
+	// Another org's owner, a member of the org, and an unknown org: 404, nothing deleted.
+	for _, try := range []struct {
+		who *User
+		org string
+	}{{otherOwner, "orgA"}, {member, "orgA"}, {owner, "orgZ"}} {
+		err := DeleteOrganization(try.who, try.org)
+		if e, ok := err.(*RBACError); !ok || e.Code != 404 {
+			t.Fatalf("%s deleting %s: want 404, got %v", try.who.ID, try.org, err)
+		}
+	}
+	if _, ok := GetOrganization("orgA"); !ok {
+		t.Fatalf("a refused delete removed the org")
+	}
+	if err := DeleteOrganization(nil, "orgA"); err == nil || err.(*RBACError).Code != 401 {
+		t.Fatalf("no caller: want 401, got %v", err)
+	}
 
-	// related keys/sessions
-	apiKeys["kA"] = &APIKey{ID: "kA", UserID: user.ID}
-	sessions["sA"] = &Session{ID: "sA", UserID: user.ID}
-
-	if err := DeleteOrganization(org.ID); err != nil {
+	if err := DeleteOrganization(owner, "orgA"); err != nil {
 		t.Fatalf("DeleteOrganization error: %v", err)
 	}
-	if _, ok := GetOrganization(org.ID); ok {
-		t.Fatalf("organization not deleted")
+	gone := map[string]bool{}
+	_, gone["org"] = GetOrganization("orgA")
+	_, gone["deployment"] = GetDeployment("dA")
+	_, gone["dns"] = GetDNSRecord("dnsA")
+	_, gone["org key"] = GetAPIKey("orgKeyA")
+	_, gone["invitation"] = GetInvitation("invA")
+	_, gone["owner membership"] = GetMembership("orgA", owner.ID)
+	_, gone["member membership"] = GetMembership("orgA", member.ID)
+	for what, still := range gone {
+		if still {
+			t.Errorf("%s of the deleted org was kept", what)
+		}
 	}
-	if _, ok := GetDeployment(dep.ID); ok {
-		t.Fatalf("deployment not deleted")
+	kept := map[string]bool{}
+	_, kept["owner account"] = GetUser(owner.ID)
+	_, kept["member account"] = GetUser(member.ID)
+	_, kept["member session"] = GetSession("sM")
+	_, kept["personal key"] = GetAPIKey("personal")
+	_, kept["other org"] = GetOrganization("orgB")
+	_, kept["other org deployment"] = GetDeployment("dB")
+	_, kept["other org key"] = GetAPIKey("orgKeyB")
+	_, kept["other org invitation"] = GetInvitation("invB")
+	_, kept["member's other membership"] = GetMembership("orgB", member.ID)
+	for what, ok := range kept {
+		if !ok {
+			t.Errorf("%s was deleted", what)
+		}
 	}
-	if _, ok := GetUser(user.ID); ok {
-		t.Fatalf("user not deleted")
+	if m, _ := GetMembership("orgB", member.ID); m == nil || m.Role != TierAdmin {
+		t.Errorf("the member's orgB membership changed: %+v", m)
 	}
-	if _, ok := GetAPIKey("kA"); ok {
-		t.Fatalf("apikey not deleted")
+	var logged *AuditEntry
+	for _, e := range GetAuditLog() {
+		if e.Action == "org_deleted_cascade" {
+			e := e
+			logged = &e
+		}
 	}
-	if _, ok := GetSession("sA"); ok {
-		t.Fatalf("session not deleted")
+	want := map[string]int{"deployments": 1, "api_keys": 1, "invitations": 1, "memberships": 2}
+	if logged == nil || logged.TargetID != "orgA" || logged.UserID != owner.ID {
+		t.Fatalf("org_deleted_cascade audit entry missing or wrong: %+v", logged)
+	}
+	for k, v := range want {
+		if logged.DeletedItems[k] != v {
+			t.Errorf("deleted_items[%s] = %d, want %d", k, logged.DeletedItems[k], v)
+		}
 	}
 }
 
+// RBAC-07
 func TestCascadeRollbackOnError(t *testing.T) {
 	ResetAllData()
 	user := &User{ID: "uRollback", Tier: TierMember}
@@ -185,6 +255,7 @@ func TestCascadeRollbackOnError(t *testing.T) {
 	SetCascadeInjectError(false)
 }
 
+// RBAC-08
 func TestPermissionAuditLogged(t *testing.T) {
 	ResetAllData()
 	owner := &User{ID: "owner1", Tier: TierOwner}
@@ -213,6 +284,7 @@ func TestPermissionAuditLogged(t *testing.T) {
 	}
 }
 
+// RBAC-09
 func TestTierHierarchy(t *testing.T) {
 	ResetAllData()
 	owner := &User{ID: "o1", Tier: TierOwner}
@@ -233,6 +305,7 @@ func TestTierHierarchy(t *testing.T) {
 	}
 }
 
+// RBAC-10
 func TestPermissionCheckResponseTime(t *testing.T) {
 	ResetAllData()
 	user := &User{ID: "fast", Tier: TierOwner}

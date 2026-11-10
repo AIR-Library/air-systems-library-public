@@ -50,12 +50,13 @@ class TaskFailedException extends RuntimeException
 /**
  * The job queue: lifecycle, worker, retries, progress and results.
  *
- * Retry policy: `max_retries` is the number of attempts a job gets before it fails for good
- * (a job with max_retries 1 that fails has no retry left). After a failed attempt the job's
- * status is 'failed'; if attempts remain, next_retry_at is set to now + 2^(retry_count-1) seconds
- * and runDueJobs() runs it again once that time has passed. next_retry_at = null on a failed job
- * means it failed for good. retry_count counts failed attempts, carried over to a job created by
- * a manual retry (retryJob), which gets a fresh set of attempts.
+ * Retry policy (JOBS-03/04 as amended 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): `max_retries` counts retries AFTER
+ * the first attempt, so a job runs at most max_retries + 1 times (max_retries 3 -> 4 runs). When attempt
+ * n fails and a retry is left, retry n is scheduled: status goes back to 'enqueued', retry_count = n and
+ * next_retry_at = failed_at + 2^(n-1) seconds (1s, 2s, 4s, ...); the worker skips the job until then.
+ * When attempt max_retries + 1 fails, status is 'failed' with retry_count = max_retries and
+ * next_retry_at null. (It used to treat max_retries as the number of attempts and kept a waiting job in
+ * 'failed'.) A manual retry (retryJob) of a failed job creates a new job with a fresh set of retries.
  *
  * Why: see the file header. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.
  * Touches: the database.
@@ -310,8 +311,9 @@ SQL;
 
     /**
      * Retry a failed job by hand (POST /jobs/:job_id/retry): creates a new enqueued job with the
-     * same task, params and max_retries, carrying retry_count over, and stops the original's
-     * pending automatic retry so the task cannot run twice. A job can be retried by hand once.
+     * same task, params and max_retries and a fresh set of retries (retry_count 0; it used to carry the
+     * old count over, which no longer fits "retry_count counts this job's retries", 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP),
+     * and clears the original's next_retry_at so the task cannot run twice. A job can be retried by hand once.
      *
      * @param string $jobId
      * @return array {success: true, new_job_id: string, status: 'enqueued'}
@@ -351,7 +353,7 @@ SQL;
                 ':params' => $job['params'],
                 ':created_at' => $this->formatTime($this->now()),
                 ':max_retries' => (int) $job['max_retries'],
-                ':retry_count' => (int) $job['retry_count'],
+                ':retry_count' => 0,
                 ':retry_of' => $jobId,
             ]);
             $this->pdo->commit();
@@ -399,8 +401,9 @@ SQL;
      *
      * Why: the job is claimed with one conditional UPDATE (enqueued -> running) so two workers
      * can never run it twice, and the handler runs outside a transaction so progress is visible
-     * while it runs. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches the database
-     * and whatever the task handler touches.
+     * while it runs. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. A job waiting for a
+     * retry's backoff (next_retry_at in the future) is left alone too (JOBS-03 as amended, same day).
+     * Touches the database and whatever the task handler touches.
      */
     public function processJob(string $jobId): void
     {
@@ -412,6 +415,9 @@ SQL;
         if ($job['scheduled_at'] !== null && $this->parseTime($job['scheduled_at'], 'scheduled_at') > $now) {
             return; // not due yet
         }
+        if ($job['next_retry_at'] !== null && $this->parseTime($job['next_retry_at'], 'next_retry_at') > $now) {
+            return; // waiting for its retry's backoff (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+        }
         if ($this->claim($jobId, 'enqueued', $now)) {
             $this->execute($jobId);
         }
@@ -419,8 +425,8 @@ SQL;
 
     /**
      * The worker loop's step: run every job that is due, oldest first: enqueued jobs whose
-     * scheduled_at has passed (or is empty), and failed jobs whose next_retry_at has passed and
-     * that still have attempts left.
+     * scheduled_at has passed (or is empty) and whose next_retry_at (a scheduled retry) has passed
+     * (or is empty). Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: a job waiting for a retry is now 'enqueued'.
      *
      * @param int $limit Most jobs to run in this call.
      * @return list<string> Ids of the jobs this call ran.
@@ -433,11 +439,12 @@ SQL;
     {
         $now = $this->now();
         $nowText = $this->formatTime($now);
+        // A job waiting for a retry is 'enqueued' with next_retry_at in the future and is skipped until
+        // then (JOBS-03 as amended, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
         $stmt = $this->pdo->prepare(
             "SELECT id, status FROM jobs
-             WHERE (status = 'enqueued' AND (scheduled_at IS NULL OR scheduled_at <= :now1))
-                OR (status = 'failed' AND next_retry_at IS NOT NULL AND next_retry_at <= :now2
-                    AND attempts < max_retries)
+             WHERE status = 'enqueued' AND (scheduled_at IS NULL OR scheduled_at <= :now1)
+               AND (next_retry_at IS NULL OR next_retry_at <= :now2)
              ORDER BY rowid ASC LIMIT :limit"
         );
         $stmt->bindValue(':now1', $nowText);
@@ -455,9 +462,10 @@ SQL;
     }
 
     /**
-     * Atomically move a job from $fromStatus to 'running'.
+     * Atomically move a due 'enqueued' job (scheduled_at and next_retry_at passed or empty) to 'running'.
      *
      * @return bool True when this caller won the claim.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the 'failed' branch is gone (a waiting retry is 'enqueued').
      *
      * Why: replaces MySQL's SELECT ... FOR UPDATE, which SQLite does not have. 2026-11-10,
      * session session_012zDydZCZ4AChqhEZ4oVtaP. Touches the database.
@@ -465,28 +473,23 @@ SQL;
     private function claim(string $jobId, string $fromStatus, DateTimeImmutable $now): bool
     {
         $nowText = $this->formatTime($now);
-        if ($fromStatus === 'enqueued') {
-            $stmt = $this->pdo->prepare(
-                "UPDATE jobs SET status = 'running', started_at = :now, error = NULL
-                 WHERE id = :id AND status = 'enqueued' AND (scheduled_at IS NULL OR scheduled_at <= :now2)"
-            );
-        } else {
-            $stmt = $this->pdo->prepare(
-                "UPDATE jobs SET status = 'running', started_at = :now, next_retry_at = NULL, error = NULL
-                 WHERE id = :id AND status = 'failed' AND next_retry_at IS NOT NULL
-                   AND next_retry_at <= :now2 AND attempts < max_retries"
-            );
+        if ($fromStatus !== 'enqueued') {
+            return false;
         }
-        $stmt->execute([':now' => $nowText, ':now2' => $nowText, ':id' => $jobId]);
+        $stmt = $this->pdo->prepare(
+            "UPDATE jobs SET status = 'running', started_at = :now, next_retry_at = NULL, error = NULL
+             WHERE id = :id AND status = 'enqueued' AND (scheduled_at IS NULL OR scheduled_at <= :now2)
+               AND (next_retry_at IS NULL OR next_retry_at <= :now3)"
+        );
+        $stmt->execute([':now' => $nowText, ':now2' => $nowText, ':now3' => $nowText, ':id' => $jobId]);
         return $stmt->rowCount() === 1;
     }
 
     /**
      * Run a claimed ('running') job's handler and record the outcome and a job_runs row.
      *
-     * On success: status 'completed', result and completed_at set. On failure: attempts and
-     * retry_count go up, the error message is stored, status becomes 'failed', and next_retry_at
-     * is now + 2^(retry_count-1) seconds while attempts < max_retries, else null (failed for good).
+     * On success: status 'completed', result and completed_at set. On failure: see recordFailure()
+     * (retry n scheduled as 'enqueued' while retries are left, else 'failed').
      *
      * Why: see processJob(). 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.
      * Touches the database and the task handler.
@@ -536,30 +539,37 @@ SQL;
     }
 
     /**
-     * Record a failed attempt: see execute() for the rules.
+     * Record a failed attempt (JOBS-03/04 as amended).
      *
-     * Why: failures used to be swallowed into status 'enqueued' with a MySQL-only update.
-     * 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches the database.
+     * Inputs: job id, run id, the error. Output: none. Attempt n = attempts + 1 just failed. If
+     * n <= max_retries, retry n is scheduled: status 'enqueued', retry_count = n,
+     * next_retry_at = now + 2^(n-1) seconds. Otherwise (attempt max_retries + 1 failed): status 'failed',
+     * retry_count = max_retries, next_retry_at null, completed_at now.
+     * Why: failures used to be swallowed into status 'enqueued' with a MySQL-only update; then max_retries
+     * counted attempts and a waiting job was 'failed' (changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
+     * Touches the database.
      */
     private function recordFailure(string $jobId, string $runId, Throwable $error): void
     {
         $job = $this->getJob($jobId);
         $attempts = (int) $job['attempts'] + 1;
-        $retryCount = (int) $job['retry_count'] + 1;
+        $maxRetries = (int) $job['max_retries'];
         $now = $this->now();
-        $retryLeft = $attempts < (int) $job['max_retries'];
+        $retryLeft = $attempts <= $maxRetries;
+        $retryCount = $retryLeft ? $attempts : $maxRetries;
         $nextRetryAt = $retryLeft
-            ? $this->formatTime($now->modify(sprintf('+%d seconds', 2 ** ($retryCount - 1))))
+            ? $this->formatTime($now->modify(sprintf('+%d seconds', 2 ** ($attempts - 1))))
             : null;
         $message = substr($error->getMessage(), 0, 1000);
 
         $this->pdo->beginTransaction();
         try {
             $this->pdo->prepare(
-                "UPDATE jobs SET status = 'failed', attempts = :attempts, retry_count = :retry_count,
+                "UPDATE jobs SET status = :status, attempts = :attempts, retry_count = :retry_count,
                         error = :error, next_retry_at = :next_retry_at, completed_at = :completed_at
                  WHERE id = :id"
             )->execute([
+                ':status' => $retryLeft ? 'enqueued' : 'failed',
                 ':attempts' => $attempts,
                 ':retry_count' => $retryCount,
                 ':error' => $message,

@@ -5,7 +5,7 @@
 //! activity, files, preferences, transactions, audit trail) as JSON or CSV, stores it through a
 //! `FileStorage`, and emails a download link signed with HMAC-SHA256 that expires after 7 days. Account
 //! deletion needs the emailed confirmation token (stored only as a SHA-256 hash), waits a 30-day grace
-//! period during which the user can cancel, and then removes the user's export files from storage and
+//! period during which the user can cancel (none for a statutory reason), and then removes the user's export files from storage and
 //! cascades over every user table (export requests included) except the audit log, so an old signed
 //! link stops working (CodeRabbit review on PR 19, 2026-11-10). Every request and action is written to
 //! the audit log.
@@ -13,6 +13,11 @@
 //! (compile-time-checked SQL macros), real S3 and SMTP clients, and it stored the deletion token in
 //! clear text. Rewritten on SQLite with storage and email behind traits, 2026-11-10,
 //! session_012zDydZCZ4AChqhEZ4oVtaP.
+//! Amended 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP, EXPORT-05/12/13/14): statutory reasons get no
+//! grace period and are erased on confirm; the confirmation token expires after 24 hours and is
+//! single-use; confirm and cancel act only on the caller's own request; the cascade logs
+//! 'user_deleted_cascade', then calls an injected `AuditEraser` last, and nulls deletion_requests.user_id;
+//! the admin lists check the verified caller's role.
 //! Touches: the SQLite database it owns; files through `FileStorage` (S3 in production, memory in
 //! tests); email through `Mailer` (network in production); the clock; OS randomness. No money.
 
@@ -31,8 +36,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Export download links live 7 days (spec).
 pub const EXPORT_LINK_DAYS: i64 = 7;
-/// Deletion grace period: 30 days (spec, GDPR).
+/// Deletion grace period for user_requested / other: 30 days (a product choice; statutory reasons get none).
 pub const GRACE_PERIOD_DAYS: i64 = 30;
+/// A deletion confirmation token is valid 24 hours (2026-11-10 amendment, EXPORT-14).
+pub const CONFIRM_TOKEN_HOURS: i64 = 24;
 /// User-data tables the cascade deletes from (the audit log is kept on purpose).
 pub const CASCADE_TABLES: [&str; 6] = ["sessions", "activity", "files", "preferences", "transactions", "api_keys"];
 
@@ -46,6 +53,8 @@ pub enum ComplianceError {
     ExportNotFound,
     DeletionNotFound,
     TokenMismatch,
+    TokenExpired,
+    AuditErase(String),
     NotAllowed(String),
     InvalidLink,
     LinkExpired,
@@ -124,6 +133,26 @@ names!(ExportStatus { Pending => "pending", Completed => "completed", Failed => 
 names!(DeletionStatus { Pending => "pending", Approved => "approved", Completed => "completed", Cancelled => "cancelled" });
 names!(DeletionReason { UserRequested => "user_requested", GdprRequest => "gdpr_request", GdprRightToBeForgotten => "gdpr_right_to_be_forgotten", Other => "other" });
 
+/// What: statutory-reason test for `DeletionReason`. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+impl DeletionReason {
+    /// What: true for a statutory erasure request (gdpr_request, gdpr_right_to_be_forgotten), which must
+    /// be completed without undue delay and so gets no grace period. Out: bool.
+    /// Why: 2026-11-10 amendment (EXPORT-05/12). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+    pub fn is_statutory(&self) -> bool {
+        matches!(self, DeletionReason::GdprRequest | DeletionReason::GdprRightToBeForgotten)
+    }
+}
+
+/// What: the verified caller of an admin endpoint, built by the server from the authenticated session
+/// (never from a request body, query or header). Why: identity from the verified caller (specs README);
+/// the admin lists (endpoints 6 and 7) relied on the caller having checked the role. 2026-11-10,
+/// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Caller {
+    pub user_id: i64,
+    pub is_admin: bool,
+}
+
 /// What: an `export_requests` row. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportRequest {
@@ -142,7 +171,8 @@ pub struct ExportRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeletionRequest {
     pub id: String,
-    pub user_id: i64,
+    /// NULL (None) once the deletion completed, so the row cannot re-identify erased audit entries.
+    pub user_id: Option<i64>,
     pub requested_at: DateTime<Utc>,
     pub status: DeletionStatus,
     pub reason: DeletionReason,
@@ -278,11 +308,35 @@ impl Mailer for InMemoryMailer {
     }
 }
 
+/// What: the audit system's erasure entry point (audit_logging.md `erase_subject`), injected like the
+/// mailer so tests pass a fake. The cascade calls it LAST, after the user's rows are deleted and
+/// 'user_deleted_cascade' is logged. In: user id. Out: `()` or a message (the cascade then rolls back).
+/// Why: 2026-11-10 amendment (EXPORT-13): nothing erased the user's personal data in the audit tables.
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the audit store in a real implementation.
+pub trait AuditEraser: Send {
+    /// What: erase the subject's personal audit data. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    fn erase_subject(&self, user_id: i64) -> Result<(), String>;
+}
+
+/// What: the default eraser until one is configured: it refuses, so no account is deleted while its
+/// audit personal data would be left behind (fail closed). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+/// Touches: nothing.
+pub struct UnconfiguredAuditEraser;
+
+/// What: `AuditEraser` for `UnconfiguredAuditEraser`. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+impl AuditEraser for UnconfiguredAuditEraser {
+    /// What: always an error. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+    fn erase_subject(&self, _user_id: i64) -> Result<(), String> {
+        Err("audit eraser not configured".into())
+    }
+}
+
 /// What: the service. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: see the module doc.
 pub struct ComplianceService {
     db: Mutex<Connection>,
     storage: Box<dyn FileStorage>,
     mailer: Box<dyn Mailer>,
+    audit_eraser: Box<dyn AuditEraser>,
     signing_key: Vec<u8>,
     base_url: String,
     clock: Box<dyn Fn() -> DateTime<Utc> + Send + Sync>,
@@ -336,6 +390,7 @@ impl ComplianceService {
             db: Mutex::new(conn),
             storage,
             mailer,
+            audit_eraser: Box::new(UnconfiguredAuditEraser),
             signing_key: signing_key.to_vec(),
             base_url: base_url.trim_end_matches('/').to_string(),
             clock: Box::new(Utc::now),
@@ -346,6 +401,13 @@ impl ComplianceService {
     /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
     pub fn with_clock(mut self, clock: Box<dyn Fn() -> DateTime<Utc> + Send + Sync>) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// What: set the audit eraser the deletion cascade calls last (EXPORT-13). In: the eraser.
+    /// Out: the service. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+    pub fn with_audit_eraser(mut self, eraser: Box<dyn AuditEraser>) -> Self {
+        self.audit_eraser = eraser;
         self
     }
 
@@ -545,21 +607,24 @@ impl ComplianceService {
         Ok(ExportStatusResponse { export_id: e.id, status: e.status, file_url: e.file_url, expires_at: e.expires_at, requested_at: e.requested_at })
     }
 
-    /// What: start a deletion (spec endpoint 3): a pending request scheduled 30 days out, and an email
-    /// with a one-time confirmation token (only its SHA-256 is stored). In: the authenticated user,
-    /// reason. Out: pending deletion. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
-    /// Touches: database, email, OS randomness.
+    /// What: start a deletion (spec endpoint 3). will_delete_at = requested_at + 30 days for
+    /// user_requested / other (the user can cancel), and = requested_at for a statutory reason
+    /// (gdpr_request, gdpr_right_to_be_forgotten: no grace period). Nothing is deleted yet: the user must
+    /// confirm with the emailed token: 32 OS-random bytes, stored only as SHA-256, single-use, valid 24
+    /// hours, bound to this deletion id. In: the authenticated user (from the server's session), reason.
+    /// Out: pending deletion. Why: 2026-11-10 amendment (EXPORT-05/12/14).
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database, email, OS randomness.
     pub async fn request_account_deletion(&self, user_id: i64, reason: DeletionReason) -> Result<DeletionResponse, ComplianceError> {
         let conn = self.db();
         let to = Self::user_email(&conn, user_id)?;
         let id = random_hex(16);
         let token = random_hex(32);
         let now = (self.clock)();
-        let scheduled = now + Duration::days(GRACE_PERIOD_DAYS);
+        let scheduled = if reason.is_statutory() { now } else { now + Duration::days(GRACE_PERIOD_DAYS) };
         conn.execute(
-            "INSERT INTO deletion_requests (id, user_id, requested_at, status, reason, scheduled_for, token_hash)
-             VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6)",
-            params![id, user_id, ts(now), reason.as_str(), ts(scheduled), hex(&Sha256::digest(token.as_bytes()))],
+            "INSERT INTO deletion_requests (id, user_id, requested_at, status, reason, scheduled_for, token_hash, token_expires_at)
+             VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6, ?7)",
+            params![id, user_id, ts(now), reason.as_str(), ts(scheduled), hex(&Sha256::digest(token.as_bytes())), ts(now + Duration::hours(CONFIRM_TOKEN_HOURS))],
         )?;
         self.mailer
             .send(SentEmail {
@@ -587,93 +652,129 @@ impl ComplianceService {
         })
     }
 
-    /// What: confirm a deletion with the emailed token (spec endpoint 4); constant-time hash
-    /// comparison; pending -> approved. Out: when it will run. 2026-11-10,
-    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
-    pub async fn confirm_deletion(&self, deletion_id: String, token: &str) -> Result<ConfirmDeletionResponse, ComplianceError> {
-        let conn = self.db();
-        let row: Option<(DeletionRequest, String)> = conn
-            .query_row(
-                "SELECT id, user_id, requested_at, status, reason, scheduled_for, deleted_at, token_hash FROM deletion_requests WHERE id = ?1",
-                params![deletion_id],
-                |r| Ok((Self::deletion_row(r)?, r.get(7)?)),
-            )
-            .optional()?;
-        let (d, hash) = row.ok_or(ComplianceError::DeletionNotFound)?;
-        if !ct_eq(hex(&Sha256::digest(token.as_bytes())).as_bytes(), hash.as_bytes()) {
-            return Err(ComplianceError::TokenMismatch);
+    /// What: confirm the caller's own deletion with the emailed token (spec endpoint 4). Order: the
+    /// request must be the caller's (else `DeletionNotFound`, 404, for anyone else's); the token's SHA-256
+    /// must match in constant time (`TokenMismatch`; a used token's hash is cleared, so a reused token is
+    /// refused the same way); the token must be under 24 hours old (`TokenExpired`); the request must be
+    /// pending. Then pending -> approved and the token is spent. For a statutory reason the cascade runs
+    /// before this returns: status 'completed', deleted_at = deletion_scheduled_for = now (if the cascade
+    /// fails, the request stays approved and due now, and the error is returned).
+    /// In: the authenticated user (from the server's session), deletion id, token. Out: when it runs.
+    /// Why: 2026-11-10 amendment (EXPORT-12/14). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// Touches: database; for a statutory reason also file storage and the audit eraser.
+    pub async fn confirm_deletion(&self, user_id: i64, deletion_id: String, token: &str) -> Result<ConfirmDeletionResponse, ComplianceError> {
+        let (d, now) = {
+            let conn = self.db();
+            let row: Option<(DeletionRequest, String, Option<String>)> = conn
+                .query_row(
+                    "SELECT id, user_id, requested_at, status, reason, scheduled_for, deleted_at, token_hash, token_expires_at
+                     FROM deletion_requests WHERE id = ?1 AND user_id = ?2",
+                    params![deletion_id, user_id],
+                    |r| Ok((Self::deletion_row(r)?, r.get(7)?, r.get(8)?)),
+                )
+                .optional()?;
+            let (d, hash, expires) = row.ok_or(ComplianceError::DeletionNotFound)?;
+            if !ct_eq(hex(&Sha256::digest(token.as_bytes())).as_bytes(), hash.as_bytes()) {
+                return Err(ComplianceError::TokenMismatch);
+            }
+            let now = (self.clock)();
+            if parse_ts(expires).map_or(true, |e| now >= e) {
+                return Err(ComplianceError::TokenExpired);
+            }
+            if d.status != DeletionStatus::Pending {
+                return Err(ComplianceError::NotAllowed(format!("deletion is {}", d.status.as_str())));
+            }
+            let scheduled = if d.reason.is_statutory() { now } else { d.scheduled_for };
+            let n = conn.execute(
+                "UPDATE deletion_requests SET status = 'approved', token_hash = '', scheduled_for = ?3
+                 WHERE id = ?1 AND user_id = ?2 AND status = 'pending' AND token_hash = ?4",
+                params![d.id, user_id, ts(scheduled), hash],
+            )?;
+            if n != 1 {
+                return Err(ComplianceError::TokenMismatch);
+            }
+            self.audit(&conn, user_id, "deletion_confirmed", json!({ "deletion_id": d.id }))?;
+            (DeletionRequest { scheduled_for: scheduled, ..d }, now)
+        };
+        if d.reason.is_statutory() {
+            self.cascade(user_id, Some(&d.id)).await?;
+            return Ok(ConfirmDeletionResponse { success: true, deletion_scheduled_for: now });
         }
-        if d.status != DeletionStatus::Pending {
-            return Err(ComplianceError::NotAllowed(format!("deletion is {}", d.status.as_str())));
-        }
-        conn.execute("UPDATE deletion_requests SET status = 'approved' WHERE id = ?1 AND status = 'pending'", params![d.id])?;
-        self.audit(&conn, d.user_id, "deletion_confirmed", json!({ "deletion_id": d.id }))?;
         Ok(ConfirmDeletionResponse { success: true, deletion_scheduled_for: d.scheduled_for })
     }
 
-    /// What: cancel the user's own deletion within the grace period (spec endpoint 5). In: the
-    /// authenticated user, deletion id. Out: cancelled. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
-    /// Touches: database.
+    /// What: cancel the caller's own deletion within the grace period (spec endpoint 5); anyone else's
+    /// request is `DeletionNotFound` (404). In: the authenticated user, deletion id. Out: cancelled.
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
     pub async fn cancel_deletion(&self, user_id: i64, deletion_id: String) -> Result<CancelDeletionResponse, ComplianceError> {
         let conn = self.db();
         let d = conn
             .query_row(
-                "SELECT id, user_id, requested_at, status, reason, scheduled_for, deleted_at FROM deletion_requests WHERE id = ?1",
-                params![deletion_id],
+                "SELECT id, user_id, requested_at, status, reason, scheduled_for, deleted_at FROM deletion_requests WHERE id = ?1 AND user_id = ?2",
+                params![deletion_id, user_id],
                 Self::deletion_row,
             )
             .optional()?
-            .filter(|d| d.user_id == user_id)
             .ok_or(ComplianceError::DeletionNotFound)?;
         if !matches!(d.status, DeletionStatus::Pending | DeletionStatus::Approved) || (self.clock)() >= d.scheduled_for {
             return Err(ComplianceError::NotAllowed("the grace period is over or the request is closed".into()));
         }
-        conn.execute("UPDATE deletion_requests SET status = 'cancelled' WHERE id = ?1", params![d.id])?;
+        conn.execute("UPDATE deletion_requests SET status = 'cancelled', token_hash = '' WHERE id = ?1", params![d.id])?;
         self.audit(&conn, user_id, "deletion_cancelled", json!({ "deletion_id": d.id }))?;
         Ok(CancelDeletionResponse { success: true, status: DeletionStatus::Cancelled })
     }
 
     /// What: run every confirmed deletion whose grace period has ended (call from a scheduled job).
-    /// A user whose export files could not be removed from storage is skipped: the request stays
-    /// `approved` (so the next run retries it), an audit row `deletion_cleanup_failed` is written, and
-    /// the other due users are still processed. Out: how many users were deleted; database errors are
-    /// returned. Why: the retry behaviour was added for the CodeRabbit review on PR 19 (export files
-    /// must go with the account, and a storage outage must not lose the deletion). 2026-11-10,
-    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database, file storage (deletes export files).
+    /// A user whose export files could not be removed from storage, or whose audit data could not be
+    /// erased, is skipped: the request stays `approved` (so the next run retries it), an audit row
+    /// `deletion_cleanup_failed` is written, and the other due users are still processed. Out: how many
+    /// users were deleted; database errors are returned. Why: the retry behaviour was added for the
+    /// CodeRabbit review on PR 19 (export files must go with the account, and a storage outage must not
+    /// lose the deletion); the eraser case for the 2026-11-10 amendment (EXPORT-13). 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database, file storage (deletes export files), audit eraser.
     pub async fn process_due_deletions(&self) -> Result<usize, ComplianceError> {
         let now = ts((self.clock)());
         let due: Vec<(String, i64)> = {
             let conn = self.db();
-            let mut stmt = conn.prepare("SELECT id, user_id FROM deletion_requests WHERE status = 'approved' AND scheduled_for <= ?1 ORDER BY rowid")?;
+            let mut stmt = conn.prepare(
+                "SELECT id, user_id FROM deletion_requests WHERE status = 'approved' AND user_id IS NOT NULL AND scheduled_for <= ?1 ORDER BY rowid",
+            )?;
             let rows = stmt.query_map(params![now], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
             rows
         };
         let mut deleted = 0;
         for (id, user_id) in &due {
-            match self.cascade_delete_user(*user_id).await {
-                Ok(()) => {}
-                Err(ComplianceError::Storage(e)) => {
+            match self.cascade(*user_id, Some(id)).await {
+                Ok(()) => deleted += 1,
+                Err(ComplianceError::Storage(e)) | Err(ComplianceError::AuditErase(e)) => {
                     let conn = self.db();
                     self.audit(&conn, *user_id, "deletion_cleanup_failed", json!({ "deletion_id": id, "error": e }))?;
-                    continue;
                 }
                 Err(e) => return Err(e),
             }
-            self.db().execute("UPDATE deletion_requests SET status = 'completed', deleted_at = ?2 WHERE id = ?1", params![id, now])?;
-            deleted += 1;
         }
         Ok(deleted)
     }
 
-    /// What: delete the user's export files from storage, then (in one transaction) the user's export
-    /// requests, rows in every user table and the user, keeping the audit log (spec "except audit_log
-    /// (keep for compliance)"); writes an audit row with counts. If any export file cannot be removed
-    /// it returns `Storage` before the transaction starts, so nothing is deleted and the call can be
-    /// retried (removing a file twice is fine). In: user id. Out: `()`.
-    /// Why: export cleanup added for the CodeRabbit review on PR 19: the files and `export_requests`
-    /// rows used to survive the deletion, so a recent signed link still downloaded the user's data.
-    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database, file storage (deletes files).
+    /// What: `cascade` with no deletion request (an operator's direct erasure). 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: as `cascade`.
     pub async fn cascade_delete_user(&self, user_id: i64) -> Result<(), ComplianceError> {
+        self.cascade(user_id, None).await
+    }
+
+    /// What: delete the user's export files from storage, then in ONE transaction, in this order:
+    /// (1) delete the user's rows (export requests, every user table, the user), never the audit tables;
+    /// (2) log 'user_deleted_cascade' with the user as subject (counts only); complete the deletion
+    /// request and set deletion_requests.user_id NULL for every request of this user (so the rows cannot
+    /// re-identify erased audit entries); (3) call the audit eraser's erase_subject(user_id) LAST, then
+    /// commit. Nothing logs this user afterwards. If an export file cannot be removed it returns
+    /// `Storage` before the transaction starts; if the eraser fails the transaction rolls back
+    /// (`AuditErase`); either way nothing is deleted and the call can be retried.
+    /// In: user id, the deletion request being completed (if any). Out: `()`.
+    /// Why: export cleanup for the CodeRabbit review on PR 19; order, eraser and NULL user_id for the
+    /// 2026-11-10 amendment (EXPORT-13). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// Touches: database, file storage (deletes files), the audit eraser.
+    async fn cascade(&self, user_id: i64, deletion_id: Option<&str>) -> Result<(), ComplianceError> {
         let mut conn = self.db();
         let keys: Vec<String> = {
             let mut stmt = conn.prepare("SELECT file_key FROM export_requests WHERE user_id = ?1 AND file_key IS NOT NULL ORDER BY rowid")?;
@@ -683,6 +784,7 @@ impl ComplianceService {
         for key in &keys {
             self.storage.delete(key).map_err(ComplianceError::Storage)?;
         }
+        let now = ts((self.clock)());
         let tx = conn.transaction()?;
         let mut counts = serde_json::Map::new();
         let n = tx.execute("DELETE FROM export_requests WHERE user_id = ?1", params![user_id])?;
@@ -695,16 +797,29 @@ impl ComplianceService {
         tx.execute("DELETE FROM users WHERE id = ?1", params![user_id])?;
         tx.execute(
             "INSERT INTO audit_log (id, user_id, action, created_at, details) VALUES (?1, ?2, 'user_deleted_cascade', ?3, ?4)",
-            params![random_hex(16), user_id, ts((self.clock)()), Value::Object(counts).to_string()],
+            params![random_hex(16), user_id, now, Value::Object(counts).to_string()],
         )?;
+        if let Some(id) = deletion_id {
+            tx.execute("UPDATE deletion_requests SET status = 'completed', deleted_at = ?2, scheduled_for = ?2 WHERE id = ?1", params![id, now])?;
+        }
+        tx.execute(
+            "UPDATE deletion_requests SET status = CASE WHEN status IN ('pending', 'approved') THEN 'cancelled' ELSE status END,
+                token_hash = '', user_id = NULL WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        self.audit_eraser.erase_subject(user_id).map_err(ComplianceError::AuditErase)?;
         tx.commit()?;
         Ok(())
     }
 
-    /// What: export requests, optionally by user and status, in request order (spec endpoint 6;
-    /// the caller must have checked that the actor is an admin). 2026-11-10,
-    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (read).
-    pub async fn list_exports(&self, user_id: Option<i64>, status: Option<ExportStatus>) -> Result<ExportListResponse, ComplianceError> {
+    /// What: export requests, optionally by user and status, in request order (spec endpoint 6, admin
+    /// only). In: the verified caller (`NotAllowed` unless admin), filters. Out: the list and total.
+    /// Changed 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): the admin check moved here from "checked by
+    /// the caller", so it cannot be forgotten. Touches: database (read).
+    pub async fn list_exports(&self, caller: &Caller, user_id: Option<i64>, status: Option<ExportStatus>) -> Result<ExportListResponse, ComplianceError> {
+        if !caller.is_admin {
+            return Err(ComplianceError::NotAllowed("admin only".into()));
+        }
         let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT id, user_id, requested_at, status, format, file_url, completed_at, expires_at FROM export_requests
@@ -714,9 +829,13 @@ impl ComplianceService {
         Ok(ExportListResponse { total: exports.len() as i64, exports })
     }
 
-    /// What: deletion requests, optionally by status, in request order (spec endpoint 7; admin only,
-    /// checked by the caller). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (read).
-    pub async fn list_deletions(&self, status: Option<DeletionStatus>) -> Result<DeletionListResponse, ComplianceError> {
+    /// What: deletion requests, optionally by status, in request order (spec endpoint 7, admin only).
+    /// In: the verified caller (`NotAllowed` unless admin), filter. Out: the list and total.
+    /// Changed 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): the admin check moved here. Touches: database (read).
+    pub async fn list_deletions(&self, caller: &Caller, status: Option<DeletionStatus>) -> Result<DeletionListResponse, ComplianceError> {
+        if !caller.is_admin {
+            return Err(ComplianceError::NotAllowed("admin only".into()));
+        }
         let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT id, user_id, requested_at, status, reason, scheduled_for, deleted_at FROM deletion_requests
@@ -727,15 +846,16 @@ impl ComplianceService {
     }
 }
 
-/// The schema: the spec's two tables (plus file key, schedule and token hash), the audit log, and
+/// The schema: the spec's two tables (plus file key, schedule, token hash and token expiry; deletion
+/// user_id is nullable since 2026-11-10, EXPORT-13), the audit log, and
 /// the application's user tables that exports read and the cascade deletes.
 pub const MIGRATIONS: &str = "
 CREATE TABLE IF NOT EXISTS export_requests (id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, requested_at TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('pending','completed','failed')), format TEXT NOT NULL CHECK (format IN ('json','csv')),
     file_key TEXT NULL, file_url TEXT NULL, completed_at TEXT NULL, expires_at TEXT NULL);
-CREATE TABLE IF NOT EXISTS deletion_requests (id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, requested_at TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS deletion_requests (id TEXT PRIMARY KEY, user_id INTEGER NULL, requested_at TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('pending','approved','completed','cancelled')), reason TEXT NOT NULL,
-    scheduled_for TEXT NOT NULL, deleted_at TEXT NULL, token_hash TEXT NOT NULL);
+    scheduled_for TEXT NOT NULL, deleted_at TEXT NULL, token_hash TEXT NOT NULL, token_expires_at TEXT NULL);
 CREATE TABLE IF NOT EXISTS audit_log (id TEXT PRIMARY KEY, user_id INTEGER, action TEXT NOT NULL, created_at TEXT NOT NULL, details TEXT);
 CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, email TEXT NOT NULL, name TEXT NOT NULL, created_at TEXT NOT NULL,
     tier TEXT NOT NULL, status TEXT NOT NULL);

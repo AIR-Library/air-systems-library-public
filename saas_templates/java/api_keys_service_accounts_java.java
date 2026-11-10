@@ -231,18 +231,30 @@ public class ApiKeysServiceAccounts {
         private final Duration window = Duration.ofHours(1);
 
         public boolean allow(String keyId, int limit) {
-            String hourKey = keyId + ":" + LocalDateTime.now().truncatedTo(ChronoUnit.HOURS);
+            return allow(keyId, limit, LocalDateTime.now());
+        }
+
+        /**
+         * Counts one call in the key's current clock hour and says whether it is within the limit.
+         * In: key id, limit per hour, the caller's "now". Out: true while count <= limit (the limit+1st call is refused).
+         * Why: KEYS-04 with an injectable clock (spec rule "Deterministic"); 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+         * Touches: memory only.
+         */
+        public boolean allow(String keyId, int limit, LocalDateTime now) {
+            String hourKey = keyId + ":" + now.truncatedTo(ChronoUnit.HOURS);
             AtomicInteger counter = counters.computeIfAbsent(hourKey, k -> new AtomicInteger(0));
             int current = counter.incrementAndGet();
             // Opportunistic cleanup of stale hour buckets (older than 2 hours)
             if (ThreadLocalRandom.current().nextInt(100) == 0) {
-                cleanupStaleBuckets();
+                cleanupStaleBuckets(now);
             }
             return current <= limit;
         }
 
-        private void cleanupStaleBuckets() {
-            LocalDateTime cutoff = LocalDateTime.now().minusHours(2);
+        /** Drops hour buckets older than two hours before the caller's now (not the wall clock, so an injected clock
+         *  never loses a live bucket); 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory. */
+        private void cleanupStaleBuckets(LocalDateTime now) {
+            LocalDateTime cutoff = now.minusHours(2);
             counters.entrySet().removeIf(entry -> {
                 String[] parts = entry.getKey().split(":", 2);
                 if (parts.length == 2) {
@@ -263,6 +275,30 @@ public class ApiKeysServiceAccounts {
         }
     }
 
+    /**
+     * A refused API call: HTTP status 401 (invalid, revoked or expired key), 403 (scope) or 429 (rate limit) and an
+     * error code. In: status, code, message. Why: the spec answers 401/403/429, which plain IllegalArgument/IllegalState
+     * exceptions could not say; 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+     */
+    public static class ApiKeyException extends RuntimeException {
+        private final int status;
+        private final String error;
+
+        public ApiKeyException(int status, String error, String message) {
+            super(message);
+            this.status = status;
+            this.error = error;
+        }
+
+        public int getStatus() {
+            return status;
+        }
+
+        public String getError() {
+            return error;
+        }
+    }
+
     /* ---------- Service ---------- */
     public static class ApiKeyService {
         private final ApiKeyRepository keyRepo;
@@ -270,13 +306,98 @@ public class ApiKeysServiceAccounts {
         private final RateLimiter rateLimiter;
         private final ObjectMapper mapper = new ObjectMapper();
         private final SecureRandom random = new SecureRandom();
+        private final Clock clock;
+        /** SHA-256(secret) -> key id for secrets already proven with bcrypt (see resolveKey). */
+        private final ConcurrentHashMap<String, Long> verifiedSecrets = new ConcurrentHashMap<>();
 
         public ApiKeyService(ApiKeyRepository keyRepo,
                              ApiKeyUsageRepository usageRepo,
                              RateLimiter rateLimiter) {
+            this(keyRepo, usageRepo, rateLimiter, Clock.systemUTC());
+        }
+
+        /**
+         * Service with an injectable clock. In: repositories, rate limiter, clock. Why: spec "Deterministic: time comes
+         * from an injectable clock" (KEYS-04/06/07); 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+         */
+        public ApiKeyService(ApiKeyRepository keyRepo,
+                             ApiKeyUsageRepository usageRepo,
+                             RateLimiter rateLimiter,
+                             Clock clock) {
             this.keyRepo = keyRepo;
             this.usageRepo = usageRepo;
             this.rateLimiter = rateLimiter;
+            this.clock = clock;
+        }
+
+        private LocalDateTime now() {
+            return LocalDateTime.now(clock);
+        }
+
+        /**
+         * Finds the key a presented secret belongs to. The first use of a secret is checked with bcrypt against the
+         * stored hashes; after that its SHA-256 digest maps straight to the key id, so a key's 1000 calls an hour do not
+         * cost 1000 bcrypt runs. The digest of a 192-bit random secret reveals nothing usable, and only secrets that
+         * already passed bcrypt are cached. Revocation and expiry are still read from the key on every call.
+         * In: the secret. Out: the key, or empty. Why: KEYS-02/04; 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+         * Touches: the key repository, memory.
+         */
+        private Optional<ApiKey> resolveKey(String secret) {
+            if (secret == null || !secret.startsWith("sk_")) {
+                return Optional.empty();
+            }
+            String digest = sha256Hex(secret);
+            Long cached = verifiedSecrets.get(digest);
+            if (cached != null) {
+                Optional<ApiKey> k = keyRepo.findById(cached);
+                if (k.isPresent()) {
+                    return k;
+                }
+                verifiedSecrets.remove(digest);
+            }
+            Optional<ApiKey> found = keyRepo.findBySecret(secret);
+            found.ifPresent(k -> verifiedSecrets.put(digest, k.id));
+            return found;
+        }
+
+        private static String sha256Hex(String s) {
+            try {
+                byte[] d = java.security.MessageDigest.getInstance("SHA-256").digest(s.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                StringBuilder sb = new StringBuilder();
+                for (byte b : d) sb.append(String.format("%02x", b));
+                return sb.toString();
+            } catch (java.security.NoSuchAlgorithmException e) {
+                throw new IllegalStateException(e);
+            }
+        }
+
+        /**
+         * Whether a key's scopes allow METHOD on endpoint, by the spec's scope list: read:X = GET /X, write:X = POST/PUT
+         * /X, write:billing = POST /subscriptions and PUT /billing, webhook:manage = POST/DELETE /webhooks, * = all.
+         * The resource is the endpoint's first path segment (a leading /api is ignored).
+         * In: scopes, method, endpoint. Out: allowed. Why: KEYS-05 ("read:deployments can't write deployments"); the
+         * old check compared literal "GET /x" strings, which no spec scope is. 2026-11-10,
+         * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+         */
+        static boolean scopeAllows(List<String> scopes, String method, String endpoint) {
+            String m = method.toUpperCase(Locale.ROOT);
+            String path = endpoint.startsWith("/api/") ? endpoint.substring(4) : endpoint;
+            String[] segs = path.replaceAll("^/+", "").split("[/?]");
+            String resource = segs.length > 0 ? segs[0] : "";
+            for (String scope : scopes) {
+                if ("*".equals(scope)) return true;
+                if ("write:billing".equals(scope)
+                        && (("POST".equals(m) && "subscriptions".equals(resource)) || ("PUT".equals(m) && "billing".equals(resource)))) {
+                    return true;
+                }
+                if ("webhook:manage".equals(scope) && "webhooks".equals(resource)
+                        && ("POST".equals(m) || "DELETE".equals(m))) {
+                    return true;
+                }
+                if (scope.equals("read:" + resource) && "GET".equals(m)) return true;
+                if (scope.equals("write:" + resource) && ("POST".equals(m) || "PUT".equals(m))) return true;
+            }
+            return false;
         }
 
         /* Create API key */
@@ -287,7 +408,7 @@ public class ApiKeysServiceAccounts {
             String secret = generateSecret();
             String hash = BCrypt.hashpw(secret, BCrypt.gensalt());
             ApiKey key = new ApiKey(0, userId, name, hash, scopes,
-                    rateLimit, expiresAt, LocalDateTime.now(), true);
+                    rateLimit, expiresAt, now(), true);
             keyRepo.save(key);
             Map<String, Object> resp = new HashMap<>();
             resp.put("api_key_id", key.id);
@@ -322,7 +443,7 @@ public class ApiKeysServiceAccounts {
             ApiKey key = keyRepo.findById(apiKeyId)
                     .orElseThrow(() -> new IllegalArgumentException("Key not found"));
             key.isActive = false;
-            key.revokedAt = LocalDateTime.now();
+            key.revokedAt = now();
             keyRepo.save(key);
             Map<String, Object> resp = new HashMap<>();
             resp.put("success", true);
@@ -335,7 +456,7 @@ public class ApiKeysServiceAccounts {
             ApiKey oldKey = keyRepo.findById(apiKeyId)
                     .orElseThrow(() -> new IllegalArgumentException("Key not found"));
             oldKey.isActive = false;
-            oldKey.revokedAt = LocalDateTime.now();
+            oldKey.revokedAt = now();
             oldKey.gracePeriodEndsAt = oldKey.revokedAt.plusHours(24);
             keyRepo.save(oldKey);
 
@@ -343,7 +464,7 @@ public class ApiKeysServiceAccounts {
             String hash = BCrypt.hashpw(secret, BCrypt.gensalt());
             ApiKey newKey = new ApiKey(0, oldKey.userId, oldKey.name + " (rotated)",
                     hash, oldKey.scopes, oldKey.rateLimit,
-                    oldKey.expiresAt, LocalDateTime.now(), true);
+                    oldKey.expiresAt, now(), true);
             keyRepo.save(newKey);
 
             Map<String, Object> resp = new HashMap<>();
@@ -353,41 +474,51 @@ public class ApiKeysServiceAccounts {
             return resp;
         }
 
-        /* Use API key (validate and log) - atomic rate-limit check + usage logging */
+        /**
+         * Use API key: the request's "Authorization: Bearer <key>" secret is checked, then active/grace period, expiry,
+         * scope and the hourly rate limit; the call is logged to api_key_usage.
+         * In: the bearer secret, endpoint, method, the status the handler answered. Out: {status}.
+         * Throws ApiKeyException 401 invalid_api_key / api_key_revoked / api_key_expired, 403 insufficient_scope,
+         * 429 rate_limited. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: typed 401/403/429 (KEYS-03/04/05/07), spec
+         * scope names (KEYS-05), injected clock, refused 401/403 calls of a known key are logged too ("every API call
+         * logged"). Touches: key and usage repositories.
+         */
         public Map<String, Object> useKey(String secret, String endpoint,
                                           String method, int status) {
-            ApiKey key = keyRepo.findBySecret(secret)
-                    .orElseThrow(() -> new IllegalArgumentException("Invalid key"));
+            ApiKey key = resolveKey(secret)
+                    .orElseThrow(() -> new ApiKeyException(401, "invalid_api_key", "Invalid key"));
+            LocalDateTime now = now();
             // Check active or grace period
             if (!key.isActive) {
-                if (key.gracePeriodEndsAt == null || LocalDateTime.now().isAfter(key.gracePeriodEndsAt)) {
-                    throw new IllegalArgumentException("Key revoked");
+                if (key.gracePeriodEndsAt == null || now.isAfter(key.gracePeriodEndsAt)) {
+                    usageRepo.save(new ApiKeyUsage(0, key.id, endpoint, method, 401, now));
+                    throw new ApiKeyException(401, "api_key_revoked", "Key revoked");
                 }
             }
             // Check expiry
-            if (key.expiresAt != null && LocalDateTime.now().isAfter(key.expiresAt)) {
-                throw new IllegalArgumentException("Key expired");
+            if (key.expiresAt != null && now.isAfter(key.expiresAt)) {
+                usageRepo.save(new ApiKeyUsage(0, key.id, endpoint, method, 401, now));
+                throw new ApiKeyException(401, "api_key_expired", "Key expired");
             }
             // Check scope
-            String action = method.toUpperCase() + " " + endpoint;
-            if (!key.scopes.contains("*") && !key.scopes.contains(action)) {
-                throw new IllegalArgumentException("Insufficient scope");
+            if (!scopeAllows(key.scopes, method, endpoint)) {
+                usageRepo.save(new ApiKeyUsage(0, key.id, endpoint, method, 403, now));
+                throw new ApiKeyException(403, "insufficient_scope", "Insufficient scope");
             }
             // Atomic rate-limit check and usage logging per key, on a lock object of this key's own: a lock on an interned
             // String can be taken by unrelated code anywhere in the process (code scanning, 2026-11-08, session f3daac6e, from review).
             synchronized (keyLocks.computeIfAbsent(key.id, id -> new Object())) {
-                if (!rateLimiter.allow(String.valueOf(key.id), key.rateLimit)) {
+                if (!rateLimiter.allow(String.valueOf(key.id), key.rateLimit, now)) {
                     // Rejected calls are counted per key, second and endpoint, not stored one by one: a flood of them
                     // would otherwise fill memory while being refused (2026-11-08, session f3daac6e, from review).
                     // Counted by the usage repository, so every service sharing it sees the same numbers.
-                    usageRepo.countRejected(key.id, LocalDateTime.now(), method + " " + endpoint);
-                    throw new IllegalStateException("Rate limit exceeded");
+                    usageRepo.countRejected(key.id, now, method + " " + endpoint);
+                    throw new ApiKeyException(429, "rate_limited", "Rate limit exceeded");
                 }
                 // Log usage
-                ApiKeyUsage usage = new ApiKeyUsage(0, key.id, endpoint, method, status,
-                        LocalDateTime.now());
+                ApiKeyUsage usage = new ApiKeyUsage(0, key.id, endpoint, method, status, now);
                 usageRepo.save(usage);
-                key.lastUsedAt = LocalDateTime.now();
+                key.lastUsedAt = now;
                 keyRepo.save(key);
             }
 

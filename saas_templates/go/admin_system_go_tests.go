@@ -3,25 +3,61 @@ package admin
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"database/sql"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
 
 // fakeBilling is the in-memory PlanChanger the tests install instead of Stripe: it records each
-// call and never touches the network. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.
+// update and never touches the network. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP;
+// changed the same day (ADMIN-12): it answers the subscription's items and records the item id and
+// price each update is sent.
 type fakeBilling struct {
-	calls []string // "subscriptionID->tier"
+	items map[string][]string // subscription -> item ids (default: one item "si_<subscription>")
+	calls []string            // "subscriptionID|itemID|priceID"
 }
 
-// ChangePlan records the call and succeeds. Inputs: subscription id, tier. Output: nil.
-// Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
-func (f *fakeBilling) ChangePlan(_ context.Context, subscriptionID, tier string) error {
-	f.calls = append(f.calls, subscriptionID+"->"+tier)
+// PriceID maps a tier to "price_<tier>".
+func (f *fakeBilling) PriceID(tier string) (string, error) { return "price_" + tier, nil }
+
+// SubscriptionItems returns the configured items.
+func (f *fakeBilling) SubscriptionItems(_ context.Context, subscriptionID string) ([]string, error) {
+	if ids, ok := f.items[subscriptionID]; ok {
+		return ids, nil
+	}
+	return []string{"si_" + subscriptionID}, nil
+}
+
+// UpdateSubscriptionItem records the update and succeeds.
+func (f *fakeBilling) UpdateSubscriptionItem(_ context.Context, subscriptionID, itemID, priceID string) error {
+	f.calls = append(f.calls, subscriptionID+"|"+itemID+"|"+priceID)
 	return nil
+}
+
+// fakeMail records the invites and reset links the admin system sends (no network in tests).
+// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-01, ADMIN-04).
+type fakeMail struct {
+	invites, resets map[string]string // email -> token
+}
+
+func (f *fakeMail) SendInvite(email, token string) error        { f.invites[email] = token; return nil }
+func (f *fakeMail) SendPasswordReset(email, token string) error { f.resets[email] = token; return nil }
+
+// tokenStored reports whether the SHA-256 of token is stored for purpose (and the raw token is not).
+func tokenStored(t *testing.T, token, purpose string) bool {
+	t.Helper()
+	h := sha256.Sum256([]byte(token))
+	var n, raw int
+	db.QueryRow(`SELECT COUNT(*) FROM user_tokens WHERE token_hash=? AND purpose=?`, hex.EncodeToString(h[:]), purpose).Scan(&n)
+	db.QueryRow(`SELECT COUNT(*) FROM user_tokens WHERE token_hash=?`, token).Scan(&raw)
+	return n == 1 && raw == 0
 }
 
 // setupTestEnv opens a fresh in-memory database, registers the routes, and opts in to reading the
@@ -30,6 +66,7 @@ func (f *fakeBilling) ChangePlan(_ context.Context, subscriptionID, tier string)
 // default resolver now fails closed, so the tests opt in explicitly). Touches: the test database.
 func setupTestEnv(t *testing.T) *http.ServeMux {
 	ResolveUserID = TrustedHeaderResolver("X-User-ID")
+	Mail = &fakeMail{invites: map[string]string{}, resets: map[string]string{}} // 2026-11-10: emails are really sent
 	if err := InitDB(":memory:"); err != nil {
 		t.Fatalf("DB init failed: %v", err)
 	}
@@ -60,6 +97,7 @@ func doRequest(mux *http.ServeMux, method, path string, body map[string]string, 
 }
 
 // ---------- Tests ----------
+// ADMIN-01
 func TestCreateUserHappyPath(t *testing.T) {
 	mux := setupTestEnv(t)
 	// create owner first
@@ -90,8 +128,15 @@ func TestCreateUserHappyPath(t *testing.T) {
 	if out["email"] != "newuser@example.com" {
 		t.Fatalf("email mismatch")
 	}
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: ADMIN-01 says "invite sent"; the invite carries a token
+	// stored only as its hash.
+	invite := Mail.(*fakeMail).invites["newuser@example.com"]
+	if invite == "" || !tokenStored(t, invite, "invite") {
+		t.Fatalf("invite not sent, or its token not stored as a hash: %q", invite)
+	}
 }
 
+// ADMIN-02
 func TestCreateUserDuplicateEmail(t *testing.T) {
 	mux := setupTestEnv(t)
 	ownerID := seedOwner(t)
@@ -115,6 +160,7 @@ func TestCreateUserDuplicateEmail(t *testing.T) {
 	}
 }
 
+// ADMIN-03
 func TestCreateUserNonOwner(t *testing.T) {
 	mux := setupTestEnv(t)
 	seedOwner(t) // an owner exists; the caller below is an admin
@@ -142,6 +188,7 @@ func TestCreateUserNonOwner(t *testing.T) {
 	}
 }
 
+// ADMIN-04
 func TestResetPasswordHappyPath(t *testing.T) {
 	mux := setupTestEnv(t)
 	ownerID := seedOwner(t)
@@ -165,8 +212,14 @@ func TestResetPasswordHappyPath(t *testing.T) {
 	if out["status"] != "reset_email_sent" {
 		t.Fatalf("unexpected status")
 	}
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: ADMIN-04 says "email sent"; prove it reached the mailer.
+	reset := Mail.(*fakeMail).resets["user@example.com"]
+	if reset == "" || !tokenStored(t, reset, "password_reset") {
+		t.Fatalf("reset email not sent, or its token not stored as a hash: %q", reset)
+	}
 }
 
+// ADMIN-05
 func TestResetPasswordOwnAccount(t *testing.T) {
 	mux := setupTestEnv(t)
 	ownerID := seedOwner(t)
@@ -185,6 +238,7 @@ func TestResetPasswordOwnAccount(t *testing.T) {
 	}
 }
 
+// ADMIN-06
 func TestChangeRoleHappyPath(t *testing.T) {
 	mux := setupTestEnv(t)
 	ownerID := seedOwner(t)
@@ -209,8 +263,17 @@ func TestChangeRoleHappyPath(t *testing.T) {
 	if out["new_tier"] != "admin" {
 		t.Fatalf("role not changed")
 	}
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: ADMIN-06 also says "audit logged".
+	var role string
+	var audits int
+	db.QueryRow(`SELECT role FROM users WHERE id=?`, userID).Scan(&role)
+	db.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='role_changed' AND resource_id=? AND old_value='user' AND new_value='admin'`, userID).Scan(&audits)
+	if role != "admin" || audits != 1 {
+		t.Fatalf("role %q, role_changed audit rows %d", role, audits)
+	}
 }
 
+// ADMIN-07
 func TestChangeRoleLastOwner(t *testing.T) {
 	mux := setupTestEnv(t)
 	ownerID := seedOwner(t)
@@ -231,6 +294,7 @@ func TestChangeRoleLastOwner(t *testing.T) {
 	}
 }
 
+// ADMIN-08
 func TestSuspendUserHappyPath(t *testing.T) {
 	mux := setupTestEnv(t)
 	ownerID := seedOwner(t)
@@ -256,6 +320,7 @@ func TestSuspendUserHappyPath(t *testing.T) {
 	}
 }
 
+// ADMIN-09
 func TestSuspendOwnAccount(t *testing.T) {
 	mux := setupTestEnv(t)
 	ownerID := seedOwner(t)
@@ -275,6 +340,7 @@ func TestSuspendOwnAccount(t *testing.T) {
 	}
 }
 
+// ADMIN-10
 func TestCustomersListPagination(t *testing.T) {
 	mux := setupTestEnv(t)
 	ownerID := seedOwner(t)
@@ -295,8 +361,15 @@ func TestCustomersListPagination(t *testing.T) {
 	if list[0]["email"] != "c2@example.com" {
 		t.Fatalf("unexpected first item")
 	}
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: ADMIN-10 also says "all fields present".
+	for _, f := range []string{"customer_id", "email", "name", "tier", "signup_date", "invoice_count", "status"} {
+		if _, ok := list[0][f]; !ok {
+			t.Errorf("customers list is missing %s", f)
+		}
+	}
 }
 
+// ADMIN-11
 func TestCustomersDetail(t *testing.T) {
 	mux := setupTestEnv(t)
 	ownerID := seedOwner(t)
@@ -318,8 +391,15 @@ func TestCustomersDetail(t *testing.T) {
 	if out["subscription_status"] != "active" {
 		t.Fatalf("status mismatch")
 	}
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: ADMIN-11 says "all fields present".
+	for _, f := range []string{"customer_id", "email", "name", "tier", "subscription_status", "payment_method", "address", "notes"} {
+		if _, ok := out[f]; !ok {
+			t.Errorf("customer detail is missing %s", f)
+		}
+	}
 }
 
+// ADMIN-12
 func TestChangePlanStripeCalled(t *testing.T) {
 	// Stripe sits behind the PlanChanger interface; the in-memory fake proves it was called without
 	// any network call (a dummy key against the real API can only fail).
@@ -348,17 +428,43 @@ func TestChangePlanStripeCalled(t *testing.T) {
 	if out["new_tier"] != "admin" {
 		t.Fatalf("plan not changed")
 	}
-	if len(fake.calls) != 1 || fake.calls[0] != "sub_123->admin" {
-		t.Fatalf("expected one Stripe plan change for sub_123 to admin, got %v", fake.calls)
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-12, amended): the update carries the existing item
+	// id and the new price, so no second item is added.
+	if len(fake.calls) != 1 || fake.calls[0] != "sub_123|si_sub_123|price_admin" {
+		t.Fatalf("expected one update of item si_sub_123 to price_admin, got %v", fake.calls)
+	}
+	var audits int
+	db.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='plan_changed' AND resource_id=?`, cid).Scan(&audits)
+	if audits != 1 {
+		t.Fatalf("expected one plan_changed audit row, got %d", audits)
+	}
+	// An unknown tier is 400, a subscription with two items is 409; neither reaches the update.
+	path := "/admin/customers/" + strconv.FormatInt(cid, 10) + "/action"
+	if r := doRequest(mux, http.MethodPost, path, map[string]string{"action": "change_plan", "new_tier": "platinum"}, ownerID, "owner", nil); r.Code != http.StatusBadRequest {
+		t.Fatalf("unknown tier: expected 400, got %d", r.Code)
+	}
+	fake.items = map[string][]string{"sub_123": {"si_a", "si_b"}}
+	r := doRequest(mux, http.MethodPost, path, map[string]string{"action": "change_plan", "new_tier": "user"}, ownerID, "owner", nil)
+	var amb map[string]interface{}
+	_ = json.NewDecoder(r.Body).Decode(&amb)
+	if r.Code != http.StatusConflict || amb["error"] != "subscription_item_ambiguous" {
+		t.Fatalf("two items: expected 409 subscription_item_ambiguous, got %d %v", r.Code, amb)
+	}
+	if len(fake.calls) != 1 {
+		t.Fatalf("a refused change must not update Stripe: %v", fake.calls)
 	}
 }
 
+// ADMIN-13
 func TestQueueRefund(t *testing.T) {
 	mux := setupTestEnv(t)
 	ownerID := seedOwner(t)
-	// create dummy invoice record (not a real table, assume exists)
-	_, _ = db.Exec(`INSERT INTO refunds (invoice_id, amount, reason, status, created_by, created_at) VALUES (?,?,?,?,?,?)`,
-		1, 1000, "test", "succeeded", ownerID, time.Now().UTC())
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: queue_refund now checks the invoice (spec: "invoice exists,
+	// status='succeeded'"), so the test seeds a real invoice of customer 1 instead of a fake refund row.
+	_, _ = db.Exec(`INSERT INTO customers (id,email,name,tier,signup_date,invoice_count,status) VALUES (1,?,?,?,?,?,?)`,
+		"ref@example.com", "Ref", "user", time.Now().UTC(), 1, "active")
+	_, _ = db.Exec(`INSERT INTO invoices (id, customer_id, amount, status) VALUES (1, 1, 1000, 'succeeded')`)
+	_, _ = db.Exec(`INSERT INTO invoices (id, customer_id, amount, status) VALUES (2, 1, 1000, 'failed')`)
 	payload := map[string]string{
 		"action":     "queue_refund",
 		"invoice_id": "1",
@@ -374,8 +480,35 @@ func TestQueueRefund(t *testing.T) {
 	if out["status"] != "queued" {
 		t.Fatalf("refund not queued")
 	}
+	var st string
+	if err := db.QueryRow(`SELECT status FROM refunds WHERE id=?`, int64(out["refund_id"].(float64))).Scan(&st); err != nil || st != "queued" {
+		t.Fatalf("refund row: %q (%v)", st, err)
+	}
+	// The invoice checks: unknown or another customer's invoice, a failed invoice, and a total above it.
+	for _, c := range []struct {
+		invoice, amount, code string
+		status             int
+	}{
+		{"99", "10", "invoice_not_found", http.StatusNotFound},
+		{"2", "10", "invalid_invoice_status", http.StatusBadRequest},
+		{"1", "501", "refund_exceeds_invoice", http.StatusBadRequest},
+		{"1", "0", "invalid_amount", http.StatusBadRequest},
+	} {
+		r := doRequest(mux, http.MethodPost, "/admin/customers/1/action",
+			map[string]string{"action": "queue_refund", "invoice_id": c.invoice, "amount": c.amount, "reason": "x"}, ownerID, "owner", nil)
+		var body map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if r.Code != c.status || body["error"] != c.code {
+			t.Errorf("invoice %s amount %s: expected %d %s, got %d %v", c.invoice, c.amount, c.status, c.code, r.Code, body)
+		}
+	}
+	if r := doRequest(mux, http.MethodPost, "/admin/customers/2/action",
+		map[string]string{"action": "queue_refund", "invoice_id": "1", "amount": "10", "reason": "x"}, ownerID, "owner", nil); r.Code != http.StatusNotFound {
+		t.Errorf("another customer's invoice: expected 404, got %d", r.Code)
+	}
 }
 
+// ADMIN-14
 func TestCreateDeployment(t *testing.T) {
 	mux := setupTestEnv(t)
 	ownerID := seedOwner(t)
@@ -401,8 +534,14 @@ func TestCreateDeployment(t *testing.T) {
 	if out["domain"] != "example.com" {
 		t.Fatalf("domain mismatch")
 	}
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: ADMIN-14 also says "config initialized".
+	var theme int64
+	if err := db.QueryRow(`SELECT theme_id FROM deployment_configs WHERE deployment_id=?`, int64(out["deployment_id"].(float64))).Scan(&theme); err != nil || theme != 1 {
+		t.Fatalf("deployment config not initialised: %d (%v)", theme, err)
+	}
 }
 
+// ADMIN-15
 func TestPublishDeployment(t *testing.T) {
 	mux := setupTestEnv(t)
 	ownerID := seedOwner(t)
@@ -428,14 +567,43 @@ func TestPublishDeployment(t *testing.T) {
 	if out["status"] != "live" {
 		t.Fatalf("deployment not live")
 	}
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: ADMIN-15 says "double-gate checked": with the server-side
+	// flag off, an owner still cannot publish (the request header is ignored), and an admin never can.
+	_, _ = db.Exec(`INSERT INTO deployments (customer_id,domain,tier,theme_id,status) VALUES (?,?,?,?,?)`, 1, "gate.com", "user", 1, "draft")
+	var gateID int64
+	db.QueryRow(`SELECT id FROM deployments WHERE domain='gate.com'`).Scan(&gateID)
+	gate := map[string]string{"action": "publish", "deployment_id": strconv.FormatInt(gateID, 10)}
+	SafetyFlags.CanPublish = false
+	r := doRequest(mux, http.MethodPost, "/admin/deployments/action", gate, ownerID, "owner", headers)
+	SafetyFlags.CanPublish = true
+	if r.Code != http.StatusForbidden {
+		t.Fatalf("publish with the safety flag off: expected 403, got %d", r.Code)
+	}
+	res, _ := db.Exec(`INSERT INTO users (email,name,role,status,created_at) VALUES (?,?,?,?,?)`, "adm@example.com", "Adm", "admin", "active", time.Now().UTC())
+	adminID, _ := res.LastInsertId()
+	if r := doRequest(mux, http.MethodPost, "/admin/deployments/action", gate, adminID, "owner", headers); r.Code != http.StatusForbidden {
+		t.Fatalf("publish by an admin: expected 403, got %d", r.Code)
+	}
+	var st string
+	db.QueryRow(`SELECT status FROM deployments WHERE id=?`, gateID).Scan(&st)
+	if st != "draft" {
+		t.Fatalf("a refused publish changed the status to %q", st)
+	}
 }
 
+// ADMIN-16
 func TestGovernanceApprove(t *testing.T) {
 	mux := setupTestEnv(t)
 	ownerID := seedOwner(t)
-	_, _ = db.Exec(`INSERT INTO actions (action_type,actor_id,submitted_at,status) VALUES (?,?,?,?)`,
-		"user_create", 2, time.Now().UTC(), "pending")
-	row := db.QueryRow(`SELECT id FROM actions WHERE action_type='user_create'`)
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-16: "action executed"): approval now runs the
+	// action, so the test submits one with an executor (change_role on a real user) and checks it ran; an
+	// action type without an executor is refused and stays pending.
+	res, _ := db.Exec(`INSERT INTO users (email,name,role,status,created_at) VALUES (?,?,?,?,?)`,
+		"target@example.com", "Target", "user", "active", time.Now().UTC())
+	targetID, _ := res.LastInsertId()
+	_, _ = db.Exec(`INSERT INTO actions (action_type,actor_id,target_resource_id,params,submitted_at,status) VALUES (?,?,?,?,?,?)`,
+		"change_role", 2, targetID, `{"new_tier":"admin"}`, time.Now().UTC(), "pending")
+	row := db.QueryRow(`SELECT id FROM actions WHERE action_type='change_role'`)
 	var actID int64
 	row.Scan(&actID)
 
@@ -451,8 +619,24 @@ func TestGovernanceApprove(t *testing.T) {
 	if out["status"] != "approved" {
 		t.Fatalf("not approved")
 	}
+	var role string
+	var result sql.NullString
+	db.QueryRow(`SELECT role FROM users WHERE id=?`, targetID).Scan(&role)
+	db.QueryRow(`SELECT execution_result FROM actions WHERE id=?`, actID).Scan(&result)
+	if role != "admin" || !strings.Contains(result.String, `"new_tier":"admin"`) {
+		t.Fatalf("the approved action did not run: role %q, result %q", role, result.String)
+	}
+	res, _ = db.Exec(`INSERT INTO actions (action_type,actor_id,submitted_at,status) VALUES (?,?,?,?)`, "launch_rocket", 2, time.Now().UTC(), "pending")
+	otherID, _ := res.LastInsertId()
+	r := doRequest(mux, http.MethodPost, "/admin/governance/actions/"+strconv.FormatInt(otherID, 10)+"/decide", payload, ownerID, "owner", nil)
+	var st string
+	db.QueryRow(`SELECT status FROM actions WHERE id=?`, otherID).Scan(&st)
+	if r.Code != http.StatusUnprocessableEntity || st != "pending" {
+		t.Fatalf("an action with no executor must not be approved: %d, status %q", r.Code, st)
+	}
 }
 
+// ADMIN-17
 func TestGovernanceReject(t *testing.T) {
 	mux := setupTestEnv(t)
 	ownerID := seedOwner(t)
@@ -474,6 +658,13 @@ func TestGovernanceReject(t *testing.T) {
 	_ = json.NewDecoder(resp.Body).Decode(&out)
 	if out["status"] != "rejected" {
 		t.Fatalf("not rejected")
+	}
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: ADMIN-17 also says "reason logged".
+	var reason, rejection string
+	db.QueryRow(`SELECT reason FROM audit_log WHERE action='action_rejected' AND resource_id=?`, actID).Scan(&reason)
+	db.QueryRow(`SELECT rejection_reason FROM actions WHERE id=?`, actID).Scan(&rejection)
+	if reason != "not allowed" || rejection != "not allowed" {
+		t.Fatalf("reason not logged: audit %q, action %q", reason, rejection)
 	}
 }
 
@@ -498,8 +689,13 @@ func countDecisionAudits(t *testing.T, actID int64) int {
 func TestGovernanceDecideTwiceConflicts(t *testing.T) {
 	mux := setupTestEnv(t)
 	ownerID := seedOwner(t)
-	res, err := db.Exec(`INSERT INTO actions (action_type,actor_id,submitted_at,status) VALUES (?,?,?,?)`,
-		"user_create", 2, time.Now().UTC(), "pending")
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: approval executes the action, so it is one with an
+	// executor (suspend_user on a real user); "user_create" has none and would now be refused.
+	ures, _ := db.Exec(`INSERT INTO users (email,name,role,status,created_at) VALUES (?,?,?,?,?)`,
+		"victim@example.com", "Victim", "user", "active", time.Now().UTC())
+	targetID, _ := ures.LastInsertId()
+	res, err := db.Exec(`INSERT INTO actions (action_type,actor_id,target_resource_id,params,submitted_at,status) VALUES (?,?,?,?,?,?)`,
+		"suspend_user", 2, targetID, `{"reason":"abuse"}`, time.Now().UTC(), "pending")
 	if err != nil {
 		t.Fatalf("seed action: %v", err)
 	}
@@ -573,6 +769,7 @@ func TestDefaultResolverFailsClosed(t *testing.T) {
 	}
 }
 
+// ADMIN-18
 func TestAuditLogSearch(t *testing.T) {
 	mux := setupTestEnv(t)
 	ownerID := seedOwner(t)
@@ -590,6 +787,32 @@ func TestAuditLogSearch(t *testing.T) {
 	}
 	if list[0]["action"] != "test_action" {
 		t.Fatalf("unexpected audit action")
+	}
+	// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: ADMIN-18 says "correct filters applied, pagination works".
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < 5; i++ {
+		_, _ = db.Exec(`INSERT INTO audit_log (timestamp,actor_id,action,resource_type,resource_id) VALUES (?,?,?,?,?)`,
+			base.Add(time.Duration(i)*time.Hour), ownerID, "page_action", "user", 7)
+	}
+	get := func(q string) []map[string]interface{} {
+		r := doRequest(mux, http.MethodGet, "/admin/governance/audit-log?"+q, nil, ownerID, "owner", nil)
+		var l []map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&l)
+		return l
+	}
+	if l := get("action_type=page_action&resource_id=7&limit=2&offset=0"); len(l) != 2 {
+		t.Fatalf("page 1: expected 2, got %d", len(l))
+	}
+	if l := get("action_type=page_action&limit=2&offset=4"); len(l) != 1 {
+		t.Fatalf("last page: expected 1, got %d", len(l))
+	}
+	for _, e := range get("action_type=page_action&limit=100") {
+		if e["action"] != "page_action" {
+			t.Fatalf("the action filter let %v through", e["action"])
+		}
+	}
+	if l := get("action_type=page_action&resource_id=8"); len(l) != 0 {
+		t.Fatalf("the resource filter let %d rows through", len(l))
 	}
 }
 

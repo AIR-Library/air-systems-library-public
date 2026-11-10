@@ -92,14 +92,18 @@ CREATE TABLE IF NOT EXISTS flag_audit (
 );
 `;
 
-function stableHash(input: string): number {
-  const hashBuffer = crypto.createHash('sha256').update(input).digest();
-  const first8 = hashBuffer.subarray(0, 8);
-  let result = 0;
-  for (let i = 0; i < 8; i++) {
-    result = (result * 256) + first8[i];
-  }
-  return result;
+/**
+ * stable_hash from the spec: the first 8 bytes of SHA-256(input) read as an unsigned big-endian integer.
+ *
+ * In: the string `flag_key + ":" + targeting_key`. Out: a bigint in [0, 2^64).
+ * Why: spec FLAG-05 fixes the algorithm so every language puts a user in the same bucket. The previous
+ * version accumulated the 8 bytes in a JS number (a double, exact only to 2^53), so `% 100` gave a
+ * different bucket from the other seven languages for most keys (e.g. "rollout_flag:user0": 16 here,
+ * 84 everywhere else). BigInt keeps all 64 bits. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+ * Touches: nothing (pure function).
+ */
+function stableHash(input: string): bigint {
+  return crypto.createHash('sha256').update(input).digest().readBigUInt64BE(0);
 }
 
 function evaluateConditions(conditions: unknown[], context: Context): boolean {
@@ -278,7 +282,7 @@ export class FeatureFlags {
           const rollout = r.rollout as Record<string, unknown> | null;
           if (rollout && typeof rollout.percentage === 'number') {
             const targetingKey = (context.targeting_key as string) ?? '';
-            const bucket = stableHash(`${flag_key}:${targetingKey}`) % 100;
+            const bucket = Number(stableHash(`${flag_key}:${targetingKey}`) % 100n);
             if (bucket < rollout.percentage) {
               return {
                 flag_key,

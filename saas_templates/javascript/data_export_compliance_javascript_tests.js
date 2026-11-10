@@ -14,8 +14,21 @@ jest.setTimeout(30000);
 const DAY_MS = 24 * 60 * 60 * 1000;
 const JWT_SECRET = crypto.randomBytes(32).toString('hex');
 let clock = Date.parse('2026-01-01T09:00:00.000Z');
-const service = createComplianceService({ now: () => clock, jwtSecret: JWT_SECRET, autoRunJobs: false });
-const { app, run, all, get, transporter, storage } = service;
+// A fake of the audit system's eraser (EXPORT-13, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). When it is called it
+// records what the database looks like at that moment, so the tests can prove the cascade order.
+const erasures = [];
+let get;
+const auditEraser = {
+    async erase_subject(userId) {
+        const user = await get('SELECT id FROM users WHERE id = ?', [userId]);
+        const audits = await get('SELECT COUNT(*) AS n FROM audit_log WHERE user_id = ?', [userId]);
+        const cascadeLogged = await get(`SELECT COUNT(*) AS n FROM audit_log WHERE user_id = ? AND action = 'user_deleted_cascade'`, [userId]);
+        erasures.push({ userId, userGone: !user, auditRows: audits.n, cascadeLogged: cascadeLogged.n });
+    },
+};
+const service = createComplianceService({ now: () => clock, jwtSecret: JWT_SECRET, autoRunJobs: false, auditEraser });
+const { app, run, all, transporter, storage } = service;
+get = service.get;
 
 const authFor = (userId, tier = 'free') => ({
     Authorization: `Bearer ${jwt.sign({ user_id: userId, tier }, JWT_SECRET, { algorithm: 'HS256' })}`,
@@ -64,6 +77,7 @@ describe('Export Endpoints', () => {
         expect(res.body.export_id).toBeDefined();
     });
 
+    // EXPORT-01 EXPORT-02 EXPORT-03
     test('Export generation creates file and sends email', async () => {
         // Spy on transporter.sendMail
         const sendMailSpy = jest.spyOn(transporter, 'sendMail');
@@ -101,6 +115,7 @@ describe('Export Endpoints', () => {
         expect(otherRes.status).toBe(404);
     });
 
+    // EXPORT-01 EXPORT-04
     test('Signed URL expires after 7 days (simulated)', async () => {
         const exportRes = await request(app)
             .post('/compliance/export')
@@ -131,12 +146,15 @@ describe('Deletion Endpoints', () => {
     let deletionId;
     let confirmationToken;
 
+    // EXPORT-09
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: reason user_requested (a gdpr_request now has no grace period,
+    // EXPORT-12), and the token is 32 random bytes (64 hex characters), no longer 20.
     test('Request deletion creates pending request and sends email', async () => {
         const sendMailSpy = jest.spyOn(transporter, 'sendMail');
         const res = await request(app)
             .post('/compliance/delete')
             .set(authFor('test-user-1'))
-            .send({ reason: 'gdpr_request' });
+            .send({ reason: 'user_requested' });
         expect(res.status).toBe(200);
         expect(res.body.success).toBe(true);
         deletionId = res.body.deletion_id;
@@ -144,17 +162,20 @@ describe('Deletion Endpoints', () => {
 
         expect(sendMailSpy).toHaveBeenCalled();
         const mail = sendMailSpy.mock.calls[0][0];
-        const tokenMatch = mail.text.match(/token=([a-f0-9]{40})/);
+        const tokenMatch = mail.text.match(/token=([a-f0-9]{64})\b/);
         expect(tokenMatch).toBeTruthy();
         confirmationToken = tokenMatch[1];
         sendMailSpy.mockRestore();
     });
 
+    // EXPORT-05 EXPORT-09
     test('Confirm deletion updates status to approved and schedules job', async () => {
+        const row0 = await get(`SELECT requested_at, will_delete_at FROM deletion_requests WHERE id = ?`, [deletionId]);
+        expect(Date.parse(row0.will_delete_at)).toBe(Date.parse(row0.requested_at) + 30 * DAY_MS);
         const wrong = await request(app)
             .post(`/compliance/delete/${deletionId}/confirm`)
             .set(authFor('test-user-1'))
-            .send({ confirmation_token: 'f'.repeat(40) });
+            .send({ confirmation_token: 'f'.repeat(64) });
         expect(wrong.status).toBe(400);
         const res = await request(app)
             .post(`/compliance/delete/${deletionId}/confirm`)
@@ -169,6 +190,7 @@ describe('Deletion Endpoints', () => {
         expect(row.status).toBe('approved');
     });
 
+    // EXPORT-06
     test('Cancel deletion within grace period works', async () => {
         // Create a new deletion request to cancel
         const res = await request(app)
@@ -185,6 +207,7 @@ describe('Deletion Endpoints', () => {
         expect(row.status).toBe('cancelled');
     });
 
+    // EXPORT-07 EXPORT-08 EXPORT-13
     test('Cascade delete removes user data but keeps audit log', async () => {
         const start = clock;
         // Still inside the 30-day grace period: nothing is deleted yet
@@ -206,12 +229,40 @@ describe('Deletion Endpoints', () => {
         // Audit log should still have entries
         const audits = await all(`SELECT * FROM audit_log WHERE user_id = ?`, ['test-user-1']);
         expect(audits.length).toBeGreaterThan(0);
-        expect(audits.map((a) => a.action)).toContain('account_deleted');
+        // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the cascade logs 'user_deleted_cascade' (spec amended; it was
+        // 'account_deleted', written after the cascade), then calls the audit eraser LAST, and nothing logs the user
+        // afterwards; the request rows no longer name the user.
+        expect(audits.map((a) => a.action)).toContain('user_deleted_cascade');
+        expect(erasures).toEqual([{ userId: 'test-user-1', userGone: true, auditRows: audits.length, cascadeLogged: 1 }]);
+        expect(audits[audits.length - 1].action).toBe('user_deleted_cascade');
+        const req = await get(`SELECT user_id, status FROM deletion_requests WHERE id = ?`, [deletionId]);
+        expect(req).toEqual({ user_id: null, status: 'completed' });
+        expect(await all(`SELECT id FROM deletion_requests WHERE user_id = ?`, ['test-user-1'])).toHaveLength(0);
         clock = start;
+    });
+
+    /**
+     * EXPORT-11: every export and deletion request is in the audit log with its details (the why-chain inputs:
+     * export id and format, deletion id and reason), and the log survives the account's deletion.
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches the test database.
+     */
+    // EXPORT-11
+    test('Every export and deletion request is audited with its details', async () => {
+        const rows = await all(`SELECT action, details FROM audit_log WHERE user_id = ? ORDER BY created_at, rowid`, ['test-user-1']);
+        const actions = rows.map((r) => r.action);
+        for (const a of ['data_export_requested', 'data_export_completed', 'deletion_requested', 'deletion_confirmed',
+            'deletion_cancelled', 'user_deleted_cascade']) {
+            expect(actions).toContain(a);
+        }
+        const requested = rows.filter((r) => r.action === 'deletion_requested').map((r) => JSON.parse(r.details));
+        expect(requested.map((d) => d.reason)).toEqual(['user_requested', 'user_requested']);
+        const exported = rows.filter((r) => r.action === 'data_export_requested').map((r) => JSON.parse(r.details));
+        expect(exported.map((d) => d.format)).toEqual(['json', 'json', 'csv']);
     });
 });
 
 describe('Admin Endpoints', () => {
+    // EXPORT-10
     test('Admin can list export requests', async () => {
         const res = await request(app)
             .get('/admin/compliance/exports')
@@ -226,6 +277,7 @@ describe('Admin Endpoints', () => {
         expect(header.status).toBe(401);
     });
 
+    // EXPORT-10
     test('Admin can list deletion requests', async () => {
         const res = await request(app)
             .get('/admin/compliance/deletions')
@@ -239,5 +291,89 @@ describe('Admin Endpoints', () => {
             .query({ status: 'completed' });
         expect(completed.body.deletions).toHaveLength(1);
         expect(completed.body.deletions[0]).not.toHaveProperty('confirmation_token_hash');
+    });
+});
+
+/**
+ * Seeds one active user with a session and an API key. In: id, email. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+ */
+async function seedUser(id, email) {
+    const at = new Date(clock).toISOString();
+    await run(`INSERT INTO users (id,email,name,created_at,tier,status) VALUES (?,?,?,?,?,?)`, [id, email, id, at, 'free', 'active']);
+    await run(`INSERT INTO sessions (id,user_id,ip,device,created_at) VALUES (?,?,?,?,?)`, [uuidv4(), id, '203.0.113.9', 'Firefox', at]);
+    await run(`INSERT INTO api_keys (id,user_id,name,created_at) VALUES (?,?,?,?)`, [uuidv4(), id, 'k', at]);
+}
+
+/** Requests a deletion for userId and returns { deletion_id, will_delete_at, token } (token from the e-mail). */
+async function requestDeletion(userId, reason) {
+    const spy = jest.spyOn(transporter, 'sendMail');
+    const res = await request(app).post('/compliance/delete').set(authFor(userId)).send({ reason });
+    const token = spy.mock.calls[0][0].text.match(/token=([a-f0-9]{64})\b/)[1];
+    spy.mockRestore();
+    return { ...res.body, token };
+}
+
+describe('Deletion rules amended 2026-11-10', () => {
+    /**
+     * EXPORT-12: a statutory erasure request (gdpr_request or gdpr_right_to_be_forgotten) gets no grace period:
+     * will_delete_at = requested_at, and confirm runs the cascade before it returns (status completed, deleted_at =
+     * deletion_scheduled_for = now). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches the test database.
+     */
+    // EXPORT-12
+    test('A gdpr_request or gdpr_right_to_be_forgotten request is not held for 30 days', async () => {
+        for (const reason of ['gdpr_request', 'gdpr_right_to_be_forgotten']) {
+            const id = `gdpr-${reason}`;
+            await seedUser(id, `${id}@example.com`);
+            const d = await requestDeletion(id, reason);
+            expect(d.will_delete_at).toBe(new Date(clock).toISOString());
+            expect(await get('SELECT id FROM users WHERE id = ?', [id])).toBeDefined(); // nothing deleted before confirm
+            clock += 60 * 1000;
+            const res = await request(app).post(`/compliance/delete/${d.deletion_id}/confirm`).set(authFor(id))
+                .send({ confirmation_token: d.token });
+            expect(res.status).toBe(200);
+            expect(res.body.status).toBe('completed');
+            expect(res.body.deletion_scheduled_for).toBe(new Date(clock).toISOString());
+            expect(await get('SELECT id FROM users WHERE id = ?', [id])).toBeUndefined();
+            expect(await all('SELECT id FROM sessions WHERE user_id = ?', [id])).toHaveLength(0);
+            const row = await get('SELECT status, deleted_at, user_id FROM deletion_requests WHERE id = ?', [d.deletion_id]);
+            expect(row).toEqual({ status: 'completed', deleted_at: new Date(clock).toISOString(), user_id: null });
+            expect(erasures[erasures.length - 1]).toMatchObject({ userId: id, userGone: true, cascadeLogged: 1 });
+        }
+    });
+
+    /**
+     * EXPORT-14: nothing is deleted before confirm; a wrong token, a reused token and a token older than 24 h are
+     * refused; another user's deletion request is 404 for both confirm and cancel and is left as it was.
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches the test database.
+     */
+    // EXPORT-14
+    test('Confirmation token: wrong, reused and expired tokens refused; another user\'s request is 404', async () => {
+        await seedUser('confirm-user', 'confirm@example.com');
+        await seedUser('intruder', 'intruder@example.com');
+        const d = await requestDeletion('confirm-user', 'user_requested');
+        expect(await get('SELECT id FROM users WHERE id = ?', ['confirm-user'])).toBeDefined();
+        expect(await all('SELECT id FROM sessions WHERE user_id = ?', ['confirm-user'])).toHaveLength(1);
+
+        const confirm = (userId, token) => request(app).post(`/compliance/delete/${d.deletion_id}/confirm`)
+            .set(authFor(userId)).send({ confirmation_token: token });
+        expect((await confirm('intruder', d.token)).status).toBe(404);
+        expect((await request(app).delete(`/compliance/delete/${d.deletion_id}`).set(authFor('intruder'))).status).toBe(404);
+        expect((await confirm('confirm-user', d.token.replace(/^./, (c) => (c === 'a' ? 'b' : 'a')))).status).toBe(400);
+        expect((await confirm('confirm-user', d.token.slice(0, 40))).status).toBe(400);
+        expect((await get('SELECT status FROM deletion_requests WHERE id = ?', [d.deletion_id])).status).toBe('pending');
+
+        const ok = await confirm('confirm-user', d.token);
+        expect(ok.status).toBe(200);
+        const reused = await confirm('confirm-user', d.token);
+        expect(reused.status).toBe(409);
+        expect(await get('SELECT id FROM users WHERE id = ?', ['confirm-user'])).toBeDefined(); // grace period: still there
+
+        const late = await requestDeletion('intruder', 'other');
+        clock += 24 * 60 * 60 * 1000 + 1;
+        const expired = await request(app).post(`/compliance/delete/${late.deletion_id}/confirm`).set(authFor('intruder'))
+            .send({ confirmation_token: late.token });
+        expect(expired.status).toBe(410);
+        expect((await get('SELECT status FROM deletion_requests WHERE id = ?', [late.deletion_id])).status).toBe('pending');
+        expect(await get('SELECT id FROM users WHERE id = ?', ['intruder'])).toBeDefined();
     });
 });

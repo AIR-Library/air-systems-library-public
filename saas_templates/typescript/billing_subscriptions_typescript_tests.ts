@@ -50,6 +50,7 @@ describe('Billing Subscriptions System', () => {
   const mockStripe = {
     subscriptions: {
       create: jest.fn(),
+      retrieve: jest.fn(),
       update: jest.fn()
     },
     webhooks: {
@@ -71,6 +72,7 @@ describe('Billing Subscriptions System', () => {
   });
 
   describe('create_subscription', () => {
+    // BILL-01
     it('should create subscription successfully', async () => {
       const mockSubscription = {
         id: 'sub_123',
@@ -130,6 +132,7 @@ describe('Billing Subscriptions System', () => {
       });
     });
 
+    // BILL-02
     it('should return invalid_tier error for invalid tier', async () => {
       const result = await create_subscription('cus_123', 'invalid_tier');
       expect(result).toEqual({ error: 'invalid_tier', message: 'Invalid tier: invalid_tier' });
@@ -137,6 +140,7 @@ describe('Billing Subscriptions System', () => {
   });
 
   describe('change_plan', () => {
+    // BILL-03
     it('should change plan successfully', async () => {
       const mockSubscription = {
         id: 'sub_123',
@@ -154,6 +158,7 @@ describe('Billing Subscriptions System', () => {
           amount_due: -500 // $5 credit
         }
       };
+      mockStripe.subscriptions.retrieve.mockResolvedValue({ id: 'sub_123', items: { data: [{ id: 'si_solo_1', price: { id: 'price_solo' } }] } });
       mockStripe.subscriptions.update.mockResolvedValue(mockSubscription);
       
       const mockPool = {
@@ -194,16 +199,49 @@ describe('Billing Subscriptions System', () => {
         effective_date: expect.any(String),
         proration_credit: 5 // $5 credit
       });
+      // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: BILL-03 amendment: the update must name the existing item
+      // (si_solo_1), or Stripe adds a second item and bills both plans; this used to expect a bare { price }.
+      expect(mockStripe.subscriptions.retrieve).toHaveBeenCalledWith('sub_123');
+      expect(mockStripe.subscriptions.update).toHaveBeenCalledTimes(1);
       expect(mockStripe.subscriptions.update).toHaveBeenCalledWith('sub_123', {
-        items: [{ price: 'price_team' }],
+        items: [{ id: 'si_solo_1', price: 'price_team' }],
         proration_behavior: 'create_prorations',
         expand: ['latest_invoice']
       });
     });
 
+    // BILL-03
     it('should return invalid_tier error for invalid new tier', async () => {
       const result = await change_plan('sub_123', 'invalid_tier');
       expect(result).toEqual({ error: 'invalid_tier', message: 'Invalid tier: invalid_tier' });
+      expect(mockStripe.subscriptions.retrieve).not.toHaveBeenCalled();
+      expect(mockStripe.subscriptions.update).not.toHaveBeenCalled();
+    });
+
+    /**
+     * BILL-03: a subscription with zero or two items is 409 subscription_item_ambiguous and Stripe is never
+     * updated, nor the database tier. In: mocked Stripe and pg. Out: assertions only. Why: spec amendment
+     * 2026-11-10 (both checks come before any update). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches: mocks only.
+     */
+    // BILL-03
+    it('refuses a subscription without exactly one item before any update (409 subscription_item_ambiguous)', async () => {
+      for (const data of [[], [{ id: 'si_a' }, { id: 'si_b' }]]) {
+        jest.clearAllMocks();
+        const clientQuery = jest.fn().mockImplementation((text: string) => {
+          if (text.includes('SELECT stripe_subscription_id, tier FROM subscriptions')) {
+            return Promise.resolve({ rows: [{ stripe_subscription_id: 'sub_123', tier: 'price_solo' }], rowCount: 1 });
+          }
+          return Promise.resolve({});
+        });
+        set_clients({ pool: { query: jest.fn(), connect: jest.fn().mockResolvedValue({ query: clientQuery, release: jest.fn() }) } as any });
+        mockStripe.subscriptions.retrieve.mockResolvedValue({ id: 'sub_123', items: { data } });
+
+        const result = await change_plan('sub_123', 'price_team');
+        expect(result).toMatchObject({ error: 'subscription_item_ambiguous' });
+        expect(mockStripe.subscriptions.update).not.toHaveBeenCalled();
+        expect(clientQuery.mock.calls.some(([text]) => /UPDATE subscriptions SET tier/.test(text))).toBe(false);
+      }
     });
 
     it('should return subscription_not_found error', async () => {
@@ -224,6 +262,7 @@ describe('Billing Subscriptions System', () => {
   });
 
   describe('queue_refund', () => {
+    // BILL-04
     it('should queue refund successfully', async () => {
       const mockPool = {
         query: jest.fn(),
@@ -263,6 +302,7 @@ describe('Billing Subscriptions System', () => {
       );
     });
 
+    // BILL-05
     it('should return refund_exceeds_invoice error', async () => {
       const mockPool = {
         query: jest.fn(),
@@ -297,6 +337,7 @@ describe('Billing Subscriptions System', () => {
   });
 
   describe('handle_stripe_webhook', () => {
+    // BILL-06
     it('should handle invoice.payment_succeeded', async () => {
       const mockEvent = {
         id: 'evt_123',
@@ -347,6 +388,7 @@ describe('Billing Subscriptions System', () => {
       );
     });
 
+    // BILL-07
     it('should handle duplicate event (idempotency)', async () => {
       const mockEvent = {
         id: 'evt_123',
@@ -385,6 +427,7 @@ describe('Billing Subscriptions System', () => {
       );
     });
 
+    // BILL-08
     it('should handle customer.subscription.updated', async () => {
       const mockEvent = {
         id: 'evt_123',
@@ -553,6 +596,7 @@ describe('Billing Subscriptions System', () => {
       ]);
     });
 
+    // BILL-09
     it('should reject a webhook whose signature is invalid (403 invalid_signature)', async () => {
       const mockPool = { query: jest.fn(), connect: jest.fn() };
       set_clients({ pool: mockPool as any });
@@ -565,6 +609,30 @@ describe('Billing Subscriptions System', () => {
       expect(mockStripe.webhooks.constructEvent).toHaveBeenCalledWith('{"id":"evt_forged"}', 't=1,v1=bad', 'whsec_test');
       // Nothing is written for an unverified event.
       expect(mockPool.connect).not.toHaveBeenCalled();
+    });
+
+    /**
+     * BILL-10: a verified webhook (payment_succeeded) is acknowledged with { received: true } well inside Stripe's
+     * 3-second budget. In: a mocked verified event and a mocked database client. Out: assertions only.
+     * Why: spec BILL-10 had no test here. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: mocks only.
+     */
+    // BILL-10
+    it('acknowledges a verified webhook with {received: true} in under 3 seconds', async () => {
+      const client = {
+        query: jest.fn().mockImplementation((text: string) =>
+          Promise.resolve(text.includes('FROM events') ? { rows: [], rowCount: 0 } : {})),
+        release: jest.fn(),
+      };
+      set_clients({ pool: { query: jest.fn(), connect: jest.fn().mockResolvedValue(client) } as any });
+      mockStripe.webhooks.constructEvent.mockReturnValue({
+        id: 'evt_fast', type: 'invoice.payment_succeeded',
+        data: { object: { id: 'in_fast', customer: 'cus_123', amount_paid: 1000 } },
+      });
+
+      const started = Date.now();
+      const result = await verify_and_handle_stripe_webhook('{"id":"evt_fast"}', 't=1,v1=ok', 'whsec_test');
+      expect(result).toEqual({ received: true });
+      expect(Date.now() - started).toBeLessThan(3000);
     });
   });
 });

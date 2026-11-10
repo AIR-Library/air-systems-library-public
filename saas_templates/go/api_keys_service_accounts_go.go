@@ -412,15 +412,18 @@ func (s *Service) ListAPIKeys(ctx context.Context, userID int64) (*ListAPIKeysRe
 }
 
 // RevokeAPIKey deactivates a key at once, including any rotated-out key still in its grace period.
-// The HTTP layer must check that the caller owns the key (or is an admin) before calling it.
-// Output: success and revoked_at; 404 if the key does not exist.
-// Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
-func (s *Service) RevokeAPIKey(ctx context.Context, apiKeyID string) (*RevokeAPIKeyResponse, error) {
+// Inputs: the verified caller's user id (from the session, never from the request body) and the key
+// id from the URL. Output: success and revoked_at; 404 if the key does not exist OR belongs to another
+// user (the same answer, so a caller cannot learn which key ids exist).
+// Why: the key id alone let any caller revoke anyone's key (Phase B review, 2026-11-10: "Revoke/Rotate
+// take only a key id"); the ownership check is now in the one statement that writes, so no handler can
+// forget it. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
+func (s *Service) RevokeAPIKey(ctx context.Context, callerUserID int64, apiKeyID string) (*RevokeAPIKeyResponse, error) {
 	now := s.now().UTC()
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE api_keys SET is_active = 0, revoked_at = COALESCE(revoked_at, ?),
 			previous_key_prefix = NULL, previous_key_secret_hash = NULL, grace_period_ends_at = NULL
-		WHERE id = ?`, now.UnixNano(), apiKeyID)
+		WHERE id = ? AND user_id = ?`, now.UnixNano(), apiKeyID, callerUserID)
 	if err != nil {
 		return nil, err
 	}
@@ -435,15 +438,18 @@ func (s *Service) RevokeAPIKey(ctx context.Context, apiKeyID string) (*RevokeAPI
 // RotateAPIKey issues a new secret for the same key id; the old secret keeps working until
 // grace_period_ends_at (24h). A revoked key cannot be rotated, and a key still inside a grace period
 // cannot be rotated again (409), so a second rotation never cuts the first one's grace short.
+// Inputs: the verified caller's user id and the key id; a key owned by another user is 404, exactly
+// like a missing one (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the key id alone let any caller
+// rotate anyone's key and receive the new secret).
 // Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (the old code scanned nine columns
 // into ten targets and updated a missing updated_at column). Touches: database, OS random source.
-func (s *Service) RotateAPIKey(ctx context.Context, apiKeyID string) (*RotateAPIKeyResponse, error) {
+func (s *Service) RotateAPIKey(ctx context.Context, callerUserID int64, apiKeyID string) (*RotateAPIKeyResponse, error) {
 	now := s.now().UTC()
 	var active int
 	var prefix, hash string
 	var grace sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT is_active, key_prefix, key_secret_hash, grace_period_ends_at FROM api_keys WHERE id = ?`,
-		apiKeyID).Scan(&active, &prefix, &hash, &grace)
+	err := s.db.QueryRowContext(ctx, `SELECT is_active, key_prefix, key_secret_hash, grace_period_ends_at FROM api_keys WHERE id = ? AND user_id = ?`,
+		apiKeyID, callerUserID).Scan(&active, &prefix, &hash, &grace)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, apiErr(404, "not_found", "api key not found")
 	}
@@ -465,8 +471,8 @@ func (s *Service) RotateAPIKey(ctx context.Context, apiKeyID string) (*RotateAPI
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE api_keys SET key_prefix = ?, key_secret_hash = ?, previous_key_prefix = ?,
 			previous_key_secret_hash = ?, grace_period_ends_at = ?
-		WHERE id = ? AND key_secret_hash = ? AND is_active = 1`,
-		newPrefix, newHash, prefix, hash, graceEnds.UnixNano(), apiKeyID, hash)
+		WHERE id = ? AND user_id = ? AND key_secret_hash = ? AND is_active = 1`,
+		newPrefix, newHash, prefix, hash, graceEnds.UnixNano(), apiKeyID, callerUserID, hash)
 	if err != nil {
 		return nil, err
 	}
@@ -635,9 +641,19 @@ func endpointMethodToScope(endpoint, method string) string {
 
 // GetAPIKeyUsageStats summarises api_key_usage for a key between from and to (inclusive): total
 // requests, requests by "<endpoint> <METHOD>", 429 count and error counts by status.
+// Inputs: the verified caller's user id, the key id and the range; another user's key is 404
+// (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: usage of any key id was readable by anyone).
 // Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (SQLite; the errors map no longer
 // shadows the errors package). Touches: database.
-func (s *Service) GetAPIKeyUsageStats(ctx context.Context, apiKeyID string, from, to time.Time) (*GetAPIKeyUsageStatsResponse, error) {
+func (s *Service) GetAPIKeyUsageStats(ctx context.Context, callerUserID int64, apiKeyID string, from, to time.Time) (*GetAPIKeyUsageStatsResponse, error) {
+	var owner int64
+	err := s.db.QueryRowContext(ctx, `SELECT user_id FROM api_keys WHERE id = ? AND user_id = ?`, apiKeyID, callerUserID).Scan(&owner)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, apiErr(404, "not_found", "api key not found")
+	}
+	if err != nil {
+		return nil, err
+	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT endpoint, method, status, COUNT(*) FROM api_key_usage
 		WHERE api_key_id = ? AND timestamp >= ? AND timestamp <= ?

@@ -19,6 +19,7 @@ def teardown_module(module):
     set_store(InMemoryHealthCheckStore())
 
 
+# HEALTH-01
 def test_all_checks_pass_returns_200_pass():
     def check_ok():
         return {"status": "pass", "observedValue": 100, "observedUnit": "ms"}
@@ -37,6 +38,7 @@ def test_all_checks_pass_returns_200_pass():
     assert result["body"]["checks"]["cache:cache"][0]["status"] == "pass"
 
 
+# HEALTH-02
 def test_critical_check_fails_returns_503_fail():
     def check_fail():
         return {"status": "fail", "observedValue": 0, "observedUnit": "ms"}
@@ -51,6 +53,7 @@ def test_critical_check_fails_returns_503_fail():
     assert result["body"]["checks"]["db:datastore"][0]["status"] == "fail"
 
 
+# HEALTH-03
 def test_only_non_critical_fails_returns_200_warn():
     def check_ok():
         return {"status": "pass", "observedValue": 100, "observedUnit": "ms"}
@@ -70,6 +73,7 @@ def test_only_non_critical_fails_returns_200_warn():
     assert result["body"]["checks"]["cache:cache"][0]["status"] == "fail"
 
 
+# HEALTH-04
 def test_slow_check_past_timeout_returns_fail_for_that_check():
     def slow_check():
         time.sleep(0.5)
@@ -85,6 +89,7 @@ def test_slow_check_past_timeout_returns_fail_for_that_check():
     assert result["body"]["checks"]["slow:service"][0]["status"] == "fail"
 
 
+# HEALTH-05
 def test_liveness_stays_pass_even_when_dependency_check_would_fail():
     def check_fail():
         return {"status": "fail", "observedValue": 0, "observedUnit": "ms"}
@@ -100,6 +105,7 @@ def test_liveness_stays_pass_even_when_dependency_check_would_fail():
     assert result["body"]["checks"] == {}
 
 
+# HEALTH-06
 def test_output_contains_no_connection_string():
     def check_with_secret():
         return {"status": "pass", "observedValue": 1, "observedUnit": "ms"}
@@ -113,6 +119,32 @@ def test_output_contains_no_connection_string():
     assert "connection" not in body_str.lower()
     assert "secret" not in body_str.lower()
     assert "token" not in body_str.lower()
+
+
+# HEALTH-06
+def test_failing_check_error_with_connection_string_is_not_in_output():
+    """A check that fails with a connection string in its error must not leak it into readiness().
+
+    In: a critical check raising an error whose message holds a DSN with a password. Out: asserts the
+    response is 503 "fail" and the JSON body holds neither the DSN nor its password.
+    Why: HEALTH-06 ("the output contains no connection string"); the older HEALTH-06 test never fed one in.
+    2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory check registry only.
+    """
+    import json
+    set_store(InMemoryHealthCheckStore())
+    dsn = "postgres://admin:hunter2@db.internal:5432/app"
+
+    def check_raises():
+        raise RuntimeError(f"could not connect to {dsn}")
+
+    register_check("db", "datastore", check_raises, critical=True, timeout_ms=1000)
+    result = readiness()
+    body = json.dumps(result["body"])
+    assert result["http_status"] == 503
+    assert result["body"]["status"] == "fail"
+    assert dsn not in body
+    assert "hunter2" not in body
+    assert "postgres://" not in body
 
 
 def test_sqlite_store_persists_across_calls():

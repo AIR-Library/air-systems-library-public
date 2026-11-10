@@ -44,6 +44,7 @@ public static class OrganizationsTeamsTests
     private static byte[] RandomToken() { var b = new byte[32]; RandomNumberGenerator.Fill(b); return b; }
 
     // Test 1: a non-member cannot read members of another org (IDOR attempt by id)
+    // ORG-01
     public static void TestNonMemberCannotReadMembersOfAnotherOrg()
     {
         var store = new InMemoryStore();
@@ -77,6 +78,7 @@ public static class OrganizationsTeamsTests
     }
 
     // Test 2: a member cannot invite; an admin can
+    // ORG-02
     public static void TestMemberCannotInviteAdminCan()
     {
         var store = new InMemoryStore();
@@ -114,6 +116,7 @@ public static class OrganizationsTeamsTests
     }
 
     // Test 3: an admin cannot remove the owner; the last owner cannot leave
+    // ORG-03
     public static void TestAdminCannotRemoveOwnerLastOwnerCannotLeave()
     {
         var store = new InMemoryStore();
@@ -153,6 +156,7 @@ public static class OrganizationsTeamsTests
     }
 
     // Test 4: an invitation works once; the second use fails
+    // ORG-04
     public static void TestInvitationWorksOnceSecondUseFails()
     {
         var store = new InMemoryStore();
@@ -186,6 +190,7 @@ public static class OrganizationsTeamsTests
     }
 
     // Test 5: an expired invitation fails; accepting with a different email fails
+    // ORG-05
     public static void TestExpiredInvitationFailsDifferentEmailFails()
     {
         var store = new InMemoryStore();
@@ -232,6 +237,7 @@ public static class OrganizationsTeamsTests
     }
 
     // Test 6: the raw token is not stored anywhere in the database
+    // ORG-06
     public static void TestRawTokenNotStoredInDatabase()
     {
         var store = new InMemoryStore();

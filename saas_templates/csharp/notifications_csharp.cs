@@ -51,10 +51,14 @@ namespace Notifications
     }
 
     /// <summary>
-    /// One notification (spec schema notification_logs) and its delivery state. Status: queued, sent, failed, skipped,
-    /// opened, bounced. SentAt is set only when a provider accepted the message; ScheduledFor and NextAttemptAt drive
-    /// the delivery worker. Changed 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): status started as "sent"
-    /// before anything was sent. Pure data.
+    /// One notification (spec schema notification_logs) and its delivery state. Status: queued, sending, sent, failed,
+    /// skipped, opened, bounced. SentAt is set only when a provider accepted the message; ScheduledAt and NextAttemptAt
+    /// drive deliver_due; ClaimedAt is when a worker claimed it ('sending'). Status and ClaimedAt are concurrency tokens,
+    /// so every write is conditional on the values read (the spec's "UPDATE ... WHERE status = 'queued'" claim and
+    /// "WHERE status = 'sending' AND claimed_at = &lt;this claim&gt;" final write).
+    /// Changed 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): status started as "sent" before anything was sent.
+    /// Changed again 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-12): ScheduledFor renamed ScheduledAt (spec
+    /// column scheduled_at), ClaimedAt added. Pure data.
     /// </summary>
     public class NotificationLog
     {
@@ -65,7 +69,8 @@ namespace Notifications
         public string Channel { get; set; } = null!; // email, sms, in_app
         public string VarsUsed { get; set; } = null!; // JSON
         public DateTime CreatedAt { get; set; }
-        public DateTime ScheduledFor { get; set; }
+        public DateTime ScheduledAt { get; set; }
+        public DateTime? ClaimedAt { get; set; }
         public DateTime? SentAt { get; set; }
         public DateTime? OpenedAt { get; set; }
         public DateTime? ClickedAt { get; set; }
@@ -113,6 +118,10 @@ namespace Notifications
         /// <summary>Maps the entities to their tables and indexes. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the EF model only.</summary>
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            // Conditional writes for deliver_due (NOTIF-12; 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+            modelBuilder.Entity<NotificationLog>().Property(l => l.Status).IsConcurrencyToken();
+            modelBuilder.Entity<NotificationLog>().Property(l => l.ClaimedAt).IsConcurrencyToken();
+
             // Seed templates
             modelBuilder.Entity<NotificationTemplate>().HasData(
                 new NotificationTemplate
@@ -307,39 +316,53 @@ namespace Notifications
     }
 
     /// <summary>
-    /// Builds and checks unsubscribe tokens: base64url(HMAC-SHA256(secret, "userId:channel")), compared with
-    /// CryptographicOperations.FixedTimeEquals, so a link only works for the user and channel it was issued for.
-    /// The secret comes from Notifications:UnsubscribeSecret (at least 32 bytes); without it a random per-process
-    /// secret is used (development: links stop working after a restart). Added 2026-11-10 (session
-    /// session_012zDydZCZ4AChqhEZ4oVtaP): the old link was ?user=&lt;id&gt;, which anyone could forge. Pure.
+    /// Builds and checks unsubscribe tokens (NOTIF-11, amended 2026-11-10): token = lower-case hex of
+    /// HMAC-SHA256(secret, "unsubscribe:" + user_id + ":" + channel). The secret comes from configuration
+    /// (Notifications:UnsubscribeSecret) and must be at least 32 bytes, or the service refuses to start (an empty key
+    /// makes a forgeable HMAC). Verify refuses, the same way and before any user lookup, a token that is not exactly
+    /// 64 characters of [0-9a-f], an unknown channel and a mismatch; the comparison is constant-time and never throws.
+    /// Rewritten 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: it was base64url over "userId:channel" and fell back to a
+    /// random per-process secret. Pure.
     /// </summary>
     public class UnsubscribeTokens
     {
         private readonly byte[] _key;
 
+        /// <summary>Throws ArgumentException for a missing secret or one shorter than 32 bytes (UTF-8).</summary>
         public UnsubscribeTokens(string? secret)
         {
-            if (!string.IsNullOrEmpty(secret) && Encoding.UTF8.GetByteCount(secret) < 32)
-                throw new ArgumentException("Notifications:UnsubscribeSecret must be at least 32 bytes");
-            _key = string.IsNullOrEmpty(secret) ? RandomNumberGenerator.GetBytes(32) : Encoding.UTF8.GetBytes(secret);
+            if (string.IsNullOrEmpty(secret) || Encoding.UTF8.GetByteCount(secret) < 32)
+                throw new ArgumentException("Notifications:UnsubscribeSecret must be set and at least 32 bytes");
+            _key = Encoding.UTF8.GetBytes(secret);
         }
 
-        /// <summary>The token for a user and channel. Pure.</summary>
+        /// <summary>The token for a user and channel: 64 lower-case hex characters. Pure.</summary>
         public string Create(long userId, string channel)
         {
             using var hmac = new HMACSHA256(_key);
-            var mac = hmac.ComputeHash(Encoding.UTF8.GetBytes($"{userId}:{channel}"));
-            return Convert.ToBase64String(mac).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+            var mac = hmac.ComputeHash(Encoding.UTF8.GetBytes($"unsubscribe:{userId}:{channel}"));
+            return Convert.ToHexString(mac).ToLowerInvariant();
         }
 
-        /// <summary>True when the token was issued for this user and channel (constant-time comparison). Pure.</summary>
-        public bool Verify(long userId, string channel, string? token)
+        /// <summary>True when the token is well-formed, the channel is known and the token was issued for them. Pure.</summary>
+        public bool Verify(long userId, string? channel, string? token)
         {
-            if (string.IsNullOrEmpty(token)) return false;
+            if (token == null || token.Length != 64 || !token.All(c => (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+                return false;
+            if (channel == null || !NotificationService.Channels.Contains(channel))
+                return false;
             var expected = Encoding.ASCII.GetBytes(Create(userId, channel));
-            var provided = Encoding.ASCII.GetBytes(token);
-            return expected.Length == provided.Length && CryptographicOperations.FixedTimeEquals(expected, provided);
+            return CryptographicOperations.FixedTimeEquals(expected, Encoding.ASCII.GetBytes(token));
         }
+    }
+
+    /// <summary>
+    /// The clock the service and worker read (UTC). Tests replace <see cref="Now"/> to move time. Added 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-05/08/12 are tested at exact times). Touches nothing.
+    /// </summary>
+    public class NotificationClock
+    {
+        public Func<DateTime> Now { get; set; } = () => DateTime.UtcNow;
     }
 
     /// <summary>Wakes the delivery worker when a message is queued, so it need not wait for its next poll. Touches: process memory.</summary>
@@ -381,20 +404,34 @@ namespace Notifications
         private readonly NotificationDbContext _db;
         private readonly DeliverySignal _signal;
         private readonly UnsubscribeTokens _tokens;
+        private readonly NotificationClock _clock;
 
-        public NotificationService(NotificationDbContext db, DeliverySignal signal, UnsubscribeTokens tokens)
+        /// <summary>
+        /// In: the database, the worker's wake-up signal, the unsubscribe token service and the clock.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the clock. Touches nothing.
+        /// </summary>
+        public NotificationService(NotificationDbContext db, DeliverySignal signal, UnsubscribeTokens tokens, NotificationClock clock)
         {
             _db = db;
             _signal = signal;
             _tokens = tokens;
+            _clock = clock;
         }
 
-        /// <summary>The preferences a user without a stored row gets: every channel on, no quiet hours, DND off. Pure.</summary>
-        private static UserNotificationPreference Defaults(long userId) => new()
+        /// <summary>
+        /// The preferences a user without a stored row gets: do_not_disturb false, no quiet hours, channels
+        /// {email: true, sms: false, in_app: true}. SMS is opt-in (it costs money and needs prior consent).
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-02 amendment): every channel was on. Pure.
+        /// </summary>
+        public static UserNotificationPreference Defaults(long userId) => new()
         {
             UserId = userId,
-            ChannelsEnabled = Channels.ToDictionary(c => c, _ => true)
+            ChannelsEnabled = new Dictionary<string, bool> { ["email"] = true, ["sms"] = false, ["in_app"] = true }
         };
+
+        /// <summary>True when the preferences allow this channel now: not do-not-disturb and the channel is on. Pure.</summary>
+        public static bool Allows(UserNotificationPreference pref, string channel) =>
+            !pref.DoNotDisturb && pref.ChannelsEnabled.TryGetValue(channel, out var on) && on;
 
         /// <summary>
         /// True when <paramref name="now"/> (UTC) falls in the user's quiet hours; ranges may cross midnight; no range,
@@ -423,8 +460,9 @@ namespace Notifications
 
         /// <summary>
         /// Spec endpoint 1. Validates the user id, template and channel; records a skipped message when do-not-disturb is
-        /// on or the chosen channel is disabled; otherwise queues it for now, for scheduled_at, or for the end of quiet
-        /// hours, whichever is latest. Only the template's declared variables are kept. Output: success, message id and
+        /// on or the chosen channel is disabled; otherwise queues it ('queued' with scheduled_at) for now, for
+        /// scheduled_at, or, inside quiet hours, for quiet_hours_end (NOTIF-05), whichever is latest; deliver_due sends
+        /// it (NOTIF-12). Time comes from the injected clock (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). Only the template's declared variables are kept. Output: success, message id and
         /// status queued / skipped, or success false with an error code. Touches: notification_logs, preferences (read).
         /// </summary>
         public async Task<SendResult> SendAsync(long userId, string? templateKey, string? channel,
@@ -439,7 +477,7 @@ namespace Notifications
             var kept = (vars ?? new()).Where(kv => allowed.Contains(kv.Key)).ToDictionary(kv => kv.Key, kv => kv.Value);
 
             var pref = await _db.UserNotificationPreferences.AsNoTracking().FirstOrDefaultAsync(p => p.UserId == userId) ?? Defaults(userId);
-            var now = DateTime.UtcNow;
+            var now = _clock.Now();
             var selected = pref.DoNotDisturb ? null : ChooseChannel(channel, template, pref.ChannelsEnabled);
 
             var log = new NotificationLog
@@ -449,7 +487,7 @@ namespace Notifications
                 Channel = selected ?? channel ?? "none",
                 VarsUsed = JsonSerializer.Serialize(kept),
                 CreatedAt = now,
-                ScheduledFor = now,
+                ScheduledAt = now,
                 Sequence = NextSequence()
             };
 
@@ -468,7 +506,7 @@ namespace Notifications
                     if (end <= due) end = end.AddDays(1);
                     due = end;
                 }
-                log.ScheduledFor = due;
+                log.ScheduledAt = due;
                 log.Status = "queued";
             }
 
@@ -540,14 +578,47 @@ namespace Notifications
         }
 
         /// <summary>
-        /// Turns one channel off for a user when the signed token matches (spec: unsubscribe; future messages on that
-        /// channel are skipped). Output: true when applied. Added 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP).
-        /// Touches: preferences.
+        /// The unsubscribe link's POST (NOTIF-11): when the token is valid for this user and channel (checked first,
+        /// before any user lookup; see <see cref="UnsubscribeTokens.Verify"/>), sets channels_enabled[channel] = false.
+        /// Out: true when applied; false (nothing changed) for a missing, malformed, altered or foreign token or an
+        /// unknown channel. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: hex HMAC token, GET no longer changes
+        /// anything (see <see cref="CheckUnsubscribeLink"/>). Touches: preferences.
         /// </summary>
-        public async Task<bool> UnsubscribeAsync(long userId, string channel, string? token)
+        public async Task<bool> UnsubscribeAsync(long userId, string? channel, string? token)
         {
-            if (!Channels.Contains(channel) || !_tokens.Verify(userId, channel, token)) return false;
-            return await UpdatePreferencesAsync(userId, new UpdatePrefRequest { ChannelsEnabled = new() { [channel] = false } }) == null;
+            if (!_tokens.Verify(userId, channel, token)) return false;
+            return await UpdatePreferencesAsync(userId, new UpdatePrefRequest { ChannelsEnabled = new() { [channel!] = false } }) == null;
+        }
+
+        /// <summary>
+        /// The unsubscribe link's GET: only says whether the link is valid, so a mail scanner that follows links changes
+        /// nothing (RFC 8058 one-click uses POST). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Pure.
+        /// </summary>
+        public bool CheckUnsubscribeLink(long userId, string? channel, string? token) => _tokens.Verify(userId, channel, token);
+
+        /// <summary>
+        /// Tracking (NOTIF-07): the user clicked a link in a delivered message; marks it opened (opened_at, clicked_at,
+        /// status 'opened'). The message id is a random GUID, so it cannot be guessed. Out: false for an unknown or
+        /// undelivered message. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (there was no tracking write at all).
+        /// Touches: notification_logs.
+        /// </summary>
+        public async Task<bool> MarkOpenedAsync(Guid messageId)
+        {
+            var log = await _db.NotificationLogs.FirstOrDefaultAsync(l => l.Id == messageId);
+            if (log == null || log.SentAt == null) return false;
+            var now = _clock.Now();
+            log.OpenedAt ??= now;
+            log.ClickedAt ??= now;
+            log.Status = "opened";
+            try
+            {
+                await _db.SaveChangesAsync();
+            }
+            catch (DbUpdateConcurrencyException)
+            {
+                return false;
+            }
+            return true;
         }
 
         /// <summary>Parses "HH:mm" (00:00-23:59). Pure.</summary>
@@ -561,25 +632,32 @@ namespace Notifications
     }
 
     /// <summary>
-    /// Delivers due messages: every 200 ms (or at once when signalled) it takes queued messages whose time has come,
-    /// oldest first, renders them (variables HTML-encoded in the HTML body; an email gets its signed unsubscribe link)
-    /// and hands them to the channel's gateway. In-app messages are delivered by being stored. A failed attempt is
-    /// retried after 1 s, then 2 s; the third failure marks the message failed with the error (spec: "retry 3x with
-    /// exponential backoff"). Added 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP), replacing in-memory
-    /// closures that used a disposed DbContext. Touches: notification_logs, the gateways (network in production).
+    /// Delivers due messages: every 200 ms (or at once when signalled) it runs <see cref="DeliverDueAsync(DateTime, CancellationToken)"/>
+    /// with the clock's time. Rendering: variables HTML-encoded in the HTML body; an email gets its signed unsubscribe
+    /// link. In-app messages are delivered by being stored. A failed attempt is retried after 1 s, then 2 s; the third
+    /// failure marks the message failed (spec: "retry 3x with exponential backoff"). Added 2026-11-10 (session
+    /// session_012zDydZCZ4AChqhEZ4oVtaP), replacing in-memory closures that used a disposed DbContext; deliver_due's
+    /// four steps added the same day (NOTIF-12). Touches: notification_logs, preferences (read), the gateways.
     /// </summary>
     public class DeliveryWorker : BackgroundService
     {
         public const int MaxAttempts = 3;
+
+        /// <summary>A 'sending' row claimed longer ago than this is re-queued (a crashed worker).</summary>
+        public static readonly TimeSpan ClaimTimeout = TimeSpan.FromSeconds(300);
+
         private readonly IServiceProvider _sp;
         private readonly DeliverySignal _signal;
         private readonly ILogger<DeliveryWorker> _logger;
+        private readonly NotificationClock _clock;
 
-        public DeliveryWorker(IServiceProvider sp, DeliverySignal signal, ILogger<DeliveryWorker> logger)
+        /// <summary>In: the service provider, the wake-up signal, a logger and the clock. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the clock.</summary>
+        public DeliveryWorker(IServiceProvider sp, DeliverySignal signal, ILogger<DeliveryWorker> logger, NotificationClock clock)
         {
             _sp = sp;
             _signal = signal;
             _logger = logger;
+            _clock = clock;
         }
 
         /// <summary>The worker loop: one pass, then wait, until the host stops; a failing pass is logged, not fatal. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: see the class summary.</summary>
@@ -604,35 +682,112 @@ namespace Notifications
             }
         }
 
-        /// <summary>One pass over due messages (at most 100). Touches: see the class summary.</summary>
-        public async Task DeliverDueAsync(CancellationToken ct)
+        /// <summary>One pass at the clock's time. Touches: see the class summary.</summary>
+        public Task<int> DeliverDueAsync(CancellationToken ct) => DeliverDueAsync(_clock.Now(), ct);
+
+        /// <summary>
+        /// deliver_due(now), the spec's four steps (NOTIF-12, amended 2026-11-10):
+        /// 1. 'sending' rows with claimed_at + 300 s &lt; now go back to 'queued' (a crashed worker);
+        /// 2. 'queued' rows with scheduled_at &lt;= now (and any retry wait over), by scheduled_at then insertion order, at
+        ///    most 100, are claimed one by one with a conditional write (status 'queued' -&gt; 'sending', claimed_at = now);
+        ///    a row another worker claimed first is skipped;
+        /// 3. preferences are read NOW: do-not-disturb or the channel turned off (unsubscribed) -&gt; 'skipped';
+        /// 4. the outcome (sent / retry later / failed / skipped) is written conditionally on status 'sending' and this
+        ///    claimed_at, so a row re-queued meanwhile is not overwritten.
+        /// In: the time to judge "due" by. Out: how many messages were sent in this pass.
+        /// Written 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: notification_logs, preferences, the gateways.
+        /// </summary>
+        public async Task<int> DeliverDueAsync(DateTime now, CancellationToken ct)
         {
             using var scope = _sp.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<NotificationDbContext>();
-            var now = DateTime.UtcNow;
-            var due = await db.NotificationLogs
-                .Where(l => l.Status == "queued" && l.ScheduledFor <= now && (l.NextAttemptAt == null || l.NextAttemptAt <= now))
-                .OrderBy(l => l.ScheduledFor).ThenBy(l => l.Sequence)
+
+            // 1. re-queue stale claims
+            var staleBefore = now - ClaimTimeout;
+            var stale = await db.NotificationLogs
+                .Where(l => l.Status == "sending" && l.ClaimedAt != null && l.ClaimedAt < staleBefore)
+                .ToListAsync(ct);
+            foreach (var log in stale)
+            {
+                log.Status = "queued";
+                log.ClaimedAt = null;
+                await TrySaveAsync(db, ct);
+            }
+
+            // 2. due rows, oldest first
+            var dueIds = await db.NotificationLogs
+                .Where(l => l.Status == "queued" && l.ScheduledAt <= now && (l.NextAttemptAt == null || l.NextAttemptAt <= now))
+                .OrderBy(l => l.ScheduledAt).ThenBy(l => l.Sequence)
+                .Select(l => l.Id)
                 .Take(100)
                 .ToListAsync(ct);
-            foreach (var log in due)
+
+            var sent = 0;
+            foreach (var id in dueIds)
             {
-                try
+                db.ChangeTracker.Clear();
+                var log = await db.NotificationLogs.FirstOrDefaultAsync(l => l.Id == id && l.Status == "queued", ct);
+                if (log == null) continue;
+                log.Status = "sending";
+                log.ClaimedAt = now;
+                if (!await TrySaveAsync(db, ct)) continue; // another worker claimed it first
+
+                // 3. preferences as they are now
+                var pref = await db.UserNotificationPreferences.AsNoTracking().FirstOrDefaultAsync(p => p.UserId == log.UserId, ct)
+                    ?? NotificationService.Defaults(log.UserId);
+                if (!NotificationService.Allows(pref, log.Channel))
                 {
-                    await DeliverAsync(scope.ServiceProvider, db, log, ct);
-                    log.Status = "sent";
-                    log.SentAt = DateTime.UtcNow;
-                    log.Error = null;
+                    log.Status = "skipped";
+                    log.Error = pref.DoNotDisturb ? "do_not_disturb" : "channel_disabled";
                 }
-                catch (Exception ex) when (ex is not OperationCanceledException)
+                else
                 {
-                    log.Attempts++;
-                    log.Error = ex.Message;
-                    if (log.Attempts >= MaxAttempts) log.Status = "failed";
-                    else log.NextAttemptAt = DateTime.UtcNow.AddSeconds(Math.Pow(2, log.Attempts - 1));
-                    _logger.LogWarning("Notification {MessageId} attempt {Attempt} failed", log.Id, log.Attempts);
+                    try
+                    {
+                        await DeliverAsync(scope.ServiceProvider, db, log, ct);
+                        log.Status = "sent";
+                        log.SentAt = now;
+                        log.Error = null;
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        log.Attempts++;
+                        log.Error = ex.Message;
+                        if (log.Attempts >= MaxAttempts)
+                        {
+                            log.Status = "failed";
+                        }
+                        else
+                        {
+                            log.Status = "queued";
+                            log.ClaimedAt = null;
+                            log.NextAttemptAt = now.AddSeconds(Math.Pow(2, log.Attempts - 1));
+                        }
+                        _logger.LogWarning("Notification {MessageId} attempt {Attempt} failed", log.Id, log.Attempts);
+                    }
                 }
+
+                // 4. conditional final write (original status 'sending' and this claimed_at)
+                if (await TrySaveAsync(db, ct) && log.Status == "sent") sent++;
+            }
+            return sent;
+        }
+
+        /// <summary>
+        /// SaveChanges as a conditional write: false when the row changed since it was read (another worker claimed or
+        /// re-queued it). Only DbUpdateConcurrencyException is caught. Touches: the database.
+        /// </summary>
+        private async Task<bool> TrySaveAsync(NotificationDbContext db, CancellationToken ct)
+        {
+            try
+            {
                 await db.SaveChangesAsync(ct);
+                return true;
+            }
+            catch (DbUpdateConcurrencyException)
+            {
+                db.ChangeTracker.Clear();
+                return false;
             }
         }
 
@@ -648,7 +803,7 @@ namespace Notifications
             {
                 var tokens = sp.GetRequiredService<UnsubscribeTokens>();
                 var baseUrl = sp.GetRequiredService<IConfiguration>()["Notifications:PublicBaseUrl"] ?? "";
-                var link = $"{baseUrl}/notifications/unsubscribe?user_id={log.UserId}&channel=email&token={tokens.Create(log.UserId, "email")}";
+                var link = $"{baseUrl}/unsubscribe?user_id={log.UserId}&channel=email&token={tokens.Create(log.UserId, "email")}";
                 var html = Render(template.BodyHtml, vars, html: true) + $"<p><a href=\"{WebUtility.HtmlEncode(link)}\">Unsubscribe</a></p>";
                 await sp.GetRequiredService<IEmailGateway>().SendEmailAsync(log.UserId, subject, html, text + "\n\nUnsubscribe: " + link, ct);
             }
@@ -716,7 +871,10 @@ namespace Notifications
                 services.AddSingleton<IEmailGateway>(sp => sp.GetRequiredService<DevelopmentOutbox>());
             }
             services.TryAddSingletonSms();
-            services.AddSingleton(new UnsubscribeTokens(_config["Notifications:UnsubscribeSecret"]));
+            // Built on first use from the host's final configuration; Configure resolves it at start-up, so a missing or
+            // short secret stops the service from starting (NOTIF-11; 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
+            services.AddSingleton(sp => new UnsubscribeTokens(sp.GetRequiredService<IConfiguration>()["Notifications:UnsubscribeSecret"]));
+            services.AddSingleton<NotificationClock>();
             services.AddSingleton<DeliverySignal>();
             services.AddScoped<NotificationService>();
             services.AddHostedService<DeliveryWorker>();
@@ -725,6 +883,8 @@ namespace Notifications
         /// <summary>Creates the schema (and seeds templates) and maps the endpoints. Touches: the notifications database.</summary>
         public void Configure(WebApplication app)
         {
+            // refuse to start without a usable unsubscribe secret (throws ArgumentException)
+            app.Services.GetRequiredService<UnsubscribeTokens>();
             using (var scope = app.Services.CreateScope())
                 scope.ServiceProvider.GetRequiredService<NotificationDbContext>().Database.EnsureCreated();
 
@@ -757,6 +917,7 @@ namespace Notifications
                     template_key = log.TemplateKey,
                     channel = log.Channel,
                     status = log.Status,
+                    scheduled_at = log.ScheduledAt,
                     sent_at = log.SentAt,
                     opened_at = log.OpenedAt,
                     clicked_at = log.ClickedAt,
@@ -786,10 +947,35 @@ namespace Notifications
                 return error == null ? Results.Ok(new { success = true }) : Results.BadRequest(new { success = false, error });
             });
 
-            app.MapGet("/notifications/unsubscribe", async (long user_id, string channel, string? token, NotificationService service) =>
-                await service.UnsubscribeAsync(user_id, channel, token)
+            // Unsubscribe link (NOTIF-11; changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): GET only confirms, POST
+            // unsubscribes; any bad link is the same 403 invalid_unsubscribe_token. Query values are read as strings so
+            // a malformed user id is also that 403, not a binding error.
+            app.MapGet("/unsubscribe", (HttpContext context, NotificationService service) =>
+            {
+                var (ok, userId, channel, token) = ReadLink(context);
+                return ok && service.CheckUnsubscribeLink(userId, channel, token)
+                    ? Results.Ok(new { confirm = true, user_id = userId, channel, message = "POST to this link to unsubscribe" })
+                    : Results.Json(new { error = "invalid_unsubscribe_token" }, statusCode: 403);
+            });
+            app.MapPost("/unsubscribe", async (HttpContext context, NotificationService service) =>
+            {
+                var (ok, userId, channel, token) = ReadLink(context);
+                return ok && await service.UnsubscribeAsync(userId, channel, token)
                     ? Results.Ok(new { success = true })
-                    : Results.BadRequest(new { success = false, error = "invalid_unsubscribe_link" }));
+                    : Results.Json(new { error = "invalid_unsubscribe_token" }, statusCode: 403);
+            });
+
+            // Tracking (NOTIF-07): a click on a link in the message marks it opened.
+            app.MapGet("/notifications/open/{messageId:guid}", async (Guid messageId, NotificationService service) =>
+                await service.MarkOpenedAsync(messageId) ? Results.Ok(new { success = true }) : Results.NotFound());
+        }
+
+        /// <summary>The unsubscribe link's user_id, channel and token from the query; ok false when user_id is not a number. Pure.</summary>
+        private static (bool Ok, long UserId, string? Channel, string? Token) ReadLink(HttpContext context)
+        {
+            var q = context.Request.Query;
+            var ok = long.TryParse(q["user_id"].ToString(), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var userId);
+            return (ok, userId, q["channel"].ToString(), q["token"].ToString());
         }
 
         /// <summary>Reads a JSON body, or null when it is missing or malformed. Touches: the request body.</summary>

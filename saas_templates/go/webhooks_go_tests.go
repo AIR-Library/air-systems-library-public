@@ -17,6 +17,7 @@ func newTestWebhook() *Webhook {
 	return NewWebhook(store)
 }
 
+// HOOK-01
 func TestWebhook_SignVerifyRoundtrip(t *testing.T) {
 	w := newTestWebhook()
 	_, secret, err := w.CreateEndpoint(1, "https://example.com", []string{"test"})
@@ -43,6 +44,7 @@ func TestWebhook_SignVerifyRoundtrip(t *testing.T) {
 	}
 }
 
+// HOOK-02
 func TestWebhook_VerifyFailsOnChangedBody(t *testing.T) {
 	w := newTestWebhook()
 	_, secret, err := w.CreateEndpoint(1, "https://example.com", []string{"test"})
@@ -68,6 +70,7 @@ func TestWebhook_VerifyFailsOnChangedBody(t *testing.T) {
 	}
 }
 
+// HOOK-02
 func TestWebhook_VerifyFailsOnChangedTimestamp(t *testing.T) {
 	w := newTestWebhook()
 	_, secret, err := w.CreateEndpoint(1, "https://example.com", []string{"test"})
@@ -91,6 +94,7 @@ func TestWebhook_VerifyFailsOnChangedTimestamp(t *testing.T) {
 	}
 }
 
+// HOOK-03
 func TestWebhook_VerifyRejectsOldTimestamp(t *testing.T) {
 	w := newTestWebhook()
 	_, secret, err := w.CreateEndpoint(1, "https://example.com", []string{"test"})
@@ -115,6 +119,7 @@ func TestWebhook_VerifyRejectsOldTimestamp(t *testing.T) {
 	}
 }
 
+// HOOK-04
 func TestWebhook_VerifyAcceptsOneOfMultipleSignatures(t *testing.T) {
 	w := newTestWebhook()
 	_, secret1, err := w.CreateEndpoint(1, "https://example.com", []string{"test"})
@@ -151,6 +156,7 @@ func TestWebhook_VerifyAcceptsOneOfMultipleSignatures(t *testing.T) {
 	}
 }
 
+// HOOK-05
 func TestWebhook_DeliverSuccessAndRetry(t *testing.T) {
 	w := newTestWebhook()
 
@@ -298,6 +304,7 @@ func TestWebhook_DeliverSuccessAndRetry(t *testing.T) {
 	}
 }
 
+// HOOK-07
 func TestWebhook_DeliverWebhookIDConsistent(t *testing.T) {
 	w := newTestWebhook()
 
@@ -351,6 +358,7 @@ func TestWebhook_DeliverWebhookIDConsistent(t *testing.T) {
 	}
 }
 
+// HOOK-08
 func TestWebhook_SecretGeneration(t *testing.T) {
 	w := newTestWebhook()
 	_, secret, err := w.CreateEndpoint(999, "https://example.com", []string{"any"})
@@ -392,6 +400,7 @@ func TestWebhook_RotateSecret(t *testing.T) {
 	}
 }
 
+// HOOK-06
 func TestWebhook_OrgIsolation(t *testing.T) {
 	w := newTestWebhook()
 

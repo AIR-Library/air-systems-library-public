@@ -166,6 +166,7 @@ describe('AuthSystem', () => {
   }
 
   describe('signup', () => {
+    // AUTH-01
     it('happy path (valid email, strong password) → user created, email sent', async () => {
       const result = await auth.signup('test@example.com', STRONG, 'Test User');
 
@@ -177,6 +178,7 @@ describe('AuthSystem', () => {
       expect(db.auditActions()).toContain('user_created');
     });
 
+    // AUTH-02
     it('signup duplicate email → {error: "email_already_exists"}', async () => {
       await auth.signup('test@example.com', STRONG, 'Test User');
 
@@ -186,12 +188,21 @@ describe('AuthSystem', () => {
       expect(db.users).toHaveLength(1);
     });
 
-    it('signup weak password → {error: "password_too_weak"}', async () => {
-      expect(await auth.signup('a@example.com', 'short', 'A')).toEqual({ error: 'password_too_weak', reason: 'too_short' });
-      expect(await auth.signup('b@example.com', 'x'.repeat(65), 'B')).toEqual({ error: 'password_too_weak', reason: 'too_long' });
+    // AUTH-03
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the spec amendment renamed the error to "password_rejected"
+    // (no "password_too_weak" anywhere) and fixed the order too_short, too_long, blocklisted, first failure wins.
+    // Each attempt passes its own client IP so the 5-per-IP signup limit is not what answers.
+    it('signup weak password → {error: "password_rejected", reason}', async () => {
+      expect(await auth.signup('a@example.com', 'short', 'A', '10.0.0.1')).toEqual({ error: 'password_rejected', reason: 'too_short' });
+      expect(await auth.signup('b@example.com', 'x'.repeat(65), 'B', '10.0.0.2')).toEqual({ error: 'password_rejected', reason: 'too_long' });
+      expect(await auth.signup('c@example.com', 'password123', 'C', '10.0.0.3')).toEqual({ error: 'password_rejected', reason: 'too_short' });
+      expect(await auth.signup('d@example.com', 'PasswordPassword', 'D', '10.0.0.4')).toEqual({ error: 'password_rejected', reason: 'blocklisted' });
+      expect(await auth.signup('Long.Name@Example.com', 'long.name@example.com', 'E', '10.0.0.5')).toEqual({ error: 'password_rejected', reason: 'blocklisted' });
+      expect(await auth.signup('f@example.com', 'Correct Horse Battery', 'correct horse battery', '10.0.0.6')).toEqual({ error: 'password_rejected', reason: 'blocklisted' });
       expect(db.users).toHaveLength(0);
     });
 
+    // AUTH-04
     it('signup IP rate limit → {error: "too_many_signups_from_ip"}', async () => {
       for (let i = 0; i < 5; i++) {
         await auth.signup(`user${i}@example.com`, STRONG, `User ${i}`);
@@ -205,6 +216,7 @@ describe('AuthSystem', () => {
   });
 
   describe('verify_email', () => {
+    // AUTH-05
     it('verify_email happy path → user verified, code used up', async () => {
       await auth.signup('test@example.com', STRONG, 'Test User');
 
@@ -215,6 +227,7 @@ describe('AuthSystem', () => {
       expect(db.codes).toHaveLength(0);
     });
 
+    // AUTH-06
     it('verify_email expired code → {error: "code_expired"}', async () => {
       await auth.signup('test@example.com', STRONG, 'Test User');
       db.codes[0].expires_at = new Date(Date.now() - 60 * 60 * 1000);
@@ -225,6 +238,7 @@ describe('AuthSystem', () => {
   });
 
   describe('login', () => {
+    // AUTH-07
     it('login happy path (no MFA) → token returned', async () => {
       const user = await verifiedUser();
 
@@ -240,6 +254,7 @@ describe('AuthSystem', () => {
       expect(db.sessions).toHaveLength(1);
     });
 
+    // AUTH-08
     it('login with MFA enabled → {status: "mfa_required", challenge_id}', async () => {
       const { challengeId } = await mfaChallenge();
 
@@ -247,6 +262,7 @@ describe('AuthSystem', () => {
       expect(db.sessions).toHaveLength(0);
     });
 
+    // AUTH-09
     it('login invalid password → {error: "invalid_credentials"}', async () => {
       const user = await verifiedUser();
 
@@ -265,6 +281,7 @@ describe('AuthSystem', () => {
   });
 
   describe('oauth_callback', () => {
+    // AUTH-10
     it('oauth_callback happy path (new user) → user created + oauth linked', async () => {
       const result = await auth.oauth_callback('google', 'authcode', 'valid_state');
 
@@ -273,6 +290,7 @@ describe('AuthSystem', () => {
       expect(db.oauthLinks).toHaveLength(1);
     });
 
+    // AUTH-11
     it('oauth_callback existing user → oauth linked to existing account', async () => {
       const user = await verifiedUser('user@github.com');
 
@@ -286,6 +304,7 @@ describe('AuthSystem', () => {
   });
 
   describe('mfa_challenge', () => {
+    // AUTH-12
     it('mfa_challenge happy path → token returned, challenge used up, actor audited', async () => {
       const { secret, challengeId } = await mfaChallenge();
       const code = speakeasy.totp({ secret, encoding: 'base32' });
@@ -298,6 +317,7 @@ describe('AuthSystem', () => {
       expect(errors).toHaveLength(0);
     });
 
+    // AUTH-13
     it('mfa_challenge wrong code → {error: "invalid_code"}', async () => {
       const { challengeId } = await mfaChallenge();
 
@@ -332,6 +352,7 @@ describe('AuthSystem', () => {
   });
 
   describe('token_refresh', () => {
+    // AUTH-14
     it('token_refresh happy path → new token issued, actor audited', async () => {
       const user = await verifiedUser();
       await auth.login(user.email, STRONG, 'device123', '1.2.3.4');
@@ -342,6 +363,7 @@ describe('AuthSystem', () => {
       expect(db.audit.find((a) => a.action === 'token_refreshed')?.actor_id).toBe(user.id);
     });
 
+    // AUTH-15
     it('token_refresh banned user → {error: "user_banned"}', async () => {
       const user = await verifiedUser();
       await auth.login(user.email, STRONG, 'device123', '1.2.3.4');

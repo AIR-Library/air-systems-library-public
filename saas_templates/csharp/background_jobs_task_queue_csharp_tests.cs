@@ -115,6 +115,9 @@ public class BackgroundJobsTests : IClassFixture<WebApplicationFactory<Backgroun
         throw new TimeoutException($"Job {jobId} did not reach status {desired} in time");
     }
 
+    // JOBS-01
+    // JOBS-02
+    // JOBS-09
     [Fact]
     public async Task Enqueue_Job_Runs_To_Completion()
     {
@@ -125,6 +128,7 @@ public class BackgroundJobsTests : IClassFixture<WebApplicationFactory<Backgroun
         Assert.NotNull(result);
     }
 
+    // JOBS-03
     [Fact]
     public async Task Job_Fails_And_Retries_With_Exponential_Backoff()
     {
@@ -136,10 +140,13 @@ public class BackgroundJobsTests : IClassFixture<WebApplicationFactory<Backgroun
         using var scope = _factory.Services.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<JobsDbContext>();
         var job = await db.Jobs.FindAsync(jobId);
-        Assert.Equal(3, job!.RetryCount); // initial try + 2 retries
+        // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (JOBS-03/04 amendment): retry_count counts retries only,
+        // so after the first try and 2 retries it is 2 (was asserted as 3, counting the first try too).
+        Assert.Equal(2, job!.RetryCount);
         Assert.Equal(JobStatus.Failed, job.Status);
     }
 
+    // JOBS-04
     [Fact]
     public async Task Job_Exceeds_Max_Retries_And_Fails()
     {
@@ -149,10 +156,14 @@ public class BackgroundJobsTests : IClassFixture<WebApplicationFactory<Backgroun
         using var scope = _factory.Services.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<JobsDbContext>();
         var job = await db.Jobs.FindAsync(jobId);
-        Assert.Equal(2, job!.RetryCount); // initial + 1 retry
+        // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (JOBS-04 amendment): failed with retry_count = max_retries
+        // (was asserted as 2 = max_retries + 1).
+        Assert.Equal(1, job!.RetryCount);
         Assert.Equal(JobStatus.Failed, job.Status);
+        Assert.Equal(2, await db.JobRuns.CountAsync(r => r.JobId == jobId)); // the first try and one retry
     }
 
+    // JOBS-05
     [Fact]
     public async Task User_Cancels_Before_Start()
     {
@@ -166,6 +177,7 @@ public class BackgroundJobsTests : IClassFixture<WebApplicationFactory<Backgroun
         Assert.Equal(JobStatus.Cancelled, status);
     }
 
+    // JOBS-06
     [Fact]
     public async Task Progress_Tracking_Updates()
     {
@@ -180,6 +192,7 @@ public class BackgroundJobsTests : IClassFixture<WebApplicationFactory<Backgroun
         Assert.Matches(@"^\d+/\d+$", progress);
     }
 
+    // JOBS-07
     [Fact]
     public async Task Scheduled_Jobs_Run_After_Scheduled_Time()
     {
@@ -193,14 +206,19 @@ public class BackgroundJobsTests : IClassFixture<WebApplicationFactory<Backgroun
         Assert.Equal(JobStatus.Completed, finalStatus);
     }
 
+    // JOBS-08
     [Fact]
     public async Task Bulk_Job_Does_Not_Block_Request()
     {
+        // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: JOBS-08 names 10,000 items; the job now walks 10,000 and
+        // the test checks all were processed (before, the handler always walked 500).
         var start = DateTime.UtcNow;
-        var jobId = await EnqueueJobAsync("send_bulk_email", new { template_key = "test", filter = new { } });
+        var jobId = await EnqueueJobAsync("send_bulk_email", new { template_key = "test", filter = new { }, count = 10_000 });
         var elapsed = DateTime.UtcNow - start;
         Assert.True(elapsed.TotalSeconds < 1, "Enqueue request should be fast");
         await WaitForStatusAsync(jobId, JobStatus.Completed, TimeSpan.FromSeconds(30));
+        var result = (JsonElement)(await GetJobResultAsync(jobId))!;
+        Assert.Equal(10_000, result.GetProperty("sent").GetInt32());
     }
 
     [Fact]
@@ -270,6 +288,118 @@ public class JobWorkerShutdownAndRedirectTests
 
     /// <summary>A pass-through DelegatingHandler, to prove the sender reaches the innermost handler. Pure.</summary>
     private sealed class PassThroughHandler : DelegatingHandler { }
+
+    /// <summary>A webhook sender that always fails and counts its calls (a failed attempt). No network. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.</summary>
+    private sealed class AlwaysFailingSender : IWebhookSender
+    {
+        public int Calls;
+        public Task SendAsync(string url, string payloadJson, CancellationToken ct)
+        {
+            Interlocked.Increment(ref Calls);
+            throw new HttpRequestException("receiver answered 500");
+        }
+    }
+
+    /// <summary>
+    /// A worker over a private in-memory database with the given sender and clock, and one enqueued webhook_retry job
+    /// with <paramref name="maxRetries"/>. Out: the provider (dispose it), the worker and the job id. 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite.
+    /// </summary>
+    private static async Task<(ServiceProvider Provider, SqliteConnection KeepAlive, JobProcessor Worker, Guid JobId)> WorkerWithJob(
+        IWebhookSender sender, Func<DateTime> clock, int maxRetries)
+    {
+        var connectionString = $"DataSource=file:jobs_retry_{Guid.NewGuid():N}?mode=memory&cache=shared";
+        var keepAlive = new SqliteConnection(connectionString);
+        keepAlive.Open();
+        var services = new ServiceCollection();
+        services.AddDbContext<JobsDbContext>(o => o.UseSqlite(connectionString));
+        services.AddScoped<IJobRepository, JobRepository>();
+        services.AddSingleton<JobDispatcher>();
+        services.AddSingleton(sender);
+        services.AddTransient<WebhookRetryHandler>();
+        var provider = services.BuildServiceProvider();
+        using var scope = provider.CreateScope();
+        scope.ServiceProvider.GetRequiredService<JobsDbContext>().Database.EnsureCreated();
+        var job = await scope.ServiceProvider.GetRequiredService<IJobRepository>()
+            .EnqueueAsync("webhook_retry", new { url = "https://hooks.example.com/deliver" }, null, maxRetries);
+        return (provider, keepAlive, new JobProcessor(provider, NullLogger<JobProcessor>.Instance, clock), job.Id);
+    }
+
+    /// <summary>Reads a job outside the worker's scope. Touches: in-memory SQLite.</summary>
+    private static async Task<Job> ReadJob(ServiceProvider provider, Guid jobId)
+    {
+        using var scope = provider.CreateScope();
+        return await scope.ServiceProvider.GetRequiredService<JobsDbContext>().Jobs.AsNoTracking().SingleAsync(j => j.Id == jobId);
+    }
+
+    /// <summary>
+    /// JOBS-03: after a failed attempt the job waits 'enqueued' with retry_count 1 and next_retry_at = failure + 1 s;
+    /// the worker skips it before then; retry 2 waits 2 s. Deterministic: the worker's clock is moved by hand.
+    /// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec amendment). Touches: in-memory SQLite.
+    /// </summary>
+    // JOBS-03
+    [Fact]
+    public async Task Failed_Attempt_Waits_1s_Then_2s_And_Counts_Retries()
+    {
+        var now = new DateTime(2026, 11, 10, 12, 0, 0, DateTimeKind.Utc);
+        var sender = new AlwaysFailingSender();
+        var (provider, keepAlive, worker, jobId) = await WorkerWithJob(sender, () => now, 3);
+        using var _p = provider;
+        using var _k = keepAlive;
+
+        await worker.ProcessPendingJobs(CancellationToken.None);
+        var job = await ReadJob(provider, jobId);
+        Assert.Equal(1, sender.Calls);
+        Assert.Equal(JobStatus.Enqueued, job.Status);
+        Assert.Equal(1, job.RetryCount);
+        Assert.Equal(now.AddSeconds(1), job.NextRetryAt);
+
+        now = now.AddMilliseconds(999);
+        await worker.ProcessPendingJobs(CancellationToken.None);
+        Assert.Equal(1, sender.Calls); // not due yet: skipped
+
+        now = now.AddMilliseconds(1);
+        await worker.ProcessPendingJobs(CancellationToken.None);
+        job = await ReadJob(provider, jobId);
+        Assert.Equal(2, sender.Calls);
+        Assert.Equal(2, job.RetryCount);
+        Assert.Equal(now.AddSeconds(2), job.NextRetryAt);
+        Assert.Equal(JobStatus.Enqueued, job.Status);
+    }
+
+    /// <summary>
+    /// JOBS-04: with max_retries = 3 the job runs 4 times (waits 1 s, 2 s, 4 s), then is 'failed' with retry_count 3,
+    /// no next_retry_at, and never runs again. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec amendment).
+    /// Touches: in-memory SQLite.
+    /// </summary>
+    // JOBS-04
+    [Fact]
+    public async Task Max_Retries_3_Runs_4_Times_Then_Failed_With_RetryCount_3()
+    {
+        var now = new DateTime(2026, 11, 10, 12, 0, 0, DateTimeKind.Utc);
+        var sender = new AlwaysFailingSender();
+        var (provider, keepAlive, worker, jobId) = await WorkerWithJob(sender, () => now, 3);
+        using var _p = provider;
+        using var _k = keepAlive;
+
+        foreach (var wait in new[] { 0, 1, 2, 4 })
+        {
+            now = now.AddSeconds(wait);
+            await worker.ProcessPendingJobs(CancellationToken.None);
+        }
+
+        var job = await ReadJob(provider, jobId);
+        Assert.Equal(4, sender.Calls);
+        Assert.Equal(JobStatus.Failed, job.Status);
+        Assert.Equal(3, job.RetryCount);
+        Assert.Null(job.NextRetryAt);
+
+        now = now.AddHours(1);
+        await worker.ProcessPendingJobs(CancellationToken.None);
+        Assert.Equal(4, sender.Calls);
+        using var scope = provider.CreateScope();
+        Assert.Equal(4, await scope.ServiceProvider.GetRequiredService<JobsDbContext>().JobRuns.CountAsync(r => r.JobId == jobId));
+    }
 
     [Fact]
     public async Task Job_Interrupted_By_Shutdown_Is_Requeued_Without_Using_A_Retry()

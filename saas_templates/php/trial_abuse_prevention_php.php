@@ -18,6 +18,14 @@ use RuntimeException;
  * Implements the 6-gate abuse detection pipeline (email trial history, payment
  * method history, IP signup rate limit, device fingerprint, trial payment
  * timing, chargeback history) with a shared why-chain audit log.
+ *
+ * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (TRIAL-09/10/11/14/15 as amended): the device gate counts OTHER
+ * users (null-safe) and decides FAIL >= 5, PASS < 2, PASS for the user's own device, else CHALLENGE; the
+ * device row is written after the decision and only for PASS/CHALLENGE, and signup runs the gate before
+ * recording (recording first made a device farm always pass). Payment timing judges the payment being added
+ * now: days_after_trial = floor((now - (created_at + trial_days)) / 1 day); PASS < 5, FAIL >= 90 with no
+ * earlier payment, else CHALLENGE; trial_days is configuration (default 14).
+ * Touches: the database (all tables below). No network.
  */
 final class TrialAbusePrevention
 {
@@ -45,7 +53,6 @@ final class TrialAbusePrevention
     private const EMAIL_LIMIT_CHALLENGE = 1;
     private const EMAIL_LIMIT_FAIL = 2;
 
-    private const LATE_PAYMENT_CHALLENGE_DAYS = 30;
     private const LATE_PAYMENT_GRACE_DAYS = 5;
     private const READD_BLOCK_DAYS = 90;
 
@@ -61,11 +68,22 @@ final class TrialAbusePrevention
 
     private PDO $db;
     private ?string $nowOverride;
+    private int $trialDays;
 
-    public function __construct(PDO $db, ?string $nowOverride = null)
+    /**
+     * Inputs: $db (shared connection), $nowOverride (fixed "now" for tests and replays; null = the system
+     * clock, UTC), $trialDays (trial length for new signups; configuration, default 14).
+     * Why: trial_days is configurable (amended TRIAL-10/11/15). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches: nothing until a method is called.
+     */
+    public function __construct(PDO $db, ?string $nowOverride = null, int $trialDays = 14)
     {
+        if ($trialDays < 0) {
+            throw new InvalidArgumentException('trial_days must not be negative');
+        }
         $this->db = $db;
         $this->nowOverride = $nowOverride;
+        $this->trialDays = $trialDays;
     }
 
     /**
@@ -285,16 +303,27 @@ final class TrialAbusePrevention
     }
 
     /**
-     * Gate 4: device fingerprint.
+     * Gate 4: device fingerprint (amended TRIAL-09/14).
+     *
+     * Inputs: the device {user_agent, screen_resolution, timezone, browser_language} and the user it is
+     * being checked for (null before the user exists, e.g. at signup). Output: GateResult with
+     * matching_users = the number of OTHER users with this device hash (null-safe: with no user every user
+     * counts). Decision, in this order: FAIL if count >= 5; PASS if count < 2; PASS if this user already has
+     * a row for this device; CHALLENGE otherwise. This method writes NO device row; callers record the device
+     * after the decision and only for PASS/CHALLENGE (checkAndRecordDevice, signup).
+     * Why: the old gate counted the user themself, let a known device pass even at 5+ users, and the old
+     * CHALLENGE range overlapped FAIL at exactly 5. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches: the database (reads; one gate_decisions row).
      */
     public function checkDeviceFingerprint(array $device, ?string $userId = null): GateResult
     {
         $deviceHash = self::computeDeviceHash($device);
 
         $stmt = $this->db->prepare(
-            'SELECT COUNT(DISTINCT user_id) FROM device_fingerprints WHERE device_hash = :hash'
+            'SELECT COUNT(DISTINCT user_id) FROM device_fingerprints
+             WHERE device_hash = :hash AND (:uid1 IS NULL OR user_id != :uid2)'
         );
-        $stmt->execute(['hash' => $deviceHash]);
+        $stmt->execute(['hash' => $deviceHash, 'uid1' => $userId, 'uid2' => $userId]);
         $matchingUsers = (int) $stmt->fetchColumn();
 
         $knownDevice = false;
@@ -306,32 +335,48 @@ final class TrialAbusePrevention
             $knownDevice = (int) $known->fetchColumn() > 0;
         }
 
-        if ($matchingUsers < self::DEVICE_LIMIT_CHALLENGE || $knownDevice) {
-            $decision = self::DECISION_PASS;
-        } elseif ($matchingUsers >= self::DEVICE_LIMIT_FAIL) {
+        if ($matchingUsers >= self::DEVICE_LIMIT_FAIL) {
             $decision = self::DECISION_FAIL;
+        } elseif ($matchingUsers < self::DEVICE_LIMIT_CHALLENGE) {
+            $decision = self::DECISION_PASS;
+        } elseif ($knownDevice) {
+            $decision = self::DECISION_PASS;
         } else {
             $decision = self::DECISION_CHALLENGE;
         }
 
-        $this->logGate(
-            self::GATE_DEVICE_FINGERPRINT,
-            $userId,
-            $decision,
-            ['device_hash' => $deviceHash, 'matching_users' => $matchingUsers, 'known_device' => $knownDevice],
-            ['decision' => $decision]
-        );
+        $inputs = ['device_hash' => $deviceHash, 'matching_users' => $matchingUsers, 'known_device' => $knownDevice];
+        $this->logGate(self::GATE_DEVICE_FINGERPRINT, $userId, $decision, $inputs, ['decision' => $decision]);
 
-        return new GateResult(
-            self::GATE_DEVICE_FINGERPRINT,
-            $decision,
-            ['device_hash' => $deviceHash, 'matching_users' => $matchingUsers, 'known_device' => $knownDevice],
-            ['decision' => $decision]
-        );
+        return new GateResult(self::GATE_DEVICE_FINGERPRINT, $decision, $inputs, ['decision' => $decision]);
     }
 
     /**
-     * Gate 5: trial payment timing.
+     * Run the device gate for an existing user and then, only for PASS or CHALLENGE, record the device
+     * (once per user and device). A FAIL records nothing. Output: the GateResult.
+     * Why: amended TRIAL-14 ("a FAIL records no device row"; the row is written after the decision).
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database.
+     */
+    public function checkAndRecordDevice(array $device, string $userId): GateResult
+    {
+        $result = $this->checkDeviceFingerprint($device, $userId);
+        if (!$result->isFail() && !$result->ruleInputs['known_device']) {
+            $this->recordDeviceFingerprint($userId, $device, $result->ruleInputs['device_hash']);
+        }
+        return $result;
+    }
+
+    /**
+     * Gate 5: trial payment timing (amended TRIAL-10/11/15), judged when a payment method is being added,
+     * so the payment date is now.
+     *
+     * Input: the user id. Output: GateResult with days_after_trial = floor((now - trial_end) / 1 day), where
+     * trial_end = user.created_at + user.trial_days (negative while the trial runs; floor rounds toward
+     * negative infinity) and earlier_payment = the ledger already has a payment_added_date for the user.
+     * Decision: PASS if days_after_trial < 5; FAIL if days_after_trial >= 90 and no earlier payment;
+     * CHALLENGE otherwise. Throws InvalidArgumentException for an unknown user.
+     * Why: the old rule compared days since signup and a stored payment date in ways the spec dropped.
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database (reads; one gate_decisions row).
      */
     public function checkTrialPaymentTiming(string $userId): GateResult
     {
@@ -341,44 +386,27 @@ final class TrialAbusePrevention
         }
 
         $trialDays = (int) $user['trial_days'];
-        $trialStartDate = new DateTimeImmutable($user['created_at']);
-        $now = $this->now();
-        $daysElapsed = (int) floor(($now->getTimestamp() - $trialStartDate->getTimestamp()) / 86400);
+        $trialEnd = (new DateTimeImmutable($user['created_at']))->getTimestamp() + $trialDays * 86400;
+        $now = $this->now()->getTimestamp();
+        $daysAfterTrial = (int) floor(($now - $trialEnd) / 86400);
 
-        $ledger = $this->fetchLedgerByUser($userId);
-        $paymentAddedDate = $ledger['payment_added_date'] ?? null;
-        $trialEnded = $daysElapsed > $trialDays;
-        $neverAddedPayment = $paymentAddedDate === null;
-        $readdAfter90 = $daysElapsed >= self::READD_BLOCK_DAYS;
+        $earlierPayment = false;
+        $stmt = $this->db->prepare('SELECT COUNT(*) FROM trial_abuse_ledger WHERE user_id = :uid AND payment_added_date IS NOT NULL');
+        $stmt->execute(['uid' => $userId]);
+        $earlierPayment = (int) $stmt->fetchColumn() > 0;
 
-        if ($trialEnded && $neverAddedPayment && $readdAfter90) {
-            $decision = self::DECISION_FAIL;
-        } elseif ($daysElapsed > $trialDays + self::LATE_PAYMENT_CHALLENGE_DAYS && $paymentAddedDate !== null) {
-            $paymentDate = new DateTimeImmutable($paymentAddedDate);
-            $lateThreshold = $trialStartDate->modify('+' . $trialDays . ' days');
-            if ($paymentDate > $lateThreshold) {
-                $decision = self::DECISION_CHALLENGE;
-            } else {
-                $decision = self::DECISION_PASS;
-            }
-        } else {
+        if ($daysAfterTrial < self::LATE_PAYMENT_GRACE_DAYS) {
             $decision = self::DECISION_PASS;
+        } elseif ($daysAfterTrial >= self::READD_BLOCK_DAYS && !$earlierPayment) {
+            $decision = self::DECISION_FAIL;
+        } else {
+            $decision = self::DECISION_CHALLENGE;
         }
 
-        $this->logGate(
-            self::GATE_TRIAL_PAYMENT_TIMING,
-            $userId,
-            $decision,
-            ['trial_duration' => $trialDays, 'days_elapsed' => $daysElapsed, 'payment_delay' => $paymentAddedDate],
-            ['decision' => $decision]
-        );
+        $inputs = ['trial_duration' => $trialDays, 'payment_delay' => $daysAfterTrial, 'days_after_trial' => $daysAfterTrial, 'earlier_payment' => $earlierPayment];
+        $this->logGate(self::GATE_TRIAL_PAYMENT_TIMING, $userId, $decision, $inputs, ['decision' => $decision]);
 
-        return new GateResult(
-            self::GATE_TRIAL_PAYMENT_TIMING,
-            $decision,
-            ['trial_duration' => $trialDays, 'days_elapsed' => $daysElapsed, 'payment_delay' => $paymentAddedDate],
-            ['decision' => $decision]
-        );
+        return new GateResult(self::GATE_TRIAL_PAYMENT_TIMING, $decision, $inputs, ['decision' => $decision]);
     }
 
     /**
@@ -434,7 +462,15 @@ final class TrialAbusePrevention
     }
 
     /**
-     * Run the signup flow: email + IP gates, create user, apply flags, log ledger.
+     * Run the signup flow: email + IP gates (+ the device gate when a device is given), create user, apply
+     * flags, record the device (PASS/CHALLENGE only), log ledger.
+     *
+     * Inputs: email, password, the caller's IP (from the server, not the body), the device or []. Output:
+     * {status, body}: 409 email_has_trial_history, 429 too_many_signups_from_ip, 403 device_suspected_fraud
+     * (no user and no device row are created), or 200 with challenge 'captcha' / 'email_confirm'.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the device gate now runs BEFORE the device is recorded (it used to
+     * record first and never check), and new users get the configured trial_days.
+     * Touches: the database.
      *
      * @return array{status: int, body: array<string, mixed>}
      */
@@ -442,6 +478,7 @@ final class TrialAbusePrevention
     {
         $emailGate = $this->checkEmailTrialHistory($email);
         $ipGate = $this->checkIpSignupRateLimit($ip);
+        $deviceGate = $device !== [] ? $this->checkDeviceFingerprint($device, null) : null;
 
         if ($emailGate->decision === self::DECISION_FAIL) {
             return [
@@ -466,6 +503,17 @@ final class TrialAbusePrevention
             ];
         }
 
+        if ($deviceGate !== null && $deviceGate->isFail()) {
+            return [
+                'status' => 403,
+                'body' => [
+                    'error' => 'device_suspected_fraud',
+                    'message' => 'This device is linked to too many accounts.',
+                    'code' => 403,
+                ],
+            ];
+        }
+
         $userId = $this->generateId('usr');
         $now = $this->now()->format('Y-m-d H:i:s');
         $passwordHash = password_hash($password, PASSWORD_DEFAULT);
@@ -480,7 +528,7 @@ final class TrialAbusePrevention
             'hash' => $passwordHash,
             'flags' => null,
             'cust' => null,
-            'days' => 14,
+            'days' => $this->trialDays,
             'created' => $now,
         ]);
 
@@ -507,9 +555,15 @@ final class TrialAbusePrevention
             'ip' => $ipGate->decision,
         ];
 
-        $deviceHash = $device !== [] ? self::computeDeviceHash($device) : null;
-        if ($deviceHash !== null) {
+        // The device row is written after the gate's decision, and only for PASS or CHALLENGE (a FAIL
+        // returned above).
+        $deviceHash = $deviceGate?->ruleInputs['device_hash'];
+        if ($deviceGate !== null) {
+            $gateFlags['device'] = $deviceGate->decision;
             $this->recordDeviceFingerprint($userId, $device, $deviceHash);
+            if ($deviceGate->isChallenge()) {
+                $abuseFlags[] = 'new_device_challenge';
+            }
         }
 
         $ledgerStmt = $this->db->prepare(
@@ -548,6 +602,10 @@ final class TrialAbusePrevention
             'verification_email_sent' => true,
         ];
 
+        if ($deviceGate !== null && $deviceGate->isChallenge()) {
+            $body['challenge'] = self::CHALLENGE_EMAIL_CONFIRM;
+            $body['message'] = 'New device login detected. Please confirm your email.';
+        }
         if ($ipGate->decision === self::DECISION_CHALLENGE) {
             $body['challenge'] = self::CHALLENGE_CAPTCHA;
             $body['message'] = 'Please complete CAPTCHA verification.';
@@ -840,7 +898,7 @@ final class TrialAbusePrevention
             'status' => $overrides['subscription_status'] ?? 'trialing',
             'cb' => $overrides['chargeback_count'] ?? 0,
             'rf' => $overrides['refund_count'] ?? 0,
-            'flags' => $overrides['gate_flags'] !== null ? json_encode($overrides['gate_flags']) : null,
+            'flags' => isset($overrides['gate_flags']) ? json_encode($overrides['gate_flags']) : null,
             'alert' => $overrides['alert_reason'] ?? null,
             'created' => $overrides['created_at'] ?? $now,
         ]);

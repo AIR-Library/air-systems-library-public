@@ -4,12 +4,43 @@ using System.Linq;
 using Xunit;
 using AdminSystem;
 
+/// <summary>
+/// Records the Stripe calls change_plan makes and answers retrieve with <see cref="ItemIds"/>. No network.
+/// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-12 amendment).
+/// </summary>
+public class FakeAdminStripe : IAdminStripeClient
+{
+    public List<string> ItemIds = new List<string> { "si_1" };
+    public List<(string Sub, string Item, string Price, string Proration)> Updates = new List<(string, string, string, string)>();
+
+    public IReadOnlyList<string> RetrieveSubscriptionItemIds(string subscriptionId) => ItemIds;
+
+    public void UpdateSubscriptionItem(string subscriptionId, string itemId, string priceId, string prorationBehavior) =>
+        Updates.Add((subscriptionId, itemId, priceId, prorationBehavior));
+}
+
+/// <summary>Records the emails admin actions send. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. No network.</summary>
+public class FakeAdminMailer : IAdminMailer
+{
+    public List<(string Kind, string Email, string Token)> Sent = new List<(string, string, string)>();
+    public void SendInvite(string email, string oneTimeToken) => Sent.Add(("invite", email, oneTimeToken));
+    public void SendPasswordReset(string email, string resetToken) => Sent.Add(("reset", email, resetToken));
+}
+
 public class AdminControllerTests
 {
-    private readonly AdminController _controller = new AdminController();
+    private readonly FakeAdminStripe _stripe = new FakeAdminStripe();
+    private readonly FakeAdminMailer _mailer = new FakeAdminMailer();
+    private readonly AdminController _controller;
 
+    /// <summary>
+    /// Clears the shared state and builds the controller with the fake Stripe client and mailer.
+    /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: fakes injected; governance executors reset.
+    /// </summary>
     public AdminControllerTests()
     {
+        _controller = new AdminController(_stripe, mailer: _mailer);
+        GovernanceExecutors.Reset();
         // Clear all static state before each test to ensure isolation
         Database.Users.Clear();
         Database.Customers.Clear();
@@ -64,7 +95,7 @@ public class AdminControllerTests
         {
             Email = "cust@example.com",
             Name = "Customer",
-            Tier = Role.User,
+            Tier = "solo", // customers carry a plan, not a staff role (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
             StripeSubscriptionId = "sub_123"
         };
         Database.Customers.Add(cust);
@@ -78,7 +109,8 @@ public class AdminControllerTests
             CustomerId = customerId,
             Domain = domain,
             Tier = Role.User,
-            ThemeId = Guid.NewGuid()
+            ThemeId = Guid.NewGuid(),
+            DomainVerified = true // publish now checks it (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
         };
         Database.Deployments.Add(dep);
         return dep;
@@ -112,6 +144,7 @@ public class AdminControllerTests
     }
 
     // ---------- USER TESTS ----------
+    // ADMIN-01
     [Fact]
     public void CreateUser_HappyPath()
     {
@@ -123,8 +156,16 @@ public class AdminControllerTests
         Assert.True(((dynamic)result).success);
         Assert.Equal("new@example.com", ((dynamic)result).email);
         Assert.Equal("User", ((dynamic)result).tier);
+        // ADMIN-01 "user created + invite sent" (asserts added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+        Assert.Contains(Database.Users, u => u.Email == "new@example.com");
+        Assert.True(((dynamic)result).invite_sent);
+        Assert.Single(_mailer.Sent);
+        Assert.Equal(("invite", "new@example.com"), (_mailer.Sent[0].Kind, _mailer.Sent[0].Email));
+        Assert.Null(((dynamic)result).one_time_password);
+        Assert.Contains(Database.AuditLog, l => l.Action == "user_created");
     }
 
+    // ADMIN-02
     [Fact]
     public void CreateUser_DuplicateEmail()
     {
@@ -136,8 +177,10 @@ public class AdminControllerTests
         var ex = Assert.Throws<ApiException>(() =>
             _controller.CreateUser(csrf, "dup@example.com", "Dup", "User", false));
         Assert.Equal("email_exists", ex.Code);
+        Assert.Equal(409, ex.Status);
     }
 
+    // ADMIN-03
     [Fact]
     public void CreateUser_NonOwner()
     {
@@ -148,6 +191,7 @@ public class AdminControllerTests
         var ex = Assert.Throws<ApiException>(() =>
             _controller.CreateUser(csrf, "test@example.com", "Test", "User", false));
         Assert.Equal("owner_only", ex.Code);
+        Assert.Equal(403, ex.Status);
     }
 
     [Fact]
@@ -162,6 +206,7 @@ public class AdminControllerTests
         Assert.Equal("invalid_tier", ex.Code);
     }
 
+    // ADMIN-04
     [Fact]
     public void ResetPassword_HappyPath()
     {
@@ -173,8 +218,14 @@ public class AdminControllerTests
         var result = _controller.ResetPassword(csrf, user.UserId);
         Assert.True(((dynamic)result).success);
         Assert.Equal("reset_email_sent", ((dynamic)result).status);
+        // ADMIN-04 "email sent" (asserts added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP); only the token's hash is kept
+        Assert.Single(_mailer.Sent);
+        Assert.Equal(("reset", "reset@example.com"), (_mailer.Sent[0].Kind, _mailer.Sent[0].Email));
+        Assert.NotEqual(_mailer.Sent[0].Token, user.PasswordTokenHash);
+        Assert.Equal(64, user.PasswordTokenHash.Length);
     }
 
+    // ADMIN-05
     [Fact]
     public void ResetPassword_OwnAccount()
     {
@@ -187,8 +238,14 @@ public class AdminControllerTests
         var ex = Assert.Throws<ApiException>(() =>
             _controller.ResetPassword(csrf, owner.UserId));
         Assert.Equal("cannot_reset_own_password", ex.Code);
+        Assert.Equal(400, ex.Status);
     }
 
+    /// <summary>
+    /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the spec checks the own-account gate before the last-owner
+    /// check, so the sole owner resetting their own password now gets cannot_reset_own_password. The last-owner refusal
+    /// is shown on another owner who is the last ACTIVE owner because the acting owner is suspended.
+    /// </summary>
     [Fact]
     public void ResetPassword_LastOwner()
     {
@@ -196,11 +253,18 @@ public class AdminControllerTests
         SetupAuth(owner);
         var csrf = GetCsrfToken(owner);
 
-        var ex = Assert.Throws<ApiException>(() =>
+        var own = Assert.Throws<ApiException>(() =>
             _controller.ResetPassword(csrf, owner.UserId));
+        Assert.Equal("cannot_reset_own_password", own.Code);
+
+        var owner2 = CreateOwner("owner2@example.com");
+        owner.Status = "suspended";
+        var ex = Assert.Throws<ApiException>(() =>
+            _controller.ResetPassword(csrf, owner2.UserId));
         Assert.Equal("cannot_reset_last_owner", ex.Code);
     }
 
+    // ADMIN-06
     [Fact]
     public void ChangeRole_HappyPath()
     {
@@ -213,6 +277,9 @@ public class AdminControllerTests
         Assert.True(((dynamic)result).success);
         Assert.Equal("User", ((dynamic)result).old_tier);
         Assert.Equal("Admin", ((dynamic)result).new_tier);
+        // ADMIN-06 "role changed + audit logged" (asserts added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+        Assert.Equal(Role.Admin, user.Tier);
+        Assert.Contains(Database.AuditLog, l => l.Action == "role_changed" && l.ResourceId == user.UserId && l.OldValue == "User" && l.NewValue == "Admin");
     }
 
     [Fact]
@@ -229,17 +296,30 @@ public class AdminControllerTests
         Assert.Equal("cannot_change_own_role", ex.Code);
     }
 
+    /// <summary>
+    /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: own-account gate first (spec order), so the sole owner
+    /// demoting themselves gets cannot_change_own_role; demoting another owner who is the last ACTIVE owner (the actor
+    /// is suspended) is cannot_demote_last_owner and the role is unchanged.
+    /// </summary>
+    // ADMIN-07
     [Fact]
     public void ChangeRole_LastOwner()
     {
-        // Only one owner exists, try to demote them
         var owner = CreateOwner();
         SetupAuth(owner);
         var csrf = GetCsrfToken(owner);
 
-        var ex = Assert.Throws<ApiException>(() =>
+        var own = Assert.Throws<ApiException>(() =>
             _controller.ChangeUserRole(csrf, owner.UserId, "Admin"));
+        Assert.Equal("cannot_change_own_role", own.Code);
+
+        var owner2 = CreateOwner("owner2@example.com");
+        owner.Status = "suspended";
+        var ex = Assert.Throws<ApiException>(() =>
+            _controller.ChangeUserRole(csrf, owner2.UserId, "Admin"));
         Assert.Equal("cannot_demote_last_owner", ex.Code);
+        Assert.Equal(400, ex.Status);
+        Assert.Equal(Role.Owner, owner2.Tier);
     }
 
     [Fact]
@@ -255,6 +335,7 @@ public class AdminControllerTests
         Assert.Equal("invalid_tier", ex.Code);
     }
 
+    // ADMIN-08
     [Fact]
     public void SuspendUser_HappyPath()
     {
@@ -266,8 +347,10 @@ public class AdminControllerTests
         var result = _controller.SuspendUser(csrf, user.UserId, "Violation");
         Assert.True(((dynamic)result).success);
         Assert.True(((dynamic)result).suspended);
+        Assert.Equal("suspended", user.Status); // ADMIN-08 "status changed" (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
     }
 
+    // ADMIN-09
     [Fact]
     public void SuspendUser_OwnAccount()
     {
@@ -282,6 +365,10 @@ public class AdminControllerTests
         Assert.Equal("cannot_suspend_yourself", ex.Code);
     }
 
+    /// <summary>
+    /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: own-account gate first (spec order), so the sole owner gets
+    /// cannot_suspend_yourself; suspending another owner who is the last ACTIVE owner is cannot_suspend_last_owner.
+    /// </summary>
     [Fact]
     public void SuspendUser_LastOwner()
     {
@@ -289,12 +376,20 @@ public class AdminControllerTests
         SetupAuth(owner);
         var csrf = GetCsrfToken(owner);
 
-        var ex = Assert.Throws<ApiException>(() =>
+        var own = Assert.Throws<ApiException>(() =>
             _controller.SuspendUser(csrf, owner.UserId, "Self"));
+        Assert.Equal("cannot_suspend_yourself", own.Code);
+
+        var owner2 = CreateOwner("owner2@example.com");
+        owner.Status = "suspended";
+        var ex = Assert.Throws<ApiException>(() =>
+            _controller.SuspendUser(csrf, owner2.UserId, "Last"));
         Assert.Equal("cannot_suspend_last_owner", ex.Code);
+        Assert.Equal("active", owner2.Status);
     }
 
     // ---------- CUSTOMER TESTS ----------
+    // ADMIN-10
     [Fact]
     public void Customers_List_Pagination()
     {
@@ -309,14 +404,26 @@ public class AdminControllerTests
             {
                 Email = $"c{i}@example.com",
                 Name = $"Cust{i}",
-                Tier = Role.User
+                Tier = "team"
             });
         }
 
         var result = _controller.ListCustomers(csrf, page: 2, pageSize: 10) as List<object>;
         Assert.Equal(10, result.Count);
+        // ADMIN-10 "pagination works, all fields present" (asserts added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+        dynamic first = result[0];
+        Assert.Equal("c10@example.com", first.email);
+        Assert.Equal("Cust10", first.name);
+        Assert.Equal("team", first.tier);
+        Assert.Equal("active", first.status);
+        Assert.Equal(0, first.invoice_count);
+        Assert.IsType<Guid>(first.customer_id);
+        Assert.IsType<DateTime>(first.signup_date);
+        Assert.Equal(10, (_controller.ListCustomers(csrf, page: 3, pageSize: 10) as List<object>).Count);
+        Assert.Empty(_controller.ListCustomers(csrf, page: 4, pageSize: 10) as List<object>);
     }
 
+    // ADMIN-11
     [Fact]
     public void Customer_Detail_AllFields()
     {
@@ -325,12 +432,22 @@ public class AdminControllerTests
         var csrf = GetCsrfToken(owner);
         var cust = CreateCustomer();
 
+        cust.PaymentMethod = "card_visa_4242";
+        cust.Address = "1 Main St";
+        cust.Notes = "VIP";
         var result = _controller.GetCustomerDetail(csrf, cust.CustomerId);
         Assert.Equal(cust.CustomerId, ((dynamic)result).customer_id);
         Assert.Equal(cust.Email, ((dynamic)result).email);
         Assert.Equal(cust.Name, ((dynamic)result).name);
+        // ADMIN-11 "all fields present" (asserts added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+        Assert.Equal("solo", ((dynamic)result).tier);
+        Assert.Equal("active", ((dynamic)result).subscription_status);
+        Assert.Equal("card_visa_4242", ((dynamic)result).payment_method);
+        Assert.Equal("1 Main St", ((dynamic)result).address);
+        Assert.Equal("VIP", ((dynamic)result).notes);
     }
 
+    // ADMIN-12
     [Fact]
     public void ChangePlan_StripeCalledAndAuditLogged()
     {
@@ -339,10 +456,45 @@ public class AdminControllerTests
         var csrf = GetCsrfToken(owner);
         var cust = CreateCustomer();
 
-        var result = _controller.ChangeCustomerPlan(csrf, cust.CustomerId, "Admin");
+        // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-12 amendment): a customer moves between plans,
+        // and Stripe is updated on the subscription's one existing item with the new price and create_prorations.
+        var result = _controller.ChangeCustomerPlan(csrf, cust.CustomerId, "team");
         Assert.True(((dynamic)result).success);
-        Assert.Equal("User", ((dynamic)result).old_tier);
-        Assert.Equal("Admin", ((dynamic)result).new_tier);
+        Assert.Equal("solo", ((dynamic)result).old_tier);
+        Assert.Equal("team", ((dynamic)result).new_tier);
+        Assert.Equal(new[] { ("sub_123", "si_1", "price_team", "create_prorations") }, _stripe.Updates);
+        Assert.Equal("team", cust.Tier);
+        Assert.Contains(Database.AuditLog, l => l.Action == "plan_changed" && l.ResourceId == cust.CustomerId && l.OldValue == "solo" && l.NewValue == "team");
+    }
+
+    /// <summary>
+    /// ADMIN-12 refusals, both before any update: an unknown plan is 400 invalid_tier; a subscription with no item or
+    /// two items is 409 subscription_item_ambiguous. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// </summary>
+    // ADMIN-12
+    [Fact]
+    public void ChangePlan_UnknownTierOrNotExactlyOneItem_NoUpdate()
+    {
+        var owner = CreateOwner();
+        SetupAuth(owner);
+        var csrf = GetCsrfToken(owner);
+        var cust = CreateCustomer();
+
+        var bad = Assert.Throws<ApiException>(() => _controller.ChangeCustomerPlan(csrf, cust.CustomerId, "platinum"));
+        Assert.Equal("invalid_tier", bad.Code);
+        Assert.Equal(400, bad.Status);
+
+        foreach (var items in new[] { new List<string>(), new List<string> { "si_a", "si_b" } })
+        {
+            _stripe.ItemIds = items;
+            var ex = Assert.Throws<ApiException>(() => _controller.ChangeCustomerPlan(csrf, cust.CustomerId, "team"));
+            Assert.Equal("subscription_item_ambiguous", ex.Code);
+            Assert.Equal(409, ex.Status);
+        }
+
+        Assert.Empty(_stripe.Updates);
+        Assert.Equal("solo", cust.Tier);
+        Assert.DoesNotContain(Database.AuditLog, l => l.Action == "plan_changed");
     }
 
     [Fact]
@@ -358,6 +510,7 @@ public class AdminControllerTests
         Assert.Equal("invalid_tier", ex.Code);
     }
 
+    // ADMIN-13
     [Fact]
     public void QueueRefund_CreatedWithQueuedStatus()
     {
@@ -371,6 +524,10 @@ public class AdminControllerTests
         Assert.True(((dynamic)refundResult).success);
         Assert.Equal("queued", ((dynamic)refundResult).status);
         Assert.Equal(100.00m, ((dynamic)refundResult).amount);
+        // ADMIN-13 "refund record created" (asserts added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+        var row = Assert.Single(Database.Refunds);
+        Assert.Equal("queued", row.Status);
+        Assert.Equal(owner.UserId, row.CreatedBy);
     }
 
     [Fact]
@@ -437,6 +594,7 @@ public class AdminControllerTests
     }
 
     // ---------- DEPLOYMENT TESTS ----------
+    // ADMIN-14
     [Fact]
     public void CreateDeployment_HappyPath()
     {
@@ -445,9 +603,15 @@ public class AdminControllerTests
         var csrf = GetCsrfToken(owner);
         var cust = CreateCustomer();
 
-        var result = _controller.CreateDeployment(csrf, cust.CustomerId, "newsite.com", "User", Guid.NewGuid());
+        var themeId = Guid.NewGuid();
+        var result = _controller.CreateDeployment(csrf, cust.CustomerId, "newsite.com", "User", themeId);
         Assert.True(((dynamic)result).success);
         Assert.Equal("newsite.com", ((dynamic)result).domain);
+        // ADMIN-14 "deployment created + config initialized" (asserts added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+        var dep = Assert.Single(Database.Deployments);
+        Assert.Equal(DeploymentStatus.Draft, dep.Status);
+        Assert.Equal("newsite.com", dep.Config["domain"]);
+        Assert.Equal(themeId.ToString(), dep.Config["theme_id"]);
     }
 
     [Fact]
@@ -463,6 +627,7 @@ public class AdminControllerTests
         Assert.Equal("invalid_tier", ex.Code);
     }
 
+    // ADMIN-15
     [Fact]
     public void PublishDeployment_DoubleGateChecked()
     {
@@ -475,6 +640,18 @@ public class AdminControllerTests
         var result = _controller.PublishDeployment(csrf, dep.DeploymentId);
         Assert.True(((dynamic)result).success);
         Assert.Equal("live", ((dynamic)result).status);
+        Assert.Equal(DeploymentStatus.Live, dep.Status);
+        Assert.NotNull(dep.PublishedAt);
+
+        // the first gate: an admin (not owner) is refused; an unverified domain is refused (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+        var unverified = CreateDeployment(cust.CustomerId, "unverified.com");
+        unverified.DomainVerified = false;
+        Assert.Equal("domain_not_verified", Assert.Throws<ApiException>(() => _controller.PublishDeployment(csrf, unverified.DeploymentId)).Code);
+        var admin = CreateAdmin();
+        SetupAuth(admin);
+        unverified.DomainVerified = true;
+        Assert.Equal("owner_only", Assert.Throws<ApiException>(() => _controller.PublishDeployment(GetCsrfToken(admin), unverified.DeploymentId)).Code);
+        Assert.Equal(DeploymentStatus.Draft, unverified.Status);
     }
 
     [Fact]
@@ -500,6 +677,7 @@ public class AdminControllerTests
     }
 
     // ---------- GOVERNANCE TESTS ----------
+    // ADMIN-16
     [Fact]
     public void Governance_Approve_ExecutesAndLogs()
     {
@@ -515,12 +693,31 @@ public class AdminControllerTests
             Reason = "Testing"
         };
         Database.GovernanceActions.Add(ga);
+        // ADMIN-16 "action executed": approve runs the action's executor (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+        var executed = new List<Guid>();
+        GovernanceExecutors.ByType["test_action"] = a => { executed.Add(a.TargetResourceId); return "done"; };
 
         var result = _controller.DecideGovernanceAction(csrf, ga.ActionId, "approve");
         Assert.True(((dynamic)result).success);
         Assert.Equal("approved", ((dynamic)result).status);
+        Assert.Equal(new[] { ga.TargetResourceId }, executed);
+        Assert.Equal("approved", ga.Status);
+        Assert.Equal(owner.UserId, ga.ApprovedBy);
+        Assert.Contains(Database.AuditLog, l => l.Action == "action_approved" && l.NewValue == "done");
+
+        // the built-in suspend_user executor really suspends; an action type with no executor stays pending
+        var target = CreateUser("target@example.com");
+        var suspend = new GovernanceAction { ActionType = "suspend_user", ActorId = owner.UserId, TargetResourceId = target.UserId, Reason = "abuse" };
+        var unknown = new GovernanceAction { ActionType = "no_such_type", ActorId = owner.UserId, TargetResourceId = Guid.NewGuid(), Reason = "?" };
+        Database.GovernanceActions.Add(suspend);
+        Database.GovernanceActions.Add(unknown);
+        _controller.DecideGovernanceAction(csrf, suspend.ActionId, "approve");
+        Assert.Equal("suspended", target.Status);
+        Assert.Equal("unsupported_action_type", Assert.Throws<ApiException>(() => _controller.DecideGovernanceAction(csrf, unknown.ActionId, "approve")).Code);
+        Assert.Equal("pending", unknown.Status);
     }
 
+    // ADMIN-17
     [Fact]
     public void Governance_Reject_LogsReason()
     {
@@ -540,6 +737,9 @@ public class AdminControllerTests
         var result = _controller.DecideGovernanceAction(csrf, ga.ActionId, "reject", "Not needed");
         Assert.True(((dynamic)result).success);
         Assert.Equal("rejected", ((dynamic)result).status);
+        // ADMIN-17 "reason logged" (asserts added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+        Assert.Equal("Not needed", ga.RejectionReason);
+        Assert.Contains(Database.AuditLog, l => l.Action == "action_rejected" && l.ResourceId == ga.ActionId && l.Reason == "Not needed");
     }
 
     [Fact]
@@ -563,6 +763,7 @@ public class AdminControllerTests
         Assert.Equal("missing_reason", ex.Code);
     }
 
+    // ADMIN-18
     [Fact]
     public void AuditLog_Search_FiltersAndPagination()
     {
@@ -579,6 +780,14 @@ public class AdminControllerTests
 
         var result = _controller.SearchAuditLog(csrf, actionType: "test_action", limit: 3, offset: 1) as List<object>;
         Assert.Equal(3, result.Count);
+        // ADMIN-18 filters (asserts added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): other actions are excluded,
+        // offset moves the window, and a resource filter finds exactly that resource's entry
+        AuditLogger.Log("other_action", owner.UserId, "test", Guid.NewGuid());
+        Assert.All(result, r => Assert.Equal("test_action", ((dynamic)r).action));
+        Assert.Equal(2, (_controller.SearchAuditLog(csrf, actionType: "test_action", limit: 3, offset: 3) as List<object>).Count);
+        var oneResource = Database.AuditLog[2].ResourceId;
+        var byResource = _controller.SearchAuditLog(csrf, resourceId: oneResource) as List<object>;
+        Assert.Equal(oneResource, ((dynamic)Assert.Single(byResource)).resource_id);
     }
 
     // ---------- CSRF TESTS ----------

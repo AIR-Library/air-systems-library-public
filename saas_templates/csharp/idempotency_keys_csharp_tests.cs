@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.Text.Json;
+using System.Linq;
 using System.Threading;
 using AOI.IdempotencyKeys;
+using Microsoft.Data.Sqlite;
 
 public static class IdempotencyKeysTests
 {
@@ -20,6 +22,14 @@ public static class IdempotencyKeysTests
         TestExpiredKeyRunsOperationAgain();
         TestOperationExceptionFreesKey();
         TestErrorResponsesHaveProblemJsonContentType();
+        foreach (var (name, factory) in Stores())
+        {
+            TestInProgressPastExpiryIsUncertain(name, factory);
+            TestOtherErrorLeavesKeyUncertainUntilRelease(name, factory);
+            TestResolveStoresResponseOnce(name, factory);
+            TestConcurrentReleaseExactlyOneWins(name, factory);
+            TestExpiredCompletedRunsAgainOnStore(name, factory);
+        }
 
         Console.WriteLine($"\n=== Results: {_testsRun} tests run, {_failures} failures ===");
         return _failures > 0 ? 1 : 0;
@@ -55,6 +65,42 @@ public static class IdempotencyKeysTests
 
     private static IIdempotencyStore NewStore() => new InMemoryStore();
 
+    /// <summary>
+    /// Both stores the template ships: in memory, and SQL over an open in-memory SQLite connection (it must stay open:
+    /// an in-memory SQLite database lives only as long as its connection). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// Touches: process memory.
+    /// </summary>
+    private static IEnumerable<(string Name, Func<IIdempotencyStore> Factory)> Stores()
+    {
+        yield return ("memory", () => new InMemoryStore());
+        yield return ("sqlite", () =>
+        {
+            var conn = new SqliteConnection("Data Source=:memory:");
+            conn.Open();
+            return new SqlStore(conn);
+        });
+    }
+
+    /// <summary>A movable test clock (UTC). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.</summary>
+    private sealed class TestClock
+    {
+        public DateTime Now = new DateTime(2026, 11, 10, 12, 0, 0, DateTimeKind.Utc);
+    }
+
+    /// <summary>An operation that counts its calls and then times out (an unknown outcome). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.</summary>
+    private static (int status, string body) TimeoutOp()
+    {
+        _opCount++;
+        throw new TimeoutException("provider did not answer");
+    }
+
+    /// <summary>The type of a problem response's body. Pure.</summary>
+    private static string ProblemTypeOf((int status, string contentType, string body) r)
+    {
+        using var doc = JsonDocument.Parse(r.body);
+        return doc.RootElement.GetProperty("type").GetString();
+    }
+
     private static IdempotencyKeys NewKeys(IIdempotencyStore store = null) => new IdempotencyKeys(store ?? NewStore());
 
     private static int _opCount;
@@ -71,6 +117,7 @@ public static class IdempotencyKeysTests
         throw new InvalidOperationException("operation failed");
     }
 
+    // IDEM-01
     private static void TestFirstCallRunsOperationOnce()
     {
         _opCount = 0;
@@ -82,6 +129,7 @@ public static class IdempotencyKeysTests
         AssertEqual(1, _opCount, "Operation called exactly once");
     }
 
+    // IDEM-02
     private static void TestSecondIdenticalCallReturnsStoredResponse()
     {
         _opCount = 0;
@@ -94,6 +142,7 @@ public static class IdempotencyKeysTests
         AssertEqual(1, _opCount, "Operation called only once for two identical calls");
     }
 
+    // IDEM-03
     private static void TestSameKeyDifferentBodyReturns422()
     {
         _opCount = 0;
@@ -105,6 +154,7 @@ public static class IdempotencyKeysTests
         AssertEqual(1, _opCount, "Operation not called for mismatched payload");
     }
 
+    // IDEM-04
     private static void TestSameKeyWhileInProgressReturns409()
     {
         _opCount = 0;
@@ -143,6 +193,7 @@ public static class IdempotencyKeysTests
         AssertNull(firstError, "First operation completed without error");
     }
 
+    // IDEM-05
     private static void TestRequiredOperationNoKeyReturns400()
     {
         _opCount = 0;
@@ -153,6 +204,7 @@ public static class IdempotencyKeysTests
         AssertEqual(0, _opCount, "Operation not called when key missing");
     }
 
+    // IDEM-06
     private static void TestSameKeyDifferentScopesIndependent()
     {
         _opCount = 0;
@@ -164,33 +216,53 @@ public static class IdempotencyKeysTests
         AssertEqual(2, _opCount, "Operation called twice for different scopes");
     }
 
+    /// <summary>
+    /// IDEM-07, first half: a completed key past its expiry runs the operation again.
+    /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the clock is moved instead of a 100 ms sleep (deterministic).
+    /// </summary>
+    // IDEM-07
     private static void TestExpiredKeyRunsOperationAgain()
     {
         _opCount = 0;
         var store = new InMemoryStore();
-        var keys = new IdempotencyKeys(store, ttl: TimeSpan.FromMilliseconds(50));
+        var clock = new TestClock();
+        var keys = new IdempotencyKeys(store, ttl: TimeSpan.FromMilliseconds(50), clock: () => clock.Now);
         var result1 = keys.Handle("client1", "key-expired", "POST", "/charge", "{\"amount\":100}", CountingOp);
         AssertEqual(1, _opCount, "First call runs operation");
 
-        Thread.Sleep(100);
+        clock.Now = clock.Now.AddMilliseconds(49);
+        keys.Handle("client1", "key-expired", "POST", "/charge", "{\"amount\":100}", CountingOp);
+        AssertEqual(1, _opCount, "Before expiry the stored response is served");
 
+        clock.Now = clock.Now.AddMilliseconds(1);
         var result2 = keys.Handle("client1", "key-expired", "POST", "/charge", "{\"amount\":100}", CountingOp);
         AssertEqual(2, _opCount, "Operation runs again after key expires");
         AssertEqual(200, result2.status, "Second call returns 200");
         AssertEqual("application/json", result2.contentType, "Second call content-type is application/json");
     }
 
+    /// <summary>
+    /// IDEM-08: an operation that raises OperationFailedException frees the key; a retry runs it.
+    /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec amendment): it threw InvalidOperationException, which now
+    /// means "outcome unknown" and leaves the key uncertain (IDEM-10); a definite failure is OperationFailedException.
+    /// </summary>
+    // IDEM-08
     private static void TestOperationExceptionFreesKey()
     {
         _opCount = 0;
         var keys = NewKeys();
         try
         {
-            keys.Handle("client1", "key-fail", "POST", "/charge", "{\"amount\":100}", FailingOp);
+            keys.Handle("client1", "key-fail", "POST", "/charge", "{\"amount\":100}", () =>
+            {
+                _opCount++;
+                throw new OperationFailedException("card declined");
+            });
             Assert(false, "Expected exception from failing operation");
         }
-        catch (InvalidOperationException)
+        catch (OperationFailedException)
         {
+            Assert(true, "OperationFailedException is re-raised");
         }
         AssertEqual(1, _opCount, "Operation called once before failing");
 
@@ -199,6 +271,157 @@ public static class IdempotencyKeysTests
         AssertEqual(2, _opCount, "Operation called again on retry");
     }
 
+    /// <summary>
+    /// IDEM-07, second half: an in_progress key past expires_at (a killed process) gets 409 outcome_unknown and does not
+    /// run, is listed for reconciliation, survives purge_expired, and is freed only by release(). Added 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the store.
+    /// </summary>
+    // IDEM-07
+    private static void TestInProgressPastExpiryIsUncertain(string name, Func<IIdempotencyStore> factory)
+    {
+        _opCount = 0;
+        var store = factory();
+        var clock = new TestClock();
+        var t0 = clock.Now;
+        var keys = new IdempotencyKeys(store, clock: () => clock.Now);
+        const string body = "{\"amount\":100}";
+        // a request claimed the key and its process was killed: the record stays in_progress
+        AssertEqual(true, store.TryClaim("client-a", "key-1", IdempotencyKeys.Fingerprint("POST", "/charges", body), t0, t0.AddHours(24)),
+            $"[{name}] a claim that never finishes");
+
+        clock.Now = t0.AddHours(23);
+        var during = keys.Handle("client-a", "key-1", "POST", "/charges", body, CountingOp);
+        AssertEqual(409, during.status, $"[{name}] before expires_at it is plain in progress");
+        AssertEqual(IdempotencyKeys.ProblemType, ProblemTypeOf(during), $"[{name}] in-progress problem type");
+        AssertEqual(422, keys.Handle("client-a", "key-1", "POST", "/charges", "{\"amount\":5}", CountingOp).status,
+            $"[{name}] a different payload is 422 even while in progress");
+
+        clock.Now = t0.AddHours(24);
+        var after = keys.Handle("client-a", "key-1", "POST", "/charges", body, CountingOp);
+        AssertEqual(409, after.status, $"[{name}] in_progress past expires_at -> 409");
+        AssertEqual(IdempotencyKeys.OutcomeUnknownType, ProblemTypeOf(after), $"[{name}] ... outcome_unknown");
+        AssertEqual(0, _opCount, $"[{name}] the operation did not run");
+        AssertEqual(0, keys.PurgeExpired(), $"[{name}] purge keeps it");
+        var listed = keys.ListUncertain();
+        AssertEqual(1, listed.Count, $"[{name}] listed for reconciliation");
+        AssertEqual(("client-a", "key-1", t0), (listed[0].Scope, listed[0].IdemKey, listed[0].CreatedAt), $"[{name}] ... with scope, key, created_at");
+        AssertEqual(true, keys.Release("client-a", "key-1"), $"[{name}] release frees it");
+        var retry = keys.Handle("client-a", "key-1", "POST", "/charges", body, CountingOp);
+        AssertEqual(200, retry.status, $"[{name}] after release the retry runs");
+        AssertEqual(1, _opCount, $"[{name}] ... exactly once");
+    }
+
+    /// <summary>
+    /// IDEM-10: any other error leaves the key 'uncertain': the error is re-raised, a retry gets 409 outcome_unknown and
+    /// the count stays 1, purge keeps it; after release() a retry runs. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// </summary>
+    // IDEM-10
+    private static void TestOtherErrorLeavesKeyUncertainUntilRelease(string name, Func<IIdempotencyStore> factory)
+    {
+        _opCount = 0;
+        var clock = new TestClock();
+        var keys = new IdempotencyKeys(factory(), clock: () => clock.Now);
+        var raised = false;
+        try { keys.Handle("client-a", "key-u", "POST", "/charges", "{\"amount\":100}", TimeoutOp); }
+        catch (TimeoutException) { raised = true; }
+        Assert(raised, $"[{name}] the timeout is re-raised");
+
+        var retry = keys.Handle("client-a", "key-u", "POST", "/charges", "{\"amount\":100}", CountingOp);
+        AssertEqual(409, retry.status, $"[{name}] retry of an uncertain key -> 409");
+        AssertEqual("application/problem+json", retry.contentType, $"[{name}] problem+json");
+        AssertEqual(IdempotencyKeys.OutcomeUnknownType, ProblemTypeOf(retry), $"[{name}] outcome_unknown");
+        AssertEqual(1, _opCount, $"[{name}] the operation count stays at 1");
+
+        clock.Now = clock.Now.AddDays(30);
+        AssertEqual(0, keys.PurgeExpired(), $"[{name}] an uncertain key never expires");
+        AssertEqual(409, keys.Handle("client-a", "key-u", "POST", "/charges", "{\"amount\":100}", CountingOp).status, $"[{name}] still 409 a month later");
+        AssertEqual(false, keys.Release("client-a", "no-such-key"), $"[{name}] release of an unknown key is false");
+        AssertEqual(true, keys.Release("client-a", "key-u"), $"[{name}] release frees the key");
+        var after = keys.Handle("client-a", "key-u", "POST", "/charges", "{\"amount\":100}", CountingOp);
+        AssertEqual(200, after.status, $"[{name}] after release the retry runs");
+        AssertEqual(2, _opCount, $"[{name}] ... once more");
+        AssertEqual(false, keys.Release("client-a", "key-u"), $"[{name}] release of a completed key is false");
+    }
+
+    /// <summary>
+    /// IDEM-11: resolve() on an uncertain key stores the response (expires 24 h later); a retry returns it without
+    /// running; a second resolve() or release() returns false and changes nothing. Added 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// </summary>
+    // IDEM-11
+    private static void TestResolveStoresResponseOnce(string name, Func<IIdempotencyStore> factory)
+    {
+        _opCount = 0;
+        var clock = new TestClock();
+        var store = factory();
+        var keys = new IdempotencyKeys(store, clock: () => clock.Now);
+        try { keys.Handle("client-a", "key-r", "POST", "/charges", "{\"amount\":100}", TimeoutOp); }
+        catch (TimeoutException) { Assert(true, $"[{name}] timeout re-raised"); }
+
+        AssertEqual(true, keys.Resolve("client-a", "key-r", 201, "{\"id\":\"ch_found\"}"), $"[{name}] resolve stores the found outcome");
+        AssertEqual(clock.Now.AddHours(24), store.Get("client-a", "key-r").ExpiresAt, $"[{name}] expires_at = now + 24h");
+        var retry = keys.Handle("client-a", "key-r", "POST", "/charges", "{\"amount\":100}", CountingOp);
+        AssertEqual(201, retry.status, $"[{name}] the retry gets the resolved status");
+        AssertEqual("{\"id\":\"ch_found\"}", retry.body, $"[{name}] ... and body");
+        AssertEqual(1, _opCount, $"[{name}] the operation did not run again");
+        AssertEqual(false, keys.Resolve("client-a", "key-r", 500, "{}"), $"[{name}] a second resolve is false");
+        AssertEqual(false, keys.Release("client-a", "key-r"), $"[{name}] release after resolve is false");
+        AssertEqual("{\"id\":\"ch_found\"}", keys.Handle("client-a", "key-r", "POST", "/charges", "{\"amount\":100}", CountingOp).body, $"[{name}] unchanged");
+        AssertEqual(0, keys.ListUncertain().Count, $"[{name}] nothing left to reconcile");
+    }
+
+    /// <summary>
+    /// release() is one conditional write: of two concurrent calls exactly one returns true (repeated 50 times).
+    /// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the store, two threads.
+    /// </summary>
+    private static void TestConcurrentReleaseExactlyOneWins(string name, Func<IIdempotencyStore> factory)
+    {
+        var store = factory();
+        var clock = new TestClock();
+        var keys = new IdempotencyKeys(store, clock: () => clock.Now);
+        var allExactlyOne = true;
+        for (var i = 0; i < 50; i++)
+        {
+            var key = "race-" + i;
+            try { keys.Handle("client-a", key, "POST", "/charges", "{}", TimeoutOp); }
+            catch (TimeoutException)
+            {
+                // Expected: Handle re-throws the operation's timeout after marking the key 'uncertain', which is the
+                // state this race test needs (IDEM-10). Code-quality review on PR 20, 2026-11-10,
+                // session_012zDydZCZ4AChqhEZ4oVtaP.
+            }
+            var wins = 0;
+            using var start = new ManualResetEventSlim(false);
+            var threads = Enumerable.Range(0, 2).Select(_ => new Thread(() =>
+            {
+                start.Wait();
+                if (i % 2 == 0 ? keys.Release("client-a", key) : keys.Resolve("client-a", key, 200, "{}"))
+                    Interlocked.Increment(ref wins);
+            })).ToList();
+            threads.ForEach(t => t.Start());
+            start.Set();
+            threads.ForEach(t => t.Join());
+            if (wins != 1) allExactlyOne = false;
+        }
+        Assert(allExactlyOne, $"[{name}] of two concurrent release/resolve calls exactly one returns true");
+    }
+
+    /// <summary>IDEM-07 on both stores: a completed key past expires_at is replaced by the claim and runs again. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.</summary>
+    private static void TestExpiredCompletedRunsAgainOnStore(string name, Func<IIdempotencyStore> factory)
+    {
+        _opCount = 0;
+        var clock = new TestClock();
+        var keys = new IdempotencyKeys(factory(), clock: () => clock.Now);
+        keys.Handle("client-a", "key-e", "POST", "/charges", "{}", CountingOp);
+        keys.Handle("client-a", "key-e", "POST", "/charges", "{}", CountingOp);
+        AssertEqual(1, _opCount, $"[{name}] served from the store within 24 h");
+        clock.Now = clock.Now.AddHours(24);
+        AssertEqual(200, keys.Handle("client-a", "key-e", "POST", "/charges", "{}", CountingOp).status, $"[{name}] after 24 h");
+        AssertEqual(2, _opCount, $"[{name}] the operation ran again");
+        AssertEqual(0, keys.PurgeExpired(), $"[{name}] the fresh record is not purged");
+    }
+
+    // IDEM-09
     private static void TestErrorResponsesHaveProblemJsonContentType()
     {
         var keys = NewKeys();

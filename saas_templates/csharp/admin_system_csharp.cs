@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.RegularExpressions;
 
 // DDL (for reference, not executed in this in‑memory implementation)
@@ -20,7 +22,7 @@ CREATE TABLE customers (
     customer_id   UUID PRIMARY KEY,
     email         TEXT NOT NULL,
     name          TEXT NOT NULL,
-    tier          TEXT NOT NULL,
+    tier          TEXT NOT NULL,          -- plan: solo, team, enterprise
     signup_date   TIMESTAMP NOT NULL,
     invoice_count INT NOT NULL,
     status        TEXT NOT NULL,
@@ -37,6 +39,8 @@ CREATE TABLE deployments (
     tier          TEXT NOT NULL,
     status        TEXT NOT NULL,          -- draft, live, suspended, archived
     theme_id      UUID,
+    domain_verified BOOLEAN NOT NULL DEFAULT FALSE,
+    config        JSON NOT NULL,          -- initialised at create
     published_at  TIMESTAMP,
     suspend_reason TEXT,
     archived_at   TIMESTAMP
@@ -102,6 +106,15 @@ namespace AdminSystem
         public string Status { get; set; } = "active";
         public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
         public string CsrfToken { get; set; } = Guid.NewGuid().ToString("N");
+
+        /// <summary>
+        /// SHA-256 (hex) of the latest password-reset or invite token; the raw token only goes to the user's email.
+        /// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (reset and invite sent nothing before). Pure data.
+        /// </summary>
+        public string PasswordTokenHash { get; set; }
+
+        /// <summary>When <see cref="PasswordTokenHash"/> stops working (1 hour after issue).</summary>
+        public DateTime? PasswordTokenExpiresAt { get; set; }
     }
 
     public class Customer
@@ -109,7 +122,12 @@ namespace AdminSystem
         public Guid CustomerId { get; set; } = Guid.NewGuid();
         public string Email { get; set; }
         public string Name { get; set; }
-        public Role Tier { get; set; }
+
+        /// <summary>
+        /// The customer's plan: solo, team or enterprise. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: it was
+        /// a staff Role (Owner/Admin/User), so change_plan moved customers to "Admin". Pure data.
+        /// </summary>
+        public string Tier { get; set; } = "solo";
         public DateTime SignupDate { get; set; } = DateTime.UtcNow;
         public int InvoiceCount { get; set; } = 0;
         public string Status { get; set; } = "active";
@@ -127,6 +145,12 @@ namespace AdminSystem
         public Role Tier { get; set; }
         public DeploymentStatus Status { get; set; } = DeploymentStatus.Draft;
         public Guid ThemeId { get; set; }
+
+        /// <summary>True once the customer's domain is verified; publish requires it (spec: Check domain_verified). Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.</summary>
+        public bool DomainVerified { get; set; }
+
+        /// <summary>The deployment's configuration, initialised by create (ADMIN-14). Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.</summary>
+        public Dictionary<string, string> Config { get; set; } = new Dictionary<string, string>();
         public DateTime? PublishedAt { get; set; }
         public string SuspendReason { get; set; }
         public DateTime? ArchivedAt { get; set; }
@@ -210,7 +234,10 @@ namespace AdminSystem
             if (AuthContext.CurrentUser == null)
                 throw new ApiException("unauthorized", "No authenticated user");
 
-            if (string.IsNullOrWhiteSpace(token) || token != AuthContext.CurrentUser.CsrfToken)
+            // constant-time compare (docs/specs/README.md "Secure by default"; was !=, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+            var expected = AuthContext.CurrentUser.CsrfToken;
+            if (string.IsNullOrWhiteSpace(token) || string.IsNullOrEmpty(expected) ||
+                !CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(token), Encoding.UTF8.GetBytes(expected)))
                 throw new ApiException("csrf_invalid", "Invalid CSRF token");
         }
 
@@ -256,6 +283,22 @@ namespace AdminSystem
                 throw new ApiException("invalid_tier", "Owner tier cannot be assigned via this operation");
         }
 
+        /// <summary>The customer plans change_plan accepts.</summary>
+        public static readonly string[] PlanTiers = { "solo", "team", "enterprise" };
+
+        /// <summary>
+        /// Validates a customer plan tier (solo, team, enterprise; case-insensitive) and returns it lower-cased.
+        /// Throws ApiException(invalid_tier, 400) otherwise. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: change_plan
+        /// validated customer plans as staff roles. Pure.
+        /// </summary>
+        public static string ValidatePlanTier(string tier)
+        {
+            var t = tier?.Trim().ToLowerInvariant();
+            if (t == null || Array.IndexOf(PlanTiers, t) < 0)
+                throw new ApiException("invalid_tier", "Tier is not recognized");
+            return t;
+        }
+
         /// <summary>
         /// Refuses an amount of zero or less with ApiException(invalid_amount). Used by refunds. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
         /// </summary>
@@ -285,16 +328,108 @@ namespace AdminSystem
         }
     }
 
-    // Mock Stripe client
-    public static class StripeClient
+    /// <summary>
+    /// The Stripe calls admin change_plan makes (billing_subscriptions.md flow 2). Production uses
+    /// <see cref="StripeNetAdminClient"/>; tests pass a fake, so no test touches the network.
+    /// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-12 amendment): the old static mock took a bare price,
+    /// which in Stripe adds a second item and bills both plans. Touches: Stripe (network, money) in production.
+    /// </summary>
+    public interface IAdminStripeClient
     {
-        public static void UpdateSubscription(string subscriptionId, string priceId)
+        /// <summary>stripe.subscriptions.retrieve: the ids of the subscription's items, in Stripe's order.</summary>
+        IReadOnlyList<string> RetrieveSubscriptionItemIds(string subscriptionId);
+
+        /// <summary>stripe.subscriptions.update(subscriptionId, {items: [{id: itemId, price: priceId}], proration_behavior}).</summary>
+        void UpdateSubscriptionItem(string subscriptionId, string itemId, string priceId, string prorationBehavior);
+    }
+
+    /// <summary>
+    /// Stripe.net adapter for <see cref="IAdminStripeClient"/>, keyed by STRIPE_SECRET_KEY (never hard-coded; read on
+    /// first use). Provider errors become ApiException(stripe_error, 502). Added 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: environment, Stripe's API (network, money).
+    /// </summary>
+    public class StripeNetAdminClient : IAdminStripeClient
+    {
+        private Stripe.StripeClient _client;
+
+        private Stripe.StripeClient Client()
         {
-            // In real implementation this would call Stripe API.
-            // Here we just simulate success.
-            if (string.IsNullOrWhiteSpace(subscriptionId) || string.IsNullOrWhiteSpace(priceId))
-                throw new ApiException("stripe_error", "Invalid Stripe parameters");
+            if (_client != null) return _client;
+            var key = Environment.GetEnvironmentVariable("STRIPE_SECRET_KEY");
+            if (string.IsNullOrWhiteSpace(key))
+                throw new ApiException("stripe_error", "STRIPE_SECRET_KEY not set");
+            return _client = new Stripe.StripeClient(key);
         }
+
+        /// <inheritdoc/>
+        public IReadOnlyList<string> RetrieveSubscriptionItemIds(string subscriptionId)
+        {
+            try
+            {
+                var sub = new Stripe.SubscriptionService(Client()).Get(subscriptionId);
+                return sub?.Items?.Data?.Select(i => i.Id).ToList() ?? new List<string>();
+            }
+            catch (Stripe.StripeException e)
+            {
+                throw new ApiException("stripe_error", "The payment provider rejected the request: " + e.StripeError?.Code);
+            }
+        }
+
+        /// <inheritdoc/>
+        public void UpdateSubscriptionItem(string subscriptionId, string itemId, string priceId, string prorationBehavior)
+        {
+            try
+            {
+                new Stripe.SubscriptionService(Client()).Update(subscriptionId, new Stripe.SubscriptionUpdateOptions
+                {
+                    Items = new List<Stripe.SubscriptionItemOptions> { new Stripe.SubscriptionItemOptions { Id = itemId, Price = priceId } },
+                    ProrationBehavior = prorationBehavior
+                });
+            }
+            catch (Stripe.StripeException e)
+            {
+                throw new ApiException("stripe_error", "The payment provider rejected the request: " + e.StripeError?.Code);
+            }
+        }
+    }
+
+    /// <summary>
+    /// The emails admin actions send. Tests pass a fake; production wires the app's mail sender.
+    /// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: ADMIN-01 "invite sent" and ADMIN-04 "email sent" had no
+    /// sender at all. Touches: email (network) in production.
+    /// </summary>
+    public interface IAdminMailer
+    {
+        /// <summary>Sends a new user the invite with their one-time set-password token.</summary>
+        void SendInvite(string email, string oneTimeToken);
+
+        /// <summary>Sends a user the password-reset link token.</summary>
+        void SendPasswordReset(string email, string resetToken);
+    }
+
+    /// <summary>
+    /// What approving a governance action runs: action_type -> executor(action) returning a short execution result.
+    /// ADMIN-16 "approve -> action executed". "suspend_user" is built in; an app registers the rest. Added 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP (approve only flipped the status). Touches: whatever an executor touches.
+    /// </summary>
+    public static class GovernanceExecutors
+    {
+        public static readonly Dictionary<string, Func<GovernanceAction, string>> ByType = new Dictionary<string, Func<GovernanceAction, string>>();
+
+        /// <summary>Clears the registry and restores the built-in executors (used between tests).</summary>
+        public static void Reset()
+        {
+            ByType.Clear();
+            ByType["suspend_user"] = ga =>
+            {
+                var user = Database.Users.FirstOrDefault(u => u.UserId == ga.TargetResourceId)
+                    ?? throw new ApiException("user_not_found", "User does not exist");
+                user.Status = "suspended";
+                return "user_suspended";
+            };
+        }
+
+        static GovernanceExecutors() => Reset();
     }
 
     // Safety flags
@@ -307,7 +442,30 @@ namespace AdminSystem
     public class ApiException : Exception
     {
         public string Code { get; }
-        public ApiException(string code, string message) : base(message) => Code = code;
+
+        /// <summary>
+        /// The HTTP status the route returns. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the spec names 403
+        /// owner_only, 409 email_exists and 400 for the other refusals; 409 subscription_item_ambiguous (ADMIN-12).
+        /// </summary>
+        public int Status { get; }
+
+        /// <summary>An error with a code, a message and the status (default chosen from the code; see <see cref="DefaultStatus"/>).</summary>
+        public ApiException(string code, string message, int? status = null) : base(message)
+        {
+            Code = code;
+            Status = status ?? DefaultStatus(code);
+        }
+
+        /// <summary>401 unauthorized; 403 permission and CSRF refusals; 404 *_not_found; 409 conflicts; 502 stripe_error; 400 otherwise. Pure.</summary>
+        public static int DefaultStatus(string code) => code switch
+        {
+            "unauthorized" => 401,
+            "owner_only" or "admin_or_owner_required" or "csrf_invalid" or "publish_blocked" => 403,
+            "email_exists" or "domain_exists" or "subscription_item_ambiguous" => 409,
+            "stripe_error" => 502,
+            _ when code != null && code.EndsWith("_not_found") => 404,
+            _ => 400
+        };
     }
 
     // Response wrappers
@@ -325,7 +483,48 @@ namespace AdminSystem
     // Admin controller
     public class AdminController
     {
+        private readonly IAdminStripeClient _stripe;
+        private readonly IAdminMailer _mailer;
+
+        /// <summary>
+        /// Issues a one-time token for <paramref name="user"/>: 32 random bytes (URL-safe base64) returned once, stored
+        /// only as its SHA-256, valid 1 hour. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the user record.
+        /// </summary>
+        private static string IssuePasswordToken(User user)
+        {
+            var raw = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+            user.PasswordTokenHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(raw))).ToLowerInvariant();
+            user.PasswordTokenExpiresAt = DateTime.UtcNow.AddHours(1);
+            return raw;
+        }
+        private readonly IReadOnlyDictionary<string, string> _priceIds;
+
+        /// <summary>
+        /// Builds the controller. In: the Stripe client (default: the Stripe.net adapter keyed by STRIPE_SECRET_KEY) and
+        /// the price id of each plan (default price_solo, price_team, price_enterprise). The caller's identity is always
+        /// AuthContext.CurrentUser, set by the authentication layer, never a request field.
+        /// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (injectable Stripe for ADMIN-12). Touches nothing.
+        /// </summary>
+        public AdminController(IAdminStripeClient stripe = null, IReadOnlyDictionary<string, string> priceIds = null,
+            IAdminMailer mailer = null)
+        {
+            _mailer = mailer;
+            _stripe = stripe ?? new StripeNetAdminClient();
+            _priceIds = priceIds ?? new Dictionary<string, string>
+            {
+                { "solo", "price_solo" }, { "team", "price_team" }, { "enterprise", "price_enterprise" }
+            };
+        }
+
         // ---------- USERS ----------
+        /// <summary>
+        /// Owner-only: creates a staff user (User or Admin; never Owner) after the CSRF check. Refuses a duplicate email
+        /// (409 email_exists) and a non-owner (403 owner_only). Issues a one-time set-password token: emailed as an invite
+        /// when notify is true and a mailer is configured (ADMIN-01), otherwise returned once as one_time_password.
+        /// Output: { success, user_id, email, tier, created_at, invite_sent, one_time_password }.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the invite is really sent. Touches: the in-memory user
+        /// and audit records, email through the mailer.
+        /// </summary>
         public object CreateUser(string csrfToken, string email, string name, string tier, bool notify)
         {
             CsrfValidator.Verify(csrfToken);
@@ -352,11 +551,12 @@ namespace AdminSystem
 
             Database.Users.Add(user);
 
-            // Simulate invite email / one‑time password
-            if (notify)
-            {
-                // Email sending omitted.
-            }
+            // Invite email, or the one-time password shown once to the owner when notify is false or no mailer is
+            // configured (spec: "send invite email (or show one-time password)"; 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+            var oneTimeToken = IssuePasswordToken(user);
+            var invited = notify && _mailer != null;
+            if (invited)
+                _mailer.SendInvite(user.Email, oneTimeToken);
 
             return new
             {
@@ -364,13 +564,16 @@ namespace AdminSystem
                 user_id = user.UserId,
                 email = user.Email,
                 tier = user.Tier.ToString(),
-                created_at = user.CreatedAt
+                created_at = user.CreatedAt,
+                invite_sent = invited,
+                one_time_password = invited ? null : oneTimeToken
             };
         }
 
         /// <summary>
         /// Owner-only: resets a user's password after the CSRF check.
-        /// Refuses an unknown user, the last active owner and the caller's own account. Output: { success, ... }.
+        /// Refuses the caller's own account (400 cannot_reset_own_password), then an unknown user, then the last active
+        /// owner, in the spec's gate-then-check order (changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). Output: { success, ... }.
         /// Touches: the in-memory user and audit records. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
         /// </summary>
         public object ResetPassword(string csrfToken, Guid userId)
@@ -378,28 +581,31 @@ namespace AdminSystem
             CsrfValidator.Verify(csrfToken);
             RequireOwner();
 
+            // Gate before check (spec order; changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): own account first.
+            if (userId == AuthContext.CurrentUser.UserId)
+                throw new ApiException("cannot_reset_own_password", "Cannot reset own password");
+
             var target = Database.Users.FirstOrDefault(u => u.UserId == userId)
                 ?? throw new ApiException("user_not_found", "User does not exist");
 
-            // Check last active owner FIRST (more specific protection)
             if (IsLastActiveOwner(target))
                 throw new ApiException("cannot_reset_last_owner", "Cannot reset password of last active owner");
-
-            if (target.UserId == AuthContext.CurrentUser.UserId)
-                throw new ApiException("cannot_reset_own_password", "Cannot reset own password");
 
             AuditLogger.Log("password_reset_initiated", AuthContext.CurrentUser.UserId,
                 resourceType: "user", resourceId: target.UserId);
 
-            // Simulate token generation and email
-            // Omitted.
+            // generate the reset token and email the link (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: nothing was sent)
+            if (_mailer == null)
+                throw new ApiException("email_not_configured", "No mail sender is configured", 503);
+            _mailer.SendPasswordReset(target.Email, IssuePasswordToken(target));
 
             return new { success = true, status = "reset_email_sent" };
         }
 
         /// <summary>
         /// Owner-only: changes a user's tier after the CSRF check; the Owner tier cannot be assigned here.
-        /// Refuses an unknown user, demoting the last active owner, and the caller's own role. Output: { success, old/new tier }.
+        /// Refuses the caller's own role, then an unknown user, then demoting the last active owner (spec order; changed
+        /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). Output: { success, old/new tier }.
         /// Touches: the in-memory user and audit records. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
         /// </summary>
         public object ChangeUserRole(string csrfToken, Guid userId, string newTier)
@@ -410,15 +616,15 @@ namespace AdminSystem
             Validation.ValidateTier(newTier, allowOwner: false); // Cannot promote to Owner via API
             var newRole = (Role)Enum.Parse(typeof(Role), newTier, true);
 
+            // Gate before check (spec order; changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): own account first.
+            if (userId == AuthContext.CurrentUser.UserId)
+                throw new ApiException("cannot_change_own_role", "Cannot change own role");
+
             var target = Database.Users.FirstOrDefault(u => u.UserId == userId)
                 ?? throw new ApiException("user_not_found", "User does not exist");
 
-            // Check last active owner FIRST (more specific protection)
             if (IsLastActiveOwner(target) && newRole != Role.Owner)
                 throw new ApiException("cannot_demote_last_owner", "Cannot demote last active owner");
-
-            if (target.UserId == AuthContext.CurrentUser.UserId)
-                throw new ApiException("cannot_change_own_role", "Cannot change own role");
 
             var oldTier = target.Tier.ToString();
 
@@ -439,22 +645,23 @@ namespace AdminSystem
 
         /// <summary>
         /// Owner-only: suspends a user with a reason after the CSRF check.
-        /// Refuses an unknown user, the last active owner and the caller. Touches: the in-memory user and audit records. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// Refuses the caller (cannot_suspend_yourself), then an unknown user, then the last active owner (spec order;
+        /// changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). Touches: the in-memory user and audit records. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
         /// </summary>
         public object SuspendUser(string csrfToken, Guid userId, string reason)
         {
             CsrfValidator.Verify(csrfToken);
             RequireOwner();
 
+            // Gate before check (spec order; changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): own account first.
+            if (userId == AuthContext.CurrentUser.UserId)
+                throw new ApiException("cannot_suspend_yourself", "Cannot suspend yourself");
+
             var target = Database.Users.FirstOrDefault(u => u.UserId == userId)
                 ?? throw new ApiException("user_not_found", "User does not exist");
 
-            // Check last active owner FIRST (more specific protection)
             if (IsLastActiveOwner(target))
                 throw new ApiException("cannot_suspend_last_owner", "Cannot suspend last active owner");
-
-            if (target.UserId == AuthContext.CurrentUser.UserId)
-                throw new ApiException("cannot_suspend_yourself", "Cannot suspend yourself");
 
             AuditLogger.Log("user_suspended", AuthContext.CurrentUser.UserId,
                 resourceType: "user", resourceId: target.UserId,
@@ -477,7 +684,7 @@ namespace AdminSystem
                 customer_id = c.CustomerId,
                 email = c.Email,
                 name = c.Name,
-                tier = c.Tier.ToString(),
+                tier = c.Tier,
                 signup_date = c.SignupDate,
                 invoice_count = c.InvoiceCount,
                 status = c.Status
@@ -499,7 +706,7 @@ namespace AdminSystem
                 customer_id = c.CustomerId,
                 email = c.Email,
                 name = c.Name,
-                tier = c.Tier.ToString(),
+                tier = c.Tier,
                 subscription_status = c.Status,
                 payment_method = c.PaymentMethod,
                 address = c.Address,
@@ -508,38 +715,49 @@ namespace AdminSystem
         }
 
         /// <summary>
-        /// Owner-only: moves a customer to another plan tier (never Owner) after the CSRF check.
-        /// Refuses an unknown customer. Touches: the in-memory customer and audit records. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// Owner-only: moves a customer to another plan (solo, team, enterprise) after the CSRF check, by billing's
+        /// change_plan rule (billing_subscriptions.md flow 2, ADMIN-12 amended 2026-11-10):
+        /// unknown tier -> 400 invalid_tier; unknown customer -> 404 customer_not_found; retrieve the subscription and
+        /// refuse one without exactly one item -> 409 subscription_item_ambiguous; all before any update. Then
+        /// stripe.subscriptions.update with {items: [{id: current_item_id, price}], proration_behavior:
+        /// 'create_prorations'} (a bare price would add a second item and bill both plans), audit "plan_changed".
+        /// Output: { success, customer_id, old_tier, new_tier, effective_date }.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: plans instead of staff roles; injected Stripe client;
+        /// item id rule. Touches: Stripe (network, money), the in-memory customer and audit records.
         /// </summary>
         public object ChangeCustomerPlan(string csrfToken, Guid customerId, string newTier)
         {
             CsrfValidator.Verify(csrfToken);
             RequireOwner();
 
-            Validation.ValidateTier(newTier, allowOwner: false); // Customers cannot be Owner tier
-            var newRole = (Role)Enum.Parse(typeof(Role), newTier, true);
+            var tier = Validation.ValidatePlanTier(newTier);
+            if (!_priceIds.TryGetValue(tier, out var priceId))
+                throw new ApiException("invalid_tier", "Tier has no price");
 
             var cust = Database.Customers.FirstOrDefault(c => c.CustomerId == customerId)
                 ?? throw new ApiException("customer_not_found", "Customer does not exist");
+            if (string.IsNullOrWhiteSpace(cust.StripeSubscriptionId))
+                throw new ApiException("subscription_not_found", "Customer has no subscription");
 
-            var oldTier = cust.Tier.ToString();
+            var itemIds = _stripe.RetrieveSubscriptionItemIds(cust.StripeSubscriptionId);
+            if (itemIds == null || itemIds.Count != 1)
+                throw new ApiException("subscription_item_ambiguous", "The subscription does not have exactly one item");
 
-            // Simulate Stripe call
-            var priceId = $"price_{newTier.ToLower()}";
-            StripeClient.UpdateSubscription(cust.StripeSubscriptionId, priceId);
+            _stripe.UpdateSubscriptionItem(cust.StripeSubscriptionId, itemIds[0], priceId, "create_prorations");
 
+            var oldTier = cust.Tier;
             AuditLogger.Log("plan_changed", AuthContext.CurrentUser.UserId,
                 resourceType: "customer", resourceId: cust.CustomerId,
-                oldValue: oldTier, newValue: newTier);
+                oldValue: oldTier, newValue: tier);
 
-            cust.Tier = newRole;
+            cust.Tier = tier;
 
             return new
             {
                 success = true,
                 customer_id = cust.CustomerId,
                 old_tier = oldTier,
-                new_tier = newTier,
+                new_tier = tier,
                 effective_date = DateTime.UtcNow
             };
         }
@@ -633,12 +851,20 @@ namespace AdminSystem
 
             // Assume theme existence check passes.
 
+            // init config (ADMIN-14; added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: there was no config)
             var deployment = new Deployment
             {
                 CustomerId = customerId,
                 Domain = domain,
                 Tier = role,
-                ThemeId = themeId
+                ThemeId = themeId,
+                Config = new Dictionary<string, string>
+                {
+                    { "domain", domain },
+                    { "theme_id", themeId.ToString() },
+                    { "tier", role.ToString() },
+                    { "created_by", AuthContext.CurrentUser.UserId.ToString() }
+                }
             };
 
             AuditLogger.Log("deployment_created", AuthContext.CurrentUser.UserId,
@@ -656,6 +882,12 @@ namespace AdminSystem
             };
         }
 
+        /// <summary>
+        /// Owner-only, double-gated publish (ADMIN-15): CSRF, owner, then SafetyFlags.CanPublish (403 publish_blocked);
+        /// the deployment must be a draft with a verified domain and a theme. Sets status 'live' and published_at.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: domain_verified and theme_set are checked (they were
+        /// assumed). Touches: the in-memory deployment and audit records.
+        /// </summary>
         public object PublishDeployment(string csrfToken, Guid deploymentId)
         {
             CsrfValidator.Verify(csrfToken);
@@ -669,7 +901,11 @@ namespace AdminSystem
             if (dep.Status != DeploymentStatus.Draft)
                 throw new ApiException("invalid_state", "Only draft deployments can be published");
 
-            // Assume domain verification and theme set checks pass.
+            // spec Check: domain_verified, theme_set (were assumed; enforced 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+            if (!dep.DomainVerified)
+                throw new ApiException("domain_not_verified", "The deployment's domain is not verified");
+            if (dep.ThemeId == Guid.Empty)
+                throw new ApiException("theme_not_set", "The deployment has no theme");
 
             AuditLogger.Log("deployment_published", AuthContext.CurrentUser.UserId,
                 resourceType: "deployment", resourceId: dep.DeploymentId,
@@ -750,6 +986,14 @@ namespace AdminSystem
             return items;
         }
 
+        /// <summary>
+        /// Owner-only decision on a pending governance action. approve: runs the action's executor
+        /// (<see cref="GovernanceExecutors"/>; 400 unsupported_action_type when none), then status 'approved',
+        /// approved_by, approved_at, audit "action_approved" with the execution result (ADMIN-16). reject: requires a
+        /// reason (400 missing_reason), status 'rejected', audit "action_rejected" with the reason (ADMIN-17).
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: approve executes the action. Touches: the in-memory
+        /// governance and audit records, and whatever the executor touches.
+        /// </summary>
         public object DecideGovernanceAction(string csrfToken, Guid actionId, string decide, string reason = null)
         {
             CsrfValidator.Verify(csrfToken);
@@ -763,17 +1007,21 @@ namespace AdminSystem
 
             if (decide.Equals("approve", StringComparison.OrdinalIgnoreCase))
             {
-                // Execute original action (simplified: just mark as approved)
+                // Execute the original action first; an action with no executor stays pending
+                // (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: approve used to mark it approved without running it)
+                if (!GovernanceExecutors.ByType.TryGetValue(ga.ActionType ?? "", out var execute))
+                    throw new ApiException("unsupported_action_type", "No executor for this action type");
+                var executionResult = execute(ga);
+
                 ga.Status = "approved";
                 ga.ApprovedBy = AuthContext.CurrentUser.UserId;
                 ga.ApprovedAt = DateTime.UtcNow;
 
                 AuditLogger.Log("action_approved", AuthContext.CurrentUser.UserId,
                     resourceType: "governance_action", resourceId: ga.ActionId,
-                    newValue: "approved");
+                    newValue: executionResult);
 
-                // In a real system we would invoke the original action logic.
-                return new { success = true, action_id = ga.ActionId, status = "approved" };
+                return new { success = true, action_id = ga.ActionId, status = "approved", execution_result = executionResult };
             }
             else if (decide.Equals("reject", StringComparison.OrdinalIgnoreCase))
             {

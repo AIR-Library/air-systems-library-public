@@ -7,12 +7,14 @@ as the other languages.
 Storage: an in-memory inverted index per document type (term -> {doc_key: term_frequency}, each
          posting list kept in indexing order), a vocabulary string for partial matching, and a
          metadata index (field -> lower-cased value -> doc keys) for filters.
-Tokenization: whitespace/punctuation split, lowercase, stop-word removal.
+Tokenization: a word is a maximal run of Unicode letters and digits (\\p{L}, \\p{N}); each word is
+          lower-cased with str.lower; no stop words (SEARCH-03 as amended 2026-11-10).
 Matching: every query word must match the document (spec: "stripe integration" finds documents
-          with both words). A word matches exactly, or partially when a document word contains it
-          ("stri" finds "stripe").
-Relevance: per query word 1.0 for an exact match and 2/3 for a partial match, averaged over the
-           query words; so exact > partial, in [0, 1]. Ties: most recently indexed first.
+          with both words). A query word matches a document word equal to it or starting with it
+          ("stri" finds "stripe"; "ripe" does not).
+Relevance: per query word 1.0 for an exact word match and 2/3 for a prefix match, averaged over the
+           query words; so exact > prefix, in [0, 1]. Ties: insertion order, the document indexed first
+           comes first (SEARCH-09 as amended 2026-11-10).
 Filters: metadata field:value, case-insensitive, from the filters argument or embedded in q.
 Facets: counts per metadata value over all matches (not just the returned page).
 
@@ -27,6 +29,10 @@ Repair 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP
     The budget was not loosened. Other changes: queries are AND (spec), ties break by indexing order
     (deterministic, not by float timestamps), document types may not contain ':' (it made keys
     ambiguous), and the engine has a public clear().
+Amendment 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec amended after review on PR 19)
+    Words are runs of Unicode letters/digits ("café" is one word; it was split at "é"), no stop words,
+    a query word matches by word prefix (was any substring, so "ripe" found "stripe"), and equal scores
+    keep insertion order (was newest first).
 Touches: memory only (no database, network or files). SCHEMA_SQL is reference DDL for persisting
 documents; this module does not execute it.
 """
@@ -58,37 +64,30 @@ CREATE INDEX IF NOT EXISTS idx_search_index_type_id
     ON search_index (document_type, document_id);
 """
 
-# ---------------------------------------------------------------------------
-# Stop words (common words removed during tokenization)
-# ---------------------------------------------------------------------------
-STOP_WORDS = frozenset(
-    """
-    a an and are as at be but by for from had has have he her his i if in is it
-    its me my no nor not of on or our she so that the their them then there these
-    they this to was we were what when where which who will with you your
-    """.split()
-)
-
 EXACT_SCORE = 1.0
 PARTIAL_SCORE = 2.0 / 3.0
 
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
+# [^\W_] is a Unicode letter or digit: for str patterns \w is exactly the characters for which isalnum() is
+# true (letters L*, numbers N*) plus "_", so removing "_" leaves \p{L} and \p{N} (SEARCH-03, 2026-11-10).
+_TOKEN_RE = re.compile(r"[^\W_]+")
 _FILTER_RE = re.compile(r"(\w+):(\S+)")
-_VOCAB_SEP = "\n"  # never part of a token ([a-z0-9]+)
+_VOCAB_SEP = "\n"  # never part of a token (not a letter or digit)
 
 
 # ---------------------------------------------------------------------------
 # Tokenization
 # ---------------------------------------------------------------------------
 def tokenize(text: str) -> List[str]:
-    """Split on whitespace/punctuation, lowercase, remove stop words. Input: text (None allowed).
+    """Split text into words and lower-case them. Input: text (None allowed).
 
-    Output: the tokens in order, duplicates kept. Unchanged behaviour; documented 2026-11-10,
-    session session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+    Output: the words in order, duplicates kept. A word is a maximal run of Unicode letters and digits;
+    everything else separates words; each word is lower-cased with str.lower after the split; no stop words.
+    Why: SEARCH-03 as amended 2026-11-10 (the old split was [a-z0-9]+ on the lower-cased text, so "café"
+    became "caf", and it dropped stop words). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
     """
     if not text:
         return []
-    return [t for t in _TOKEN_RE.findall(text.lower()) if t not in STOP_WORDS]
+    return [w.lower() for w in _TOKEN_RE.findall(text)]
 
 
 # ---------------------------------------------------------------------------
@@ -271,22 +270,24 @@ class SearchEngine:
         return self._vocab_blob
 
     def _partial_terms(self, token: str) -> Set[str]:
-        """Live vocabulary terms that contain ``token`` but are not equal to it (lock held).
+        """Live vocabulary terms that START with ``token`` but are not equal to it (lock held).
 
-        str.find runs in C over the vocabulary string, so this costs one pass over the vocabulary's
-        bytes plus Python work per matching term. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP:
-        replaces a Python loop over every vocabulary word.
+        Every term in the vocabulary string follows a separator, so searching for separator + token finds
+        exactly the terms with that prefix; str.find runs in C, one pass over the vocabulary's bytes plus
+        Python work per matching term. Why: SEARCH-03 as amended 2026-11-10 ("ripe" must not find "stripe";
+        this used to match any substring). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches memory only.
         """
         blob = self._vocabulary()
         found: Set[str] = set()
-        i = blob.find(token)
+        needle = _VOCAB_SEP + token
+        i = blob.find(needle)
         while i != -1:
-            start = blob.rfind(_VOCAB_SEP, 0, i) + 1
-            end = blob.find(_VOCAB_SEP, i)
+            start = i + 1
+            end = blob.find(_VOCAB_SEP, start)
             term = blob[start:end]
             if term != token and self._term_alive(term):
                 found.add(term)
-            i = blob.find(token, end)
+            i = blob.find(needle, end)
         return found
 
     def _filter_keys(self, filters: Dict[str, str]) -> Optional[Set[str]]:
@@ -305,16 +306,17 @@ class SearchEngine:
         return result  # read-only: may be the index's own set
 
     @staticmethod
-    def _newest_first(dicts: List[Dict[str, Any]], docs: Dict[str, Document]) -> Iterator[str]:
-        """Merge several insertion-ordered key dicts into one stream of keys, most recently indexed first.
+    def _oldest_first(dicts: List[Dict[str, Any]], docs: Dict[str, Document]) -> Iterator[str]:
+        """Merge several insertion-ordered key dicts into one stream of keys, the first indexed first.
 
-        Lazy: reads only as many keys as the caller consumes. 2026-11-10, session
-        session_012zDydZCZ4AChqhEZ4oVtaP.
+        Lazy: reads only as many keys as the caller consumes. Why: SEARCH-09 as amended 2026-11-10 (equal
+        scores keep insertion order; this was newest first). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        Touches memory only.
         """
         if len(dicts) == 1:
-            return iter(reversed(dicts[0]))
-        streams = [((-docs[k].seq, k) for k in reversed(d)) for d in dicts]
-        return (k for _neg_seq, k in heapq.merge(*streams))
+            return iter(dicts[0])
+        streams = [((docs[k].seq, k) for k in d) for d in dicts]
+        return (k for _seq, k in heapq.merge(*streams))
 
     # -- public API --------------------------------------------------------
     def index_document(
@@ -374,7 +376,8 @@ class SearchEngine:
         offset: int = 0,
     ) -> Dict[str, Any]:
         """
-        GET /search: documents matching every word of ``q``, ranked by relevance, newest first on ties.
+        GET /search: documents matching every word of ``q``, ranked by relevance, insertion order on ties
+        (SEARCH-09 as amended 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP; was newest first).
 
         Inputs: q (words plus optional field:value filters), document_type, filters, facets,
         limit (>= 0), offset (>= 0).
@@ -441,7 +444,7 @@ class SearchEngine:
         Every match of a group has the same score: no word -> all documents (1.0); one word -> exact
         matches (1.0), then documents that only match partially (2/3). Totals come from posting-list
         lengths, or C-level set operations when filters apply or partial lists overlap. The page is read
-        lazily, newest first, from the ordered posting lists (skipping ``offset`` in C where possible),
+        lazily, in insertion order (2026-11-10, SEARCH-09; was newest first), from the ordered posting lists (skipping ``offset`` in C where possible),
         or picked from the matching keys when filters leave few of them. Returns (the page as
         (score, doc) pairs, total, all matching keys when ``need_all`` else ()). 2026-11-10, session
         session_012zDydZCZ4AChqhEZ4oVtaP.
@@ -501,10 +504,10 @@ class SearchEngine:
             take = limit - len(page)
             if members is not None and group_total * 8 < size:
                 # few matches left by the filters: rank them directly instead of walking the lists
-                newest = heapq.nlargest(skip + take, itertools.chain(*hits), key=lambda k: self._docs[k].seq)
-                keys = newest[skip:]
+                oldest = heapq.nsmallest(skip + take, itertools.chain(*hits), key=lambda k: self._docs[k].seq)
+                keys = oldest[skip:]
             else:
-                stream: Iterable[str] = self._newest_first(dicts, self._docs)
+                stream: Iterable[str] = self._oldest_first(dicts, self._docs)
                 if members is not None:
                     stream = (k for k, _ in itertools.groupby(stream) if k in members)  # groupby drops repeats
                 keys = list(itertools.islice(stream, skip, skip + take))
@@ -520,8 +523,9 @@ class SearchEngine:
 
         Words are applied fewest matches first; each step is a C-level set operation, or a
         membership check per remaining candidate when that is cheaper. Score = mean over words of 1.0
-        (exact) or 2/3 (partial). Returns (best ``want`` pairs ordered by score desc then newest first,
-        total, matching keys). 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.
+        (exact) or 2/3 (prefix). Returns (best ``want`` pairs ordered by score desc then insertion order,
+        total, matching keys). 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP; ties by insertion order
+        since the SEARCH-09 amendment of 2026-11-10.
         """
         plans = []
         for token in query_tokens:
@@ -543,9 +547,10 @@ class SearchEngine:
         n = len(query_tokens)
 
         def rank(key: str) -> Tuple[float, int]:
+            """Sort key: higher score first, then insertion order (SEARCH-09 as amended; was newest first). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP."""
             doc = self._docs[key]
             score = sum(EXACT_SCORE if t in doc.term_tf else PARTIAL_SCORE for t in query_tokens) / n
-            return (-score, -doc.seq)
+            return (-score, doc.seq)
 
         best = heapq.nsmallest(want, candidates, key=rank)
         page = [(-rank(k)[0], self._docs[k]) for k in best]
@@ -723,5 +728,4 @@ __all__ = [
     "handle_unindex",
     "handle_reindex",
     "SCHEMA_SQL",
-    "STOP_WORDS",
 ]

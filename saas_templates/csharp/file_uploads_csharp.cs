@@ -20,14 +20,25 @@ namespace FileUploads
             "pdf", "png", "jpg", "jpeg", "gif", "txt", "csv", "docx", "xlsx"
         };
 
+        private readonly Func<DateTimeOffset> _clock;
+
+        /// <summary>
+        /// Builds the service.
+        /// In: the file store, the storage directory (outside the webroot), the HMAC key for download links,
+        /// isMember(user, org), the size limit (default 10 MB) and an optional clock (default UTC now).
+        /// Why the clock: link expiry (UPLOAD-06) is tested without sleeping, so no test depends on wall time
+        /// (docs/specs/README.md "Deterministic"). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        /// Touches: creates the storage directory on disk.
+        /// </summary>
         public FileUploadService(IFileStore store, string storageDir, byte[] hmacKey,
-            Func<Guid, Guid, bool> isMember, long sizeLimitBytes = 10 * 1024 * 1024)
+            Func<Guid, Guid, bool> isMember, long sizeLimitBytes = 10 * 1024 * 1024, Func<DateTimeOffset> clock = null)
         {
             _store = store;
             _storageDir = storageDir;
             _hmacKey = hmacKey;
             _isMember = isMember;
             _sizeLimitBytes = sizeLimitBytes;
+            _clock = clock ?? (() => DateTimeOffset.UtcNow);
             Directory.CreateDirectory(_storageDir);
         }
 
@@ -71,7 +82,7 @@ namespace FileUploads
                 MimeType = mimeType,
                 SizeBytes = bytes.Length,
                 Sha256 = ComputeSha256(bytes),
-                CreatedAt = DateTimeOffset.UtcNow,
+                CreatedAt = _clock(),
                 DeletedAt = null
             };
 
@@ -79,6 +90,14 @@ namespace FileUploads
             return record.Id;
         }
 
+        /// <summary>
+        /// Makes an expiring signed download link.
+        /// In: the caller, the file id and the lifetime in seconds (default 300). Out: "payload.signature", where
+        /// payload = base64url("file_id:expires_at") and signature = base64url(HMAC-SHA256(key, payload)).
+        /// Errors: FileUploadException for a missing or deleted file (not found) or a caller outside the file's org.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the link no longer carries the creator's id; the
+        /// spec signs (file_id, expires_at) and download() checks the CALLER instead. Touches: reads the store.
+        /// </summary>
         public string CreateDownloadLink(Guid userId, Guid fileId, int ttlSeconds = 300)
         {
             FileRecord record = _store.GetFile(fileId);
@@ -88,14 +107,23 @@ namespace FileUploads
             if (!_isMember(userId, record.OrgId))
                 throw new FileUploadException("User not authorized to download this file.");
 
-            long expiresAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds() + ttlSeconds;
-            string payload = $"{fileId}:{expiresAt}:{userId}";
+            long expiresAt = _clock().ToUnixTimeSeconds() + ttlSeconds;
+            string payload = $"{fileId}:{expiresAt}";
             string payloadB64 = Base64UrlEncode(Encoding.UTF8.GetBytes(payload));
             string signature = Base64UrlEncode(HmacSha256(payloadB64));
             return $"{payloadB64}.{signature}";
         }
 
-        public byte[] Download(string token)
+        /// <summary>
+        /// Returns a file's bytes for a valid link.
+        /// In: the verified caller and the link token. Out: the file's bytes.
+        /// Errors (FileUploadException, never a parse exception): malformed token, bad signature (constant-time
+        /// compare), expired link, deleted or missing file (not found), and a caller who is not a member of the
+        /// file's org. Why: file_uploads spec "download(user, token) ... the caller is needed to re-check access";
+        /// before 2026-11-10 the C# version took only the token and trusted the user id inside it, so a forwarded
+        /// link worked for anyone. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the store, reads a file on disk.
+        /// </summary>
+        public byte[] Download(Guid userId, string token)
         {
             if (string.IsNullOrEmpty(token))
                 throw new FileUploadException("Invalid token.");
@@ -114,7 +142,7 @@ namespace FileUploads
                 payloadBytes = Base64UrlDecode(payloadB64);
                 signatureBytes = Base64UrlDecode(signatureB64);
             }
-            catch (Exception)
+            catch (FormatException)
             {
                 throw new FileUploadException("Invalid link encoding.");
             }
@@ -124,7 +152,7 @@ namespace FileUploads
 
             string payload = Encoding.UTF8.GetString(payloadBytes);
             string[] payloadParts = payload.Split(':');
-            if (payloadParts.Length != 3)
+            if (payloadParts.Length != 2)
                 throw new FileUploadException("Invalid link payload.");
 
             if (!Guid.TryParse(payloadParts[0], out Guid fileId))
@@ -133,10 +161,7 @@ namespace FileUploads
             if (!long.TryParse(payloadParts[1], out long expiresAt))
                 throw new FileUploadException("Invalid expiry in link.");
 
-            if (!Guid.TryParse(payloadParts[2], out Guid userId))
-                throw new FileUploadException("Invalid user id in link.");
-
-            if (DateTimeOffset.UtcNow.ToUnixTimeSeconds() > expiresAt)
+            if (_clock().ToUnixTimeSeconds() > expiresAt)
                 throw new FileUploadException("Link expired.");
 
             FileRecord record = _store.GetFile(fileId);
@@ -162,7 +187,7 @@ namespace FileUploads
             if (!_isMember(userId, record.OrgId))
                 throw new FileUploadException("User not authorized to delete this file.");
 
-            record.DeletedAt = DateTimeOffset.UtcNow;
+            record.DeletedAt = _clock();
             _store.UpdateFile(record);
         }
 

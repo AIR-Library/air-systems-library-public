@@ -167,11 +167,32 @@ impl Response {
     }
 }
 
-/// What: the payment provider client for plan changes. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+/// What: one item of a provider subscription (its id and the price it bills). 2026-11-10,
+/// session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-12). Touches: nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionItem {
+    pub id: String,
+    pub price: String,
+}
+
+/// What: a subscription update: `items: [{id, price}]` and `proration_behavior`. The item id is
+/// required by the type, so a bare `{price}` (which ADDS a second item and bills both plans) cannot be
+/// sent. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-12, billing BILL-03). Touches: nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionUpdate {
+    pub items: Vec<SubscriptionItem>,
+    pub proration_behavior: String,
+}
+
+/// What: the payment provider client for plan changes. Changed 2026-11-10 (ADMIN-12): it retrieves the
+/// subscription's items and updates with the existing item id. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
 /// Touches: money and the network in a real implementation (key from STRIPE_SECRET_KEY).
 pub trait StripeClient {
-    /// What: `update_subscription` (see the implementations). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
-    fn update_subscription(&self, stripe_id: &str, price_id: &str) -> AdminResult<()>;
+    /// What: the subscription's items (stripe.subscriptions.retrieve). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    fn retrieve_subscription(&self, stripe_id: &str) -> AdminResult<Vec<SubscriptionItem>>;
+    /// What: stripe.subscriptions.update with these items and proration behaviour. 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP.
+    fn update_subscription(&self, stripe_id: &str, update: &SubscriptionUpdate) -> AdminResult<()>;
 }
 
 /// What: checks that a deployment's domain points at us (DNS TXT record, HTTP token, ...).
@@ -508,10 +529,14 @@ impl AdminSystem {
         run().map(Response::success).unwrap_or_else(Response::from_error)
     }
 
-    /// What: customers action=change_plan. Gate: owner. The customer's subscription is updated at the
-    /// payment provider first; only then is the tier stored and audited. A customer without a
-    /// subscription cannot change plan here. Out: `{customer_id, old_tier, new_tier, effective_date}`.
-    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: money (provider), database.
+    /// What: customers action=change_plan. Gate: owner. The billing rule (billing_subscriptions.md flow
+    /// 2): an unknown tier is `invalid_tier`; the provider subscription is retrieved and one without
+    /// exactly one item is `subscription_item_ambiguous` (409); both before any update. Then the update is
+    /// `items: [{id: current_item_id, price}]` with 'create_prorations' (never a bare price, which adds a
+    /// second item and bills both plans); only then is the tier stored and audited. A customer without
+    /// a subscription cannot change plan here. Out: `{customer_id, old_tier, new_tier, effective_date}`.
+    /// Why: 2026-11-10 amendment (ADMIN-12). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// Touches: money (provider), database.
     pub fn change_plan(&self, current: &User, customer_id: i64, new_tier: &str) -> Response {
         let run = || -> AdminResult<Value> {
             let me = self.require_owner(current)?;
@@ -523,7 +548,13 @@ impl AdminSystem {
                 .ok_or_else(|| AdminError::NotFound("customer".into()))?;
             let sub = sub.ok_or_else(|| AdminError::Validation("no_subscription".into()))?;
             let price = self.price_ids.get(tier.as_str()).ok_or_else(|| AdminError::Validation("invalid_tier".into()))?;
-            self.stripe.update_subscription(&sub, price)?;
+            let items = self.stripe.retrieve_subscription(&sub)?;
+            let [current] = items.as_slice() else { return Err(AdminError::Conflict("subscription_item_ambiguous".into())) };
+            let update = SubscriptionUpdate {
+                items: vec![SubscriptionItem { id: current.id.clone(), price: price.clone() }],
+                proration_behavior: "create_prorations".into(),
+            };
+            self.stripe.update_subscription(&sub, &update)?;
             let ts = now();
             let tx = self.conn.unchecked_transaction()?;
             tx.execute("UPDATE customers SET tier = ?1 WHERE id = ?2", params![tier.as_str(), customer_id])?;

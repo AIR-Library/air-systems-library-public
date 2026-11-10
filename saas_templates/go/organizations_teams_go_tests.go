@@ -5,6 +5,7 @@ import (
 	"time"
 )
 
+// ORG-01
 func TestNonMemberCannotReadMembersOfAnotherOrg(t *testing.T) {
 	store := NewInMemoryStore()
 	service := NewOrganizationsTeams(store)
@@ -48,6 +49,7 @@ func TestNonMemberCannotReadMembersOfAnotherOrg(t *testing.T) {
 	}
 }
 
+// ORG-02
 func TestMemberCannotInviteAdminCan(t *testing.T) {
 	store := NewInMemoryStore()
 	service := NewOrganizationsTeams(store)
@@ -104,6 +106,7 @@ func TestMemberCannotInviteAdminCan(t *testing.T) {
 	}
 }
 
+// ORG-03
 func TestAdminCannotRemoveOwnerLastOwnerCannotLeave(t *testing.T) {
 	store := NewInMemoryStore()
 	service := NewOrganizationsTeams(store)
@@ -147,6 +150,7 @@ func TestAdminCannotRemoveOwnerLastOwnerCannotLeave(t *testing.T) {
 	}
 }
 
+// ORG-04
 func TestInvitationWorksOnceSecondUseFails(t *testing.T) {
 	store := NewInMemoryStore()
 	service := NewOrganizationsTeams(store)
@@ -181,6 +185,7 @@ func TestInvitationWorksOnceSecondUseFails(t *testing.T) {
 	}
 }
 
+// ORG-05
 func TestExpiredInvitationFailsEmailMismatchFails(t *testing.T) {
 	store := NewInMemoryStore()
 	service := NewOrganizationsTeams(store)
@@ -237,6 +242,7 @@ func TestExpiredInvitationFailsEmailMismatchFails(t *testing.T) {
 	}
 }
 
+// ORG-06
 func TestRawTokenNotStoredInDatabase(t *testing.T) {
 	store := NewInMemoryStore()
 	service := NewOrganizationsTeams(store)
@@ -270,5 +276,52 @@ func TestRawTokenNotStoredInDatabase(t *testing.T) {
 	expectedHash := hashToken(rawToken)
 	if invitation.TokenHash != expectedHash {
 		t.Fatalf("Expected token hash %s, got %s", expectedHash, invitation.TokenHash)
+	}
+}
+// TestOnlyOwnerGrantsOwnerAdminManagesMembers proves the spec's least-privilege rules beyond ORG-02/03:
+// an admin can remove and re-role a plain member, but cannot invite or promote anyone to owner, and an
+// owner can. Why: the spec (amended 2026-09-26) says only an owner may grant the owner role; Go let an
+// admin invite an owner. Written 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory store.
+func TestOnlyOwnerGrantsOwnerAdminManagesMembers(t *testing.T) {
+	service := NewOrganizationsTeams(NewInMemoryStore())
+	owner := User{ID: "owner", Email: "owner@example.com"}
+	org, err := service.CreateOrg(owner, "Org")
+	if err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	join := func(u User, role Role) {
+		tok, err := service.Invite(owner, org.ID, u.Email, role)
+		if err != nil {
+			t.Fatalf("invite %s: %v", u.ID, err)
+		}
+		if _, err := service.AcceptInvitation(u, tok); err != nil {
+			t.Fatalf("accept %s: %v", u.ID, err)
+		}
+	}
+	admin := User{ID: "admin", Email: "admin@example.com"}
+	member := User{ID: "member", Email: "member@example.com"}
+	join(admin, RoleAdmin)
+	join(member, RoleMember)
+
+	if _, err := service.Invite(admin, org.ID, "x@example.com", RoleOwner); err == nil || err.Error() != "forbidden" {
+		t.Fatalf("admin inviting an owner: want forbidden, got %v", err)
+	}
+	if err := service.ChangeRole(admin, org.ID, member.ID, RoleOwner); err == nil || err.Error() != "forbidden" {
+		t.Fatalf("admin promoting to owner: want forbidden, got %v", err)
+	}
+	if err := service.ChangeRole(admin, org.ID, owner.ID, RoleMember); err == nil || err.Error() != "forbidden" {
+		t.Fatalf("admin demoting the owner: want forbidden, got %v", err)
+	}
+	if err := service.ChangeRole(admin, org.ID, member.ID, RoleAdmin); err != nil {
+		t.Fatalf("admin changing a member's role: %v", err)
+	}
+	if err := service.RemoveMember(admin, org.ID, member.ID); err != nil {
+		t.Fatalf("admin removing a member: %v", err)
+	}
+	if err := service.ChangeRole(owner, org.ID, admin.ID, RoleOwner); err != nil {
+		t.Fatalf("owner promoting to owner: %v", err)
+	}
+	if err := service.LeaveOrg(owner, org.ID); err != nil {
+		t.Fatalf("one of two owners leaving: %v", err)
 	}
 }

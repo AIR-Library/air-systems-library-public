@@ -4,6 +4,8 @@
 //   optional sender so it can be tested without the network.
 // Why: the suite failed on CI (it was listed in ci/baseline.json). Reviewed by Claude; fixed by a free model from a continuity handoff, session c6ee9a72 (2026-11-03).
 // Touches: the database, outgoing HTTPS (curl).
+// Changed 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): injectable clock, exact event-type match (no LIKE
+//   wildcards), digits-only timestamps in verify(), pending deliveries tie-broken by insertion order.
 
 declare(strict_types=1);
 
@@ -19,15 +21,26 @@ use InvalidArgumentException;
 final class Webhooks
 {
     private PDO $db;
+    /** @var \Closure(): int */
+    private \Closure $clock;
     private const SECRET_PREFIX = 'whsec_';
     private const SECRET_BYTES_MIN = 24;
     private const SECRET_BYTES_MAX = 64;
     private const MAX_FAILURES_BEFORE_DISABLE = 5;
     public const RETRY_SCHEDULE = [5, 300, 1800, 7200, 18000, 36000, 36000]; // seconds
 
-    public function __construct(PDO $db)
+    /**
+     * Build the service on a PDO connection.
+     *
+     * Inputs: $db (shared connection; error mode set to exceptions), $clock (optional; returns unix seconds,
+     * default time()). Output: none.
+     * Why: the common rules require an injectable clock where the spec involves time (retry schedule,
+     * delivered_at). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database connection settings.
+     */
+    public function __construct(PDO $db, ?\Closure $clock = null)
     {
         $this->db = $db;
+        $this->clock = $clock ?? static fn(): int => time();
         $this->db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
     }
 
@@ -93,7 +106,7 @@ SQL;
 
         $id = 'wep_' . bin2hex(random_bytes(16));
         $secret = self::SECRET_PREFIX . base64_encode(random_bytes(32));
-        $now = time();
+        $now = ($this->clock)();
 
         $stmt = $this->db->prepare(
             'INSERT INTO webhook_endpoints (id, org_id, url, secret, event_types, active, failure_count, created_at)
@@ -105,12 +118,18 @@ SQL;
     }
 
     /**
-     * Send an event to all subscribed endpoints of the given org
+     * Send an event to all subscribed endpoints of the given org.
+     *
+     * Inputs: $orgId (the verified caller's org), $eventType, $payload. Output: the new message id "msg_...".
+     * Creates one webhook_messages row and one pending delivery per ACTIVE endpoint of THAT org whose
+     * event_types JSON array contains $eventType exactly (json_each equality, so "%" or "_" in an event type
+     * are not LIKE wildcards). Why: HOOK-06; the LIKE match let "user.%" reach every "user.*" endpoint
+     * (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). Touches: the database (one transaction).
      */
     public function sendEvent(string $orgId, string $eventType, array $payload): string
     {
         $messageId = 'msg_' . bin2hex(random_bytes(16));
-        $now = time();
+        $now = ($this->clock)();
         $payloadJson = json_encode($payload, JSON_THROW_ON_ERROR);
 
         $this->db->beginTransaction();
@@ -124,7 +143,8 @@ SQL;
                 "SELECT id FROM webhook_endpoints
                  WHERE active = 1
                  AND org_id = ?
-                 AND json_extract(event_types, '\$') LIKE '%\"' || ? || '\"%'"
+                 AND EXISTS (SELECT 1 FROM json_each(webhook_endpoints.event_types) je WHERE je.value = ?)
+                 ORDER BY rowid"
             );
             $endpoints->execute([$orgId, $eventType]);
             $endpointIds = $endpoints->fetchAll(PDO::FETCH_COLUMN);
@@ -162,7 +182,14 @@ SQL;
     }
 
     /**
-     * Deliver a single webhook delivery
+     * Deliver a single webhook delivery.
+     *
+     * Inputs: $delivery (a row with id and attempt), $sender (injectable fn(url, headers, body): int status;
+     * null uses curl). Output: {success, status_code, error}. 200-299 marks success; any other status, a
+     * thrown sender or a timeout records the status and schedules the next attempt from RETRY_SCHEDULE;
+     * the webhook-id header is always the message id, so it is the same on every retry (HOOK-05, HOOK-07).
+     * Time comes from the injected clock (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
+     * Touches: the database, outgoing HTTPS when no sender is given.
      * @param ?callable $sender Function(string $url, array $headers, string $body): int
      * @return array{success: bool, status_code: int|null, error: string|null}
      */
@@ -182,7 +209,7 @@ SQL;
             throw new RuntimeException('Delivery not found');
         }
 
-        $timestamp = time();
+        $timestamp = ($this->clock)();
         $signature = self::sign($row['secret'], $row['msg_id'], $timestamp, $row['payload']);
 
         $headers = [
@@ -226,22 +253,26 @@ SQL;
             $curlError = $success ? null : ($curlError ?: "HTTP $statusCode");
         }
 
-        $now = time();
+        $now = ($this->clock)();
 
         $this->db->beginTransaction();
         try {
             if ($success) {
                 $this->db->prepare(
-                    'UPDATE webhook_deliveries SET success = 1, status_code = ?, delivered_at = ?, error = NULL WHERE id = ?'
+                    'UPDATE webhook_deliveries SET success = 1, status_code = ?, delivered_at = ?, error = NULL, next_attempt_at = NULL WHERE id = ?'
                 )->execute([$statusCode, $now, $delivery['id']]);
                 $this->db->prepare(
                     'UPDATE webhook_endpoints SET failure_count = 0 WHERE id = ?'
                 )->execute([$row['endpoint_id']]);
             } else {
-                $attempt = $delivery['attempt'] + 1;
+                // Attempt n failed: the next one (n + 1) waits RETRY_SCHEDULE[n - 1], so the first retry is
+                // after 5 s (spec: 5s, 5m, 30m, 2h, 5h, 10h, 10h). It used RETRY_SCHEDULE[n] and skipped the 5 s
+                // step (fixed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
+                $failedAttempt = (int)$delivery['attempt'];
+                $attempt = $failedAttempt + 1;
                 $nextAttempt = null;
-                if ($attempt <= count(self::RETRY_SCHEDULE)) {
-                    $nextAttempt = $now + self::RETRY_SCHEDULE[$attempt - 1];
+                if ($failedAttempt >= 1 && $failedAttempt <= count(self::RETRY_SCHEDULE)) {
+                    $nextAttempt = $now + self::RETRY_SCHEDULE[$failedAttempt - 1];
                 }
                 $this->db->prepare(
                     'UPDATE webhook_deliveries SET attempt = ?, status_code = ?, error = ?, next_attempt_at = ? WHERE id = ?'
@@ -279,10 +310,16 @@ SQL;
     }
 
     /**
-     * Verify a webhook signature (receiver side)
+     * Verify a webhook signature (receiver side).
+     *
+     * Inputs: $secret ("whsec_..."), $headers (webhook-id, webhook-timestamp, webhook-signature), the raw body,
+     * $toleranceSeconds (default 300) and $now (optional unix seconds, default time(), so tests are
+     * deterministic). Output: true, or an error string. The timestamp must be all digits and within the
+     * tolerance; every space-separated "v1,<sig>" is compared in constant time (hash_equals).
+     * Why: HOOK-01..04; $now added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
      * @return true|string true on success, error message on failure
      */
-    public static function verify(string $secret, array $headers, string $rawBody, int $toleranceSeconds = 300): bool|string
+    public static function verify(string $secret, array $headers, string $rawBody, int $toleranceSeconds = 300, ?int $now = null): bool|string
     {
         $msgId = $headers['webhook-id'] ?? '';
         $timestampHeader = $headers['webhook-timestamp'] ?? '';
@@ -292,8 +329,11 @@ SQL;
             return 'Missing required headers';
         }
 
+        if (!preg_match('/^\d{1,12}$/', (string)$timestampHeader)) {
+            return 'Invalid timestamp';
+        }
         $timestamp = (int)$timestampHeader;
-        $now = time();
+        $now = $now ?? time();
         if (abs($now - $timestamp) > $toleranceSeconds) {
             return 'Timestamp outside tolerance';
         }
@@ -325,17 +365,18 @@ SQL;
     }
 
     /**
-     * Get pending deliveries ready for retry
+     * Get pending deliveries ready for retry, oldest due first, ties in insertion order (tie-break and the
+     * injected clock added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). Touches: the database (read).
      * @return array<int, array{id: string, message_id: string, endpoint_id: string, attempt: int}>
      */
     public function getPendingDeliveries(int $limit = 100): array
     {
-        $now = time();
+        $now = ($this->clock)();
         $stmt = $this->db->prepare(
             'SELECT id, message_id, endpoint_id, attempt
              FROM webhook_deliveries
              WHERE success = 0 AND next_attempt_at IS NOT NULL AND next_attempt_at <= ?
-             ORDER BY next_attempt_at ASC
+             ORDER BY next_attempt_at ASC, rowid ASC
              LIMIT ?'
         );
         $stmt->execute([$now, $limit]);

@@ -227,9 +227,13 @@ public class BillingService {
      * Flow 2: move a subscription to another tier. Stripe prorates; the response reports the credit for the
      * unused part of the current period at the old tier's price.
      * Input: Stripe subscription id, new tier. Output: {success, subscription_id, old_tier, new_tier,
-     * effective_date, proration_credit (cents)} or {error: invalid_tier|not_found|stripe_error|db_error}.
+     * effective_date, proration_credit (cents)} or {error: invalid_tier (400) | not_found |
+     * subscription_item_ambiguous (409) | stripe_error | db_error}.
      * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: the Stripe update did not compile and the
-     * credit was always 0. Touches: Stripe (changes what the customer is billed), the database.
+     * credit was always 0. Amended the same day (BILL-03, spec flow 2): the subscription is retrieved first, one
+     * that does not have exactly one item is refused with subscription_item_ambiguous before any update, and the
+     * update names that item's id with the new price and proration_behavior create_prorations (a bare price ADDS a
+     * second item and bills both plans). Touches: Stripe (changes what the customer is billed), the database.
      */
     public JsonObject changePlan(String subscriptionId, String newTier) {
         if (newTier == null || !PRICE_IDS.containsKey(newTier)) {
@@ -251,7 +255,12 @@ public class BillingService {
                 }
             }
 
-            StripeSubscription updated = stripe.changePrice(subscriptionId, PRICE_IDS.get(newTier));
+            StripeSubscription current = stripe.retrieveSubscription(subscriptionId);
+            if (current.itemIds.size() != 1) {
+                return errorResponse("subscription_item_ambiguous",
+                        "Subscription has " + current.itemIds.size() + " items; expected exactly one");
+            }
+            StripeSubscription updated = stripe.updateSubscriptionItem(subscriptionId, current.itemIds.get(0), PRICE_IDS.get(newTier));
             Instant now = clock.instant();
             long prorationCredit = prorationCredit(oldTier, updated, now);
 
@@ -659,8 +668,18 @@ public class BillingService {
         /** Creates a subscription for the customer on one price. Touches: Stripe (money). */
         StripeSubscription createSubscription(String customerId, String priceId) throws StripeException;
 
-        /** Moves the subscription's (first) item to another price, prorating. Touches: Stripe (money). */
-        StripeSubscription changePrice(String subscriptionId, String priceId) throws StripeException;
+        /**
+         * Reads a subscription with its item ids (stripe.subscriptions.retrieve). Added 2026-11-10,
+         * session_012zDydZCZ4AChqhEZ4oVtaP (BILL-03). Touches: Stripe (read only).
+         */
+        StripeSubscription retrieveSubscription(String subscriptionId) throws StripeException;
+
+        /**
+         * stripe.subscriptions.update(subscriptionId, {items: [{id: itemId, price: priceId}],
+         * proration_behavior: 'create_prorations'}): replaces the price of that one existing item.
+         * Replaces changePrice 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (BILL-03). Touches: Stripe (money).
+         */
+        StripeSubscription updateSubscriptionItem(String subscriptionId, String itemId, String priceId) throws StripeException;
     }
 
     /**
@@ -671,12 +690,20 @@ public class BillingService {
         public final String id;
         public final long currentPeriodStart;
         public final long currentPeriodEnd;
+        /** Ids of the subscription's items, in Stripe's order (added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, BILL-03). */
+        public final List<String> itemIds;
 
         /** Value object; no side effects. */
         public StripeSubscription(String id, long currentPeriodStart, long currentPeriodEnd) {
+            this(id, currentPeriodStart, currentPeriodEnd, List.of());
+        }
+
+        /** Value object with item ids; no side effects. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+        public StripeSubscription(String id, long currentPeriodStart, long currentPeriodEnd, List<String> itemIds) {
             this.id = id;
             this.currentPeriodStart = currentPeriodStart;
             this.currentPeriodEnd = currentPeriodEnd;
+            this.itemIds = List.copyOf(itemIds);
         }
     }
 
@@ -712,22 +739,35 @@ public class BillingService {
             return new StripeSubscription(s.getId(), orZero(s.getCurrentPeriodStart()), orZero(s.getCurrentPeriodEnd()));
         }
 
-        /** Replaces the price of the subscription's first item, with prorations. Touches: network, money. */
+        /** stripe.subscriptions.retrieve with the item ids. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: network. */
         @Override
-        public StripeSubscription changePrice(String subscriptionId, String priceId) throws StripeException {
-            RequestOptions opts = options();
-            Subscription current = Subscription.retrieve(subscriptionId, opts);
-            List<SubscriptionItem> items = current.getItems() == null ? new ArrayList<>() : current.getItems().getData();
-            SubscriptionUpdateParams.Item.Builder item = SubscriptionUpdateParams.Item.builder().setPrice(priceId);
-            if (!items.isEmpty()) {
-                item.setId(items.get(0).getId());
+        public StripeSubscription retrieveSubscription(String subscriptionId) throws StripeException {
+            Subscription s = Subscription.retrieve(subscriptionId, options());
+            List<String> ids = new ArrayList<>();
+            if (s.getItems() != null && s.getItems().getData() != null) {
+                for (SubscriptionItem it : s.getItems().getData()) {
+                    ids.add(it.getId());
+                }
             }
+            return new StripeSubscription(s.getId(), orZero(s.getCurrentPeriodStart()), orZero(s.getCurrentPeriodEnd()), ids);
+        }
+
+        /**
+         * Updates the one named item to priceId with proration_behavior create_prorations; never sends a bare price.
+         * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (BILL-03). Touches: network, money.
+         */
+        @Override
+        public StripeSubscription updateSubscriptionItem(String subscriptionId, String itemId, String priceId) throws StripeException {
+            if (itemId == null || itemId.isEmpty()) {
+                throw new IllegalArgumentException("an existing item id is required (a bare price adds a second item)");
+            }
+            RequestOptions opts = options();
             SubscriptionUpdateParams params = SubscriptionUpdateParams.builder()
-                    .addItem(item.build())
+                    .addItem(SubscriptionUpdateParams.Item.builder().setId(itemId).setPrice(priceId).build())
                     .setProrationBehavior(SubscriptionUpdateParams.ProrationBehavior.CREATE_PRORATIONS)
                     .build();
-            Subscription s = current.update(params, opts);
-            return new StripeSubscription(s.getId(), orZero(s.getCurrentPeriodStart()), orZero(s.getCurrentPeriodEnd()));
+            Subscription s = Subscription.retrieve(subscriptionId, opts).update(params, opts);
+            return new StripeSubscription(s.getId(), orZero(s.getCurrentPeriodStart()), orZero(s.getCurrentPeriodEnd()), List.of(itemId));
         }
 
         /** Null-safe unboxing of Stripe's epoch-second fields. Pure. */
@@ -743,6 +783,8 @@ public class BillingService {
      */
     public static final class InMemoryStripeGateway implements StripeGateway {
         private final Clock clock;
+        /** subscription id -> its items, each {item id, price id}, in order (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). */
+        private final Map<String, List<String[]>> itemsBySubscription = new HashMap<>();
         private final Map<String, String> priceBySubscription = new HashMap<>();
         private final Map<String, long[]> periodBySubscription = new HashMap<>();
         private final List<String> calls = new ArrayList<>();
@@ -761,27 +803,79 @@ public class BillingService {
             long end = start + Duration.ofDays(30).getSeconds();
             priceBySubscription.put(id, priceId);
             periodBySubscription.put(id, new long[]{start, end});
+            itemsBySubscription.put(id, new ArrayList<>(List.<String[]>of(new String[]{"si_" + id + "_1", priceId})));
             calls.add("create " + customerId + " " + priceId);
-            return new StripeSubscription(id, start, end);
+            return new StripeSubscription(id, start, end, List.of("si_" + id + "_1"));
         }
 
-        /** Records an existing subscription (e.g. one already in the database) with its period. */
+        /** Records an existing one-item subscription (item id "si_<id>_1") with its period. */
         public synchronized void addExisting(String subscriptionId, String priceId, long periodStart, long periodEnd) {
-            priceBySubscription.put(subscriptionId, priceId);
+            addExistingItems(subscriptionId, List.of(priceId), periodStart, periodEnd);
+        }
+
+        /**
+         * Records an existing subscription with one item per price (item ids "si_<id>_1", "si_<id>_2", ...), so tests can
+         * build the multi-item case BILL-03 refuses. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+         */
+        public synchronized void addExistingItems(String subscriptionId, List<String> priceIds, long periodStart, long periodEnd) {
+            List<String[]> items = new ArrayList<>();
+            for (int i = 0; i < priceIds.size(); i++) {
+                items.add(new String[]{"si_" + subscriptionId + "_" + (i + 1), priceIds.get(i)});
+            }
+            itemsBySubscription.put(subscriptionId, items);
+            priceBySubscription.put(subscriptionId, priceIds.isEmpty() ? null : priceIds.get(0));
             periodBySubscription.put(subscriptionId, new long[]{periodStart, periodEnd});
         }
 
-        /** Moves a known subscription to priceId (InvalidRequestException for unknown ids, as Stripe). Touches: memory only. */
+        private static StripeException missing(String what) {
+            return new com.stripe.exception.InvalidRequestException(what, null, null, "resource_missing", 404, null);
+        }
+
+        /** Returns a known subscription with its item ids and records "retrieve sub". Touches: memory only. */
         @Override
-        public synchronized StripeSubscription changePrice(String subscriptionId, String priceId) throws StripeException {
+        public synchronized StripeSubscription retrieveSubscription(String subscriptionId) throws StripeException {
             long[] period = periodBySubscription.get(subscriptionId);
             if (period == null) {
-                throw new com.stripe.exception.InvalidRequestException(
-                        "No such subscription: " + subscriptionId, null, null, "resource_missing", 404, null);
+                throw missing("No such subscription: " + subscriptionId);
             }
+            calls.add("retrieve " + subscriptionId);
+            List<String> ids = new ArrayList<>();
+            for (String[] it : itemsBySubscription.getOrDefault(subscriptionId, List.of())) {
+                ids.add(it[0]);
+            }
+            return new StripeSubscription(subscriptionId, period[0], period[1], ids);
+        }
+
+        /**
+         * Sets the named EXISTING item's price and records "update sub item price"; an unknown subscription or item
+         * throws, so a call without the right item id can never add a second item here. 2026-11-10,
+         * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+         */
+        @Override
+        public synchronized StripeSubscription updateSubscriptionItem(String subscriptionId, String itemId, String priceId) throws StripeException {
+            long[] period = periodBySubscription.get(subscriptionId);
+            if (period == null) {
+                throw missing("No such subscription: " + subscriptionId);
+            }
+            List<String[]> items = itemsBySubscription.getOrDefault(subscriptionId, new ArrayList<>());
+            String[] target = null;
+            for (String[] it : items) {
+                if (it[0].equals(itemId)) target = it;
+            }
+            if (target == null) {
+                throw missing("No such subscription item: " + itemId);
+            }
+            target[1] = priceId;
             priceBySubscription.put(subscriptionId, priceId);
-            calls.add("update " + subscriptionId + " " + priceId);
-            return new StripeSubscription(subscriptionId, period[0], period[1]);
+            calls.add("update " + subscriptionId + " " + itemId + " " + priceId);
+            List<String> ids = new ArrayList<>();
+            for (String[] it : items) ids.add(it[0]);
+            return new StripeSubscription(subscriptionId, period[0], period[1], ids);
+        }
+
+        /** Number of items on the subscription (0 if unknown). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+        public synchronized int itemCount(String subscriptionId) {
+            return itemsBySubscription.getOrDefault(subscriptionId, List.of()).size();
         }
 
         /** Price currently on the subscription, or null. */
@@ -789,7 +883,7 @@ public class BillingService {
             return priceBySubscription.get(subscriptionId);
         }
 
-        /** Every call made, in order ("create cus price", "update sub price"). */
+        /** Every call made, in order ("create cus price", "retrieve sub", "update sub item price"). */
         public synchronized List<String> calls() {
             return new ArrayList<>(calls);
         }

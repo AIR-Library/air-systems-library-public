@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 // DDL for reference
@@ -44,196 +45,351 @@ type SearchResponse struct {
 	Facets  map[string]map[string]int `json:"facets,omitempty"`
 }
 
+// docKey identifies a document: (document_type, document_id), as in the search_index table. Added
+// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: documents were keyed by id alone, so user 7 and deployment 7
+// overwrote each other.
+type docKey struct {
+	Type string
+	ID   int
+}
+
+// docEntry is one indexed document; seq is its insertion order (kept when it is re-indexed).
+type docEntry struct {
+	doc    Document
+	seq    int
+	tokens []string // distinct tokens of doc.Content
+}
+
+// Index is the in-memory inverted index.
+//
+// Phase B, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (SEARCH-03/08/09, amended): words are maximal runs
+// of Unicode letters and digits, lower-cased with strings.ToLower, with no stop words; a query term
+// matches a word equal to it (score 2) or starting with it (score 1) -- it used to match any word
+// CONTAINING it, so "ripe" found "stripe"; several terms must all match (AND); results are ordered by
+// score, then insertion order (it used to be document id). Postings are seq-ordered slices and scores are
+// accumulated in dense arrays, so a search over 1,000,000 documents stays under the 200 ms budget.
+// Touches: process memory only.
 type Index struct {
-	mu        sync.RWMutex
-	docs      map[int]Document
-	inverted  map[string]map[int]struct{}
-	stopWords map[string]struct{}
+	mu       sync.RWMutex
+	byKey    map[docKey]int        // key -> seq
+	docs     []*docEntry           // by seq; nil once unindexed
+	postings map[string][]int      // token -> ascending seqs
+	buckets  map[string][]string   // first one or two runes of a token -> tokens, for prefix lookups
+	seen     map[string]struct{}   // tokens already placed in buckets
 }
 
-var globalIndex = &Index{
-	docs:     make(map[int]Document),
-	inverted: make(map[string]map[int]struct{}),
-	stopWords: map[string]struct{}{
-		"a": {}, "an": {}, "the": {}, "and": {}, "or": {}, "but": {}, "is": {}, "are": {}, "was": {}, "were": {}, "in": {}, "on": {}, "at": {}, "by": {}, "for": {}, "with": {}, "without": {}, "to": {}, "from": {},
-	},
+var globalIndex = newIndex()
+
+// newIndex returns an empty index. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+func newIndex() *Index {
+	idx := &Index{}
+	idx.resetLocked()
+	return idx
 }
 
+func (idx *Index) resetLocked() {
+	idx.byKey = make(map[docKey]int)
+	idx.docs = nil
+	idx.postings = make(map[string][]int)
+	idx.buckets = make(map[string][]string)
+	idx.seen = make(map[string]struct{})
+}
+
+// Reset empties the index. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
 func (idx *Index) Reset() {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	idx.docs = make(map[int]Document)
-	idx.inverted = make(map[string]map[int]struct{})
+	idx.resetLocked()
 }
 
+// tokenize splits text into words: maximal runs of Unicode letters and digits (\p{L}, \p{N}), lower-cased
+// with strings.ToLower (locale independent). No stop words. In: text. Out: the words in order.
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (SEARCH-03): it split on whitespace only, so
+// "john@example.com" was one word, and it dropped stop words. Touches nothing.
 func tokenize(text string) []string {
-	words := strings.Fields(text)
 	var tokens []string
-	for _, w := range words {
-		w = strings.ToLower(w)
-		if _, ok := globalIndex.stopWords[w]; ok {
+	start := -1
+	for i, r := range text {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) {
+			if start < 0 {
+				start = i
+			}
 			continue
 		}
-		tokens = append(tokens, w)
+		if start >= 0 {
+			tokens = append(tokens, strings.ToLower(text[start:i]))
+			start = -1
+		}
+	}
+	if start >= 0 {
+		tokens = append(tokens, strings.ToLower(text[start:]))
 	}
 	return tokens
 }
 
+// distinct returns the tokens without repeats, first occurrence order.
+func distinct(tokens []string) []string {
+	seen := make(map[string]struct{}, len(tokens))
+	out := tokens[:0:0]
+	for _, t := range tokens {
+		if _, ok := seen[t]; !ok {
+			seen[t] = struct{}{}
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// bucketKeys returns the bucket a token lives in (its first two runes) and, for a one- or two-rune
+// prefix lookup, the key to scan. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+func prefixKey(s string, n int) string {
+	i := 0
+	for pos := range s {
+		if i == n {
+			return s[:pos]
+		}
+		i++
+	}
+	return s
+}
+
+// addPosting inserts seq into token's ascending posting list. The caller holds the write lock.
+func (idx *Index) addPosting(token string, seq int) {
+	list := idx.postings[token]
+	i := sort.SearchInts(list, seq)
+	if i < len(list) && list[i] == seq {
+		return
+	}
+	if i == len(list) {
+		list = append(list, seq)
+	} else {
+		list = append(list, 0)
+		copy(list[i+1:], list[i:])
+		list[i] = seq
+	}
+	idx.postings[token] = list
+	if _, ok := idx.seen[token]; !ok {
+		idx.seen[token] = struct{}{}
+		k1, k2 := prefixKey(token, 1), prefixKey(token, 2)
+		idx.buckets["1:"+k1] = append(idx.buckets["1:"+k1], token)
+		if k2 != k1 {
+			idx.buckets["2:"+k2] = append(idx.buckets["2:"+k2], token)
+		}
+	}
+}
+
+// removePosting deletes seq from token's posting list. The caller holds the write lock.
+func (idx *Index) removePosting(token string, seq int) {
+	list := idx.postings[token]
+	i := sort.SearchInts(list, seq)
+	if i < len(list) && list[i] == seq {
+		list = append(list[:i], list[i+1:]...)
+		if len(list) == 0 {
+			delete(idx.postings, token)
+		} else {
+			idx.postings[token] = list
+		}
+	}
+}
+
+// IndexDocument adds or replaces a document. A re-indexed document keeps its insertion position.
+// In: the document. Out: nil. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: keyed by (type, id),
+// postings by insertion order. Touches: memory.
 func (idx *Index) IndexDocument(doc Document) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	doc.IndexedAt = time.Now()
-	// Re-indexing a document first removes the words of its old content, or searches would still find it by them
-	// (2026-11-08, session f3daac6e, from review).
-	if old, ok := idx.docs[doc.DocumentID]; ok {
-		for _, t := range tokenize(old.Content) {
-			if ids, ok := idx.inverted[t]; ok {
-				delete(ids, doc.DocumentID)
-				if len(ids) == 0 {
-					delete(idx.inverted, t)
-				}
-			}
+	key := docKey{doc.DocumentType, doc.DocumentID}
+	tokens := distinct(tokenize(doc.Content))
+	if seq, ok := idx.byKey[key]; ok {
+		old := idx.docs[seq]
+		for _, t := range old.tokens {
+			idx.removePosting(t, seq)
 		}
+		idx.docs[seq] = &docEntry{doc: doc, seq: seq, tokens: tokens}
+		for _, t := range tokens {
+			idx.addPosting(t, seq)
+		}
+		return nil
 	}
-	idx.docs[doc.DocumentID] = doc
-	tokens := tokenize(doc.Content)
+	seq := len(idx.docs)
+	idx.docs = append(idx.docs, &docEntry{doc: doc, seq: seq, tokens: tokens})
+	idx.byKey[key] = seq
 	for _, t := range tokens {
-		if _, ok := idx.inverted[t]; !ok {
-			idx.inverted[t] = make(map[int]struct{})
-		}
-		idx.inverted[t][doc.DocumentID] = struct{}{}
+		idx.addPosting(t, seq)
 	}
 	return nil
 }
 
+// UnindexDocument removes a document. Out: an error if it is not indexed.
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
 func (idx *Index) UnindexDocument(docType string, docID int) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	doc, ok := idx.docs[docID]
-	if !ok || doc.DocumentType != docType {
+	key := docKey{docType, docID}
+	seq, ok := idx.byKey[key]
+	if !ok {
 		return errors.New("document not found")
 	}
-	delete(idx.docs, docID)
-	tokens := tokenize(doc.Content)
-	for _, t := range tokens {
-		if ids, ok := idx.inverted[t]; ok {
-			delete(ids, docID)
-			if len(ids) == 0 {
-				delete(idx.inverted, t)
-			}
-		}
+	for _, t := range idx.docs[seq].tokens {
+		idx.removePosting(t, seq)
 	}
+	idx.docs[seq] = nil
+	delete(idx.byKey, key)
 	return nil
 }
 
+// Reindex re-tokenizes every document (of docType, or all when empty) from its stored content.
+// Out: how many documents. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (the handler reached
+// into the index's maps). Touches: memory.
+func (idx *Index) Reindex(docType string) int {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	n := 0
+	for seq, e := range idx.docs {
+		if e == nil || (docType != "" && e.doc.DocumentType != docType) {
+			continue
+		}
+		for _, t := range e.tokens {
+			idx.removePosting(t, seq)
+		}
+		e.tokens = distinct(tokenize(e.doc.Content))
+		for _, t := range e.tokens {
+			idx.addPosting(t, seq)
+		}
+		n++
+	}
+	return n
+}
+
+// matchingTokens returns the indexed tokens a query term matches: the term itself first (exact), then
+// every other token that starts with it (prefix). The caller holds a read lock.
+// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (SEARCH-03). Touches nothing.
+func (idx *Index) matchingTokens(term string) (exact bool, prefix []string) {
+	_, exact = idx.postings[term]
+	k1, k2 := prefixKey(term, 1), prefixKey(term, 2)
+	bucket := idx.buckets["2:"+k2]
+	if k2 == k1 {
+		bucket = idx.buckets["1:"+k1]
+	}
+	for _, tok := range bucket {
+		if tok != term && strings.HasPrefix(tok, term) {
+			if _, live := idx.postings[tok]; live {
+				prefix = append(prefix, tok)
+			}
+		}
+	}
+	return exact, prefix
+}
+
+// Search finds documents matching every query term.
+//
+// In: query, optional document type, limit, offset, metadata filters (key -> value) and facet names.
+// Out: the page of results, the total, has_more, facet counts, and an error. Score per term: 2 when it
+// equals a word of the document, else 1 when it is a prefix of one; a document's relevance is the sum
+// over terms divided by 2 (1.0 per exact term). Order: relevance descending, then insertion order.
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (SEARCH-03, SEARCH-08, SEARCH-09). Touches: memory.
 func (idx *Index) Search(query string, docType string, limit, offset int, filters map[string]string, facets []string) ([]SearchResult, int, bool, map[string]map[string]int, error) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-
-	terms := tokenize(query)
+	if limit <= 0 {
+		limit = 20
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	terms := distinct(tokenize(query))
 	if len(terms) == 0 {
 		return []SearchResult{}, 0, false, nil, nil
 	}
 
-	docScores := make(map[int]float64)
-
-	for _, term := range terms {
-		for indexToken, docIDs := range idx.inverted {
-			matchType := 0 // 0=no match, 1=prefix, 2=contains, 3=exact
-			if indexToken == term {
-				matchType = 3
-			} else if strings.Contains(indexToken, term) {
-				matchType = 2
-			} else if strings.HasPrefix(indexToken, term) {
-				matchType = 1
-			}
-
-			if matchType > 0 {
-				for docID := range docIDs {
-					doc := idx.docs[docID]
-					if docType != "" && doc.DocumentType != docType {
-						continue
-					}
-					matched := true
-					for fkey, fval := range filters {
-						if v, ok := doc.Metadata[fkey]; ok {
-							if fmt.Sprintf("%v", v) != fval {
-								matched = false
-								break
-							}
-						} else {
-							matched = false
-							break
-						}
-					}
-					if !matched {
-						continue
-					}
-
-					var score float64
-					switch matchType {
-					case 3:
-						score = 1.0
-					case 2:
-						score = 0.8
-					case 1:
-						score = 0.5
-					}
-					docScores[docID] += score
+	n := len(idx.docs)
+	score := make([]int32, n)
+	matched := make([]uint16, n) // how many terms, in order, a document has matched so far
+	stamp := make([]uint16, n)   // the last term (1-based) that scored this document
+	for ti, term := range terms {
+		exact, prefix := idx.matchingTokens(term)
+		apply := func(list []int, s int32) {
+			for _, seq := range list {
+				if stamp[seq] == uint16(ti+1) || matched[seq] != uint16(ti) {
+					continue
 				}
+				stamp[seq] = uint16(ti + 1)
+				matched[seq]++
+				score[seq] += s
 			}
 		}
-	}
-
-	if len(docScores) == 0 {
-		return []SearchResult{}, 0, false, nil, nil
-	}
-
-	type kv struct {
-		id    int
-		score float64
-	}
-	var kvs []kv
-	for id, s := range docScores {
-		kvs = append(kvs, kv{id: id, score: s})
-	}
-	sort.Slice(kvs, func(i, j int) bool {
-		if kvs[i].score != kvs[j].score {
-			return kvs[i].score > kvs[j].score
+		if exact {
+			apply(idx.postings[term], 2)
 		}
-		return kvs[i].id < kvs[j].id
-	})
-
-	total := len(kvs)
-	hasMore := offset+limit < total
-
-	var results []SearchResult
-	for i := offset; i < offset+limit && i < total; i++ {
-		doc := idx.docs[kvs[i].id]
-		results = append(results, SearchResult{
-			DocumentID:   doc.DocumentID,
-			DocumentType: doc.DocumentType,
-			Relevance:    kvs[i].score,
-			Metadata:     doc.Metadata,
-		})
+		for _, tok := range prefix {
+			apply(idx.postings[tok], 1)
+		}
 	}
 
-	facetMap := make(map[string]map[string]int)
+	type hit struct {
+		seq   int
+		score int32
+	}
+	want := offset + limit
+	var top []hit // the best `want` hits, best first
+	total := 0
+	var facetMap map[string]map[string]int
 	if len(facets) > 0 {
+		facetMap = make(map[string]map[string]int)
 		for _, f := range facets {
 			facetMap[f] = make(map[string]int)
 		}
-		for _, kv := range kvs {
-			doc := idx.docs[kv.id]
-			for _, f := range facets {
-				if val, ok := doc.Metadata[f]; ok {
-					facetMap[f][fmt.Sprintf("%v", val)]++
-				}
+	}
+	full := uint16(len(terms))
+	for seq := 0; seq < n; seq++ {
+		if matched[seq] != full {
+			continue
+		}
+		e := idx.docs[seq]
+		if e == nil || (docType != "" && e.doc.DocumentType != docType) {
+			continue
+		}
+		ok := true
+		for fkey, fval := range filters {
+			v, present := e.doc.Metadata[fkey]
+			if !present || fmt.Sprintf("%v", v) != fval {
+				ok = false
+				break
 			}
 		}
+		if !ok {
+			continue
+		}
+		total++
+		for _, f := range facets {
+			if val, present := e.doc.Metadata[f]; present {
+				facetMap[f][fmt.Sprintf("%v", val)]++
+			}
+		}
+		// seq ascends, so among equal scores the earlier document is already ahead.
+		if len(top) == want && score[seq] <= top[len(top)-1].score {
+			continue
+		}
+		i := sort.Search(len(top), func(i int) bool { return top[i].score < score[seq] })
+		if len(top) < want {
+			top = append(top, hit{})
+		}
+		copy(top[i+1:], top[i:len(top)-1])
+		top[i] = hit{seq, score[seq]}
 	}
 
-	return results, total, hasMore, facetMap, nil
+	results := []SearchResult{}
+	for i := offset; i < len(top); i++ {
+		doc := idx.docs[top[i].seq].doc
+		results = append(results, SearchResult{
+			DocumentID:   doc.DocumentID,
+			DocumentType: doc.DocumentType,
+			Relevance:    float64(top[i].score) / 2,
+			Metadata:     doc.Metadata,
+		})
+	}
+	return results, total, offset+limit < total, facetMap, nil
 }
 
 func indexHandler(w http.ResponseWriter, r *http.Request) {
@@ -345,32 +501,12 @@ func reindexHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	// For simplicity, reindex all documents of the type
-	globalIndex.mu.Lock()
-	defer globalIndex.mu.Unlock()
-	for id, doc := range globalIndex.docs {
-		if payload.DocumentType != nil && doc.DocumentType != *payload.DocumentType {
-			continue
-		}
-		// remove old tokens
-		tokens := tokenize(doc.Content)
-		for _, t := range tokens {
-			if ids, ok := globalIndex.inverted[t]; ok {
-				delete(ids, id)
-				if len(ids) == 0 {
-					delete(globalIndex.inverted, t)
-				}
-			}
-		}
-		// re-add
-		newTokens := tokenize(doc.Content)
-		for _, t := range newTokens {
-			if _, ok := globalIndex.inverted[t]; !ok {
-				globalIndex.inverted[t] = make(map[int]struct{})
-			}
-			globalIndex.inverted[t][id] = struct{}{}
-		}
+	// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: Index.Reindex instead of reaching into its maps.
+	docType := ""
+	if payload.DocumentType != nil {
+		docType = *payload.DocumentType
 	}
+	globalIndex.Reindex(docType)
 	resp := map[string]interface{}{
 		"success": true,
 		"job_id":  fmt.Sprintf("reindex-%d", time.Now().UnixNano()),

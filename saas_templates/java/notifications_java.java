@@ -18,37 +18,79 @@ import java.util.logging.*;
  */
 public class NotificationService {
     private static final Logger logger = Logger.getLogger(NotificationService.class.getName());
+    /** A 'sending' row whose claim is older than this is taken to belong to a crashed worker (spec deliver_due step 1). */
+    public static final Duration CLAIM_TIMEOUT = Duration.ofSeconds(300);
+    private static final Set<String> CHANNELS = Set.of("email", "sms", "in_app");
+    private static final java.util.regex.Pattern TOKEN_FORMAT = java.util.regex.Pattern.compile("^[0-9a-f]{64}$");
+    private static final com.fasterxml.jackson.databind.ObjectMapper JSON = new com.fasterxml.jackson.databind.ObjectMapper();
     private final Connection conn;
     private final EmailSender emailSender;
     private final SmsSender smsSender;
     private final InAppSender inAppSender;
+    private final byte[] unsubscribeSecret;
+    private final Clock clock;
+    private final String baseUrl;
+    private final java.util.function.LongConsumer sleeper;
 
     /**
-     * Creates a service with the in-memory stand-in senders and its own private in-memory database.
-     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: one database per instance (a shared
-     * "test" database made the second instance fail on duplicate templates). Touches: in-memory H2.
+     * Service with the in-memory stand-in senders, the system UTC clock and the unsubscribe secret from the
+     * NOTIFICATION_UNSUBSCRIBE_SECRET environment variable (refuses to start without one of 32+ bytes).
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-11). Touches: in-memory H2, the environment.
      */
     public NotificationService() throws SQLException {
-        this.conn = DriverManager.getConnection(newDatabaseUrl());
-        this.emailSender = new SimpleEmailSender();
-        this.smsSender = new SimpleSmsSender();
-        this.inAppSender = new SimpleInAppSender();
-        initDatabase();
-        seedTemplates();
+        this(new SimpleEmailSender(), new SimpleSmsSender(), new SimpleInAppSender());
     }
 
     /**
-     * Creates a service with the given senders (real or fake) and its own private in-memory database.
-     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: one database per instance.
-     * Touches: in-memory H2; the senders.
+     * Service with the given senders; secret from NOTIFICATION_UNSUBSCRIBE_SECRET, system UTC clock, base URL from
+     * NOTIFICATION_BASE_URL (default https://app.example.com), real sleeps between retries.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory H2; the senders; the environment.
      */
     public NotificationService(EmailSender emailSender, SmsSender smsSender, InAppSender inAppSender) throws SQLException {
+        this(emailSender, smsSender, inAppSender, envSecret(), Clock.systemUTC(),
+                Optional.ofNullable(System.getenv("NOTIFICATION_BASE_URL")).orElse("https://app.example.com"),
+                ms -> {
+                    try {
+                        Thread.sleep(ms);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                });
+    }
+
+    /**
+     * The full constructor. In: the three senders (network in a real deployment), the unsubscribe HMAC secret (at least
+     * 32 bytes, from configuration, never hard-coded), the clock every time decision uses, the base URL of unsubscribe
+     * links, and the retry sleeper (tests pass a no-op). Out: a service on its own private in-memory database.
+     * Throws IllegalArgumentException for a missing or short secret: an empty key makes a forgeable HMAC (NOTIF-11).
+     * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory H2.
+     */
+    public NotificationService(EmailSender emailSender, SmsSender smsSender, InAppSender inAppSender,
+                               byte[] unsubscribeSecret, Clock clock, String baseUrl,
+                               java.util.function.LongConsumer sleeper) throws SQLException {
+        if (unsubscribeSecret == null || unsubscribeSecret.length < 32) {
+            throw new IllegalArgumentException("the unsubscribe secret must be at least 32 bytes");
+        }
+        this.unsubscribeSecret = unsubscribeSecret.clone();
+        this.clock = Objects.requireNonNull(clock);
+        this.baseUrl = Objects.requireNonNull(baseUrl).replaceAll("/+$", "");
+        this.sleeper = Objects.requireNonNull(sleeper);
         this.conn = DriverManager.getConnection(newDatabaseUrl());
         this.emailSender = emailSender;
         this.smsSender = smsSender;
         this.inAppSender = inAppSender;
         initDatabase();
         seedTemplates();
+    }
+
+    private static byte[] envSecret() {
+        String v = System.getenv("NOTIFICATION_UNSUBSCRIBE_SECRET");
+        return v == null ? null : v.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    /** "Now" from the injected clock, as UTC local time (the stored timestamps are UTC). */
+    private LocalDateTime now() {
+        return LocalDateTime.ofInstant(clock.instant(), ZoneOffset.UTC);
     }
 
     /**
@@ -85,7 +127,13 @@ public class NotificationService {
                     "clicked_at TIMESTAMP," +
                     "bounced BOOLEAN," +
                     "error TEXT," +
-                    "status VARCHAR(20)" +
+                    "status VARCHAR(20)," +
+                    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-05/12): scheduled and quiet-hours sends
+                    // wait as 'queued' with scheduled_at; claimed_at marks a deliver_due claim; seq keeps
+                    // insertion order for ties.
+                    "scheduled_at TIMESTAMP," +
+                    "claimed_at TIMESTAMP," +
+                    "seq BIGINT AUTO_INCREMENT" +
                     ")");
             stmt.execute("CREATE TABLE IF NOT EXISTS user_notification_preferences (" +
                     "user_id BIGINT PRIMARY KEY," +
@@ -172,29 +220,32 @@ public class NotificationService {
         }
     }
 
+    /** Default preferences for a user who has set none: no quiet hours, do_not_disturb false, SMS off (opt-in). */
+    private static UserNotificationPreferences defaultPreferences(long userId) {
+        return new UserNotificationPreferences(userId, false, null, null,
+                new HashMap<>(Map.of("email", true, "sms", false, "in_app", true)));
+    }
+
     /**
-     * Sends one notification, honouring do-not-disturb (skipped), quiet hours (queued), disabled channels
-     * (skipped) and scheduled_at (queued); retries a failing email/SMS/in-app send up to 3 attempts with
-     * exponential backoff (1s, 2s); a bounce is not retried. Every outcome is logged.
-     * Input: NotificationRequest. Output: SendResponse(success, messageId, status sent|queued|skipped|failed).
-     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: the log now records the channel actually
-     * used (it recorded null for auto-selected channels). Touches: the database; the senders.
+     * Sends one notification. Order: do-not-disturb -> 'skipped'; no enabled channel -> 'skipped'; scheduled_at in the
+     * future -> 'queued' with that scheduled_at; inside quiet hours -> 'queued' with scheduled_at = the end of the quiet
+     * window; otherwise sent now, retrying a failing send up to 3 attempts with exponential backoff (1 s, 2 s) through
+     * the injected sleeper; a bounce is not retried. Queued rows are sent by deliverDue, never by a timer.
+     * In: NotificationRequest. Out: SendResponse(success, messageId, status sent|queued|skipped|failed).
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-02/05/12): defaults (SMS off, no quiet hours), queued
+     * rows carry scheduled_at, injected clock and sleeper, emails carry a signed unsubscribe link.
+     * Touches: the database; the senders (network).
      */
     public SendResponse sendSingle(NotificationRequest request) {
         String messageId = UUID.randomUUID().toString();
-        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime now = now();
         UserNotificationPreferences prefs = getUserPreferences(request.userId);
         if (prefs == null) {
-            prefs = new UserNotificationPreferences(request.userId, false, "00:00", "00:00",
-                    Map.of("email", true, "sms", true, "in_app", true));
+            prefs = defaultPreferences(request.userId);
         }
         if (prefs.doNotDisturb) {
             logMessage(messageId, request, request.channel, "skipped", null, null, null, false, "Do-not-disturb");
             return new SendResponse(true, messageId, "skipped");
-        }
-        if (isInQuietHours(prefs, now.toLocalTime())) {
-            logMessage(messageId, request, request.channel, "queued", null, null, null, false, null);
-            return new SendResponse(true, messageId, "queued");
         }
         String channel = request.channel;
         if (channel == null) {
@@ -205,7 +256,11 @@ public class NotificationService {
             return new SendResponse(true, messageId, "skipped");
         }
         if (request.scheduledAt != null && request.scheduledAt.isAfter(now)) {
-            logMessage(messageId, request, channel, "queued", null, null, null, false, null);
+            logQueued(messageId, request, channel, request.scheduledAt);
+            return new SendResponse(true, messageId, "queued");
+        }
+        if (isInQuietHours(prefs, now.toLocalTime())) {
+            logQueued(messageId, request, channel, quietHoursEnd(prefs, now));
             return new SendResponse(true, messageId, "queued");
         }
         NotificationTemplate template = getTemplate(request.templateKey);
@@ -213,41 +268,254 @@ public class NotificationService {
             logMessage(messageId, request, channel, "failed", null, null, null, false, "Template not found");
             return new SendResponse(false, messageId, "failed");
         }
-        String body = renderTemplate(template.bodyText, request.vars);
-        String subject = template.subject != null ? renderTemplate(template.subject, request.vars) : null;
-        boolean success = false;
+        DeliveryOutcome outcome = deliver(request.userId, channel, template, request.vars);
+        if (outcome.success) {
+            logMessage(messageId, request, channel, "sent", now, null, null, false, null);
+            return new SendResponse(true, messageId, "sent");
+        }
+        logMessage(messageId, request, channel, outcome.bounced ? "bounced" : "failed", now, null, null, outcome.bounced, outcome.error);
+        return new SendResponse(false, messageId, "failed");
+    }
+
+    /** Result of one delivery with retries. */
+    private static final class DeliveryOutcome {
+        final boolean success;
+        final boolean bounced;
+        final String error;
+
+        DeliveryOutcome(boolean success, boolean bounced, String error) {
+            this.success = success;
+            this.bounced = bounced;
+            this.error = error;
+        }
+    }
+
+    /**
+     * Renders the template and sends it on the channel, retrying up to 3 attempts with 1 s then 2 s waits; an email's
+     * body ends with the user's signed unsubscribe link. In: user id, channel, template, vars. Out: the outcome.
+     * Split out of sendSingle 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, so deliverDue sends the same way.
+     * Touches: the senders (network).
+     */
+    private DeliveryOutcome deliver(long userId, String channel, NotificationTemplate template, Map<String, Object> vars) {
+        String body = renderTemplate(template.bodyText, vars);
+        String subject = template.subject != null ? renderTemplate(template.subject, vars) : null;
+        if ("email".equals(channel)) {
+            body = body + "\n\nUnsubscribe: " + unsubscribeLink(userId, "email");
+        }
         String error = null;
-        boolean bounced = false;
-        int attempts = 0;
-        while (attempts < 3 && !success) {
+        for (int attempt = 1; attempt <= 3; attempt++) {
             try {
-                attempts++;
                 if (channel.equals("email")) {
-                    emailSender.send(request.userId + "@example.com", subject, body);
+                    emailSender.send(userId + "@example.com", subject, body);
                 } else if (channel.equals("sms")) {
-                    smsSender.send(request.userId + "@example.com", body);
+                    smsSender.send(userId + "@example.com", body);
                 } else if (channel.equals("in_app")) {
-                    inAppSender.send(request.userId, body);
+                    inAppSender.send(userId, body);
                 }
-                success = true;
+                return new DeliveryOutcome(true, false, null);
             } catch (BounceException be) {
-                bounced = true;
-                error = be.getMessage();
-                break;
+                return new DeliveryOutcome(false, true, be.getMessage());
             } catch (Exception e) {
                 error = e.getMessage();
-                if (attempts < 3) {
-                    try { Thread.sleep((long) Math.pow(2, attempts - 1) * 1000); } catch (InterruptedException ie) {}
+                if (attempt < 3) {
+                    sleeper.accept((long) Math.pow(2, attempt - 1) * 1000);
                 }
             }
         }
-        if (success) {
-            logMessage(messageId, request, channel, "sent", now, null, null, bounced, error);
-            return new SendResponse(true, messageId, "sent");
-        } else {
-            logMessage(messageId, request, channel, bounced ? "bounced" : "failed", now, null, null, bounced, error);
-            return new SendResponse(false, messageId, "failed");
+        return new DeliveryOutcome(false, false, error);
+    }
+
+    /** The next moment the quiet window ends (today or tomorrow), the scheduled_at of a message held by quiet hours. */
+    private LocalDateTime quietHoursEnd(UserNotificationPreferences prefs, LocalDateTime now) {
+        LocalTime end = LocalTime.parse(prefs.quietHoursEnd);
+        LocalDateTime candidate = now.toLocalDate().atTime(end);
+        return candidate.isAfter(now) ? candidate : candidate.plusDays(1);
+    }
+
+    /** Writes a 'queued' row with its scheduled_at. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database. */
+    private void logQueued(String messageId, NotificationRequest request, String channel, LocalDateTime scheduledAt) {
+        logMessage(messageId, request, channel, "queued", null, null, null, false, null);
+        try (PreparedStatement ps = conn.prepareStatement("UPDATE notification_logs SET scheduled_at = ? WHERE id = ?")) {
+            ps.setTimestamp(1, Timestamp.valueOf(scheduledAt));
+            ps.setString(2, messageId);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new IllegalStateException("could not queue notification", e);
         }
+    }
+
+    /**
+     * deliver_due(now): sends queued messages whose time has come, never from an in-process timer. Steps, in order:
+     * (1) 'sending' rows claimed more than 300 s ago go back to 'queued' (a crashed worker); (2) 'queued' rows with
+     * scheduled_at <= now, by scheduled_at then insertion order, are claimed one by one with a conditional UPDATE
+     * (a row another worker claimed first is skipped); (3) preferences are read NOW: do-not-disturb, an unsubscribed
+     * or disabled channel -> 'skipped'; (4) the final write is conditional on the same claim.
+     * In: now (the caller's clock). Out: how many messages were sent. Each message is sent exactly once when no
+     * worker crashes, at least once after a crash. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-12).
+     * Touches: the database; the senders (network).
+     */
+    public synchronized int deliverDue(LocalDateTime now) {
+        Timestamp nowTs = Timestamp.valueOf(now);
+        try (PreparedStatement ps = conn.prepareStatement(
+                "UPDATE notification_logs SET status = 'queued', claimed_at = NULL WHERE status = 'sending' AND claimed_at < ?")) {
+            ps.setTimestamp(1, Timestamp.valueOf(now.minus(CLAIM_TIMEOUT)));
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new IllegalStateException("deliver_due: re-queue failed", e);
+        }
+        List<String> due = new ArrayList<>();
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT id FROM notification_logs WHERE status = 'queued' AND scheduled_at <= ? ORDER BY scheduled_at, seq")) {
+            ps.setTimestamp(1, nowTs);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) due.add(rs.getString(1));
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("deliver_due: select failed", e);
+        }
+        int sent = 0;
+        for (String id : due) {
+            Timestamp claim = nowTs;
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "UPDATE notification_logs SET status = 'sending', claimed_at = ? WHERE id = ? AND status = 'queued'")) {
+                ps.setTimestamp(1, claim);
+                ps.setString(2, id);
+                if (ps.executeUpdate() == 0) continue;
+            } catch (SQLException e) {
+                throw new IllegalStateException("deliver_due: claim failed", e);
+            }
+            long userId;
+            String channel;
+            String templateKey;
+            String varsJson;
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT user_id, channel, template_key, vars_used FROM notification_logs WHERE id = ?")) {
+                ps.setString(1, id);
+                try (ResultSet rs = ps.executeQuery()) {
+                    rs.next();
+                    userId = rs.getLong(1);
+                    channel = rs.getString(2);
+                    templateKey = rs.getString(3);
+                    varsJson = rs.getString(4);
+                }
+            } catch (SQLException e) {
+                throw new IllegalStateException("deliver_due: read failed", e);
+            }
+            UserNotificationPreferences prefs = getUserPreferences(userId);
+            if (prefs == null) prefs = defaultPreferences(userId);
+            String finalStatus;
+            String error = null;
+            boolean bounced = false;
+            NotificationTemplate template = getTemplate(templateKey);
+            if (prefs.doNotDisturb || channel == null || !isChannelEnabled(prefs, channel)) {
+                finalStatus = "skipped";
+            } else if (template == null) {
+                finalStatus = "failed";
+                error = "Template not found";
+            } else {
+                DeliveryOutcome outcome = deliver(userId, channel, template, parseVars(varsJson));
+                finalStatus = outcome.success ? "sent" : (outcome.bounced ? "bounced" : "failed");
+                error = outcome.error;
+                bounced = outcome.bounced;
+            }
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "UPDATE notification_logs SET status = ?, sent_at = ?, error = ?, bounced = ? WHERE id = ? AND status = 'sending' AND claimed_at = ?")) {
+                ps.setString(1, finalStatus);
+                ps.setTimestamp(2, "skipped".equals(finalStatus) ? null : nowTs);
+                ps.setString(3, error);
+                ps.setBoolean(4, bounced);
+                ps.setString(5, id);
+                ps.setTimestamp(6, claim);
+                if (ps.executeUpdate() == 1 && "sent".equals(finalStatus)) sent++;
+            } catch (SQLException e) {
+                throw new IllegalStateException("deliver_due: final write failed", e);
+            }
+        }
+        return sent;
+    }
+
+    /** Reads a queued row's stored vars (JSON object) back; empty map for none. */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> parseVars(String json) {
+        if (json == null || json.isEmpty()) return new HashMap<>();
+        try {
+            return JSON.readValue(json, Map.class);
+        } catch (Exception e) {
+            return new HashMap<>();
+        }
+    }
+
+    /**
+     * The unsubscribe token: lowercase hex of HMAC-SHA256(secret, "unsubscribe:" + user_id + ":" + channel).
+     * In: user id (as it appears in the link), channel. Out: 64 hex characters. Added 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-11). Touches: nothing.
+     */
+    public String unsubscribeToken(String userId, String channel) {
+        try {
+            javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
+            mac.init(new javax.crypto.spec.SecretKeySpec(unsubscribeSecret, "HmacSHA256"));
+            byte[] d = mac.doFinal(("unsubscribe:" + userId + ":" + channel).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            return java.util.HexFormat.of().formatHex(d);
+        } catch (java.security.GeneralSecurityException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /** <base_url>/unsubscribe?user_id=<id>&channel=<channel>&token=<token>. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+    public String unsubscribeLink(long userId, String channel) {
+        return baseUrl + "/unsubscribe?user_id=" + userId + "&channel=" + channel + "&token="
+                + unsubscribeToken(String.valueOf(userId), channel);
+    }
+
+    /** An HTTP-shaped answer of the unsubscribe handler. */
+    public static final class HandlerResponse {
+        public final int status;
+        public final Map<String, Object> body;
+
+        public HandlerResponse(int status, Map<String, Object> body) {
+            this.status = status;
+            this.body = body;
+        }
+    }
+
+    /**
+     * The unsubscribe link handler. The token, the channel and the user id are checked BEFORE any user lookup: a token
+     * that is not exactly 64 characters of [0-9a-f], an unknown channel, or a token that does not match (compared in
+     * constant time) all get the same 403 {error: "invalid_unsubscribe_token"}. GET only answers 200 with a
+     * confirmation (a mail scanner following links changes nothing); POST sets channels_enabled[channel] = false.
+     * In: HTTP method, the link's user_id, channel and token. Out: HandlerResponse. Added 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-11: an unsigned link let anyone unsubscribe anyone). Touches: the
+     * database (POST only).
+     */
+    public HandlerResponse handleUnsubscribe(String method, String userId, String channel, String token) {
+        HandlerResponse refused = new HandlerResponse(403, Map.of("error", "invalid_unsubscribe_token"));
+        if (token == null || !TOKEN_FORMAT.matcher(token).matches() || channel == null || !CHANNELS.contains(channel)
+                || userId == null || !userId.matches("^[0-9]{1,18}$")) {
+            return refused;
+        }
+        byte[] expected = unsubscribeToken(userId, channel).getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+        if (!java.security.MessageDigest.isEqual(expected, token.getBytes(java.nio.charset.StandardCharsets.US_ASCII))) {
+            return refused;
+        }
+        long uid = Long.parseLong(userId);
+        if ("GET".equalsIgnoreCase(method)) {
+            return new HandlerResponse(200, Map.of("confirm", true, "user_id", uid, "channel", channel,
+                    "message", "Press the button to unsubscribe from " + channel + " notifications."));
+        }
+        if (!"POST".equalsIgnoreCase(method)) {
+            return new HandlerResponse(405, Map.of("error", "method_not_allowed"));
+        }
+        setChannelEnabled(uid, channel, false);
+        return new HandlerResponse(200, Map.of("success", true, "user_id", uid, "channel", channel, "unsubscribed", true));
+    }
+
+    /** Sets one channel on or off, starting from the defaults for a user with no saved preferences. Touches: the database. */
+    private void setChannelEnabled(long userId, String channel, boolean enabled) {
+        UserNotificationPreferences prefs = getUserPreferences(userId);
+        if (prefs == null) prefs = defaultPreferences(userId);
+        prefs.channelsEnabled = new HashMap<>(prefs.channelsEnabled);
+        prefs.channelsEnabled.put(channel, enabled);
+        updateUserPreferences(userId, prefs);
     }
 
     public BatchSendResponse sendBatch(List<NotificationRequest> requests) {
@@ -330,7 +598,7 @@ public class NotificationService {
     public void openMessage(String messageId) {
         try (PreparedStatement ps = conn.prepareStatement(
                 "UPDATE notification_logs SET opened_at = ? WHERE id = ?")) {
-            ps.setTimestamp(1, Timestamp.valueOf(LocalDateTime.now()));
+            ps.setTimestamp(1, Timestamp.valueOf(now()));
             ps.setString(2, messageId);
             ps.executeUpdate();
         } catch (SQLException e) {
@@ -341,7 +609,7 @@ public class NotificationService {
     public void clickMessage(String messageId) {
         try (PreparedStatement ps = conn.prepareStatement(
                 "UPDATE notification_logs SET clicked_at = ? WHERE id = ?")) {
-            ps.setTimestamp(1, Timestamp.valueOf(LocalDateTime.now()));
+            ps.setTimestamp(1, Timestamp.valueOf(now()));
             ps.setString(2, messageId);
             ps.executeUpdate();
         } catch (SQLException e) {
@@ -356,13 +624,7 @@ public class NotificationService {
      * subscribed. Touches: the database.
      */
     public void unsubscribeEmail(long userId) {
-        UserNotificationPreferences prefs = getUserPreferences(userId);
-        if (prefs == null) {
-            prefs = new UserNotificationPreferences(userId, false, "00:00", "00:00",
-                    new HashMap<>(Map.of("email", true, "sms", true, "in_app", true)));
-        }
-        prefs.channelsEnabled.put("email", false);
-        updateUserPreferences(userId, prefs);
+        setChannelEnabled(userId, "email", false);
     }
 
     /**
@@ -419,14 +681,16 @@ public class NotificationService {
         }
     }
 
+    /** True inside [start, end) of the quiet window (it may wrap midnight); no window when either end is unset. */
     private boolean isInQuietHours(UserNotificationPreferences prefs, LocalTime now) {
+        if (prefs.quietHoursStart == null || prefs.quietHoursEnd == null) return false;
         LocalTime start = LocalTime.parse(prefs.quietHoursStart);
         LocalTime end = LocalTime.parse(prefs.quietHoursEnd);
         if (start.equals(end)) return false;
         if (start.isBefore(end)) {
-            return !now.isBefore(start) && !now.isAfter(end);
+            return !now.isBefore(start) && now.isBefore(end);
         } else {
-            return !now.isBefore(start) || !now.isAfter(end);
+            return !now.isBefore(start) || now.isBefore(end);
         }
     }
 

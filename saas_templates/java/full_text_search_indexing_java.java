@@ -21,8 +21,9 @@ import java.util.stream.Collectors;
  *
  * Storage: In-memory inverted index kept in a sorted map (token -> keys in insertion order),
  * plus a forward index per document, so an update or delete touches only that document's tokens.
- * Tokenization: whitespace split, lowercase, stop-word removal.
- * Relevance: exact match > partial match > prefix match; ties break by insertion order.
+ * Tokenization (amended 2026-11-10, SEARCH-03): a word is a maximal run of Unicode letters and digits (\p{L}, \p{N}),
+ * lower-cased with toLowerCase(Locale.ROOT); no stop words. A query term matches a word equal to it or starting with it.
+ * Relevance (SEARCH-09): exact word 2 points per term, prefix 1; equal scores keep insertion order.
  * Multi-word queries: every text token must match (spec: "stripe integration" finds deployments with both words).
  * Thread safety: every read and write of the index holds this object's monitor.
  *
@@ -39,23 +40,6 @@ public class FullTextSearchIndexing implements AutoCloseable {
         public int defaultLimit = 20;
         public int maxLimit = 100;
         public int maxOffset = 10_000;
-        public Set<String> stopWords = new HashSet<>(Arrays.asList(
-                "a", "an", "the", "is", "are", "was", "were", "be", "been",
-                "being", "have", "has", "had", "do", "does", "did", "will",
-                "would", "could", "should", "may", "might", "shall", "can",
-                "need", "dare", "to", "of", "in", "for", "on", "with", "at",
-                "by", "from", "as", "into", "through", "during", "before",
-                "after", "above", "below", "between", "out", "off", "over",
-                "under", "again", "further", "then", "once", "here", "there",
-                "all", "any", "both", "each", "few", "more", "most", "other",
-                "some", "such", "no", "nor", "not", "only", "own", "same",
-                "so", "than", "too", "very", "just", "because", "but", "and",
-                "or", "if", "while", "about", "up", "down", "it", "its",
-                "this", "that", "these", "those", "i", "you", "he", "she",
-                "we", "they", "me", "him", "her", "us", "them", "my", "your",
-                "his", "our", "their", "what", "which", "who", "whom", "when",
-                "where", "why", "how", "am", "is", "are", "was", "were"
-        ));
         public int reindexBatchSize = 500;
         public long reindexDelayMs = 10;
     }
@@ -164,8 +148,8 @@ public class FullTextSearchIndexing implements AutoCloseable {
     /** Futures of submitted reindex jobs, so callers can wait for one deterministically. */
     private final Map<String, Future<?>> jobFutures = new ConcurrentHashMap<>();
 
-    private static final Pattern LEADING_NON_ALNUM = Pattern.compile("^[^a-z0-9]+");
-    private static final Pattern TRAILING_NON_ALNUM = Pattern.compile("[^a-z0-9]+$");
+    /** A word: a maximal run of Unicode letters and digits (SEARCH-03, amended 2026-11-10). */
+    private static final Pattern WORD = Pattern.compile("[\\p{L}\\p{N}]+");
     private static final Pattern WHITESPACE = Pattern.compile("\\s+");
 
     private final Config config;
@@ -191,38 +175,23 @@ public class FullTextSearchIndexing implements AutoCloseable {
     // ─── Tokenization ────────────────────────────────────────────────────────
 
     /**
-     * Splits text on whitespace, lowercases it, trims non-alphanumerics from each word's edges and drops stop words.
-     * Input: any text (null gives an empty list). Output: tokens in their order of appearance.
-     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: precompiled patterns (the 1M-document test).
+     * Splits text into words: maximal runs of Unicode letters and digits, each lower-cased with
+     * toLowerCase(Locale.ROOT). Everything else separates words; there are no stop words ("café" is one word,
+     * "stripe-integration" is two). Input: any text (null gives an empty list). Output: words in order of appearance.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (SEARCH-03 amendment): it split on whitespace only, trimmed
+     * ASCII punctuation from the edges (so "naïve," and "a-b" were mangled) and dropped a stop-word list.
      * Touches: nothing (pure).
      */
-    private List<String> tokenize(String text) {
+    static List<String> tokenize(String text) {
         if (text == null || text.isEmpty()) {
             return Collections.emptyList();
         }
-        String lower = text.toLowerCase(Locale.ROOT);
-        String[] parts = WHITESPACE.split(lower);
         List<String> tokens = new ArrayList<>();
-        for (String part : parts) {
-            String trimmed = normalizeWord(part);
-            if (trimmed.isEmpty()) continue;
-            if (config.stopWords.contains(trimmed)) continue;
-            tokens.add(trimmed);
+        java.util.regex.Matcher m = WORD.matcher(text);
+        while (m.find()) {
+            tokens.add(m.group().toLowerCase(Locale.ROOT));
         }
         return tokens;
-    }
-
-    /**
-     * Normalizes one already-lowercased word the way indexed words are normalized: trims whitespace and
-     * non-alphanumerics from its edges. Input: a word. Output: the normalized word, possibly empty.
-     * Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP, so query words and indexed words match the
-     * same way ("stripe," finds "stripe"). Touches: nothing (pure).
-     */
-    private static String normalizeWord(String word) {
-        String trimmed = word.trim();
-        if (trimmed.isEmpty()) return trimmed;
-        trimmed = LEADING_NON_ALNUM.matcher(trimmed).replaceAll("");
-        return TRAILING_NON_ALNUM.matcher(trimmed).replaceAll("");
     }
 
     private String docKey(String documentType, String documentId) {
@@ -341,11 +310,6 @@ public class FullTextSearchIndexing implements AutoCloseable {
                 }
                 if (candidates.isEmpty()) break;
             }
-        }
-
-        if (candidates == null && parts.hadTextWords) {
-            // Only stop words were typed: they are not indexed, so nothing matches ("the" finds nothing)
-            candidates = new HashSet<>();
         }
 
         // If no text at all (empty query or filters only), all documents are candidates
@@ -604,15 +568,13 @@ public class FullTextSearchIndexing implements AutoCloseable {
     private static class QueryParts {
         List<String> textTokens = new ArrayList<>();
         Map<String, String> filters = new HashMap<>();
-        /** True when the query held free-text words, even if every one was a stop word. */
-        boolean hadTextWords = false;
     }
 
     /**
      * Splits a query into free-text tokens and field:value filters ("member tier:team").
      * Input: raw query (may be null). Output: QueryParts.
-     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: text tokens are normalized like indexed
-     * words, and hadTextWords marks a stop-word-only query so it matches nothing. Touches: nothing (pure).
+     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: text is split into words exactly like indexed
+     * text (tokenize), with no stop words (SEARCH-03 amendment). Touches: nothing (pure).
      */
     private QueryParts parseQuery(String query) {
         QueryParts parts = new QueryParts();
@@ -630,10 +592,8 @@ public class FullTextSearchIndexing implements AutoCloseable {
                     parts.filters.put(field, value);
                 }
             } else {
-                String lower = normalizeWord(token.toLowerCase(Locale.ROOT));
-                if (!lower.isEmpty()) parts.hadTextWords = true;
-                if (!config.stopWords.contains(lower) && !lower.isEmpty()) {
-                    parts.textTokens.add(lower);
+                for (String word : tokenize(token)) {
+                    if (!parts.textTokens.contains(word)) parts.textTokens.add(word);
                 }
             }
         }
@@ -655,47 +615,33 @@ public class FullTextSearchIndexing implements AutoCloseable {
     }
 
     /**
-     * Scores a document for the query: per token, exact word 3.0, word containing the token 2.0, word starting
-     * with it 1.0; averaged over tokens, with a 1.5x bonus when a multi-word query matches every word exactly.
-     * Input: document, query tokens. Output: score (0 when nothing matches; 1.0 for an empty query).
-     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: scores against the document's normalized
-     * tokens (the same words the index holds) instead of re-splitting raw content on every call.
-     * Touches: nothing (pure).
+     * Scores a document for the query: per term, 2 when a word of the document equals it, else 1 when a word starts
+     * with it, summed over the terms (every term matches, see search). Input: document, query terms. Output: score
+     * (0 when a term does not match; 1.0 for an empty query). Ties are broken by the caller (insertion order).
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (SEARCH-09 amendment): a word merely CONTAINING the term
+     * scored above a prefix ("ripe" scored on "stripe"), and a 1.5x multi-word bonus is gone. Touches: nothing.
      */
     private double computeRelevance(Document doc, List<String> queryTokens) {
         if (queryTokens == null || queryTokens.isEmpty()) {
             return 1.0; // No text query, all equal
         }
-
-        double totalScore = 0.0;
-        boolean allExact = true;
-
+        double total = 0.0;
         for (String qt : queryTokens) {
-            double tokenScore = 0.0;
+            double termScore = 0.0;
             for (String w : doc.tokens) {
                 if (w.equals(qt)) {
-                    tokenScore = 3.0; // exact match
+                    termScore = 2.0;
                     break;
-                } else if (w.contains(qt)) {
-                    tokenScore = Math.max(tokenScore, 2.0); // partial match (substring)
                 } else if (w.startsWith(qt)) {
-                    tokenScore = Math.max(tokenScore, 1.0); // prefix match
+                    termScore = 1.0;
                 }
             }
-            if (tokenScore < 3.0) allExact = false;
-            totalScore += tokenScore;
+            if (termScore == 0.0) {
+                return 0.0;
+            }
+            total += termScore;
         }
-
-        // Normalize: divide by number of query tokens so multi-word queries
-        // don't get unfairly high scores
-        double normalized = totalScore / queryTokens.size();
-
-        // Bonus: if all tokens matched exactly, boost
-        if (allExact && queryTokens.size() > 1) {
-            normalized *= 1.5; // multi-word exact bonus
-        }
-
-        return normalized;
+        return total;
     }
 
     // ─── Facets ──────────────────────────────────────────────────────────────

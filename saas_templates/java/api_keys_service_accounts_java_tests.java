@@ -18,6 +18,7 @@ public class ApiKeysServiceAccountsTests {
         service = new ApiKeysServiceAccounts.ApiKeyService(keyRepo, usageRepo, rateLimiter);
     }
 
+    // KEYS-01
     @Test
     public void testCreateKeyWithScopes() {
         List<String> scopes = Arrays.asList("read:deployments", "write:webhooks");
@@ -31,9 +32,10 @@ public class ApiKeysServiceAccountsTests {
         assertTrue(key.startsWith("sk_live_"));
     }
 
+    // KEYS-02
     @Test
     public void testUseKeySuccess() {
-        List<String> scopes = Arrays.asList("GET /deployments");
+        List<String> scopes = Arrays.asList("read:deployments");
         Map<String, Object> create = service.createKey(1L, "Test", scopes,
                 null, 1000);
         String key = (String) create.get("key");
@@ -41,31 +43,83 @@ public class ApiKeysServiceAccountsTests {
         assertEquals(200, use.get("status"));
     }
 
+    // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: spec scope names (read:deployments, webhook:manage) instead of
+    // literal "GET /deployments" strings, and refusals are ApiKeyException carrying the spec's 401/403/429 status.
+    // KEYS-03
     @Test
     public void testRevokeKey() {
-        List<String> scopes = Arrays.asList("GET /deployments");
+        List<String> scopes = Arrays.asList("read:deployments");
         Map<String, Object> create = service.createKey(1L, "Test", scopes,
                 null, 1000);
         long id = (long) create.get("api_key_id");
         String key = (String) create.get("key");
         service.revokeKey(id);
-        Exception e = assertThrows(IllegalArgumentException.class,
+        ApiKeysServiceAccounts.ApiKeyException e = assertThrows(ApiKeysServiceAccounts.ApiKeyException.class,
                 () -> service.useKey(key, "/deployments", "GET", 200));
         assertTrue(e.getMessage().contains("revoked"));
+        assertEquals(401, e.getStatus());
     }
 
+    /**
+     * KEYS-04 at the size the spec names: a key with rate_limit 1000 gets its 1000 calls in one hour and the 1001st is
+     * refused with 429, then a call in the next hour is allowed again. In/out: none. Uses a fixed clock so no hour
+     * boundary can fall inside the test. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+     */
+    // KEYS-04
+    @Test
+    public void testThousandAndFirstCallInHourIs429() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-01-01T10:15:00Z"));
+        ApiKeysServiceAccounts.ApiKeyService svc = new ApiKeysServiceAccounts.ApiKeyService(
+                keyRepo, usageRepo, new ApiKeysServiceAccounts.RateLimiter(), clock);
+        String key = (String) svc.createKey(1L, "Busy", Arrays.asList("read:deployments"), null, 1000).get("key");
+        for (int i = 0; i < 1000; i++) {
+            assertEquals(200, svc.useKey(key, "/deployments", "GET", 200).get("status"));
+        }
+        ApiKeysServiceAccounts.ApiKeyException e = assertThrows(ApiKeysServiceAccounts.ApiKeyException.class,
+                () -> svc.useKey(key, "/deployments", "GET", 200));
+        assertEquals(429, e.getStatus());
+        clock.now = Instant.parse("2026-01-01T11:00:01Z");
+        assertEquals(200, svc.useKey(key, "/deployments", "GET", 200).get("status"));
+    }
+
+    /** A clock tests can move. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing. */
+    static final class MutableClock extends Clock {
+        Instant now;
+
+        MutableClock(Instant now) {
+            this.now = now;
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            return this;
+        }
+
+        @Override
+        public Instant instant() {
+            return now;
+        }
+    }
+
+    // KEYS-04
     @Test
     public void testRateLimit() {
-        List<String> scopes = Arrays.asList("GET /deployments");
+        List<String> scopes = Arrays.asList("read:deployments");
         Map<String, Object> create = service.createKey(1L, "Test", scopes,
                 null, 5);
         String key = (String) create.get("key");
         for (int i = 0; i < 5; i++) {
             service.useKey(key, "/deployments", "GET", 200);
         }
-        Exception e = assertThrows(IllegalStateException.class,
+        ApiKeysServiceAccounts.ApiKeyException e = assertThrows(ApiKeysServiceAccounts.ApiKeyException.class,
                 () -> service.useKey(key, "/deployments", "GET", 200));
         assertTrue(e.getMessage().contains("Rate limit exceeded"));
+        assertEquals(429, e.getStatus());
         // Verify rate limit hit was logged
         long keyId = (long) create.get("api_key_id");
         Map<String, Object> stats = service.getUsageStats(keyId,
@@ -73,20 +127,29 @@ public class ApiKeysServiceAccountsTests {
         assertEquals(1, stats.get("rate_limit_hits"));
     }
 
+    // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: spec scope names (read:deployments, webhook:manage) instead of
+    // literal "GET /deployments" strings, and refusals are ApiKeyException carrying the spec's 401/403/429 status.
+    // KEYS-05
     @Test
     public void testScopeCheck() {
-        List<String> scopes = Arrays.asList("GET /deployments");
+        List<String> scopes = Arrays.asList("read:deployments");
         Map<String, Object> create = service.createKey(1L, "Test", scopes,
                 null, 1000);
         String key = (String) create.get("key");
-        Exception e = assertThrows(IllegalArgumentException.class,
+        ApiKeysServiceAccounts.ApiKeyException e = assertThrows(ApiKeysServiceAccounts.ApiKeyException.class,
                 () -> service.useKey(key, "/deployments", "POST", 200));
         assertTrue(e.getMessage().contains("Insufficient scope"));
+        assertEquals(403, e.getStatus());
+        // The same key may still read deployments.
+        assertEquals(200, service.useKey(key, "/deployments", "GET", 200).get("status"));
     }
 
+    // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: spec scope names (read:deployments, webhook:manage) instead of
+    // literal "GET /deployments" strings, and refusals are ApiKeyException carrying the spec's 401/403/429 status.
+    // KEYS-06
     @Test
     public void testRotateKey() {
-        List<String> scopes = Arrays.asList("GET /deployments");
+        List<String> scopes = Arrays.asList("read:deployments");
         Map<String, Object> create = service.createKey(1L, "Test", scopes,
                 null, 1000);
         long id = (long) create.get("api_key_id");
@@ -101,27 +164,34 @@ public class ApiKeysServiceAccountsTests {
         ApiKeysServiceAccounts.ApiKey keyObj = keyRepo.findById(id).get();
         keyObj.gracePeriodEndsAt = LocalDateTime.now().minusSeconds(1);
         keyRepo.save(keyObj);
-        Exception e = assertThrows(IllegalArgumentException.class,
+        ApiKeysServiceAccounts.ApiKeyException e = assertThrows(ApiKeysServiceAccounts.ApiKeyException.class,
                 () -> service.useKey(oldKey, "/deployments", "GET", 200));
         assertTrue(e.getMessage().contains("revoked"));
         // New key still works after grace period
         service.useKey(newKey, "/deployments", "GET", 200);
     }
 
+    // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: spec scope names (read:deployments, webhook:manage) instead of
+    // literal "GET /deployments" strings, and refusals are ApiKeyException carrying the spec's 401/403/429 status.
+    // KEYS-07
     @Test
     public void testExpiredKey() {
-        List<String> scopes = Arrays.asList("GET /deployments");
+        List<String> scopes = Arrays.asList("read:deployments");
         Map<String, Object> create = service.createKey(1L, "Test", scopes,
                 LocalDateTime.now().minusDays(1), 1000);
         String key = (String) create.get("key");
-        Exception e = assertThrows(IllegalArgumentException.class,
+        ApiKeysServiceAccounts.ApiKeyException e = assertThrows(ApiKeysServiceAccounts.ApiKeyException.class,
                 () -> service.useKey(key, "/deployments", "GET", 200));
         assertTrue(e.getMessage().contains("expired"));
+        assertEquals(401, e.getStatus());
     }
 
+    // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: spec scope names (read:deployments, webhook:manage) instead of
+    // literal "GET /deployments" strings, and refusals are ApiKeyException carrying the spec's 401/403/429 status.
+    // KEYS-08
     @Test
     public void testUsageStats() {
-        List<String> scopes = Arrays.asList("GET /deployments", "POST /webhooks");
+        List<String> scopes = Arrays.asList("read:deployments", "webhook:manage");
         Map<String, Object> create = service.createKey(1L, "Test", scopes,
                 null, 1000);
         String key = (String) create.get("key");
@@ -140,9 +210,10 @@ public class ApiKeysServiceAccountsTests {
         assertEquals(1, errors.get(404));
     }
 
+    // KEYS-09
     @Test
     public void testAdminAudit() {
-        List<String> scopes = Arrays.asList("GET /deployments");
+        List<String> scopes = Arrays.asList("read:deployments");
         service.createKey(1L, "Key1", scopes, null, 1000);
         service.createKey(2L, "Key2", scopes, null, 1000);
         // Admin audit with userId filter
@@ -162,7 +233,7 @@ public class ApiKeysServiceAccountsTests {
     @Test
     public void testRateLimitAtomicWithUsageLogging() {
         // Verify that rate-limited requests are logged with status 429
-        List<String> scopes = Arrays.asList("GET /test");
+        List<String> scopes = Arrays.asList("read:test");
         Map<String, Object> create = service.createKey(1L, "Test", scopes, null, 2);
         String key = (String) create.get("key");
         long keyId = (long) create.get("api_key_id");
@@ -170,7 +241,7 @@ public class ApiKeysServiceAccountsTests {
         service.useKey(key, "/test", "GET", 200);
         service.useKey(key, "/test", "GET", 200);
         // Third request hits rate limit
-        assertThrows(IllegalStateException.class, () -> service.useKey(key, "/test", "GET", 200));
+        assertThrows(ApiKeysServiceAccounts.ApiKeyException.class, () -> service.useKey(key, "/test", "GET", 200));
         // Check usage stats include the 429
         Map<String, Object> stats = service.getUsageStats(keyId,
                 LocalDateTime.now().minusHours(1), LocalDateTime.now().plusHours(1));

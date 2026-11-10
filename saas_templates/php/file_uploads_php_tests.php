@@ -85,6 +85,7 @@ $EXE = "MZ" . str_repeat("\x00", 62);
 $GIF89a = "GIF89a" . str_repeat("\x00", 100);
 $PNG_SHA256 = 'a4d4c009619311d9b83904acfd62fe3b7f918c312522bbcc6ad51cdec4fd1edf';
 
+// UPLOAD-01
 function test_exe_rejected_by_extension_and_magic_bytes(): void {
     global $state, $tmpdir, $PNG, $EXE;
     $tmpdir = fresh_tmpdir();
@@ -100,6 +101,7 @@ function test_exe_rejected_by_extension_and_magic_bytes(): void {
     cleanup_tmpdir($tmpdir);
 }
 
+// UPLOAD-02
 function test_real_png_stored_under_generated_name(): void {
     global $state, $tmpdir, $PNG;
     $tmpdir = fresh_tmpdir();
@@ -126,6 +128,7 @@ function test_real_png_stored_under_generated_name(): void {
     cleanup_tmpdir($tmpdir);
 }
 
+// UPLOAD-03
 function test_path_traversal_name_stored_safely(): void {
     global $state, $tmpdir, $PNG;
     $tmpdir = fresh_tmpdir();
@@ -145,6 +148,7 @@ function test_path_traversal_name_stored_safely(): void {
     cleanup_tmpdir($tmpdir);
 }
 
+// UPLOAD-04
 function test_file_over_size_limit_rejected(): void {
     global $state, $tmpdir, $PNG;
     $tmpdir = fresh_tmpdir();
@@ -165,6 +169,7 @@ function test_file_over_size_limit_rejected(): void {
     cleanup_tmpdir($tmpdir);
 }
 
+// UPLOAD-05
 function test_non_member_cannot_upload_or_download(): void {
     global $state, $tmpdir, $PNG;
     $tmpdir = fresh_tmpdir();
@@ -188,6 +193,7 @@ function test_non_member_cannot_upload_or_download(): void {
     cleanup_tmpdir($tmpdir);
 }
 
+// UPLOAD-06
 function test_expired_and_tampered_links_rejected(): void {
     global $state, $tmpdir, $PNG;
     $tmpdir = fresh_tmpdir();
@@ -217,6 +223,7 @@ function test_expired_and_tampered_links_rejected(): void {
     cleanup_tmpdir($tmpdir);
 }
 
+// UPLOAD-07
 function test_deleted_file_cannot_be_linked_or_downloaded(): void {
     global $state, $tmpdir, $PNG;
     $tmpdir = fresh_tmpdir();

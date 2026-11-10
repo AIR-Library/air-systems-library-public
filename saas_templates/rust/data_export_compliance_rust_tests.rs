@@ -13,8 +13,30 @@ use super::*;
 use chrono::{TimeZone, Utc};
 use std::sync::atomic::{AtomicI64, Ordering};
 
-/// What: a service with Alice (user 1), in-memory storage and mailer, and a clock the test can move.
-/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
+/// What: a fake audit eraser that records each erase_subject call. 2026-11-10,
+/// session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-13). Touches: memory.
+#[derive(Clone, Default)]
+struct RecordingEraser {
+    calls: Arc<Mutex<Vec<i64>>>,
+}
+
+/// What: `AuditEraser` for the fake: records the user id. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+impl AuditEraser for RecordingEraser {
+    /// What: record the call. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
+    fn erase_subject(&self, user_id: i64) -> Result<(), String> {
+        self.calls.lock().unwrap().push(user_id);
+        Ok(())
+    }
+}
+
+/// What: the confirmation token in the last email. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+fn last_token(mailer: &InMemoryMailer) -> String {
+    mailer.sent.lock().unwrap().last().unwrap().body.split("token=").nth(1).unwrap().to_string()
+}
+
+/// What: a service with Alice (user 1), in-memory storage and mailer, a recording audit eraser, and a
+/// clock the test can move. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the cascade now needs
+/// an audit eraser (EXPORT-13). Touches: memory.
 fn build_service() -> (ComplianceService, InMemoryMailer, Arc<AtomicI64>) {
     let mailer = InMemoryMailer::default();
     let now = Arc::new(AtomicI64::new(Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap().timestamp()));
@@ -27,7 +49,8 @@ fn build_service() -> (ComplianceService, InMemoryMailer, Arc<AtomicI64>) {
         "https://example.com",
     )
     .unwrap()
-    .with_clock(Box::new(move || Utc.timestamp_opt(clock.load(Ordering::SeqCst), 0).unwrap()));
+    .with_clock(Box::new(move || Utc.timestamp_opt(clock.load(Ordering::SeqCst), 0).unwrap()))
+    .with_audit_eraser(Box::new(RecordingEraser::default()));
     svc.db()
         .execute(
             "INSERT INTO users (id, email, name, created_at, tier, status) VALUES (1, 'alice@example.com', 'Alice', '2025-01-01T00:00:00Z', 'pro', 'active')",
@@ -37,6 +60,9 @@ fn build_service() -> (ComplianceService, InMemoryMailer, Arc<AtomicI64>) {
     (svc, mailer, now)
 }
 
+// EXPORT-01
+// EXPORT-02
+// EXPORT-03
 #[tokio::test]
 async fn test_export_json_flow() {
     let (svc, mailer, _) = build_service();
@@ -67,6 +93,7 @@ async fn test_export_json_flow() {
     assert_eq!(data["profile"]["email"], "alice@example.com");
 }
 
+// EXPORT-01
 #[tokio::test]
 async fn test_export_csv_flow() {
     let (svc, _, _) = build_service();
@@ -79,6 +106,11 @@ async fn test_export_csv_flow() {
     assert!(status.file_url.unwrap().ends_with(".csv"));
 }
 
+/// What: EXPORT-06/09: a deletion is confirmed with the emailed token (a wrong one is refused) and
+/// cancelled within the grace period. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: confirm takes the caller (EXPORT-14).
+/// Touches: memory only.
+// EXPORT-06
+// EXPORT-09
 #[tokio::test]
 async fn test_deletion_grace_period_and_cancel() {
     let (svc, mailer, _) = build_service();
@@ -90,9 +122,10 @@ async fn test_deletion_grace_period_and_cancel() {
     // Confirm deletion with the token from the confirmation email
     let body = mailer.sent.lock().unwrap().last().unwrap().body.clone();
     let token = body.split("token=").nth(1).unwrap().to_string();
-    assert!(svc.confirm_deletion(del_resp.deletion_id.clone(), "wrong").await.is_err());
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: confirm now takes the caller (EXPORT-14: own request only)
+    assert!(svc.confirm_deletion(1, del_resp.deletion_id.clone(), "wrong").await.is_err());
 
-    let confirm = svc.confirm_deletion(del_resp.deletion_id.clone(), &token).await.expect("confirm deletion");
+    let confirm = svc.confirm_deletion(1, del_resp.deletion_id.clone(), &token).await.expect("confirm deletion");
     assert!(confirm.success);
 
     // Cancel within grace period
@@ -100,12 +133,17 @@ async fn test_deletion_grace_period_and_cancel() {
     assert_eq!(cancel.status, DeletionStatus::Cancelled);
 }
 
+/// What: EXPORT-07/08: the cascade deletes sessions and API keys and keeps the audit log. Changed
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the API-key assertion was added. Touches: memory only.
+// EXPORT-07
+// EXPORT-08
 #[tokio::test]
 async fn test_cascade_delete_preserves_audit_log() {
     let (svc, _, _) = build_service();
 
     // Insert dummy related rows
     svc.db().execute("INSERT INTO sessions (id, user_id) VALUES (?1, ?2)", params!["s1", 1]).unwrap();
+    svc.db().execute("INSERT INTO api_keys (id, user_id) VALUES (?1, ?2)", params!["k1", 1]).unwrap();
     svc.db()
         .execute(
             "INSERT INTO audit_log (id, user_id, action, created_at, details) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -119,6 +157,8 @@ async fn test_cascade_delete_preserves_audit_log() {
     // Sessions should be gone
     let sess_cnt: i64 = svc.db().query_row("SELECT COUNT(*) FROM sessions WHERE user_id = ?1", params![1], |r| r.get(0)).unwrap();
     assert_eq!(sess_cnt, 0);
+    let key_cnt: i64 = svc.db().query_row("SELECT COUNT(*) FROM api_keys WHERE user_id = ?1", params![1], |r| r.get(0)).unwrap();
+    assert_eq!(key_cnt, 0);
 
     // Audit log must still exist (the login row, plus the cascade's own record)
     let audit_cnt: i64 = svc
@@ -128,6 +168,9 @@ async fn test_cascade_delete_preserves_audit_log() {
     assert_eq!(audit_cnt, 1);
 }
 
+/// What: EXPORT-10: an admin sees every export and deletion request; a non-admin is refused. Changed
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the lists take the verified caller. Touches: memory only.
+// EXPORT-10
 #[tokio::test]
 async fn test_admin_list_exports_and_deletions() {
     let (svc, _, _) = build_service();
@@ -139,20 +182,26 @@ async fn test_admin_list_exports_and_deletions() {
     // Create a deletion request
     let d1 = svc.request_account_deletion(1, DeletionReason::GdprRequest).await.unwrap();
 
-    // List exports
-    let list = svc.list_exports(Some(1), Some(ExportStatus::Pending)).await.unwrap();
+    // List exports (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the lists take the verified caller and
+    // refuse a non-admin)
+    let admin = Caller { user_id: 99, is_admin: true };
+    let user = Caller { user_id: 1, is_admin: false };
+    assert!(matches!(svc.list_exports(&user, None, None).await, Err(ComplianceError::NotAllowed(_))));
+    assert!(matches!(svc.list_deletions(&user, None).await, Err(ComplianceError::NotAllowed(_))));
+    let list = svc.list_exports(&admin, Some(1), Some(ExportStatus::Pending)).await.unwrap();
     assert_eq!(list.total, 2);
     assert!(list.exports.iter().any(|e| e.id == e1.export_id));
     assert!(list.exports.iter().any(|e| e.id == e2.export_id));
 
     // List deletions
-    let dlist = svc.list_deletions(Some(DeletionStatus::Pending)).await.unwrap();
+    let dlist = svc.list_deletions(&admin, Some(DeletionStatus::Pending)).await.unwrap();
     assert_eq!(dlist.total, 1);
     assert_eq!(dlist.deletions[0].id, d1.deletion_id);
 }
 
 /// Added 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP), spec "Signed URL works, expires after 7 days":
 /// the link downloads, a changed signature does not, and the same link fails after 7 days.
+// EXPORT-04
 #[tokio::test]
 async fn test_signed_link_works_and_expires_after_7_days() {
     let (svc, _, now) = build_service();
@@ -170,13 +219,19 @@ async fn test_signed_link_works_and_expires_after_7_days() {
 }
 
 /// Added 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP), spec "30-day grace period enforced": a confirmed
-/// deletion does not run before 30 days, runs after, and keeps the audit log.
+/// deletion does not run before 30 days, runs after, and keeps the audit log. Changed the same day for
+/// the EXPORT-05/12 amendment: the reason is user_requested (a statutory reason now has no grace
+/// period), will_delete_at is requested_at + 30 days, and confirm takes the caller.
+// EXPORT-05
 #[tokio::test]
 async fn test_deletion_runs_only_after_grace_period() {
     let (svc, mailer, now) = build_service();
-    let d = svc.request_account_deletion(1, DeletionReason::GdprRightToBeForgotten).await.unwrap();
-    let token = mailer.sent.lock().unwrap().last().unwrap().body.split("token=").nth(1).unwrap().to_string();
-    svc.confirm_deletion(d.deletion_id.clone(), &token).await.unwrap();
+    let d = svc.request_account_deletion(1, DeletionReason::UserRequested).await.unwrap();
+    let requested_at = Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap();
+    assert_eq!(d.will_delete_at, requested_at + chrono::Duration::days(30));
+    let token = last_token(&mailer);
+    let confirm = svc.confirm_deletion(1, d.deletion_id.clone(), &token).await.unwrap();
+    assert_eq!(confirm.deletion_scheduled_for, requested_at + chrono::Duration::days(30));
     now.fetch_add(29 * 86_400, Ordering::SeqCst);
     assert_eq!(svc.process_due_deletions().await.unwrap(), 0);
     now.fetch_add(86_400, Ordering::SeqCst);
@@ -191,6 +246,8 @@ async fn test_deletion_runs_only_after_grace_period() {
 /// Added 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP), CodeRabbit review on PR 19: an export made
 /// late in the grace period has a link that is still inside its 7 days when the deletion runs. After
 /// the deletion that link is refused, the file is gone from storage and the export row is gone.
+/// Changed 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP) for the EXPORT-12/13 amendment: the reason is
+/// user_requested (a statutory reason now has no grace period) and the service has an audit eraser.
 /// Touches: memory only.
 #[tokio::test]
 async fn test_deletion_removes_exports_and_refuses_old_link() {
@@ -200,13 +257,14 @@ async fn test_deletion_removes_exports_and_refuses_old_link() {
     let clock = now.clone();
     let svc = ComplianceService::new(Connection::open_in_memory().unwrap(), Box::new(storage.clone()), Box::new(mailer.clone()), &[7u8; 32], "https://example.com")
         .unwrap()
-        .with_clock(Box::new(move || Utc.timestamp_opt(clock.load(Ordering::SeqCst), 0).unwrap()));
+        .with_clock(Box::new(move || Utc.timestamp_opt(clock.load(Ordering::SeqCst), 0).unwrap()))
+        .with_audit_eraser(Box::new(RecordingEraser::default()));
     svc.db()
         .execute("INSERT INTO users (id, email, name, created_at, tier, status) VALUES (1, 'alice@example.com', 'Alice', '2025-01-01T00:00:00Z', 'pro', 'active')", [])
         .unwrap();
-    let d = svc.request_account_deletion(1, DeletionReason::GdprRightToBeForgotten).await.unwrap();
-    let token = mailer.sent.lock().unwrap().last().unwrap().body.split("token=").nth(1).unwrap().to_string();
-    svc.confirm_deletion(d.deletion_id.clone(), &token).await.unwrap();
+    let d = svc.request_account_deletion(1, DeletionReason::UserRequested).await.unwrap();
+    let token = last_token(&mailer);
+    svc.confirm_deletion(1, d.deletion_id.clone(), &token).await.unwrap();
 
     // Day 25: export, so the 7-day link is still valid on day 30.
     now.fetch_add(25 * 86_400, Ordering::SeqCst);
@@ -258,7 +316,8 @@ impl FileStorage for FlakyDeleteStorage {
 
 /// Added 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP), CodeRabbit review on PR 19: if the export files
 /// cannot be removed, nothing is deleted and the request stays approved; the next run completes it.
-/// Touches: memory only.
+/// Changed 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): the service has an audit eraser, confirm takes
+/// the caller and the admin list takes an admin caller. Touches: memory only.
 #[tokio::test]
 async fn test_deletion_is_retried_when_export_cleanup_fails() {
     let storage = FlakyDeleteStorage::default();
@@ -267,22 +326,23 @@ async fn test_deletion_is_retried_when_export_cleanup_fails() {
     let clock = now.clone();
     let svc = ComplianceService::new(Connection::open_in_memory().unwrap(), Box::new(storage.clone()), Box::new(mailer.clone()), &[7u8; 32], "https://example.com")
         .unwrap()
-        .with_clock(Box::new(move || Utc.timestamp_opt(clock.load(Ordering::SeqCst), 0).unwrap()));
+        .with_clock(Box::new(move || Utc.timestamp_opt(clock.load(Ordering::SeqCst), 0).unwrap()))
+        .with_audit_eraser(Box::new(RecordingEraser::default()));
     svc.db()
         .execute("INSERT INTO users (id, email, name, created_at, tier, status) VALUES (1, 'alice@example.com', 'Alice', '2025-01-01T00:00:00Z', 'pro', 'active')", [])
         .unwrap();
     let e = svc.request_data_export(1, ExportFormat::Csv).await.unwrap();
     svc.generate_export_file(e.export_id, 1, ExportFormat::Csv).await.unwrap();
     let d = svc.request_account_deletion(1, DeletionReason::UserRequested).await.unwrap();
-    let token = mailer.sent.lock().unwrap().last().unwrap().body.split("token=").nth(1).unwrap().to_string();
-    svc.confirm_deletion(d.deletion_id.clone(), &token).await.unwrap();
+    let token = last_token(&mailer);
+    svc.confirm_deletion(1, d.deletion_id.clone(), &token).await.unwrap();
     now.fetch_add(30 * 86_400, Ordering::SeqCst);
 
     storage.fail.store(true, Ordering::SeqCst);
     assert_eq!(svc.process_due_deletions().await.unwrap(), 0);
     let users: i64 = svc.db().query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0)).unwrap();
     assert_eq!(users, 1, "nothing is deleted while the export files remain");
-    let pending = svc.list_deletions(Some(DeletionStatus::Approved)).await.unwrap();
+    let pending = svc.list_deletions(&Caller { user_id: 99, is_admin: true }, Some(DeletionStatus::Approved)).await.unwrap();
     assert_eq!(pending.total, 1);
 
     storage.fail.store(false, Ordering::SeqCst);
@@ -290,4 +350,202 @@ async fn test_deletion_is_retried_when_export_cleanup_fails() {
     assert!(storage.inner.files.lock().unwrap().is_empty());
     let users: i64 = svc.db().query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0)).unwrap();
     assert_eq!(users, 0);
+}
+
+/// What: EXPORT-11: every export and deletion request and action is in the audit log with its ids
+/// (the why-chain: which request, which reason), in order. In: none. Out: panics on a wrong log.
+/// Why: the spec's required test EXPORT-11 had no Rust test. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+/// Touches: memory only.
+// EXPORT-11
+#[tokio::test]
+async fn test_all_requests_are_audited() {
+    let (svc, mailer, _) = build_service();
+    let e = svc.request_data_export(1, ExportFormat::Json).await.unwrap();
+    svc.generate_export_file(e.export_id.clone(), 1, ExportFormat::Json).await.unwrap();
+    let d = svc.request_account_deletion(1, DeletionReason::UserRequested).await.unwrap();
+    svc.confirm_deletion(1, d.deletion_id.clone(), &last_token(&mailer)).await.unwrap();
+    svc.cancel_deletion(1, d.deletion_id.clone()).await.unwrap();
+    let rows: Vec<(String, String)> = {
+        let conn = svc.db();
+        let mut stmt = conn.prepare("SELECT action, details FROM audit_log WHERE user_id = 1 ORDER BY rowid").unwrap();
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        rows
+    };
+    let actions: Vec<&str> = rows.iter().map(|(a, _)| a.as_str()).collect();
+    assert_eq!(actions, ["data_export_requested", "data_export_completed", "deletion_requested", "deletion_confirmed", "deletion_cancelled"]);
+    let details: Vec<Value> = rows.iter().map(|(_, d)| serde_json::from_str(d).unwrap()).collect();
+    assert_eq!(details[0]["export_id"], e.export_id.as_str());
+    assert_eq!(details[2]["deletion_id"], d.deletion_id.as_str());
+    assert_eq!(details[2]["reason"], "user_requested");
+}
+
+/// What: EXPORT-12: a gdpr_request and a gdpr_right_to_be_forgotten request are not held for 30 days:
+/// will_delete_at = requested_at, nothing is deleted before confirm, and confirm runs the cascade before
+/// it returns (status completed, deleted_at = deletion_scheduled_for = now). In: none. Out: panics.
+/// Why: 2026-11-10 amendment (EXPORT-12). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+// EXPORT-12
+#[tokio::test]
+async fn test_statutory_deletion_has_no_grace_period() {
+    for reason in [DeletionReason::GdprRequest, DeletionReason::GdprRightToBeForgotten] {
+        let (svc, mailer, now) = build_service();
+        let requested_at = Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap();
+        let d = svc.request_account_deletion(1, reason).await.unwrap();
+        assert_eq!(d.will_delete_at, requested_at);
+        assert_eq!(svc.process_due_deletions().await.unwrap(), 0, "nothing runs before confirm");
+        now.fetch_add(3600, Ordering::SeqCst);
+        let confirm = svc.confirm_deletion(1, d.deletion_id.clone(), &last_token(&mailer)).await.unwrap();
+        let confirmed_at = requested_at + chrono::Duration::hours(1);
+        assert_eq!(confirm.deletion_scheduled_for, confirmed_at);
+        let users: i64 = svc.db().query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0)).unwrap();
+        assert_eq!(users, 0, "{:?}: deleted on confirm", reason);
+        let list = svc.list_deletions(&Caller { user_id: 99, is_admin: true }, None).await.unwrap();
+        assert_eq!(list.deletions[0].status, DeletionStatus::Completed);
+        assert_eq!(list.deletions[0].deleted_at, Some(confirmed_at));
+        assert_eq!(list.deletions[0].scheduled_for, confirmed_at);
+    }
+}
+
+/// What: an audit eraser on its own connection to the same shared-cache in-memory database, reading
+/// uncommitted rows, so it can see the cascade's state at the moment it is called: whether the user
+/// row still exists and the last audit action logged for the user. 2026-11-10,
+/// session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-13). Touches: in-memory SQLite (read).
+struct ObservingEraser {
+    conn: Mutex<Connection>,
+    seen: Arc<Mutex<Vec<(i64, i64, Option<String>)>>>,
+}
+
+/// What: `AuditEraser` for the observing fake. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+impl AuditEraser for ObservingEraser {
+    /// What: record (user id, user rows left, last audit action for the user). 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite (read).
+    fn erase_subject(&self, user_id: i64) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        let users: i64 = conn.query_row("SELECT COUNT(*) FROM users WHERE id = ?1", params![user_id], |r| r.get(0)).map_err(|e| e.to_string())?;
+        let last: Option<String> = conn
+            .query_row("SELECT action FROM audit_log WHERE user_id = ?1 ORDER BY rowid DESC LIMIT 1", params![user_id], |r| r.get(0))
+            .optional()
+            .map_err(|e| e.to_string())?;
+        self.seen.lock().unwrap().push((user_id, users, last));
+        Ok(())
+    }
+}
+
+/// What: a fake audit eraser that always fails. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+struct FailingEraser;
+
+/// What: `AuditEraser` for the failing fake. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+impl AuditEraser for FailingEraser {
+    /// What: always an error. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+    fn erase_subject(&self, _user_id: i64) -> Result<(), String> {
+        Err("audit store down".into())
+    }
+}
+
+/// What: EXPORT-13: the cascade deletes the user's rows, logs 'user_deleted_cascade', then calls
+/// erase_subject(user_id) LAST (when it is called the user row is already gone and the last audit row
+/// for the user is the cascade's); nothing is logged for the user after it; deletion_requests.user_id
+/// is NULL once completed. A failing eraser rolls the whole cascade back, and with no eraser configured
+/// nothing is deleted. In: none. Out: panics on a wrong order. Why: 2026-11-10 amendment (EXPORT-13).
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite (shared cache).
+// EXPORT-13
+#[tokio::test]
+async fn test_cascade_calls_audit_eraser_last() {
+    use rusqlite::OpenFlags;
+    let uri = "file:export13?mode=memory&cache=shared";
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_URI;
+    let main = Connection::open_with_flags(uri, flags).unwrap();
+    let observer = Connection::open_with_flags(uri, flags).unwrap();
+    observer.execute_batch("PRAGMA read_uncommitted = true;").unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mailer = InMemoryMailer::default();
+    let svc = ComplianceService::new(main, Box::new(InMemoryFileStorage::default()), Box::new(mailer.clone()), &[7u8; 32], "https://example.com")
+        .unwrap()
+        .with_audit_eraser(Box::new(ObservingEraser { conn: Mutex::new(observer), seen: seen.clone() }));
+    svc.db()
+        .execute("INSERT INTO users (id, email, name, created_at, tier, status) VALUES (1, 'alice@example.com', 'Alice', '2025-01-01T00:00:00Z', 'pro', 'active')", [])
+        .unwrap();
+    svc.db().execute("INSERT INTO sessions (id, user_id) VALUES ('s1', 1)", []).unwrap();
+    let d = svc.request_account_deletion(1, DeletionReason::GdprRightToBeForgotten).await.unwrap();
+    svc.confirm_deletion(1, d.deletion_id.clone(), &last_token(&mailer)).await.unwrap();
+
+    assert_eq!(*seen.lock().unwrap(), vec![(1, 0, Some("user_deleted_cascade".to_string()))]);
+    let last: String = svc.db().query_row("SELECT action FROM audit_log WHERE user_id = 1 ORDER BY rowid DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+    assert_eq!(last, "user_deleted_cascade", "nothing is logged for the user after the eraser");
+    let (uid, status): (Option<i64>, String) =
+        svc.db().query_row("SELECT user_id, status FROM deletion_requests WHERE id = ?1", params![d.deletion_id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!((uid, status.as_str()), (None, "completed"));
+}
+
+/// What: EXPORT-13 failure path: a failing eraser rolls the cascade back (user, sessions and the
+/// approved request stay, no 'user_deleted_cascade' row), and an unconfigured eraser refuses too.
+/// In: none. Out: panics on a partial delete. Why: 2026-11-10 amendment (EXPORT-13, one transaction).
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+// EXPORT-13
+#[tokio::test]
+async fn test_cascade_rolls_back_when_audit_erase_fails() {
+    for eraser in [Box::new(FailingEraser) as Box<dyn AuditEraser>, Box::new(UnconfiguredAuditEraser)] {
+        let mailer = InMemoryMailer::default();
+        let svc = ComplianceService::new(Connection::open_in_memory().unwrap(), Box::new(InMemoryFileStorage::default()), Box::new(mailer.clone()), &[7u8; 32], "https://example.com")
+            .unwrap()
+            .with_audit_eraser(eraser);
+        svc.db()
+            .execute("INSERT INTO users (id, email, name, created_at, tier, status) VALUES (1, 'alice@example.com', 'Alice', '2025-01-01T00:00:00Z', 'pro', 'active')", [])
+            .unwrap();
+        svc.db().execute("INSERT INTO sessions (id, user_id) VALUES ('s1', 1)", []).unwrap();
+        let d = svc.request_account_deletion(1, DeletionReason::GdprRequest).await.unwrap();
+        assert!(matches!(svc.confirm_deletion(1, d.deletion_id.clone(), &last_token(&mailer)).await, Err(ComplianceError::AuditErase(_))));
+        let counts: (i64, i64, i64) = svc
+            .db()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM users), (SELECT COUNT(*) FROM sessions), (SELECT COUNT(*) FROM audit_log WHERE action = 'user_deleted_cascade')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 1, 0));
+        let status: String = svc.db().query_row("SELECT status FROM deletion_requests WHERE id = ?1", params![d.deletion_id], |r| r.get(0)).unwrap();
+        assert_eq!(status, "approved", "stays due, so the scheduled job retries it");
+    }
+}
+
+/// What: EXPORT-14: nothing is deleted before confirm; a wrong token, a reused token and a token over
+/// 24 hours old are refused; another user's deletion request is 404 (DeletionNotFound) for confirm and
+/// cancel. In: none. Out: panics on a wrong answer. Why: 2026-11-10 amendment (EXPORT-14).
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+// EXPORT-14
+#[tokio::test]
+async fn test_deletion_confirmation_token_rules() {
+    let (svc, mailer, now) = build_service();
+    svc.db()
+        .execute("INSERT INTO users (id, email, name, created_at, tier, status) VALUES (2, 'bob@example.com', 'Bob', '2025-01-01T00:00:00Z', 'pro', 'active')", [])
+        .unwrap();
+    let d = svc.request_account_deletion(1, DeletionReason::GdprRequest).await.unwrap();
+    let token = last_token(&mailer);
+    assert_eq!(token.len(), 64, "32 random bytes as hex");
+    assert_eq!(svc.process_due_deletions().await.unwrap(), 0);
+    let users: i64 = svc.db().query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0)).unwrap();
+    assert_eq!(users, 2, "nothing deleted before confirm");
+    let stored: String = svc.db().query_row("SELECT token_hash FROM deletion_requests WHERE id = ?1", params![d.deletion_id], |r| r.get(0)).unwrap();
+    assert_ne!(stored, token, "only the hash is stored");
+
+    // another user's request: 404 for confirm (even with the right token) and cancel
+    assert_eq!(svc.confirm_deletion(2, d.deletion_id.clone(), &token).await.unwrap_err(), ComplianceError::DeletionNotFound);
+    assert_eq!(svc.cancel_deletion(2, d.deletion_id.clone()).await.unwrap_err(), ComplianceError::DeletionNotFound);
+    // wrong token
+    assert_eq!(svc.confirm_deletion(1, d.deletion_id.clone(), &"0".repeat(64)).await.unwrap_err(), ComplianceError::TokenMismatch);
+    // a token is bound to its own deletion id
+    let d2 = svc.request_account_deletion(2, DeletionReason::UserRequested).await.unwrap();
+    let token2 = last_token(&mailer);
+    assert_eq!(svc.confirm_deletion(1, d.deletion_id.clone(), &token2).await.unwrap_err(), ComplianceError::TokenMismatch);
+    // expired after 24 hours
+    now.fetch_add(24 * 3600, Ordering::SeqCst);
+    assert_eq!(svc.confirm_deletion(1, d.deletion_id.clone(), &token).await.unwrap_err(), ComplianceError::TokenExpired);
+    let users: i64 = svc.db().query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0)).unwrap();
+    assert_eq!(users, 2);
+    // a fresh request: confirm once, then the same token is refused
+    let d3 = svc.request_account_deletion(1, DeletionReason::UserRequested).await.unwrap();
+    let token3 = last_token(&mailer);
+    svc.confirm_deletion(1, d3.deletion_id.clone(), &token3).await.unwrap();
+    assert!(svc.confirm_deletion(1, d3.deletion_id.clone(), &token3).await.is_err());
+    let _ = d2;
 }

@@ -21,12 +21,22 @@ namespace TrialAbusePrevention
     {
         private readonly TrialAbusePreventionDbContext _context;
         private readonly ILogger<TrialAbusePreventionService> _logger;
-        private const int TrialDays = 14; // Example trial duration, should be configurable
+        private readonly Func<DateTime> _clock;
+        private readonly int _trialDays;
 
-        public TrialAbusePreventionService(TrialAbusePreventionDbContext context, ILogger<TrialAbusePreventionService> logger)
+        /// <summary>
+        /// Builds the service. In: the database, a logger, an optional clock returning UTC now (default
+        /// DateTime.UtcNow) and the trial length in days (configuration, default 14).
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (TRIAL-10/11/15 amendment): trial_days was a constant and
+        /// time came from the wall clock, so the payment-timing boundaries could not be tested exactly. Touches nothing.
+        /// </summary>
+        public TrialAbusePreventionService(TrialAbusePreventionDbContext context, ILogger<TrialAbusePreventionService> logger,
+            Func<DateTime> clock = null, int trialDays = 14)
         {
             _context = context;
             _logger = logger;
+            _clock = clock ?? (() => DateTime.UtcNow);
+            _trialDays = trialDays;
         }
 
         /// <summary>
@@ -79,9 +89,10 @@ namespace TrialAbusePrevention
         /// </summary>
         public async Task<GateCheckResult> CheckIpSignupRateLimit(string ip)
         {
+            var since = _clock().AddHours(-24); // injected clock (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
             var count = await _context.Signups
                 .CountAsync(s => s.Ip == ip &&
-                                 s.CreatedAt >= DateTime.UtcNow.AddHours(-24));
+                                 s.CreatedAt >= since);
 
             GateDecision decision;
             if (count < 5) decision = GateDecision.Pass;
@@ -101,40 +112,68 @@ namespace TrialAbusePrevention
         }
 
         /// <summary>
-        /// Gate: hashes the device traits and counts other users on the same device. Touches: reads fingerprints. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// Gate 4, device_fingerprint (TRIAL-08/09/14, amended 2026-11-10).
+        /// In: the device traits and the user being checked (null when not yet known). device_hash = SHA-256 of
+        /// "user_agent|screen_resolution|timezone|browser_language". count = distinct OTHER users with this device
+        /// (null-safe: with no user id every user counts). Decision, in this order: FAIL if count &gt;= 5; PASS if
+        /// count &lt; 2; PASS if this user already has a row for the device; CHALLENGE otherwise. The device row is
+        /// written AFTER the decision and only for PASS or CHALLENGE (and only once per user), so a device farm keeps
+        /// failing. Out: the decision and a reason.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: counted every user including this one, let a known
+        /// device pass even at 5+, overlapped CHALLENGE and FAIL at 5, and never recorded a row.
+        /// Touches: device_fingerprints (read, and one insert on PASS/CHALLENGE).
         /// </summary>
         public async Task<GateCheckResult> CheckDeviceFingerprint(string userAgent, string screenResolution, string timezone, string browserLanguage, string userId = null)
         {
             var device = $"{userAgent}|{screenResolution}|{timezone}|{browserLanguage}";
             var deviceHash = ComputeSha256Hash(device);
 
-            var matchingUsers = await _context.DeviceFingerprints
-                .Where(df => df.DeviceHash == deviceHash)
+            var otherUsers = await _context.DeviceFingerprints
+                .Where(df => df.DeviceHash == deviceHash && (userId == null || df.UserId != userId))
                 .Select(df => df.UserId)
                 .Distinct()
                 .CountAsync();
 
-            bool matchesKnownDevice = false;
-            if (!string.IsNullOrEmpty(userId))
-            {
-                matchesKnownDevice = await _context.DeviceFingerprints
-                    .AnyAsync(df => df.DeviceHash == deviceHash && df.UserId == userId);
-            }
+            var knownDevice = !string.IsNullOrEmpty(userId) && await _context.DeviceFingerprints
+                .AnyAsync(df => df.DeviceHash == deviceHash && df.UserId == userId);
 
             GateDecision decision;
-            if (matchingUsers < 2 || matchesKnownDevice) decision = GateDecision.Pass;
-            else if (matchingUsers <= 5) decision = GateDecision.Challenge;
-            else decision = GateDecision.Fail;
+            if (otherUsers >= 5) decision = GateDecision.Fail;
+            else if (otherUsers < 2) decision = GateDecision.Pass;
+            else if (knownDevice) decision = GateDecision.Pass;
+            else decision = GateDecision.Challenge;
 
-            var reason = $"Device hash {deviceHash} matches {matchingUsers} user(s)";
+            if (decision != GateDecision.Fail && !string.IsNullOrEmpty(userId) && !knownDevice)
+            {
+                _context.DeviceFingerprints.Add(new DeviceFingerprint
+                {
+                    UserId = userId,
+                    DeviceHash = deviceHash,
+                    UserAgent = userAgent ?? "",
+                    ScreenResolution = screenResolution ?? "",
+                    Timezone = timezone ?? "",
+                    BrowserLanguage = browserLanguage ?? "",
+                    CreatedAt = _clock()
+                });
+                await _context.SaveChangesAsync();
+            }
+
+            var reason = $"Device hash {deviceHash} matches {otherUsers} user(s) other than this one";
             _logger.LogInformation("Gate check: device_fingerprint, device_hash={DeviceHash}, matching_users={MatchingUsers}, decision={Decision}",
-                deviceHash, matchingUsers, decision);
+                deviceHash, otherUsers, decision);
 
             return new GateCheckResult { Decision = decision, Reason = reason };
         }
 
         /// <summary>
-        /// Gate: compares when payment was added with the trial window. Fail for an unknown user. Touches: reads users and ledger. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// Gate 5, trial_payment_timing (TRIAL-10/11/15, amended 2026-11-10), judged when a payment method is being added
+        /// (the payment date is now). trial_end = created_at + trial_days; days_after_trial = floor((now - trial_end) in
+        /// days), rounding toward negative infinity (negative while the trial runs); earlier_payment = the ledger already
+        /// has a payment_added_date for this user. PASS if days_after_trial &lt; 5; FAIL if &gt;= 90 and no earlier
+        /// payment; CHALLENGE otherwise. An unknown user is FAIL.
+        /// In: the user id. Out: the decision and a reason ("days_after_trial=N, earlier_payment=true|false").
+        /// Rewritten 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the old rules defaulted to PASS for most cases and
+        /// truncated days. Touches: reads users and the ledger.
         /// </summary>
         public async Task<GateCheckResult> CheckTrialPaymentTiming(string userId)
         {
@@ -146,28 +185,19 @@ namespace TrialAbusePrevention
                 return new GateCheckResult { Decision = GateDecision.Fail, Reason = notFoundReason };
             }
 
-            var trialStartDate = user.CreatedAt;
-            var now = DateTime.UtcNow;
-            var daysElapsed = (now - trialStartDate).Days;
-            var paymentAddedDate = await _context.TrialAbuseLedgers
-                .Where(l => l.UserId == userId)
-                .Select(l => l.PaymentAddedDate)
-                .OrderByDescending(d => d)
-                .FirstOrDefaultAsync();
+            var trialEnd = user.CreatedAt.AddDays(_trialDays);
+            var daysAfterTrial = (long)Math.Floor((_clock() - trialEnd).TotalDays);
+            var earlierPayment = await _context.TrialAbuseLedgers
+                .AnyAsync(l => l.UserId == userId && l.PaymentAddedDate != null);
 
             GateDecision decision;
-            if (daysElapsed < TrialDays + 5 && paymentAddedDate.HasValue && paymentAddedDate.Value > trialStartDate)
-                decision = GateDecision.Pass;
-            else if (daysElapsed > TrialDays + 30 && paymentAddedDate.HasValue && paymentAddedDate.Value > trialStartDate.AddDays(TrialDays))
-                decision = GateDecision.Challenge;
-            else if (daysElapsed > TrialDays && !paymentAddedDate.HasValue && now > trialStartDate.AddDays(TrialDays + 90))
-                decision = GateDecision.Fail;
-            else
-                decision = GateDecision.Pass; // Default to pass if none of the above conditions match
+            if (daysAfterTrial < 5) decision = GateDecision.Pass;
+            else if (daysAfterTrial >= 90 && !earlierPayment) decision = GateDecision.Fail;
+            else decision = GateDecision.Challenge;
 
-            var reason = $"Trial started {daysElapsed} days ago, payment added { (paymentAddedDate.HasValue ? ((now - paymentAddedDate.Value).Days.ToString() + " days ago") : "never") }";
+            var reason = $"days_after_trial={daysAfterTrial}, earlier_payment={(earlierPayment ? "true" : "false")}";
             _logger.LogInformation("Gate check: trial_payment_timing, user_id={UserId}, trial_duration={TrialDuration}, payment_delay={PaymentDelay}, decision={Decision}",
-                userId, daysElapsed, paymentAddedDate.HasValue ? (now - paymentAddedDate.Value).Days : (int?)null, decision);
+                userId, _trialDays, daysAfterTrial, decision);
 
             return new GateCheckResult { Decision = decision, Reason = reason };
         }

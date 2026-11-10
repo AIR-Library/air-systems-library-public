@@ -32,6 +32,7 @@ pub const WEBHOOK_TOLERANCE_SECS: i64 = 300;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BillingError {
     InvalidTier(String),
+    SubscriptionItemAmbiguous,
     RefundExceedsInvoice,
     InvalidAmount,
     InvoiceNotPaid,
@@ -49,6 +50,7 @@ impl BillingError {
     pub fn to_response(&self) -> (Value, u16) {
         let (code, status) = match self {
             BillingError::InvalidTier(_) => ("invalid_tier", 400),
+            BillingError::SubscriptionItemAmbiguous => ("subscription_item_ambiguous", 409),
             BillingError::RefundExceedsInvoice => ("refund_exceeds_invoice", 400),
             BillingError::InvalidAmount => ("invalid_amount", 400),
             BillingError::InvoiceNotPaid => ("invoice_not_paid", 400),
@@ -68,6 +70,7 @@ impl fmt::Display for BillingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BillingError::InvalidTier(t) => write!(f, "unknown tier {:?}", t),
+            BillingError::SubscriptionItemAmbiguous => write!(f, "the subscription does not have exactly one item"),
             BillingError::RefundExceedsInvoice => write!(f, "refund exceeds the refundable invoice amount"),
             BillingError::InvalidAmount => write!(f, "amount must be positive"),
             BillingError::InvoiceNotPaid => write!(f, "invoice has not succeeded"),
@@ -112,22 +115,45 @@ pub struct ProviderSubscription {
     pub proration_credit_cents: i64,
 }
 
-/// What: the hosted payment API. In: customer/subscription ids and the provider's price id.
-/// Out: the subscription, or an error message. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
-/// Touches: money and the network in a real implementation.
-pub trait PaymentProvider: Send {
-    /// What: `create_subscription` (see the implementations). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
-    fn create_subscription(&self, customer_id: &str, price_id: &str) -> Result<ProviderSubscription, String>;
-    /// What: `update_subscription` (see the implementations). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
-    fn update_subscription(&self, subscription_id: &str, price_id: &str) -> Result<ProviderSubscription, String>;
+/// What: one item of a provider subscription (its id and the price it bills). 2026-11-10,
+/// session_012zDydZCZ4AChqhEZ4oVtaP (BILL-03). Touches: nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionItem {
+    pub id: String,
+    pub price: String,
 }
 
-/// What: an in-memory provider that records each call; ids come from `next_subscription_id`.
-/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
+/// What: the body of a subscription update: `items: [{id, price}]` and `proration_behavior`. The item
+/// id is required by the type, so a bare `{price}` (which makes the provider ADD a second item and bill
+/// both plans) cannot be sent. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (BILL-03). Touches: nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionUpdate {
+    pub items: Vec<SubscriptionItem>,
+    pub proration_behavior: String,
+}
+
+/// What: the hosted payment API. In: customer/subscription ids, the provider's price id, an update.
+/// Out: the subscription (or its items), or an error message. Changed 2026-11-10 (BILL-03):
+/// `retrieve_subscription` added, and `update_subscription` takes the item id with the new price.
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: money and the network in a real implementation.
+pub trait PaymentProvider: Send {
+    /// What: create a subscription for a customer on one price. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    fn create_subscription(&self, customer_id: &str, price_id: &str) -> Result<ProviderSubscription, String>;
+    /// What: the subscription's items (stripe.subscriptions.retrieve). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    fn retrieve_subscription(&self, subscription_id: &str) -> Result<Vec<SubscriptionItem>, String>;
+    /// What: stripe.subscriptions.update with the given items and proration behaviour.
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    fn update_subscription(&self, subscription_id: &str, update: &SubscriptionUpdate) -> Result<ProviderSubscription, String>;
+}
+
+/// What: an in-memory provider that records each call and keeps each subscription's items the way the
+/// provider does (an update item with a known id replaces that item's price; an unknown id is an
+/// error); ids come from `next_subscription_id`. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
 #[derive(Clone, Default)]
 pub struct FakePaymentProvider {
     pub calls: Arc<Mutex<Vec<String>>>,
     pub next_subscription_id: Arc<Mutex<Option<String>>>,
+    pub items: Arc<Mutex<HashMap<String, Vec<SubscriptionItem>>>>,
     pub proration_credit_cents: i64,
     pub fail: bool,
 }
@@ -143,22 +169,40 @@ impl FakePaymentProvider {
     }
 }
 
-/// What: `PaymentProvider` for `FakePaymentProvider`. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing beyond what each method says.
+/// What: `PaymentProvider` for `FakePaymentProvider`. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
 impl PaymentProvider for FakePaymentProvider {
-    /// What: `create_subscription` of `PaymentProvider for FakePaymentProvider`; behaviour as the trait or type documents it. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: as described for its type.
+    /// What: record "create <customer> <price>" and store one item "si_<sub>". 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
     fn create_subscription(&self, customer_id: &str, price_id: &str) -> Result<ProviderSubscription, String> {
         self.calls.lock().map_err(|_| "lock")?.push(format!("create {} {}", customer_id, price_id));
         if self.fail {
             return Err("provider unavailable".into());
         }
         let id = self.next_subscription_id.lock().map_err(|_| "lock")?.take().unwrap_or_else(|| format!("sub_{}", random_hex(8)));
+        self.items.lock().map_err(|_| "lock")?.insert(id.clone(), vec![SubscriptionItem { id: format!("si_{}", id), price: price_id.to_string() }]);
         Ok(ProviderSubscription { id, current_period_start: 1_767_225_600, current_period_end: 1_769_904_000, proration_credit_cents: 0 })
     }
-    /// What: `update_subscription` of `PaymentProvider for FakePaymentProvider`; behaviour as the trait or type documents it. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: as described for its type.
-    fn update_subscription(&self, subscription_id: &str, price_id: &str) -> Result<ProviderSubscription, String> {
-        self.calls.lock().map_err(|_| "lock")?.push(format!("update {} {}", subscription_id, price_id));
+    /// What: record "retrieve <sub>" and return its items. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
+    fn retrieve_subscription(&self, subscription_id: &str) -> Result<Vec<SubscriptionItem>, String> {
+        self.calls.lock().map_err(|_| "lock")?.push(format!("retrieve {}", subscription_id));
         if self.fail {
             return Err("provider unavailable".into());
+        }
+        self.items.lock().map_err(|_| "lock")?.get(subscription_id).cloned().ok_or_else(|| "no such subscription".to_string())
+    }
+    /// What: record "update <sub> <item>=<price> <proration>" and replace each named item's price.
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
+    fn update_subscription(&self, subscription_id: &str, update: &SubscriptionUpdate) -> Result<ProviderSubscription, String> {
+        let items: Vec<String> = update.items.iter().map(|i| format!("{}={}", i.id, i.price)).collect();
+        self.calls.lock().map_err(|_| "lock")?.push(format!("update {} {} {}", subscription_id, items.join(","), update.proration_behavior));
+        if self.fail {
+            return Err("provider unavailable".into());
+        }
+        let mut all = self.items.lock().map_err(|_| "lock")?;
+        let current = all.get_mut(subscription_id).ok_or_else(|| "no such subscription".to_string())?;
+        for u in &update.items {
+            let item = current.iter_mut().find(|i| i.id == u.id).ok_or_else(|| "no such item".to_string())?;
+            item.price = u.price.clone();
         }
         Ok(ProviderSubscription { id: subscription_id.to_string(), current_period_start: 1_767_225_600, current_period_end: 1_769_904_000, proration_credit_cents: self.proration_credit_cents })
     }
@@ -349,16 +393,27 @@ impl BillingService {
             .optional()?)
     }
 
-    /// What: move a live subscription to another tier (flow 2). Out: `{success, subscription_id,
-    /// old_tier, new_tier, effective_date, proration_credit}` (credit in cents, from the provider).
-    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: money (provider), database.
+    /// What: move a live subscription to another tier (flow 2). Order, all before any update: an unknown
+    /// tier is `InvalidTier` (400); an unknown or cancelled subscription is refused; the provider
+    /// subscription is retrieved and one without exactly one item is `SubscriptionItemAmbiguous` (409).
+    /// Then the provider update is `items: [{id: current_item_id, price}]` with proration_behavior
+    /// 'create_prorations' (a bare price would add a second item and bill both plans).
+    /// Out: `{success, subscription_id, old_tier, new_tier, effective_date, proration_credit}` (credit in
+    /// cents, from the provider). Why: 2026-11-10 amendment (BILL-03). 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: money (provider), database.
     pub async fn change_plan(&self, request: ChangePlanRequest) -> Result<Value, BillingError> {
         let price = self.price_for(&request.new_tier)?;
         let old = self.get_subscription(&request.subscription_id)?.ok_or_else(|| BillingError::NotFound("subscription".into()))?;
         if old.status == "cancelled" {
             return Err(BillingError::InvalidEvent("subscription is cancelled".into()));
         }
-        let sub = self.provider.update_subscription(&request.subscription_id, &price).map_err(BillingError::Provider)?;
+        let items = self.provider.retrieve_subscription(&request.subscription_id).map_err(BillingError::Provider)?;
+        let [current] = items.as_slice() else { return Err(BillingError::SubscriptionItemAmbiguous) };
+        let update = SubscriptionUpdate {
+            items: vec![SubscriptionItem { id: current.id.clone(), price }],
+            proration_behavior: "create_prorations".to_string(),
+        };
+        let sub = self.provider.update_subscription(&request.subscription_id, &update).map_err(BillingError::Provider)?;
         let now = (self.clock)();
         let conn = self.db();
         conn.execute(

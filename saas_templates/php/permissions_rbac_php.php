@@ -2,6 +2,9 @@
 // Repaired 2026-11-03: foreign keys are switched on, so cascades really delete; one audit row per cascade.
 // Why: the suite failed on CI (it was listed in ci/baseline.json). Reviewed by Claude; fixed by a free model from a continuity handoff, session c6ee9a72 (2026-11-03).
 // Touches: the database only.
+// Changed 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): delete_organization follows amended RBAC-06 (caller must be an
+//   owner member of that org, else 404; deletes its deployments, org API keys, invitations and memberships; never a
+//   user account, session or personal API key); cascades write deleted_items inside their transaction.
 declare(strict_types=1);
 
 class Database
@@ -37,11 +40,37 @@ CREATE TABLE sessions (
     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
+CREATE TABLE organizations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL
+);
+
+-- org_id NULL = a personal key that belongs to its user; set = an org key (RBAC-06)
 CREATE TABLE api_keys (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
+    org_id INTEGER,
     key TEXT NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY(org_id) REFERENCES organizations(id)
+);
+
+-- memberships (org_id, user_id, role) as in organizations_teams.md
+CREATE TABLE memberships (
+    org_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('owner','admin','member')),
+    PRIMARY KEY(org_id, user_id),
+    FOREIGN KEY(org_id) REFERENCES organizations(id),
     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE invitations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL,
+    email TEXT NOT NULL,
+    token_hash TEXT NOT NULL,
+    FOREIGN KEY(org_id) REFERENCES organizations(id)
 );
 
 CREATE TABLE files (
@@ -49,11 +78,6 @@ CREATE TABLE files (
     user_id INTEGER NOT NULL,
     path TEXT NOT NULL,
     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-);
-
-CREATE TABLE organizations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL
 );
 
 CREATE TABLE deployments (
@@ -91,6 +115,7 @@ CREATE TABLE audit_logs (
     required_tier TEXT NOT NULL,
     user_tier TEXT,
     decision TEXT NOT NULL CHECK(decision IN ('PASS','FAIL')),
+    details TEXT,
     timestamp TEXT NOT NULL
 );
 SQL;
@@ -121,15 +146,22 @@ class AuditLog
         $this->pdo = $pdo;
     }
 
-    public function log(?int $userId, string $endpoint, string $requiredTier, string $userTier, string $decision): void
+    /**
+     * Append one audit row. Inputs: actor user id (null = anonymous), endpoint or action name, required tier,
+     * the caller's tier, PASS/FAIL, and optional $details (JSON-encoded; cascades put {resource_id,
+     * deleted_items} here). Output: none. Why: $details added for the cascade logs' deleted_items
+     * (RBAC-04/05/06). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database.
+     */
+    public function log(?int $userId, string $endpoint, string $requiredTier, string $userTier, string $decision, ?array $details = null): void
     {
-        $stmt = $this->pdo->prepare('INSERT INTO audit_logs (user_id, endpoint, required_tier, user_tier, decision, timestamp) VALUES (:user_id, :endpoint, :required_tier, :user_tier, :decision, :timestamp)');
+        $stmt = $this->pdo->prepare('INSERT INTO audit_logs (user_id, endpoint, required_tier, user_tier, decision, details, timestamp) VALUES (:user_id, :endpoint, :required_tier, :user_tier, :decision, :details, :timestamp)');
         $stmt->execute([
             ':user_id' => $userId,
             ':endpoint' => $endpoint,
             ':required_tier' => $requiredTier,
             ':user_tier' => $userTier,
             ':decision' => $decision,
+            ':details' => $details === null ? null : json_encode($details),
             ':timestamp' => (new DateTime('now', new DateTimeZone('UTC')))->format(DateTime::ATOM),
         ]);
     }
@@ -226,12 +258,12 @@ class CascadeDelete
             $stmt = $this->pdo->prepare('DELETE FROM users WHERE id = :id');
             $stmt->execute([':id' => $userId]);
 
+            // Logged inside the transaction with its deleted_items (it was logged after commit, without them;
+            // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
+            $this->audit->log($userId, 'user_deleted_cascade', 'owner', 'owner', 'PASS', ['user_id' => $userId, 'deleted_items' => $counts]);
             $this->pdo->commit();
 
-            $this->audit->log($userId, 'user_deleted_cascade', 'owner', 'owner', 'PASS');
-            // For simplicity, we skip storing deleted_items in audit_log
-
-            return ['ok' => true];
+            return ['ok' => true, 'deleted_items' => $counts];
         } catch (Exception $e) {
             $this->pdo->rollBack();
             return ['error' => 'cascade_error', 'code' => 500];
@@ -254,40 +286,75 @@ class CascadeDelete
             $stmt = $this->pdo->prepare('DELETE FROM deployments WHERE id = :id');
             $stmt->execute([':id' => $deploymentId]);
 
+            $this->audit->log(null, 'deployment_deleted_cascade', 'owner', 'owner', 'PASS', ['deployment_id' => $deploymentId, 'deleted_items' => $counts]);
             $this->pdo->commit();
-
-            $this->audit->log(null, 'deployment_deleted_cascade', 'owner', 'owner', 'PASS');
-            return ['ok' => true];
+            return ['ok' => true, 'deleted_items' => $counts];
         } catch (Exception $e) {
             $this->pdo->rollBack();
             return ['error' => 'cascade_error', 'code' => 500];
         }
     }
 
-    public function deleteOrganization(int $orgId): array
+    /**
+     * Delete an organization (amended RBAC-06).
+     *
+     * Inputs: $caller (the verified current user; null = anonymous) and $orgId. Output: {ok: true,
+     * deleted_items: {deployments, api_keys, invitations, memberships}}, {error: 'not_found', code: 404} when
+     * the caller's membership row for this org is not role 'owner' (a global admin or owner tier is not
+     * enough, and a missing org looks the same), or {error: 'cascade_error', code: 500} after a rollback.
+     * In one transaction: the org's deployments (their DNS, theme configs and logs cascade), API keys whose
+     * org_id is this org, ALL its invitations and membership rows, then the org, then the audit row
+     * org_deleted_cascade with deleted_items. Never a user account, a session or a personal API key (no
+     * org_id); a member's memberships in other orgs are untouched.
+     * Why: RBAC-06 as amended 2026-11-10 (it had no gate and deleted only the org row and its deployments).
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database.
+     */
+    public function deleteOrganization(?User $caller, int $orgId): array
     {
+        if ($caller === null) {
+            return ['error' => 'not_found', 'code' => 404];
+        }
         try {
             $this->pdo->beginTransaction();
 
-            // Count related items
+            $stmt = $this->pdo->prepare('SELECT role FROM memberships WHERE org_id = :org AND user_id = :user');
+            $stmt->execute([':org' => $orgId, ':user' => $caller->id]);
+            if ($stmt->fetchColumn() !== 'owner') {
+                $this->pdo->rollBack();
+                $this->audit->log($caller->id, 'org_delete', 'org_owner', $caller->tier, 'FAIL', ['org_id' => $orgId]);
+                return ['error' => 'not_found', 'code' => 404];
+            }
+
             $counts = [
                 'deployments' => $this->countRows('deployments', ['org_id' => $orgId]),
+                'api_keys' => $this->countRows('api_keys', ['org_id' => $orgId]),
+                'invitations' => $this->countRows('invitations', ['org_id' => $orgId]),
+                'memberships' => $this->countRows('memberships', ['org_id' => $orgId]),
             ];
 
-            // Delete organization (cascade will delete deployments and their cascades)
-            $stmt = $this->pdo->prepare('DELETE FROM organizations WHERE id = :id');
-            $stmt->execute([':id' => $orgId]);
+            // Deployments first (DNS records, theme configs and logs go with them by ON DELETE CASCADE).
+            $this->pdo->prepare('DELETE FROM deployments WHERE org_id = :id')->execute([':id' => $orgId]);
+            $this->pdo->prepare('DELETE FROM api_keys WHERE org_id = :id')->execute([':id' => $orgId]);
+            $this->pdo->prepare('DELETE FROM invitations WHERE org_id = :id')->execute([':id' => $orgId]);
+            $this->pdo->prepare('DELETE FROM memberships WHERE org_id = :id')->execute([':id' => $orgId]);
+            $this->pdo->prepare('DELETE FROM organizations WHERE id = :id')->execute([':id' => $orgId]);
 
+            $this->audit->log($caller->id, 'org_deleted_cascade', 'org_owner', 'owner', 'PASS', ['org_id' => $orgId, 'deleted_items' => $counts]);
             $this->pdo->commit();
-
-            $this->audit->log(null, 'org_deleted_cascade', 'owner', 'owner', 'PASS');
-            return ['ok' => true];
+            return ['ok' => true, 'deleted_items' => $counts];
         } catch (Exception $e) {
-            $this->pdo->rollBack();
+            if ($this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
             return ['error' => 'cascade_error', 'code' => 500];
         }
     }
 
+    /**
+     * COUNT(*) of $table rows matching every column = value in $conditions. Table and column names come only
+     * from this class's own literals, never from callers' input; values are bound parameters.
+     * Touches: the database (read). Documented 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     */
     private function countRows(string $table, array $conditions): int
     {
         $sql = "SELECT COUNT(*) FROM {$table} WHERE ";

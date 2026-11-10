@@ -4,6 +4,16 @@ public class FeatureFlagsTests {
     private static int passed = 0;
     private static int failed = 0;
 
+    /**
+     * Fails the test with msg unless cond holds. Why: the tests used Java `assert`, which the runner never enables
+     * (no -ea), so no assertion ran; 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+     */
+    private static void check(boolean cond, String msg) {
+        if (!cond) {
+            throw new AssertionError(msg);
+        }
+    }
+
     public static void main(String[] args) {
         testUnknownFlagReturnsDefault();
         testTypeMismatch();
@@ -20,6 +30,7 @@ public class FeatureFlagsTests {
         }
     }
 
+    // FLAG-01
     private static void testUnknownFlagReturnsDefault() {
         try {
             FeatureFlags.InMemoryStore store = new FeatureFlags.InMemoryStore();
@@ -30,17 +41,18 @@ public class FeatureFlagsTests {
             boolean result = ff.getBooleanValue("nonexistent", true, context);
             FeatureFlags.EvaluationDetails details = ff.getBooleanDetails("nonexistent", true, context);
             
-            assert result == true : "Expected default true";
-            assert details.reason.equals("ERROR") : "Expected ERROR reason";
-            assert details.errorCode.equals("FLAG_NOT_FOUND") : "Expected FLAG_NOT_FOUND";
+            check(result == true, "Expected default true");
+            check(details.reason.equals("ERROR"), "Expected ERROR reason");
+            check(details.errorCode.equals("FLAG_NOT_FOUND"), "Expected FLAG_NOT_FOUND");
             
             passed++;
-        } catch (Exception e) {
+        } catch (Throwable e) {
             failed++;
             System.out.println("testUnknownFlagReturnsDefault FAILED: " + e.getMessage());
         }
     }
 
+    // FLAG-02
     private static void testTypeMismatch() {
         try {
             FeatureFlags.InMemoryStore store = new FeatureFlags.InMemoryStore();
@@ -56,17 +68,18 @@ public class FeatureFlagsTests {
             String result = ff.getStringValue("myflag", "default", context);
             FeatureFlags.EvaluationDetails details = ff.getStringDetails("myflag", "default", context);
             
-            assert result.equals("default") : "Expected default";
-            assert details.reason.equals("ERROR") : "Expected ERROR reason";
-            assert details.errorCode.equals("TYPE_MISMATCH") : "Expected TYPE_MISMATCH";
+            check(result.equals("default"), "Expected default");
+            check(details.reason.equals("ERROR"), "Expected ERROR reason");
+            check(details.errorCode.equals("TYPE_MISMATCH"), "Expected TYPE_MISMATCH");
             
             passed++;
-        } catch (Exception e) {
+        } catch (Throwable e) {
             failed++;
             System.out.println("testTypeMismatch FAILED: " + e.getMessage());
         }
     }
 
+    // FLAG-03
     private static void testDisabledFlag() {
         try {
             FeatureFlags.InMemoryStore store = new FeatureFlags.InMemoryStore();
@@ -81,16 +94,17 @@ public class FeatureFlagsTests {
             boolean result = ff.getBooleanValue("myflag", false, context);
             FeatureFlags.EvaluationDetails details = ff.getBooleanDetails("myflag", false, context);
             
-            assert result == false : "Expected default false";
-            assert details.reason.equals("DISABLED") : "Expected DISABLED reason";
+            check(result == false, "Expected default false");
+            check(details.reason.equals("DISABLED"), "Expected DISABLED reason");
             
             passed++;
-        } catch (Exception e) {
+        } catch (Throwable e) {
             failed++;
             System.out.println("testDisabledFlag FAILED: " + e.getMessage());
         }
     }
 
+    // FLAG-04
     private static void testMatchingRule() {
         try {
             FeatureFlags.InMemoryStore store = new FeatureFlags.InMemoryStore();
@@ -107,9 +121,9 @@ public class FeatureFlagsTests {
             boolean result = ff.getBooleanValue("myflag", false, context);
             FeatureFlags.EvaluationDetails details = ff.getBooleanDetails("myflag", false, context);
             
-            assert result == true : "Expected true";
-            assert details.reason.equals("TARGETING_MATCH") : "Expected TARGETING_MATCH";
-            assert details.variant.equals("on") : "Expected variant 'on'";
+            check(result == true, "Expected true");
+            check(details.reason.equals("TARGETING_MATCH"), "Expected TARGETING_MATCH");
+            check(details.variant.equals("on"), "Expected variant 'on'");
             
             // Non-matching user
             Map<String, Object> context2 = new HashMap<>();
@@ -117,15 +131,16 @@ public class FeatureFlagsTests {
             context2.put("email", "user@other.com");
             
             boolean result2 = ff.getBooleanValue("myflag", false, context2);
-            assert result2 == false : "Expected default false for non-matching";
+            check(result2 == false, "Expected default false for non-matching");
             
             passed++;
-        } catch (Exception e) {
+        } catch (Throwable e) {
             failed++;
             System.out.println("testMatchingRule FAILED: " + e.getMessage());
         }
     }
 
+    // FLAG-05
     private static void testRolloutDeterministic() {
         try {
             FeatureFlags.InMemoryStore store = new FeatureFlags.InMemoryStore();
@@ -140,7 +155,7 @@ public class FeatureFlagsTests {
             context1.put("targeting_key", "user1");
             boolean result1 = ff.getBooleanValue("myflag", false, context1);
             boolean result2 = ff.getBooleanValue("myflag", false, context1);
-            assert result1 == result2 : "Same key should give same result";
+            check(result1 == result2, "Same key should give same result");
             
             // Count over 10,000 keys
             int trueCount = 0;
@@ -153,15 +168,16 @@ public class FeatureFlagsTests {
             }
             
             double percentage = (double) trueCount / 10000 * 100;
-            assert percentage >= 25 && percentage <= 35 : "Expected 25-35%, got " + percentage + "%";
+            check(percentage >= 25 && percentage <= 35, "Expected 25-35%, got " + percentage + "%");
             
             passed++;
-        } catch (Exception e) {
+        } catch (Throwable e) {
             failed++;
             System.out.println("testRolloutDeterministic FAILED: " + e.getMessage());
         }
     }
 
+    // FLAG-06
     private static void testRolloutFallsThrough() {
         try {
             FeatureFlags.InMemoryStore store = new FeatureFlags.InMemoryStore();
@@ -185,23 +201,24 @@ public class FeatureFlagsTests {
                 }
             }
             
-            assert fallthroughKey != null : "Could not find a fallthrough key";
+            check(fallthroughKey != null, "Could not find a fallthrough key");
             
             Map<String, Object> context = new HashMap<>();
             context.put("targeting_key", fallthroughKey);
             FeatureFlags.EvaluationDetails details = ff.getBooleanDetails("myflag", false, context);
             
             // Should fall through to second rule
-            assert details.reason.equals("TARGETING_MATCH") : "Expected TARGETING_MATCH from second rule";
-            assert details.variant.equals("always") : "Expected variant 'always'";
+            check(details.reason.equals("TARGETING_MATCH"), "Expected TARGETING_MATCH from second rule");
+            check(details.variant.equals("always"), "Expected variant 'always'");
             
             passed++;
-        } catch (Exception e) {
+        } catch (Throwable e) {
             failed++;
             System.out.println("testRolloutFallsThrough FAILED: " + e.getMessage());
         }
     }
 
+    // FLAG-07
     private static void testCorruptRules() {
         try {
             FeatureFlags.InMemoryStore store = new FeatureFlags.InMemoryStore();
@@ -216,17 +233,18 @@ public class FeatureFlagsTests {
             boolean result = ff.getBooleanValue("myflag", false, context);
             FeatureFlags.EvaluationDetails details = ff.getBooleanDetails("myflag", false, context);
             
-            assert result == false : "Expected default false";
-            assert details.reason.equals("ERROR") : "Expected ERROR reason";
-            assert details.errorCode.equals("PARSE_ERROR") : "Expected PARSE_ERROR";
+            check(result == false, "Expected default false");
+            check(details.reason.equals("ERROR"), "Expected ERROR reason");
+            check(details.errorCode.equals("PARSE_ERROR"), "Expected PARSE_ERROR");
             
             passed++;
-        } catch (Exception e) {
+        } catch (Throwable e) {
             failed++;
             System.out.println("testCorruptRules FAILED: " + e.getMessage());
         }
     }
 
+    // FLAG-08
     private static void testSetFlagAudit() {
         try {
             FeatureFlags.InMemoryStore store = new FeatureFlags.InMemoryStore();
@@ -239,20 +257,20 @@ public class FeatureFlagsTests {
             ff.setFlag("admin", "myflag", "boolean", "false", true, "[]");
             
             List<FeatureFlags.Audit> audits = store.getAudits();
-            assert audits.size() == 2 : "Expected 2 audit records, got " + audits.size();
+            check(audits.size() == 2, "Expected 2 audit records, got " + audits.size());
             
             FeatureFlags.Audit first = audits.get(0);
-            assert first.flagKey.equals("myflag") : "Expected flag key 'myflag'";
-            assert first.action.equals("set") : "Expected action 'set'";
-            assert first.oldValue == null : "Expected null old value for first set";
-            assert first.newValue.equals("true") : "Expected new value 'true'";
+            check(first.flagKey.equals("myflag"), "Expected flag key 'myflag'");
+            check(first.action.equals("set"), "Expected action 'set'");
+            check(first.oldValue == null, "Expected null old value for first set");
+            check(first.newValue.equals("true"), "Expected new value 'true'");
             
             FeatureFlags.Audit second = audits.get(1);
-            assert second.oldValue.equals("true") : "Expected old value 'true'";
-            assert second.newValue.equals("false") : "Expected new value 'false'";
+            check(second.oldValue.equals("true"), "Expected old value 'true'");
+            check(second.newValue.equals("false"), "Expected new value 'false'");
             
             passed++;
-        } catch (Exception e) {
+        } catch (Throwable e) {
             failed++;
             System.out.println("testSetFlagAudit FAILED: " + e.getMessage());
         }

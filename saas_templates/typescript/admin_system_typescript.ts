@@ -1,4 +1,4 @@
-import { randomBytes, scrypt } from 'crypto';
+import { randomBytes, scrypt, timingSafeEqual } from 'crypto';
 import { promisify } from 'util';
 import {
   createConnection,
@@ -95,9 +95,18 @@ export interface SafetyFlags {
   can_publish: boolean;
 }
 
+/**
+ * The request context the server builds for an admin call.
+ *
+ * userId is the VERIFIED caller id from the session or token (auth_system), never a body, query or header value;
+ * csrfToken is the token issued to that session; safetyFlags is server configuration.
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: `tier` is optional and IGNORED. The gates used to trust it, so any
+ * caller that could shape the context was an owner; the gates now read the caller's tier from the users table on
+ * every request (as the other languages do).
+ */
 export interface AdminContext {
   userId: number;
-  tier: Tier;
+  tier?: Tier;
   csrfToken: string;
   safetyFlags: SafetyFlags;
 }
@@ -193,11 +202,21 @@ function requireBoolean(value: unknown, field: string): boolean {
 // Stripe client (interface + live implementation)
 // ---------------------------------------------------------------------------
 
+/**
+ * Parameters for a plan change: the EXISTING item's id with the new price (a bare price makes Stripe add a second
+ * item and bill both plans), and proration. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-12 amendment).
+ */
 export interface StripeSubscriptionUpdateParams {
-  items: { price: string }[];
+  items: { id: string; price: string }[];
+  proration_behavior: 'create_prorations';
 }
 
+/**
+ * The Stripe calls the admin system makes. retrieveSubscription was added 2026-11-10,
+ * session_012zDydZCZ4AChqhEZ4oVtaP, to read the current item id before a plan change. Touches: Stripe (money).
+ */
 export interface StripeClient {
+  retrieveSubscription(subscriptionId: string): Promise<{ id: string; items: { data: { id: string }[] } }>;
   updateSubscription(subscriptionId: string, params: StripeSubscriptionUpdateParams): Promise<{ id: string; effective_date: string }>;
 }
 
@@ -211,15 +230,36 @@ export class LiveStripeClient implements StripeClient {
     }
   }
 
+  /**
+   * GET /v1/subscriptions/{id}. In: the subscription id. Out: its id and items. Why: ADMIN-12 needs the current
+   * item id. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the network (Stripe API).
+   */
+  async retrieveSubscription(subscriptionId: string): Promise<{ id: string; items: { data: { id: string }[] } }> {
+    const url = `https://api.stripe.com/v1/subscriptions/${encodeURIComponent(subscriptionId)}`;
+    const res = await fetch(url, { method: 'GET', headers: { Authorization: `Bearer ${this.apiKey}` } });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new AdminError('stripe_error', `Stripe API error: ${res.status} ${text}`, 502);
+    }
+    return (await res.json()) as { id: string; items: { data: { id: string }[] } };
+  }
+
+  /**
+   * POST /v1/subscriptions/{id} with items[i][id], items[i][price] and proration_behavior. In: id and params.
+   * Out: id and effective date. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: sends the item id (it used to send
+   * only items[0][price], which adds an item). Touches: the network (Stripe API, money).
+   */
   async updateSubscription(
     subscriptionId: string,
     params: StripeSubscriptionUpdateParams
   ): Promise<{ id: string; effective_date: string }> {
     const url = `https://api.stripe.com/v1/subscriptions/${encodeURIComponent(subscriptionId)}`;
     const body = new URLSearchParams();
-    for (const item of params.items) {
-      body.append('items[0][price]', item.price);
-    }
+    params.items.forEach((item, i) => {
+      body.append(`items[${i}][id]`, item.id);
+      body.append(`items[${i}][price]`, item.price);
+    });
+    body.append('proration_behavior', params.proration_behavior);
     const res = await fetch(url, {
       method: 'POST',
       headers: {
@@ -399,20 +439,51 @@ export class AdminSystem {
 
   // -- Gate helpers ---------------------------------------------------------
 
-  private requireOwner(ctx: AdminContext): void {
-    if (ctx.tier !== 'enterprise') {
+  /**
+   * The caller's tier as stored in the users table (null when the verified user id is unknown).
+   * In: the context. Out: the tier or null. Why: identity and role come from the verified caller and the
+   * database, never from client-shaped input such as ctx.tier. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * Touches: the database (one parameterized read).
+   */
+  private async callerTier(ctx: AdminContext): Promise<string | null> {
+    const [rows] = await this.pool.execute<RowDataPacket[]>(
+      'SELECT id, tier, status FROM users WHERE id = ?',
+      [ctx.userId]
+    );
+    return rows.length > 0 ? String(rows[0].tier) : null;
+  }
+
+  /**
+   * Gate for mutations: the caller must be an owner ('enterprise' tier) in the users table, else 403 owner_only.
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: reads the tier from the database instead of ctx.tier.
+   * Touches: the database.
+   */
+  private async requireOwner(ctx: AdminContext): Promise<void> {
+    if ((await this.callerTier(ctx)) !== 'enterprise') {
       throw new AdminError('owner_only', 'This action requires owner access.', 403);
     }
   }
 
-  private requireAdminOrOwner(ctx: AdminContext): void {
-    if (ctx.tier !== 'enterprise' && ctx.tier !== 'pro') {
+  /**
+   * Gate for reads: owner ('enterprise') or admin ('pro') in the users table, else 403 admin_or_owner_required.
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: reads the tier from the database instead of ctx.tier.
+   * Touches: the database.
+   */
+  private async requireAdminOrOwner(ctx: AdminContext): Promise<void> {
+    const tier = await this.callerTier(ctx);
+    if (tier !== 'enterprise' && tier !== 'pro') {
       throw new AdminError('admin_or_owner_required', 'This action requires admin or owner access.', 403);
     }
   }
 
+  /**
+   * Refuses a request whose CSRF token is not the session's. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP:
+   * compared in constant time (it used !==). Touches nothing.
+   */
   private verifyCsrf(ctx: AdminContext, token: string): void {
-    if (!token || token !== ctx.csrfToken) {
+    const given = Buffer.from(typeof token === 'string' ? token : '', 'utf8');
+    const expected = Buffer.from(ctx.csrfToken ?? '', 'utf8');
+    if (given.length === 0 || given.length !== expected.length || !timingSafeEqual(given, expected)) {
       throw new AdminError('csrf_mismatch', 'CSRF token verification failed.', 403);
     }
   }
@@ -442,7 +513,7 @@ export class AdminSystem {
     body: { email: string; name: string; tier: string; notify: boolean }
   ): Promise<ApiResponse> {
     this.verifyCsrf(ctx, csrf);
-    this.requireOwner(ctx);
+    await this.requireOwner(ctx);
 
     const email = requireString(body.email, 'email');
     const name = requireString(body.name, 'name');
@@ -497,7 +568,7 @@ export class AdminSystem {
     body: { user_id: number }
   ): Promise<ApiResponse> {
     this.verifyCsrf(ctx, csrf);
-    this.requireOwner(ctx);
+    await this.requireOwner(ctx);
 
     const userId = requireNumber(body.user_id, 'user_id');
 
@@ -543,7 +614,7 @@ export class AdminSystem {
     body: { user_id: number; new_tier: string }
   ): Promise<ApiResponse> {
     this.verifyCsrf(ctx, csrf);
-    this.requireOwner(ctx);
+    await this.requireOwner(ctx);
 
     const userId = requireNumber(body.user_id, 'user_id');
     const newTier = body.new_tier;
@@ -587,7 +658,7 @@ export class AdminSystem {
     body: { user_id: number; reason: string }
   ): Promise<ApiResponse> {
     this.verifyCsrf(ctx, csrf);
-    this.requireOwner(ctx);
+    await this.requireOwner(ctx);
 
     const userId = requireNumber(body.user_id, 'user_id');
     const reason = requireString(body.reason, 'reason');
@@ -627,7 +698,7 @@ export class AdminSystem {
     ctx: AdminContext,
     params: { limit?: number; offset?: number }
   ): Promise<ApiResponse> {
-    this.requireAdminOrOwner(ctx);
+    await this.requireAdminOrOwner(ctx);
 
     const limit = Math.min(Math.max(params.limit ?? 50, 1), 200);
     const offset = Math.max(params.offset ?? 0, 0);
@@ -654,7 +725,7 @@ export class AdminSystem {
   }
 
   async getCustomer(ctx: AdminContext, customerId: number): Promise<ApiResponse> {
-    this.requireAdminOrOwner(ctx);
+    await this.requireAdminOrOwner(ctx);
 
     const [rows] = await this.pool.execute<RowDataPacket[]>(
       'SELECT customer_id, email, name, tier, subscription_status, payment_method, address, notes, status FROM customers WHERE customer_id = ?',
@@ -679,6 +750,16 @@ export class AdminSystem {
     return { success: true, ...detail };
   }
 
+  /**
+   * Owner-only plan change for a customer (POST /admin/customers/{id}/action, action=change_plan).
+   *
+   * In: context, CSRF token, customer id, { new_tier }. Out: { success, customer_id, old_tier, new_tier,
+   * effective_date }. Errors: 403 csrf_mismatch / owner_only, 400 invalid_tier, 404 customer_not_found,
+   * 400 no_stripe_subscription, 409 subscription_item_ambiguous (not exactly one item; nothing updated).
+   * Why: ADMIN-12 as amended 2026-11-10: the same rule as billing change_plan, update with
+   * { id: current_item_id, price } and proration, never a bare price. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * Touches: Stripe (network, money), the database, the audit log.
+   */
   async changePlan(
     ctx: AdminContext,
     csrf: string,
@@ -686,7 +767,7 @@ export class AdminSystem {
     body: { new_tier: string }
   ): Promise<ApiResponse> {
     this.verifyCsrf(ctx, csrf);
-    this.requireOwner(ctx);
+    await this.requireOwner(ctx);
 
     const newTier = body.new_tier;
     if (!isValidTier(newTier)) {
@@ -707,9 +788,22 @@ export class AdminSystem {
       throw new AdminError('no_stripe_subscription', 'Customer has no Stripe subscription.', 400);
     }
 
+    // ADMIN-12 (amended 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): billing flow 2's rule. Read the current
+    // item; anything but exactly one item is 409 subscription_item_ambiguous before any update; then replace that
+    // item's price (a bare { price } adds a second item and bills both plans).
     const priceId = this.priceMap[newTier];
+    const current = await this.stripe.retrieveSubscription(customer.stripe_subscription_id);
+    const items = current?.items?.data ?? [];
+    if (items.length !== 1 || !items[0]?.id) {
+      throw new AdminError(
+        'subscription_item_ambiguous',
+        `Subscription has ${items.length} items; expected exactly one.`,
+        409
+      );
+    }
     const stripeResult = await this.stripe.updateSubscription(customer.stripe_subscription_id, {
-      items: [{ price: priceId }],
+      items: [{ id: items[0].id, price: priceId }],
+      proration_behavior: 'create_prorations',
     });
 
     await this.pool.execute('UPDATE customers SET tier = ? WHERE customer_id = ?', [newTier, customerId]);
@@ -732,7 +826,7 @@ export class AdminSystem {
     body: { invoice_id: number; amount: number; reason: string }
   ): Promise<ApiResponse> {
     this.verifyCsrf(ctx, csrf);
-    this.requireOwner(ctx);
+    await this.requireOwner(ctx);
 
     const invoiceId = requireNumber(body.invoice_id, 'invoice_id');
     const amount = requireNumber(body.amount, 'amount');
@@ -767,7 +861,7 @@ export class AdminSystem {
   // -- DEPLOYMENTS DOMAIN ---------------------------------------------------
 
   async listDeployments(ctx: AdminContext): Promise<ApiResponse> {
-    this.requireAdminOrOwner(ctx);
+    await this.requireAdminOrOwner(ctx);
 
     const [rows] = await this.pool.execute<RowDataPacket[]>(
       'SELECT deployment_id, customer_id, domain, tier, status, theme, published_at FROM deployments ORDER BY deployment_id'
@@ -792,7 +886,7 @@ export class AdminSystem {
     body: { customer_id: number; domain: string; tier: string; theme_id: number }
   ): Promise<ApiResponse> {
     this.verifyCsrf(ctx, csrf);
-    this.requireOwner(ctx);
+    await this.requireOwner(ctx);
 
     const customerId = requireNumber(body.customer_id, 'customer_id');
     const domain = requireString(body.domain, 'domain');
@@ -851,7 +945,7 @@ export class AdminSystem {
     body: { deployment_id: number }
   ): Promise<ApiResponse> {
     this.verifyCsrf(ctx, csrf);
-    this.requireOwner(ctx);
+    await this.requireOwner(ctx);
 
     if (!ctx.safetyFlags.can_publish) {
       throw new AdminError('publish_not_allowed', 'Publishing is not allowed by safety flags.', 403);
@@ -895,7 +989,7 @@ export class AdminSystem {
     body: { deployment_id: number; reason: string }
   ): Promise<ApiResponse> {
     this.verifyCsrf(ctx, csrf);
-    this.requireOwner(ctx);
+    await this.requireOwner(ctx);
 
     const deploymentId = requireNumber(body.deployment_id, 'deployment_id');
     const reason = requireString(body.reason, 'reason');
@@ -924,7 +1018,7 @@ export class AdminSystem {
     body: { deployment_id: number }
   ): Promise<ApiResponse> {
     this.verifyCsrf(ctx, csrf);
-    this.requireOwner(ctx);
+    await this.requireOwner(ctx);
 
     const deploymentId = requireNumber(body.deployment_id, 'deployment_id');
 
@@ -952,7 +1046,7 @@ export class AdminSystem {
     ctx: AdminContext,
     params: { limit?: number; offset?: number }
   ): Promise<ApiResponse> {
-    this.requireAdminOrOwner(ctx);
+    await this.requireAdminOrOwner(ctx);
 
     const limit = Math.min(Math.max(params.limit ?? 50, 1), 200);
     const offset = Math.max(params.offset ?? 0, 0);
@@ -988,7 +1082,7 @@ export class AdminSystem {
     body: { reason?: string }
   ): Promise<ApiResponse> {
     this.verifyCsrf(ctx, csrf);
-    this.requireOwner(ctx);
+    await this.requireOwner(ctx);
 
     const [rows] = await this.pool.execute<RowDataPacket[]>(
       'SELECT action_id, action_type, actor, target_resource_id, reason, status FROM governance_actions WHERE action_id = ?',
@@ -1078,7 +1172,7 @@ export class AdminSystem {
       offset?: number;
     }
   ): Promise<ApiResponse> {
-    this.requireAdminOrOwner(ctx);
+    await this.requireAdminOrOwner(ctx);
 
     const limit = Math.min(Math.max(params.limit ?? 100, 1), 500);
     const offset = Math.max(params.offset ?? 0, 0);

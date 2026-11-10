@@ -14,6 +14,7 @@ describe('Permissions & RBAC System', () => {
 
   describe('Middleware Functions', () => {
     describe('require_authenticated', () => {
+      // RBAC-03
       test('should return 401 when no user', () => {
         const req = {};
         const res = mockResponse();
@@ -53,6 +54,7 @@ describe('Permissions & RBAC System', () => {
         expect(next).not.toHaveBeenCalled();
       });
 
+      // RBAC-02
       test('should return 403 for member tier', () => {
         const req = { user: { id: 1, tier: 'member' } };
         const res = mockResponse();
@@ -115,6 +117,7 @@ describe('Permissions & RBAC System', () => {
         expect(next).not.toHaveBeenCalled();
       });
 
+      // RBAC-01
       test('should return 403 for admin tier', () => {
         const req = { user: { id: 1, tier: 'admin' } };
         const res = mockResponse();
@@ -188,6 +191,7 @@ describe('Permissions & RBAC System', () => {
         expect(end - start).toBeLessThan(10);
       });
 
+      // RBAC-10
       test('require_owner response time < 10ms', () => {
         const req = { user: { id: 1, tier: 'owner' } };
         const res = mockResponse();
@@ -202,6 +206,7 @@ describe('Permissions & RBAC System', () => {
 
   describe('Cascade Delete Functions', () => {
     describe('deleteUser', () => {
+      // RBAC-04
       test('should delete user and all related records', () => {
         const user = { id: 1, tier: 'member' };
         rbac.db.users.push(user);
@@ -239,6 +244,7 @@ describe('Permissions & RBAC System', () => {
         });
       });
 
+      // RBAC-07
       test('should rollback on error during deletion', () => {
         const user = { id: 1, tier: 'member' };
         rbac.db.users.push(user);
@@ -272,6 +278,7 @@ describe('Permissions & RBAC System', () => {
     });
 
     describe('deleteDeployment', () => {
+      // RBAC-05
       test('should delete deployment and all related records', () => {
         const org = { id: 1, name: 'Org1' };
         rbac.db.organizations.push(org);
@@ -310,38 +317,77 @@ describe('Permissions & RBAC System', () => {
     });
 
     describe('deleteOrganization', () => {
-      test('should delete organization and all nested records', () => {
-        const org = { id: 1, name: 'Org1' };
-        rbac.db.organizations.push(org);
-        const user = { id: 1, tier: 'member', organizationId: 1 };
-        rbac.db.users.push(user);
-        const deployment = { id: 1, orgId: 1, name: 'Dep1', status: 'active' };
-        rbac.db.deployments.push(deployment);
-        rbac.db.apiKeys.push({ id: 1, userId: 1, key: 'k1', name: 'key1' });
+      /**
+       * Seeds two orgs: org 1 (owner 1, member 2, member 3) and org 2 (owner 9, member 3 as admin), with deployments,
+       * org keys, personal keys, sessions and invitations. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+       */
+      const seedTwoOrgs = () => {
+        rbac.db.organizations.push({ id: 1, name: 'Org1' }, { id: 2, name: 'Org2' });
+        rbac.db.users.push({ id: 1, tier: 'owner' }, { id: 2, tier: 'member' }, { id: 3, tier: 'member' }, { id: 9, tier: 'owner' });
+        rbac.db.memberships.push(
+          { orgId: 1, userId: 1, role: 'owner' },
+          { orgId: 1, userId: 2, role: 'member' },
+          { orgId: 1, userId: 3, role: 'member' },
+          { orgId: 2, userId: 9, role: 'owner' },
+          { orgId: 2, userId: 3, role: 'admin' }
+        );
+        rbac.db.sessions.push({ id: 1, userId: 2, token: 's2', expires_at: new Date(0) });
+        rbac.db.deployments.push({ id: 1, orgId: 1, name: 'Dep1', status: 'active' }, { id: 2, orgId: 2, name: 'Dep2', status: 'active' });
+        rbac.db.dnsRecords.push({ id: 1, deploymentId: 1, type: 'A', name: 'a.example', value: '1.2.3.4' });
+        rbac.db.dnsRecords.push({ id: 2, deploymentId: 2, type: 'A', name: 'b.example', value: '5.6.7.8' });
+        rbac.db.apiKeys.push(
+          { id: 1, userId: 2, orgId: 1, key: 'org1-key', name: 'org key' },
+          { id: 2, userId: 2, key: 'personal-2', name: 'personal' },
+          { id: 3, userId: 3, orgId: 2, key: 'org2-key', name: 'org2 key' }
+        );
+        rbac.db.invitations.push({ id: 1, orgId: 1, email: 'a@x.test' }, { id: 2, orgId: 1, email: 'b@x.test' }, { id: 3, orgId: 2, email: 'c@x.test' });
+      };
 
-        const result = rbac.deleteOrganization(1);
+      // RBAC-06
+      // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: rewritten for the amended spec. The old test expected every
+      // member's user account and personal keys to be deleted; the spec now forbids that and gates on an org owner.
+      test('owner of the org deletes its deployments, org keys, invitations and memberships; accounts kept', () => {
+        seedTwoOrgs();
+        const result = rbac.deleteOrganization({ id: 1, tier: 'owner' }, 1);
         expect(result.success).toBe(true);
-        expect(result.deletedItems).toEqual({
-          deployments: 1,
-          users: 1,
-          apiKeys: 1,
-          organization: 1
-        });
-        expect(rbac.db.organizations.length).toBe(0);
-        expect(rbac.db.users.length).toBe(0);
-        expect(rbac.db.deployments.length).toBe(0);
-        expect(rbac.db.apiKeys.length).toBe(0);
-        expect(rbac.getAuditLog().length).toBe(1);
-        expect(rbac.getAuditLog()[0]).toMatchObject({
-          action: 'org_deleted_cascade',
-          orgId: 1,
-          deletedItems: {
-            deployments: 1,
-            users: 1,
-            apiKeys: 1,
-            organization: 1
-          }
-        });
+        expect(result.deletedItems).toEqual({ deployments: 1, api_keys: 1, invitations: 2, memberships: 3 });
+        expect(rbac.db.organizations.map(o => o.id)).toEqual([2]);
+        expect(rbac.db.deployments.map(d => d.id)).toEqual([2]);
+        expect(rbac.db.dnsRecords.map(r => r.id)).toEqual([2]);
+        expect(rbac.db.apiKeys.map(k => k.id)).toEqual([2, 3]);
+        expect(rbac.db.invitations.map(i => i.id)).toEqual([3]);
+        expect(rbac.db.users.map(u => u.id)).toEqual([1, 2, 3, 9]);
+        expect(rbac.db.sessions.length).toBe(1);
+        expect(rbac.db.memberships).toEqual([
+          { orgId: 2, userId: 9, role: 'owner' },
+          { orgId: 2, userId: 3, role: 'admin' }
+        ]);
+        const log = rbac.getAuditLog().filter(e => e.action === 'org_deleted_cascade');
+        expect(log.length).toBe(1);
+        expect(log[0]).toMatchObject({ orgId: 1, deletedItems: { deployments: 1, api_keys: 1, invitations: 2, memberships: 3 } });
+      });
+
+      // RBAC-06
+      test('another org\'s owner, a non-owner member, a global owner tier and no caller all get 404, nothing deleted', () => {
+        seedTwoOrgs();
+        const before = JSON.stringify(rbac.db);
+        for (const caller of [{ id: 9, tier: 'owner' }, { id: 2, tier: 'member' }, { id: 3, tier: 'owner' }, null, undefined]) {
+          const result = rbac.deleteOrganization(caller, 1);
+          expect(result).toMatchObject({ success: false, error: 'not_found', code: 404 });
+        }
+        expect(JSON.stringify(rbac.db)).toBe(before);
+      });
+
+      // RBAC-07
+      test('org cascade failure rolls back every table', () => {
+        seedTwoOrgs();
+        const before = JSON.stringify(rbac.db);
+        // The organizations table is the last one the cascade touches, so by then every other table has been changed.
+        rbac.db.organizations.filter = () => { throw new Error('Simulated error'); };
+        expect(() => rbac.deleteOrganization({ id: 1, tier: 'owner' }, 1)).toThrow('Simulated error');
+        expect(rbac.db.deployments.length).toBe(2);
+        expect(rbac.db.memberships.length).toBe(5);
+        expect(JSON.stringify(rbac.db)).toBe(before);
       });
     });
   });
@@ -364,6 +410,7 @@ describe('Permissions & RBAC System', () => {
       });
     });
 
+    // RBAC-08
     test('should log permission check for failed admin access', () => {
       const req = { user: { id: 1, tier: 'member' } };
       const res = mockResponse();
@@ -381,6 +428,7 @@ describe('Permissions & RBAC System', () => {
       });
     });
 
+    // RBAC-08
     test('should log permission check for passed owner access', () => {
       const req = { user: { id: 1, tier: 'owner' } };
       const res = mockResponse();
@@ -400,6 +448,7 @@ describe('Permissions & RBAC System', () => {
   });
 
   describe('Tier Hierarchy', () => {
+    // RBAC-09
     test('member cannot perform admin actions', () => {
       const req = { user: { id: 1, tier: 'member' } };
       const res = mockResponse();
@@ -413,6 +462,7 @@ describe('Permissions & RBAC System', () => {
       });
     });
 
+    // RBAC-09
     test('admin cannot perform owner actions', () => {
       const req = { user: { id: 1, tier: 'admin' } };
       const res = mockResponse();

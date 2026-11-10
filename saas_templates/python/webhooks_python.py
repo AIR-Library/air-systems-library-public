@@ -26,7 +26,10 @@ class Endpoint:
 
 @dataclass
 class Message:
+    """One event sent for one org. org_id added 2026-11-10 (HOOK-06, session_012zDydZCZ4AChqhEZ4oVtaP):
+    the message records which tenant it belongs to so its deliveries can only target that tenant."""
     id: str
+    org_id: str
     event_type: str
     payload: Dict[str, Any]
     created_at: float
@@ -55,7 +58,12 @@ class Store(ABC):
         pass
 
     @abstractmethod
-    def get_endpoints_for_event(self, event_type: str) -> List[Endpoint]:
+    def get_endpoints_for_event(self, org_id: str, event_type: str) -> List[Endpoint]:
+        """Active endpoints OF org_id subscribed to exactly event_type, in creation order.
+
+        In: the sending org and the event type. Out: the endpoints that get a delivery.
+        Why: HOOK-06, an org's events never reach another org's endpoints (spec amended 2026-09-26).
+        2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: reads the store."""
         pass
 
     @abstractmethod
@@ -63,7 +71,9 @@ class Store(ABC):
         pass
 
     @abstractmethod
-    def create_message(self, event_type: str, payload: Dict[str, Any]) -> Message:
+    def create_message(self, org_id: str, event_type: str, payload: Dict[str, Any]) -> Message:
+        """Store one message for org_id. In: org, event type, payload. Out: the Message with a "msg_" id.
+        Why: HOOK-06 (messages carry their org). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: writes the store."""
         pass
 
     @abstractmethod
@@ -116,23 +126,26 @@ class InMemoryStore(Store):
         with self._lock:
             return self._endpoints.get(endpoint_id)
 
-    def get_endpoints_for_event(self, event_type: str) -> List[Endpoint]:
+    def get_endpoints_for_event(self, org_id: str, event_type: str) -> List[Endpoint]:
+        """See Store.get_endpoints_for_event. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (HOOK-06)."""
         with self._lock:
             return [
                 ep for ep in self._endpoints.values()
-                if ep.active and event_type in ep.event_types
+                if ep.active and ep.org_id == org_id and event_type in ep.event_types
             ]
 
     def update_endpoint(self, endpoint: Endpoint) -> None:
         with self._lock:
             self._endpoints[endpoint.id] = endpoint
 
-    def create_message(self, event_type: str, payload: Dict[str, Any]) -> Message:
+    def create_message(self, org_id: str, event_type: str, payload: Dict[str, Any]) -> Message:
+        """See Store.create_message. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (HOOK-06)."""
         with self._lock:
             message_id = f"msg_{secrets.token_urlsafe(16)}"
             now = time.time()
             message = Message(
                 id=message_id,
+                org_id=org_id,
                 event_type=event_type,
                 payload=payload,
                 created_at=now,
@@ -188,6 +201,7 @@ class SqliteStore(Store):
         self._init_schema()
 
     def _init_schema(self) -> None:
+        """Create the webhook tables. [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] webhook_messages gained org_id (HOOK-06). Touches: SQLite."""
         with self._conn:
             self._conn.executescript("""
                 CREATE TABLE IF NOT EXISTS webhook_endpoints (
@@ -202,6 +216,7 @@ class SqliteStore(Store):
                 );
                 CREATE TABLE IF NOT EXISTS webhook_messages (
                     id TEXT PRIMARY KEY,
+                    org_id TEXT NOT NULL,
                     event_type TEXT NOT NULL,
                     payload TEXT NOT NULL,
                     created_at REAL NOT NULL
@@ -252,12 +267,17 @@ class SqliteStore(Store):
             return None
         return self._row_to_endpoint(row)
 
-    def get_endpoints_for_event(self, event_type: str) -> List[Endpoint]:
+    def get_endpoints_for_event(self, org_id: str, event_type: str) -> List[Endpoint]:
+        """See Store.get_endpoints_for_event. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (HOOK-06).
+
+        Filters by org in SQL and matches the event type exactly in Python: the old LIKE '%"type"%' match
+        treated "_" and "%" in an event type as wildcards and ignored the org. Touches: reads webhook_endpoints."""
         rows = self._conn.execute(
-            "SELECT * FROM webhook_endpoints WHERE active = 1 AND json_extract(event_types, '$') LIKE ?",
-            (f'%"{event_type}"%',),
+            "SELECT * FROM webhook_endpoints WHERE active = 1 AND org_id = ? ORDER BY rowid",
+            (org_id,),
         ).fetchall()
-        return [self._row_to_endpoint(row) for row in rows]
+        endpoints = [self._row_to_endpoint(row) for row in rows]
+        return [ep for ep in endpoints if event_type in ep.event_types]
 
     def update_endpoint(self, endpoint: Endpoint) -> None:
         with self._conn:
@@ -273,17 +293,19 @@ class SqliteStore(Store):
                 ),
             )
 
-    def create_message(self, event_type: str, payload: Dict[str, Any]) -> Message:
+    def create_message(self, org_id: str, event_type: str, payload: Dict[str, Any]) -> Message:
+        """See Store.create_message. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (HOOK-06). Touches: webhook_messages."""
         message_id = f"msg_{secrets.token_urlsafe(16)}"
         now = time.time()
         with self._conn:
             self._conn.execute(
-                "INSERT INTO webhook_messages (id, event_type, payload, created_at) VALUES (?, ?, ?, ?)",
-                (message_id, event_type, json.dumps(payload), now),
+                "INSERT INTO webhook_messages (id, org_id, event_type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+                (message_id, org_id, event_type, json.dumps(payload), now),
             )
-        return Message(id=message_id, event_type=event_type, payload=payload, created_at=now)
+        return Message(id=message_id, org_id=org_id, event_type=event_type, payload=payload, created_at=now)
 
     def get_message(self, message_id: str) -> Optional[Message]:
+        """The stored message (with its org_id since 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP), or None. Touches: SQLite (read)."""
         row = self._conn.execute(
             "SELECT * FROM webhook_messages WHERE id = ?", (message_id,)
         ).fetchone()
@@ -291,6 +313,7 @@ class SqliteStore(Store):
             return None
         return Message(
             id=row["id"],
+            org_id=row["org_id"],
             event_type=row["event_type"],
             payload=json.loads(row["payload"]),
             created_at=row["created_at"],
@@ -404,9 +427,16 @@ def verify(
     headers: Dict[str, str],
     raw_body: bytes,
     tolerance_seconds: int = 300,
+    now: Optional[int] = None,
 ) -> Union[bool, str]:
     """
-    Verify a webhook signature. Returns True on success, error string on failure.
+    Verify a webhook signature (receiver side). Returns True on success, an error string on failure.
+
+    In: the endpoint secret, the request headers, the raw body bytes, the tolerance in seconds and, new on
+    2026-11-10, an optional injectable `now` (unix seconds; default the wall clock) so tests are deterministic
+    (docs/specs/README.md, "time comes from an injectable clock"; session_012zDydZCZ4AChqhEZ4oVtaP).
+    Out: True, or "missing required headers" / "invalid timestamp" / "timestamp outside tolerance" /
+    "no matching signature". Signatures are compared in constant time. Touches nothing.
     """
     webhook_id = headers.get("webhook-id")
     webhook_timestamp = headers.get("webhook-timestamp")
@@ -420,7 +450,7 @@ def verify(
     except ValueError:
         return "invalid timestamp"
 
-    now = int(time.time())
+    now = int(time.time()) if now is None else int(now)
     if abs(now - timestamp) > tolerance_seconds:
         return "timestamp outside tolerance"
 
@@ -519,9 +549,16 @@ def create_endpoint(org_id: str, url: str, event_types: List[str], store: Store)
     return {"id": endpoint.id, "secret": endpoint.secret}
 
 
-def send_event(event_type: str, payload: Dict[str, Any], store: Store) -> str:
-    message = store.create_message(event_type, payload)
-    endpoints = store.get_endpoints_for_event(event_type)
+def send_event(org_id: str, event_type: str, payload: Dict[str, Any], store: Store) -> str:
+    """Create ONE message for org_id and a pending delivery for every active endpoint of THAT org subscribed
+    to event_type.
+
+    In: the sending org (from the verified caller, never the payload), the event type, the payload, the store.
+    Out: the new message id ("msg_...").
+    Why: HOOK-06; the old signature had no org_id, so every event fanned out to every tenant's endpoints.
+    2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: writes webhook_messages and webhook_deliveries."""
+    message = store.create_message(org_id, event_type, payload)
+    endpoints = store.get_endpoints_for_event(org_id, event_type)
     for endpoint in endpoints:
         store.create_delivery(message.id, endpoint.id, 0)
     return message.id

@@ -11,13 +11,46 @@ class QuotaRateLimitingTest
 {
     private PDO $pdo;
     private QuotaRateLimiter $limiter;
+    /** Fixed test time (2026-11-10 12:00:00 UTC); the limiter reads it through its injected clock. */
+    private int $now = 0;
 
+    /**
+     * Fresh in-memory database and a limiter on a fixed clock, so the per-second and per-minute windows never
+     * straddle a real second boundary (it used the wall clock; 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
+     */
     public function setUp(): void
     {
         $this->pdo = new PDO('sqlite::memory:');
         $this->pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
         $this->createTables();
-        $this->limiter = new QuotaRateLimiter($this->pdo);
+        $this->now = gmmktime(12, 0, 0, 11, 10, 2026);
+        $this->limiter = new QuotaRateLimiter($this->pdo, fn(): int => $this->now);
+    }
+
+    /**
+     * QUOTA-13: enterprise's -1 limits are unlimited. A 5 TB upload is stored, and API calls past every other
+     * tier's monthly limit (team 10,000) never get 429 from the quota; the usage still counts.
+     * Why: amended spec. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory database.
+     */
+    // QUOTA-13
+    public function testEnterpriseMinusOneIsUnlimited(): void
+    {
+        $huge = 5 * 1000 * 1000 * 1000 * 1000;
+        $result = $this->limiter->checkRequest(7, 'enterprise', '10.0.7.1', '/upload', $huge, null, null);
+        $this->assertNull($result, 'a 5 TB enterprise upload passes');
+        $this->assertEquals($huge, (int)$this->pdo->query("SELECT SUM(bytes) FROM user_files WHERE user_id = 7")->fetchColumn());
+        $this->pdo->prepare("UPDATE usage_metrics SET call_count = 10001 WHERE user_id = 7 AND month = ?")
+            ->execute([gmdate('Y-m', $this->now)]);
+        for ($i = 0; $i < 3; $i++) {
+            $this->now += 2; // stay clear of the per-second IP limit; the quota is what is under test
+            $result = $this->limiter->checkRequest(7, 'enterprise', '10.0.7.1', '/api/test', 0, null, null);
+            $this->assertNull($result, 'enterprise call past every other tier\'s limit passes');
+        }
+        $this->assertEquals(10004, (int)$this->pdo->query("SELECT call_count FROM usage_metrics WHERE user_id = 7")->fetchColumn());
+        // The same usage on team is rejected, so the pass above is the -1 rule, not a broken check.
+        $result = $this->limiter->checkRequest(7, 'team', '10.0.7.2', '/api/test', 0, null, null);
+        $this->assertEquals(429, $result['status']);
+        $this->assertEquals(10000, $result['body']['limit']);
     }
 
     private function createTables(): void
@@ -52,6 +85,7 @@ class QuotaRateLimitingTest
         $this->pdo->exec($ddl);
     }
 
+    // QUOTA-01
     public function testApiQuotaPass(): void
     {
         $result = $this->limiter->checkRequest(
@@ -65,15 +99,16 @@ class QuotaRateLimitingTest
         );
         $this->assertNull($result);
         $stmt = $this->pdo->prepare("SELECT call_count FROM usage_metrics WHERE user_id = ? AND month = ?");
-        $month = (new DateTime('now', new DateTimeZone('UTC')))->format('Y-m');
+        $month = gmdate('Y-m', $this->now); // the limiter's clock month (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
         $stmt->execute([1, $month]);
         $this->assertEquals(1, (int)$stmt->fetchColumn());
     }
 
+    // QUOTA-02
     public function testApiQuotaFail(): void
     {
         // Set usage to limit directly (bypass rate limits for quota test)
-        $month = (new DateTime('now', new DateTimeZone('UTC')))->format('Y-m');
+        $month = gmdate('Y-m', $this->now); // the limiter's clock month (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
         $this->pdo->prepare("INSERT INTO usage_metrics (user_id, month, call_count) VALUES (1, ?, 1000)")
             ->execute([$month]);
 
@@ -94,6 +129,7 @@ class QuotaRateLimitingTest
         $this->assertStringMatchesFormat('Y-m-01', $result['body']['reset_date']);
     }
 
+    // QUOTA-03
     public function testStorageQuotaPass(): void
     {
         $result = $this->limiter->checkRequest(
@@ -111,6 +147,7 @@ class QuotaRateLimitingTest
         $this->assertEquals(100, (int)$stmt->fetchColumn());
     }
 
+    // QUOTA-04
     public function testStorageQuotaFail(): void
     {
         // Exhaust solo storage (1 GB = 1000000000 bytes)
@@ -131,6 +168,7 @@ class QuotaRateLimitingTest
         $this->assertEquals(1000000000, $result['body']['limit']);
     }
 
+    // QUOTA-05
     public function testRateLimitPerUserPass(): void
     {
         // 99 requests should pass (use different IPs to avoid IP rate limit)
@@ -160,6 +198,7 @@ class QuotaRateLimitingTest
         $this->assertNull($result);
     }
 
+    // QUOTA-06
     public function testRateLimitPerUserFail(): void
     {
         // 100 requests should pass (limit is 100 per minute)
@@ -192,6 +231,7 @@ class QuotaRateLimitingTest
         $this->assertEquals(60, $result['body']['reset_seconds']);
     }
 
+    // QUOTA-07
     public function testRateLimitPerIpPass(): void
     {
         // 9 requests should pass
@@ -220,6 +260,7 @@ class QuotaRateLimitingTest
         $this->assertNull($result);
     }
 
+    // QUOTA-08
     public function testRateLimitPerIpFail(): void
     {
         // 10 requests should pass (limit is 10 per second)
@@ -251,6 +292,7 @@ class QuotaRateLimitingTest
         $this->assertEquals(1, $result['body']['reset_seconds']);
     }
 
+    // QUOTA-09
     public function testFeatureGatePass(): void
     {
         // feature_c is available in solo
@@ -266,6 +308,7 @@ class QuotaRateLimitingTest
         $this->assertNull($result);
     }
 
+    // QUOTA-10
     public function testFeatureGateFail(): void
     {
         // feature_b is not available in solo
@@ -284,10 +327,11 @@ class QuotaRateLimitingTest
         $this->assertEquals('https://example.com/upgrade', $result['body']['upgrade_url']);
     }
 
+    // QUOTA-11
     public function testMonthRollover(): void
     {
-        // Set usage to limit for current month
-        $currentMonth = (new DateTime('now', new DateTimeZone('UTC')))->format('Y-m');
+        // Set usage to limit for current month (the limiter's clock month; 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+        $currentMonth = gmdate('Y-m', $this->now);
         $this->pdo->prepare("INSERT INTO usage_metrics (user_id, month, call_count) VALUES (1, ?, 1000)")
             ->execute([$currentMonth]);
         // Request should fail (quota exhausted)
@@ -303,11 +347,10 @@ class QuotaRateLimitingTest
         $this->assertNotNull($result);
         $this->assertEquals(429, $result['status']);
         // Now set month to next month
-        $nextMonth = (new DateTime('first day of next month', new DateTimeZone('UTC')))->format('Y-m');
-        $this->pdo->prepare("INSERT INTO usage_metrics (user_id, month, call_count) VALUES (1, ?, 0)")
-            ->execute([$nextMonth]);
-        // Simulate month rollover for the limiter
-        $this->limiter->setCurrentMonthForTesting($nextMonth);
+        // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the clock moves into the next month instead of overriding the month and
+        // pre-seeding a zero row, so the rollover itself (a new month starts at zero usage) is what is tested.
+        $this->now = gmmktime(0, 0, 5, 12, 1, 2026);
+        $nextMonth = gmdate('Y-m', $this->now);
         // Request should pass (new month, usage reset)
         $result = $this->limiter->checkRequest(
             1,
@@ -324,10 +367,11 @@ class QuotaRateLimitingTest
         $this->assertEquals(1, (int)$stmt->fetchColumn());
     }
 
+    // QUOTA-12
     public function testTierUpgrade(): void
     {
         // Set usage to solo limit directly (bypass rate limits)
-        $month = (new DateTime('now', new DateTimeZone('UTC')))->format('Y-m');
+        $month = gmdate('Y-m', $this->now); // the limiter's clock month (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
         $this->pdo->prepare("INSERT INTO usage_metrics (user_id, month, call_count) VALUES (1, ?, 1000)")
             ->execute([$month]);
         // Next request as solo should fail

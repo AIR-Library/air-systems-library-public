@@ -290,16 +290,32 @@ class SafetyFlags {
 
 /* ---------- EXTERNAL SERVICES ---------- */
 
-/** What the admin system needs from Stripe. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: money. */
+/**
+ * What the admin system needs from Stripe. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.
+ * Changed the same day (ADMIN-12, admin_system.md change_plan -> billing_subscriptions.md flow 2): the plan change is
+ * three steps the caller orders itself, so the checks run before any update: the tier's price, the subscription's
+ * item ids, then an update naming the one existing item. Touches: money.
+ */
 interface AdminStripeGateway {
-    /** Moves the subscription's first item to the price of tier (prorated). */
-    void changeSubscriptionPlan(String subscriptionId, String tier) throws StripeException;
+    /** The Stripe price id of a plan tier, or null when the tier is unknown (the caller answers 400 invalid_tier). */
+    String priceFor(String tier);
+
+    /** stripe.subscriptions.retrieve: the subscription's item ids in order. Touches: Stripe (read only). */
+    List<String> subscriptionItemIds(String subscriptionId) throws StripeException;
+
+    /**
+     * stripe.subscriptions.update(subscriptionId, {items: [{id: itemId, price: priceId}],
+     * proration_behavior: 'create_prorations'}). Never a bare price: that adds a second item and bills both plans.
+     * Touches: Stripe (money).
+     */
+    void updateSubscriptionItem(String subscriptionId, String itemId, String priceId) throws StripeException;
 }
 
 /**
  * AdminStripeGateway on the real API (stripe-java 28.1.0). The price for a tier comes from the environment
- * variable STRIPE_PRICE_<TIER>; a tier without one is refused rather than guessed. The key is sent per request.
- * Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: network (api.stripe.com), money.
+ * variable STRIPE_PRICE_<TIER>; a tier without one is unknown rather than guessed. The key is sent per request.
+ * Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP; split into retrieve / update-one-item the same day
+ * (ADMIN-12). Touches: network (api.stripe.com), money.
  */
 class StripeSdkAdminGateway implements AdminStripeGateway {
     private final String apiKey;
@@ -308,39 +324,100 @@ class StripeSdkAdminGateway implements AdminStripeGateway {
         this.apiKey = apiKey;
     }
 
-    /** Retrieves the subscription and moves its first item to STRIPE_PRICE_<TIER>, prorating. Touches: network, money. */
-    @Override
-    public void changeSubscriptionPlan(String subscriptionId, String tier) throws StripeException {
+    private RequestOptions options() {
         if (apiKey == null || apiKey.isEmpty()) {
             throw new IllegalStateException("STRIPE_SECRET_KEY is not configured");
         }
+        return RequestOptions.builder().setApiKey(apiKey).build();
+    }
+
+    /** STRIPE_PRICE_<TIER> or null. Touches: reads the environment. */
+    @Override
+    public String priceFor(String tier) {
+        if (tier == null) return null;
         String price = System.getenv("STRIPE_PRICE_" + tier.toUpperCase(Locale.ROOT));
-        if (price == null || price.isEmpty()) {
-            throw new IllegalStateException("No Stripe price configured for tier " + tier);
+        return price == null || price.isEmpty() ? null : price;
+    }
+
+    /** Retrieves the subscription's item ids. Touches: network. */
+    @Override
+    public List<String> subscriptionItemIds(String subscriptionId) throws StripeException {
+        Subscription sub = Subscription.retrieve(subscriptionId, options());
+        List<String> ids = new ArrayList<>();
+        if (sub.getItems() != null && sub.getItems().getData() != null) {
+            for (SubscriptionItem it : sub.getItems().getData()) ids.add(it.getId());
         }
-        RequestOptions opts = RequestOptions.builder().setApiKey(apiKey).build();
-        Subscription sub = Subscription.retrieve(subscriptionId, opts);
-        SubscriptionUpdateParams.Item.Builder item = SubscriptionUpdateParams.Item.builder().setPrice(price);
-        List<SubscriptionItem> items = sub.getItems() == null ? List.of() : sub.getItems().getData();
-        if (!items.isEmpty()) item.setId(items.get(0).getId());
-        sub.update(SubscriptionUpdateParams.builder()
-                .addItem(item.build())
+        return ids;
+    }
+
+    /** Updates the one named item to priceId, creating prorations. Touches: network, money. */
+    @Override
+    public void updateSubscriptionItem(String subscriptionId, String itemId, String priceId) throws StripeException {
+        if (itemId == null || itemId.isEmpty()) {
+            throw new IllegalArgumentException("an existing item id is required");
+        }
+        RequestOptions opts = options();
+        Subscription.retrieve(subscriptionId, opts).update(SubscriptionUpdateParams.builder()
+                .addItem(SubscriptionUpdateParams.Item.builder().setId(itemId).setPrice(priceId).build())
                 .setProrationBehavior(SubscriptionUpdateParams.ProrationBehavior.CREATE_PRORATIONS)
                 .build(), opts);
     }
 }
 
 /**
- * In-memory AdminStripeGateway: records each call ("subscriptionId tier"), sends nothing.
- * Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+ * In-memory AdminStripeGateway: plan tiers solo, team and enterprise with fake price ids; a subscription it has not
+ * seen has one item "si_<id>_1"; it records "retrieve <sub>" and "update <sub> <item> <price>" and sends nothing.
+ * Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP; items and the update-one-item call added the same day
+ * (ADMIN-12). Touches: memory only.
  */
 class InMemoryAdminStripeGateway implements AdminStripeGateway {
+    static final Map<String, String> PRICES = Map.of(
+            "solo", "price_test_solo", "team", "price_test_team", "enterprise", "price_test_enterprise");
     private final List<String> calls = Collections.synchronizedList(new ArrayList<>());
+    private final Map<String, List<String[]>> items = new HashMap<>();
 
-    /** Records the call; sends nothing. Touches: memory only. */
     @Override
-    public void changeSubscriptionPlan(String subscriptionId, String tier) {
-        calls.add(subscriptionId + " " + tier);
+    public String priceFor(String tier) {
+        return PRICES.get(tier);
+    }
+
+    /** Sets a subscription's items (one price per item); lets tests build a two-item subscription. */
+    synchronized void setItems(String subscriptionId, List<String> priceIds) {
+        List<String[]> list = new ArrayList<>();
+        for (int i = 0; i < priceIds.size(); i++) {
+            list.add(new String[]{"si_" + subscriptionId + "_" + (i + 1), priceIds.get(i)});
+        }
+        items.put(subscriptionId, list);
+    }
+
+    private List<String[]> itemsOf(String subscriptionId) {
+        return items.computeIfAbsent(subscriptionId,
+                id -> new ArrayList<>(List.<String[]>of(new String[]{"si_" + id + "_1", null})));
+    }
+
+    @Override
+    public synchronized List<String> subscriptionItemIds(String subscriptionId) {
+        calls.add("retrieve " + subscriptionId);
+        List<String> ids = new ArrayList<>();
+        for (String[] it : itemsOf(subscriptionId)) ids.add(it[0]);
+        return ids;
+    }
+
+    /** Sets the named existing item's price; an unknown item throws (no item is ever added). */
+    @Override
+    public synchronized void updateSubscriptionItem(String subscriptionId, String itemId, String priceId) {
+        for (String[] it : itemsOf(subscriptionId)) {
+            if (it[0].equals(itemId)) {
+                it[1] = priceId;
+                calls.add("update " + subscriptionId + " " + itemId + " " + priceId);
+                return;
+            }
+        }
+        throw new IllegalArgumentException("No such subscription item: " + itemId);
+    }
+
+    synchronized int itemCount(String subscriptionId) {
+        return itemsOf(subscriptionId).size();
     }
 
     List<String> calls() {
@@ -1216,17 +1293,37 @@ class CustomerService {
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "customer_not_found"));
     }
 
-    /** Updates the Stripe subscription first; only on success the DB tier and audit change. Returns the old tier. */
+    /**
+     * change_plan (owner only; the actor is the verified caller). Same rule as billing change_plan (flow 2):
+     * unknown tier -> 400 invalid_tier; the subscription is retrieved and anything but exactly one item -> 409
+     * subscription_item_ambiguous; both before any update. Then Stripe updates that item's price with prorations,
+     * and only on success the DB tier and audit change. In: actor, customer id, new tier. Out: the old tier.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-12: the gateway used to pick the first item and,
+     * with none, sent a bare price). Touches: Stripe (money), the database.
+     */
     String changePlan(User actor, Long customerId, String newTier) {
         if (newTier == null || !TIER.matcher(newTier).matches()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "invalid_tier");
+        }
+        String price = stripe.priceFor(newTier);
+        if (price == null) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "invalid_tier");
         }
         Customer cust = getDetail(customerId);
         if (cust.getStripeSubscriptionId() == null || cust.getStripeSubscriptionId().isEmpty()) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "no_subscription");
         }
+        List<String> itemIds;
         try {
-            stripe.changeSubscriptionPlan(cust.getStripeSubscriptionId(), newTier);
+            itemIds = stripe.subscriptionItemIds(cust.getStripeSubscriptionId());
+        } catch (StripeException | RuntimeException e) {
+            throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, "stripe_error");
+        }
+        if (itemIds.size() != 1) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "subscription_item_ambiguous");
+        }
+        try {
+            stripe.updateSubscriptionItem(cust.getStripeSubscriptionId(), itemIds.get(0), price);
         } catch (StripeException | RuntimeException e) {
             throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, "stripe_error");
         }

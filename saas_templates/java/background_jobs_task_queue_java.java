@@ -36,6 +36,8 @@ public class BackgroundJobsTaskQueue implements AutoCloseable {
     private final long scheduleCheckIntervalMs;
     private final int workerCount;
     private final int maxBatchSize;
+    /** Source of "now" for every timestamp, retry and schedule decision (spec: injectable clock). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+    private final java.time.Clock clock;
 
     private static final String DDL = """
             CREATE TABLE IF NOT EXISTS jobs (
@@ -72,6 +74,16 @@ public class BackgroundJobsTaskQueue implements AutoCloseable {
             """;
 
     public BackgroundJobsTaskQueue(Connection connection, int workerCount, long pollIntervalMs) {
+        this(connection, workerCount, pollIntervalMs, java.time.Clock.systemUTC());
+    }
+
+    /**
+     * Queue on an injectable clock. In: connection, worker count, poll interval, clock. Why: JOBS-03/04/07 must be
+     * testable without sleeping (spec rule "Deterministic"); 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches: the database (creates the schema), no threads until start().
+     */
+    public BackgroundJobsTaskQueue(Connection connection, int workerCount, long pollIntervalMs, java.time.Clock clock) {
+        this.clock = clock;
         this.connection = connection;
         this.objectMapper = new ObjectMapper();
         this.objectMapper.registerModule(new JavaTimeModule());
@@ -163,7 +175,7 @@ public class BackgroundJobsTaskQueue implements AutoCloseable {
      */
     public Map<String, Object> enqueueJob(String taskType, JsonNode params, Instant scheduledAt, int maxRetries) {
         String jobId = UUID.randomUUID().toString();
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         String paramsJson = params != null ? params.toString() : "{}";
 
         try (PreparedStatement ps = connection.prepareStatement(
@@ -282,7 +294,7 @@ public class BackgroundJobsTaskQueue implements AutoCloseable {
     public Map<String, Object> cancelJob(String jobId) {
         try (PreparedStatement ps = connection.prepareStatement(
                 "UPDATE jobs SET status = 'cancelled', completed_at = ? WHERE id = ? AND status = 'enqueued'")) {
-            ps.setTimestamp(1, Timestamp.from(Instant.now()));
+            ps.setTimestamp(1, Timestamp.from(clock.instant()));
             ps.setString(2, jobId);
             int updated = ps.executeUpdate();
             if (updated > 0) {
@@ -336,7 +348,7 @@ public class BackgroundJobsTaskQueue implements AutoCloseable {
         }
 
         String newJobId = UUID.randomUUID().toString();
-        Instant now = Instant.now();
+        Instant now = clock.instant();
 
         try (PreparedStatement ps = connection.prepareStatement(
                 "INSERT INTO jobs (id, task_type, params, status, created_at, max_retries) VALUES (?, ?, ?, 'enqueued', ?, ?)")) {
@@ -403,6 +415,20 @@ public class BackgroundJobsTaskQueue implements AutoCloseable {
 
     // ==================== Worker Logic ====================
 
+    /**
+     * Runs, on the calling thread, every job that is ready now (enqueued, scheduled_at and next_retry_at passed),
+     * oldest first, one batch. In: none. Out: how many jobs were attempted. Why: a deterministic worker step for tests
+     * and for deployments that drive the queue from their own scheduler instead of start(); 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database, whatever the task handlers touch.
+     */
+    public int runReadyJobsOnce() {
+        List<Job> jobs = fetchReadyJobs();
+        for (Job job : jobs) {
+            executeJob(job);
+        }
+        return jobs.size();
+    }
+
     private void workerLoop() {
         while (running.get()) {
             try {
@@ -432,7 +458,7 @@ public class BackgroundJobsTaskQueue implements AutoCloseable {
 
     private List<Job> fetchReadyJobs() {
         List<Job> jobs = new ArrayList<>();
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         try (PreparedStatement ps = connection.prepareStatement(
                 "SELECT id, task_type, params, status, created_at, started_at, completed_at, progress, result, error, retry_count, max_retries, next_retry_at, scheduled_at " +
                 "FROM jobs WHERE status = 'enqueued' AND (scheduled_at IS NULL OR scheduled_at <= ?) AND (next_retry_at IS NULL OR next_retry_at <= ?) " +
@@ -458,7 +484,7 @@ public class BackgroundJobsTaskQueue implements AutoCloseable {
         }
 
         String runId = UUID.randomUUID().toString();
-        Instant startedAt = Instant.now();
+        Instant startedAt = clock.instant();
 
         // Create job run record
         try (PreparedStatement ps = connection.prepareStatement(
@@ -498,7 +524,7 @@ public class BackgroundJobsTaskQueue implements AutoCloseable {
     private boolean transitionToRunning(String jobId) {
         try (PreparedStatement ps = connection.prepareStatement(
                 "UPDATE jobs SET status = 'running', started_at = ? WHERE id = ? AND status = 'enqueued'")) {
-            ps.setTimestamp(1, Timestamp.from(Instant.now()));
+            ps.setTimestamp(1, Timestamp.from(clock.instant()));
             ps.setString(2, jobId);
             return ps.executeUpdate() > 0;
         } catch (SQLException e) {
@@ -507,7 +533,7 @@ public class BackgroundJobsTaskQueue implements AutoCloseable {
     }
 
     private void completeJob(Job job, String runId, Map<String, Object> result, String error) {
-        Instant completedAt = Instant.now();
+        Instant completedAt = clock.instant();
         String resultJson = result != null ? toJson(result) : null;
 
         try (PreparedStatement ps = connection.prepareStatement(
@@ -532,8 +558,14 @@ public class BackgroundJobsTaskQueue implements AutoCloseable {
         }
     }
 
+    /**
+     * After a failed attempt: retry n = retry_count + 1 waits 2^(n-1) s (status 'enqueued', next_retry_at = now + delay,
+     * retry_count = n) while n <= max_retries; when attempt max_retries + 1 fails, status 'failed' with
+     * retry_count = max_retries (JOBS-03/04 as amended 2026-11-10). Documented 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP; now on the injected clock. Touches: the database.
+     */
     private void handleJobFailure(Job job, String runId, Exception e) {
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         int newRetryCount = job.retryCount + 1;
         String errorMessage = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
 

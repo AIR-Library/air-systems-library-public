@@ -285,17 +285,60 @@ async function testTierUpgrade(): Promise<void> {
   console.log("✓ tier upgrade → limits updated immediately");
 }
 
+/**
+ * QUOTA-13: -1 is unlimited in every quota. An enterprise user already holding more bytes than any other tier
+ * allows can still store a very large upload, and 10,001 recorded calls (past team's 10,000) still pass the
+ * API quota, while the same usage on team is refused. In: an in-memory service on a fixed clock. Out: throws on
+ * failure. Why: spec amendment 2026-11-10 (QUOTA-13); enterprise API calls used Infinity, storage -1.
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: process memory only.
+ */
+async function testUnlimitedEnterprise(): Promise<void> {
+  const service = new InMemoryQuotaService({ now: () => new Date(Date.UTC(2026, 5, 15, 12, 0, 0)) });
+  assertEqual(API_CALL_LIMITS.enterprise, -1, "enterprise API limit is -1");
+  assertEqual(STORAGE_LIMITS.enterprise, -1, "enterprise storage limit is -1");
+
+  await service.addStorage("ent", 200e9);
+  const big = await service.checkStorageQuota("ent", "enterprise", 5e12);
+  assert(big.pass, "enterprise upload of any size is stored");
+
+  const teamLimit = API_CALL_LIMITS.team;
+  for (let i = 0; i <= teamLimit; i++) {
+    await service.incrementUsage("ent", "enterprise");
+    await service.incrementUsage("tm", "team");
+  }
+  const ent = await service.checkApiCallQuota("ent", "enterprise");
+  assert(ent.pass, "enterprise past every other tier's limit is never refused by the quota");
+  const team = await service.checkApiCallQuota("tm", "team");
+  assert(!team.pass, "team past its limit is refused");
+  const gates = service.getWhyChain().filter((w: any) => w.gate === "api_quota_check" && w.user_id === "ent");
+  assertEqual((gates[gates.length - 1] as any).limit, -1, "why_chain logs the -1 limit");
+}
+
 describe("Quota & Rate Limiting", () => {
+  // QUOTA-01
   test("api_quota PASS → call succeeds, usage incremented", testApiQuotaPass);
+  // QUOTA-02
   test("api_quota FAIL → call rejected 429", testApiQuotaFail);
+  // QUOTA-03
   test("storage_quota PASS → file stored", testStorageQuotaPass);
+  // QUOTA-04
   test("storage_quota FAIL → upload rejected 413", testStorageQuotaFail);
+  // QUOTA-05
   test("rate_limit_per_user PASS → < 100/min allowed", testRateLimitPerUserPass);
+  // QUOTA-06
   test("rate_limit_per_user FAIL → 100+/min rejected 429", testRateLimitPerUserFail);
+  // QUOTA-07
   test("rate_limit_per_ip PASS → < 10/sec allowed", testRateLimitPerIpPass);
+  // QUOTA-08
   test("rate_limit_per_ip FAIL → 10+/sec rejected 429", testRateLimitPerIpFail);
+  // QUOTA-09
   test("feature_gate PASS → feature available in tier", testFeatureGatePass);
+  // QUOTA-10
   test("feature_gate FAIL → feature unavailable, 403 with upgrade hint", testFeatureGateFail);
+  // QUOTA-11
   test("month rollover → usage_metrics reset for new month", testMonthRollover);
+  // QUOTA-12
   test("tier upgrade → limits updated immediately", testTierUpgrade);
+  // QUOTA-13
+  test("a limit of -1 is unlimited: enterprise storage of any size and API calls past every tier's limit", testUnlimitedEnterprise);
 });

@@ -15,13 +15,16 @@ name or in a comment on the line above it (for example `# EXPORT-01`), so a miss
 | `EXPORT-02` | Export: All data categories included (profile, activity, files, etc) |
 | `EXPORT-03` | Export: Email sent with download link |
 | `EXPORT-04` | Export: Signed URL works, expires after 7 days |
-| `EXPORT-05` | Deletion: 30-day grace period enforced |
+| `EXPORT-05` | Deletion: 30-day grace period enforced for user_requested (will_delete_at = requested_at + 30 days) |
 | `EXPORT-06` | Deletion: User can cancel within grace period |
 | `EXPORT-07` | Deletion: Cascade delete works (sessions, api_keys, etc deleted) |
 | `EXPORT-08` | Deletion: Audit log preserved (not deleted with user) |
 | `EXPORT-09` | Deletion: User confirmed via email token |
 | `EXPORT-10` | Admin: Can see all export/deletion requests |
 | `EXPORT-11` | Audit: All requests logged with why_chain support |
+| `EXPORT-12` | Deletion: a gdpr_request or gdpr_right_to_be_forgotten request is not held for 30 days (will_delete_at = requested_at) |
+| `EXPORT-13` | Deletion cascade order: the user's rows are deleted, 'user_deleted_cascade' is logged, then the audit eraser's erase_subject(user_id) is called last, and nothing is logged for the user after it; deletion_requests.user_id is NULL once completed |
+| `EXPORT-14` | Deletion confirmation: nothing is deleted before confirm; a wrong, reused or expired (over 24h) token is refused; another user's deletion request is 404 for confirm and cancel |
 
 ## Contract
 
@@ -68,10 +71,15 @@ ENDPOINTS:
    Response: { success: true, deletion_id: '...', status: 'pending', will_delete_at: '2026-10-02T00:00:00Z' }
 
    Behind scenes:
-   - 30-day grace period so the user can cancel an account deletion they asked for. This is a product choice,
-     not a GDPR requirement: a statutory erasure request (reason gdpr_request or gdpr_right_to_be_forgotten)
-     must be completed without undue delay and within one month, so a deployment may shorten the period for
-     those. Clarified 2026-11-10 from review on PR 19.
+   - 30-day grace period so the user can cancel an account deletion they asked for (reason user_requested
+     or other): will_delete_at = requested_at + 30 days. This is a product choice, not a GDPR requirement.
+   - A statutory erasure request (reason gdpr_request or gdpr_right_to_be_forgotten) must be completed
+     without undue delay and within one month, so it gets no grace period: will_delete_at = requested_at,
+     and the cascade runs as soon as the request is confirmed (step 4). Clarified 2026-11-10 from review on
+     PR 19; amended the same day so every language does the same.
+   - Nothing is deleted until the request is confirmed (step 4). The confirmation token is 32 random bytes,
+     stored only as its SHA-256, single-use, valid 24 hours, bound to its deletion_id, and compared in
+     constant time. Confirm and cancel act only on the caller's own request; anyone else's is 404.
    - Schedule cascade delete: sessions, api_keys, preferences, export files and their request rows, etc.
      The audit log is kept (EXPORT-08). Corrected 2026-11-10 from review on PR 19: this line listed audit_logs.
    - Log in audit_log: action='deletion_requested', reason
@@ -80,6 +88,8 @@ ENDPOINTS:
    POST /compliance/delete/:deletion_id/confirm
    { confirmation_token: '...' }
    Response: { success: true, deletion_scheduled_for: '2026-10-02T00:00:00Z' }
+   For a statutory reason, confirm() runs the cascade before it returns: status 'completed' and
+   deleted_at = deletion_scheduled_for = now.
 
 5. Cancel deletion (within grace period)
    DELETE /compliance/delete/:deletion_id
@@ -97,8 +107,14 @@ IMPLEMENTATION:
 - Export generation: Background job (async), not blocking request
 - Storage: S3, encrypted at rest
 - Signed URLs: 7-day expiry, download-only (no upload)
-- Grace period: 30 days before actual deletion (user can cancel via email link)
-- Cascade delete: Delete from all tables where user_id = X, except audit_log (keep for compliance)
+- Grace period: 30 days for user_requested / other (the user can cancel); none for a statutory reason
+- Cascade delete: delete from all tables where user_id = X, except the audit tables (audit_log,
+  audit_personal, audit_subjects), which only the audit system's erase_subject() touches. It is reached
+  through an injected audit eraser, like the audit logger, so tests pass a fake. One transaction, in order:
+  (1) delete the user's rows; (2) log 'user_deleted_cascade' with the user as subject; (3) call
+  erase_subject(user_id) LAST. Nothing logs this user afterwards. deletion_requests.user_id is set NULL when
+  the deletion completes, so the request row cannot re-identify erased audit entries by its timestamp.
+  Amended 2026-11-10 after an independent security review: nothing erased the user's audit personal data.
 - Audit trail: Every export and deletion request logged
 - Email confirmation: User must confirm deletion via email link (phishing protection)
 - GDPR: Support right_to_be_forgotten, right_to_access, right_to_data_portability
@@ -109,11 +125,14 @@ TESTS:
 - **EXPORT-02** Export: All data categories included (profile, activity, files, etc)
 - **EXPORT-03** Export: Email sent with download link
 - **EXPORT-04** Export: Signed URL works, expires after 7 days
-- **EXPORT-05** Deletion: 30-day grace period enforced
+- **EXPORT-05** Deletion: 30-day grace period enforced for user_requested (will_delete_at = requested_at + 30 days)
 - **EXPORT-06** Deletion: User can cancel within grace period
 - **EXPORT-07** Deletion: Cascade delete works (sessions, api_keys, etc deleted)
 - **EXPORT-08** Deletion: Audit log preserved (not deleted with user)
 - **EXPORT-09** Deletion: User confirmed via email token
 - **EXPORT-10** Admin: Can see all export/deletion requests
 - **EXPORT-11** Audit: All requests logged with why_chain support
+- **EXPORT-12** Deletion: a gdpr_request or gdpr_right_to_be_forgotten request is not held for 30 days (will_delete_at = requested_at)
+- **EXPORT-13** Deletion cascade order: the user's rows are deleted, 'user_deleted_cascade' is logged, then the audit eraser's erase_subject(user_id) is called last, and nothing is logged for the user after it; deletion_requests.user_id is NULL once completed
+- **EXPORT-14** Deletion confirmation: nothing is deleted before confirm; a wrong, reused or expired (over 24h) token is refused; another user's deletion request is 404 for confirm and cancel
 ```

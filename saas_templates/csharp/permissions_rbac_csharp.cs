@@ -125,6 +125,25 @@ namespace AOI.Rbac
                 _entries.Clear();
             }
         }
+
+        /// <summary>The number of entries. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (transaction mark).</summary>
+        public int Count
+        {
+            get { lock (_lock) { return _entries.Count; } }
+        }
+
+        /// <summary>
+        /// Drops every entry after the first <paramref name="count"/>: the rollback of a failed cascade's audit rows.
+        /// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
+        /// </summary>
+        public void TruncateTo(int count)
+        {
+            lock (_lock)
+            {
+                if (count < _entries.Count)
+                    _entries.RemoveRange(count, _entries.Count - count);
+            }
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -296,6 +315,13 @@ namespace AOI.Rbac
     // ─────────────────────────────────────────────────────────────────────────
     // Cascade delete context (simulates transactional data store)
     // ─────────────────────────────────────────────────────────────────────────
+    /// <summary>
+    /// The rows a user or deployment cascade deletes (an in-memory stand-in for the tables).
+    /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the organization fields (Deployments, Users, OrgApiKeys,
+    /// OrgSessions) were removed with the old org cascade, which deleted user accounts (RBAC-06 forbids it; the org
+    /// cascade now works on <see cref="OrgDataStore"/>). <see cref="BeforeDelete"/> is a fault hook: it runs before each
+    /// table is deleted, so RBAC-07 can make the real cascade fail part-way. Touches: memory only.
+    /// </summary>
     public class CascadeDeleteContext
     {
         public List<Guid> Sessions { get; set; } = new();
@@ -305,11 +331,87 @@ namespace AOI.Rbac
         public List<string> DnsRecords { get; set; } = new();
         public List<string> ThemeConfigs { get; set; } = new();
         public List<string> DeploymentLogs { get; set; } = new();
-        public List<Guid> Deployments { get; set; } = new();
-        public List<Guid> Users { get; set; } = new();
-        public List<Guid> OrgApiKeys { get; set; } = new();
-        public List<Guid> OrgSessions { get; set; } = new();
         public bool ArchivedToS3 { get; set; }
+
+        /// <summary>Called with a table name ("sessions", "api_keys", ...) before that table's rows are deleted; may throw.</summary>
+        public Action<string>? BeforeDelete { get; set; }
+
+        /// <summary>A copy of every list and flag (the hook is shared). Used to roll a failed cascade back.</summary>
+        public CascadeDeleteContext Snapshot() => new CascadeDeleteContext
+        {
+            Sessions = new List<Guid>(Sessions),
+            ApiKeys = new List<Guid>(ApiKeys),
+            Files = new List<Guid>(Files),
+            Preferences = new List<string>(Preferences),
+            DnsRecords = new List<string>(DnsRecords),
+            ThemeConfigs = new List<string>(ThemeConfigs),
+            DeploymentLogs = new List<string>(DeploymentLogs),
+            ArchivedToS3 = ArchivedToS3,
+            BeforeDelete = BeforeDelete
+        };
+
+        /// <summary>Puts back every list and flag from <paramref name="snapshot"/>.</summary>
+        public void RestoreFrom(CascadeDeleteContext snapshot)
+        {
+            Sessions = snapshot.Sessions;
+            ApiKeys = snapshot.ApiKeys;
+            Files = snapshot.Files;
+            Preferences = snapshot.Preferences;
+            DnsRecords = snapshot.DnsRecords;
+            ThemeConfigs = snapshot.ThemeConfigs;
+            DeploymentLogs = snapshot.DeploymentLogs;
+            ArchivedToS3 = snapshot.ArchivedToS3;
+        }
+    }
+
+    /// <summary>A membership row (org_id, user_id, role) as in organizations_teams.md. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.</summary>
+    public class OrgMembership
+    {
+        public Guid OrgId { get; set; }
+        public Guid UserId { get; set; }
+        public string Role { get; set; } = "member"; // owner | admin | member
+    }
+
+    /// <summary>An API key row. OrgId null = a personal key that belongs to its user. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.</summary>
+    public class OrgApiKey
+    {
+        public Guid Id { get; set; } = Guid.NewGuid();
+        public Guid UserId { get; set; }
+        public Guid? OrgId { get; set; }
+    }
+
+    /// <summary>An invitation row of an organization. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.</summary>
+    public class OrgInvitation
+    {
+        public Guid Id { get; set; } = Guid.NewGuid();
+        public Guid OrgId { get; set; }
+        public string Email { get; set; } = string.Empty;
+    }
+
+    /// <summary>A deployment row of an organization, with the rows its own cascade deletes. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.</summary>
+    public class OrgDeployment
+    {
+        public Guid Id { get; set; } = Guid.NewGuid();
+        public Guid OrgId { get; set; }
+        public CascadeDeleteContext Children { get; set; } = new();
+    }
+
+    /// <summary>
+    /// The tables an organization cascade reads and deletes (in-memory). Users and Sessions are here so a test can prove
+    /// they are KEPT. <see cref="BeforeDelete"/> is the fault hook for RBAC-07. Added 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP (RBAC-06 amendment). Touches: memory only.
+    /// </summary>
+    public class OrgDataStore
+    {
+        public List<User> Users { get; set; } = new();
+        public List<(Guid Id, Guid UserId)> Sessions { get; set; } = new();
+        public List<OrgMembership> Memberships { get; set; } = new();
+        public List<OrgApiKey> ApiKeys { get; set; } = new();
+        public List<OrgInvitation> Invitations { get; set; } = new();
+        public List<OrgDeployment> Deployments { get; set; } = new();
+
+        /// <summary>Called with a table name before that table's rows are deleted; may throw.</summary>
+        public Action<string>? BeforeDelete { get; set; }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -328,136 +430,138 @@ namespace AOI.Rbac
         /// delete_user cascade:
         ///   delete_all_sessions, delete_all_api_keys, delete_all_files, clear_preferences
         ///   Log: audit_log(action="user_deleted_cascade", user_id, deleted_items={sessions: N, keys: M, files: K})
+        /// Not transactional by itself (a failure part-way leaves partial deletes); callers use
+        /// <see cref="TransactionalCascadeService.DeleteUserTransactional"/>. Changed 2026-11-10,
+        /// session_012zDydZCZ4AChqhEZ4oVtaP: calls the context's BeforeDelete hook per table; a no-op catch/rethrow removed.
         /// </summary>
         public (bool Success, ErrorResponse? Error) DeleteUser(Guid userId, CascadeDeleteContext context)
         {
-            try
+            var sessionsDeleted = context.Sessions.Count;
+            var keysDeleted = context.ApiKeys.Count;
+            var filesDeleted = context.Files.Count;
+            var prefsCleared = context.Preferences.Count;
+
+            context.BeforeDelete?.Invoke("sessions");
+            context.Sessions.Clear();
+            context.BeforeDelete?.Invoke("api_keys");
+            context.ApiKeys.Clear();
+            context.BeforeDelete?.Invoke("files");
+            context.Files.Clear();
+            context.BeforeDelete?.Invoke("preferences");
+            context.Preferences.Clear();
+
+            _auditLog.Log(new AuditLogEntry
             {
-                // Simulate transactional deletes
-                var sessionsDeleted = context.Sessions.Count;
-                var keysDeleted = context.ApiKeys.Count;
-                var filesDeleted = context.Files.Count;
-                var prefsCleared = context.Preferences.Count;
-
-                // Execute deletes (in a real system this would be a DB transaction)
-                context.Sessions.Clear();
-                context.ApiKeys.Clear();
-                context.Files.Clear();
-                context.Preferences.Clear();
-
-                var deletedItems = new Dictionary<string, int>
+                Action = "user_deleted_cascade",
+                UserId = userId,
+                DeletedItems = new Dictionary<string, int>
                 {
                     { "sessions", sessionsDeleted },
                     { "keys", keysDeleted },
                     { "files", filesDeleted },
                     { "preferences", prefsCleared }
-                };
+                }
+            });
 
-                _auditLog.Log(new AuditLogEntry
-                {
-                    Action = "user_deleted_cascade",
-                    UserId = userId,
-                    DeletedItems = deletedItems
-                });
-
-                return (true, null);
-            }
-            catch (Exception)
-            {
-                // Rollback: restore context (in real system, DB transaction rollback)
-                // For simulation, we re-populate from a snapshot taken before
-                // In production this is handled by the DB transaction manager
-                throw;
-            }
+            return (true, null);
         }
 
         /// <summary>
         /// delete_deployment cascade:
         ///   delete_all_dns_records, delete_all_theme_configs, delete_all_deployment_logs, archive to S3
         ///   Log: audit_log(action="deployment_deleted_cascade", deployment_id, deleted_items={dns: N, ...})
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: BeforeDelete hook per table; no-op catch removed.
         /// </summary>
         public (bool Success, ErrorResponse? Error) DeleteDeployment(Guid deploymentId, CascadeDeleteContext context)
         {
-            try
+            var dnsDeleted = context.DnsRecords.Count;
+            var themesDeleted = context.ThemeConfigs.Count;
+            var logsDeleted = context.DeploymentLogs.Count;
+
+            context.BeforeDelete?.Invoke("dns_records");
+            context.DnsRecords.Clear();
+            context.BeforeDelete?.Invoke("theme_configs");
+            context.ThemeConfigs.Clear();
+            context.BeforeDelete?.Invoke("deployment_logs");
+            context.DeploymentLogs.Clear();
+            context.ArchivedToS3 = true;
+
+            _auditLog.Log(new AuditLogEntry
             {
-                var dnsDeleted = context.DnsRecords.Count;
-                var themesDeleted = context.ThemeConfigs.Count;
-                var logsDeleted = context.DeploymentLogs.Count;
-
-                context.DnsRecords.Clear();
-                context.ThemeConfigs.Clear();
-                context.DeploymentLogs.Clear();
-                context.ArchivedToS3 = true;
-
-                var deletedItems = new Dictionary<string, int>
+                Action = "deployment_deleted_cascade",
+                DeploymentId = deploymentId.ToString(),
+                DeletedItems = new Dictionary<string, int>
                 {
                     { "dns", dnsDeleted },
                     { "theme_configs", themesDeleted },
                     { "deployment_logs", logsDeleted },
                     { "archived_to_s3", context.ArchivedToS3 ? 1 : 0 }
-                };
+                }
+            });
 
-                _auditLog.Log(new AuditLogEntry
-                {
-                    Action = "deployment_deleted_cascade",
-                    DeploymentId = deploymentId.ToString(),
-                    DeletedItems = deletedItems
-                });
-
-                return (true, null);
-            }
-            catch (Exception)
-            {
-                throw;
-            }
+            return (true, null);
         }
 
         /// <summary>
-        /// delete_organization cascade:
-        ///   delete_all_deployments, delete_all_users, delete_all_api_keys, revoke_all_sessions
-        ///   Log: audit_log(action="org_deleted_cascade", org_id, deleted_items={deployments: N, users: M, ...})
+        /// delete_organization cascade (RBAC-06, amended 2026-11-10).
+        /// Gate: <paramref name="caller"/> (the verified caller, never a request field) must have a membership row for
+        /// <paramref name="orgId"/> with role 'owner'; otherwise 404 not_found, so another org's owner learns nothing
+        /// (null caller -> 401). A global owner tier is NOT enough.
+        /// Cascade: the org's deployments (each with the deployment cascade), API keys whose org_id is this org, all
+        /// its invitations and its membership rows. Never a user account, a session or a personal API key (org_id null),
+        /// and never another org's membership. Log: org_deleted_cascade with deleted_items {deployments, api_keys,
+        /// invitations, memberships}. Not transactional by itself; see
+        /// <see cref="TransactionalCascadeService.DeleteOrganizationTransactional"/>.
+        /// Rewritten 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the old version took no caller and deleted every
+        /// member's user account and sessions. Touches: the store and the audit log (memory).
         /// </summary>
-        public (bool Success, ErrorResponse? Error) DeleteOrganization(Guid orgId, CascadeDeleteContext context)
+        public (bool Success, ErrorResponse? Error) DeleteOrganization(User? caller, Guid orgId, OrgDataStore store)
         {
-            try
+            if (caller == null)
+                return (false, ErrorResponse.AuthenticationRequired());
+            if (!store.Memberships.Any(m => m.OrgId == orgId && m.UserId == caller.Id && m.Role == "owner"))
+                return (false, ErrorResponse.PermissionDenied("not_found", 404, "Organization not found"));
+
+            var deployments = store.Deployments.Where(d => d.OrgId == orgId).ToList();
+            foreach (var dep in deployments)
+                DeleteDeployment(dep.Id, dep.Children);
+            store.BeforeDelete?.Invoke("deployments");
+            store.Deployments.RemoveAll(d => d.OrgId == orgId);
+
+            store.BeforeDelete?.Invoke("api_keys");
+            var keys = store.ApiKeys.RemoveAll(k => k.OrgId == orgId);
+            store.BeforeDelete?.Invoke("invitations");
+            var invitations = store.Invitations.RemoveAll(i => i.OrgId == orgId);
+            store.BeforeDelete?.Invoke("memberships");
+            var memberships = store.Memberships.RemoveAll(m => m.OrgId == orgId);
+
+            _auditLog.Log(new AuditLogEntry
             {
-                var deploymentsDeleted = context.Deployments.Count;
-                var usersDeleted = context.Users.Count;
-                var apiKeysDeleted = context.OrgApiKeys.Count;
-                var sessionsRevoked = context.OrgSessions.Count;
-
-                context.Deployments.Clear();
-                context.Users.Clear();
-                context.OrgApiKeys.Clear();
-                context.OrgSessions.Clear();
-
-                var deletedItems = new Dictionary<string, int>
+                Action = "org_deleted_cascade",
+                UserId = caller.Id,
+                OrganizationId = orgId.ToString(),
+                DeletedItems = new Dictionary<string, int>
                 {
-                    { "deployments", deploymentsDeleted },
-                    { "users", usersDeleted },
-                    { "api_keys", apiKeysDeleted },
-                    { "sessions", sessionsRevoked }
-                };
+                    { "deployments", deployments.Count },
+                    { "api_keys", keys },
+                    { "invitations", invitations },
+                    { "memberships", memberships }
+                }
+            });
 
-                _auditLog.Log(new AuditLogEntry
-                {
-                    Action = "org_deleted_cascade",
-                    OrganizationId = orgId.ToString(),
-                    DeletedItems = deletedItems
-                });
-
-                return (true, null);
-            }
-            catch (Exception)
-            {
-                throw;
-            }
+            return (true, null);
         }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Transactional cascade wrapper (rollback on error)
     // ─────────────────────────────────────────────────────────────────────────
+    /// <summary>
+    /// Runs a cascade as one transaction: on any failure every table and the audit log are put back as they were and
+    /// a 500 cascade_rollback error is returned (RBAC-07, no partial deletes). Changed 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP: also rolls back audit entries written by the failed cascade, and the org
+    /// cascade is the RBAC-06 one. Touches: the given store and the audit log (memory).
+    /// </summary>
     public class TransactionalCascadeService
     {
         private readonly CascadeDeleteService _cascadeService;
@@ -469,77 +573,69 @@ namespace AOI.Rbac
             _auditLog = auditLog;
         }
 
+        private static ErrorResponse Rollback() =>
+            ErrorResponse.PermissionDenied("cascade_rollback", 500, "Cascade delete failed, transaction rolled back");
+
+        /// <summary>delete_user in one transaction. Out: (true, null) or (false, 500 cascade_rollback) with nothing deleted.</summary>
         public (bool Success, ErrorResponse? Error) DeleteUserTransactional(Guid userId, CascadeDeleteContext context)
         {
-            // Snapshot for rollback
-            var snapshot = new CascadeDeleteContext
-            {
-                Sessions = new List<Guid>(context.Sessions),
-                ApiKeys = new List<Guid>(context.ApiKeys),
-                Files = new List<Guid>(context.Files),
-                Preferences = new List<string>(context.Preferences)
-            };
-
+            var snapshot = context.Snapshot();
+            var auditMark = _auditLog.Count;
             try
             {
                 return _cascadeService.DeleteUser(userId, context);
             }
             catch (Exception)
             {
-                // Rollback
-                context.Sessions = snapshot.Sessions;
-                context.ApiKeys = snapshot.ApiKeys;
-                context.Files = snapshot.Files;
-                context.Preferences = snapshot.Preferences;
-                return (false, ErrorResponse.PermissionDenied("cascade_rollback", 500, "Cascade delete failed, transaction rolled back"));
+                context.RestoreFrom(snapshot);
+                _auditLog.TruncateTo(auditMark);
+                return (false, Rollback());
             }
         }
 
+        /// <summary>delete_deployment in one transaction. Out: (true, null) or (false, 500 cascade_rollback) with nothing deleted.</summary>
         public (bool Success, ErrorResponse? Error) DeleteDeploymentTransactional(Guid deploymentId, CascadeDeleteContext context)
         {
-            var snapshot = new CascadeDeleteContext
-            {
-                DnsRecords = new List<string>(context.DnsRecords),
-                ThemeConfigs = new List<string>(context.ThemeConfigs),
-                DeploymentLogs = new List<string>(context.DeploymentLogs),
-                ArchivedToS3 = context.ArchivedToS3
-            };
-
+            var snapshot = context.Snapshot();
+            var auditMark = _auditLog.Count;
             try
             {
                 return _cascadeService.DeleteDeployment(deploymentId, context);
             }
             catch (Exception)
             {
-                context.DnsRecords = snapshot.DnsRecords;
-                context.ThemeConfigs = snapshot.ThemeConfigs;
-                context.DeploymentLogs = snapshot.DeploymentLogs;
-                context.ArchivedToS3 = snapshot.ArchivedToS3;
-                return (false, ErrorResponse.PermissionDenied("cascade_rollback", 500, "Cascade delete failed, transaction rolled back"));
+                context.RestoreFrom(snapshot);
+                _auditLog.TruncateTo(auditMark);
+                return (false, Rollback());
             }
         }
 
-        public (bool Success, ErrorResponse? Error) DeleteOrganizationTransactional(Guid orgId, CascadeDeleteContext context)
+        /// <summary>
+        /// delete_organization (RBAC-06 gate and cascade) in one transaction. Out: (true, null), the gate's 401/404, or
+        /// (false, 500 cascade_rollback) with every table, every deployment's rows and the audit log restored.
+        /// </summary>
+        public (bool Success, ErrorResponse? Error) DeleteOrganizationTransactional(User? caller, Guid orgId, OrgDataStore store)
         {
-            var snapshot = new CascadeDeleteContext
-            {
-                Deployments = new List<Guid>(context.Deployments),
-                Users = new List<Guid>(context.Users),
-                OrgApiKeys = new List<Guid>(context.OrgApiKeys),
-                OrgSessions = new List<Guid>(context.OrgSessions)
-            };
-
+            var deployments = store.Deployments.ToList();
+            var children = deployments.Select(d => d.Children.Snapshot()).ToList();
+            var keys = store.ApiKeys.ToList();
+            var invitations = store.Invitations.ToList();
+            var memberships = store.Memberships.ToList();
+            var auditMark = _auditLog.Count;
             try
             {
-                return _cascadeService.DeleteOrganization(orgId, context);
+                return _cascadeService.DeleteOrganization(caller, orgId, store);
             }
             catch (Exception)
             {
-                context.Deployments = snapshot.Deployments;
-                context.Users = snapshot.Users;
-                context.OrgApiKeys = snapshot.OrgApiKeys;
-                context.OrgSessions = snapshot.OrgSessions;
-                return (false, ErrorResponse.PermissionDenied("cascade_rollback", 500, "Cascade delete failed, transaction rolled back"));
+                for (var i = 0; i < deployments.Count; i++)
+                    deployments[i].Children.RestoreFrom(children[i]);
+                store.Deployments = deployments;
+                store.ApiKeys = keys;
+                store.Invitations = invitations;
+                store.Memberships = memberships;
+                _auditLog.TruncateTo(auditMark);
+                return (false, Rollback());
             }
         }
     }

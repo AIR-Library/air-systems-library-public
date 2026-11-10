@@ -4,7 +4,9 @@
 //! What: `RbacSystem` checks the tier hierarchy public < member < admin < owner (`require_owner`,
 //! `require_admin`, `require_authenticated`), writes every check, pass or fail, to `audit_log`, and runs
 //! the user, deployment and organization cascades inside one transaction each (the cascade's own audit
-//! row included), so an error rolls the whole cascade back.
+//! row included), so an error rolls the whole cascade back. The organization cascade (amended
+//! 2026-11-10, RBAC-06, session_012zDydZCZ4AChqhEZ4oVtaP) is allowed only to an owner of that org (else
+//! 404) and never deletes a user account, a session or a personal API key.
 //! Why: the old file did not compile without a database at build time (`sqlx::query!` macros check SQL
 //! against `DATABASE_URL` while compiling), `initialize_schema` was private although callers need it,
 //! the users table had no `organization_id`, and the organization cascade deleted the users before
@@ -85,8 +87,10 @@ impl RbacSystem {
         Ok(RbacSystem { db: pool })
     }
 
-    /// What: create the tables (users, their sessions/keys/files/preferences, organizations,
-    /// deployments and their DNS/theme/log rows, audit_log). Public so callers sharing a pool can set it
+    /// What: create the tables (users, their sessions/keys/files/preferences, organizations, their
+    /// memberships (org_id, user_id, role) and invitations, deployments and their DNS/theme/log rows,
+    /// audit_log). API keys carry a nullable org_id: NULL is a personal key. Changed 2026-11-10 (RBAC-06
+    /// amendment): users no longer carry one organization_id, because a user may belong to several orgs. Public so callers sharing a pool can set it
     /// up. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (DDL).
     pub async fn initialize_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         sqlx::query(
@@ -96,8 +100,18 @@ impl RbacSystem {
             );
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY,
-                tier TEXT NOT NULL CHECK (tier IN ('public', 'member', 'admin', 'owner')),
-                organization_id INTEGER NULL REFERENCES organizations(id)
+                tier TEXT NOT NULL CHECK (tier IN ('public', 'member', 'admin', 'owner'))
+            );
+            CREATE TABLE IF NOT EXISTS memberships (
+                org_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                role TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'member')),
+                PRIMARY KEY (org_id, user_id)
+            );
+            CREATE TABLE IF NOT EXISTS invitations (
+                id INTEGER PRIMARY KEY,
+                org_id INTEGER NOT NULL,
+                email TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS sessions (
                 id INTEGER PRIMARY KEY,
@@ -107,6 +121,7 @@ impl RbacSystem {
             CREATE TABLE IF NOT EXISTS api_keys (
                 id INTEGER PRIMARY KEY,
                 user_id INTEGER NOT NULL,
+                org_id INTEGER NULL,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS files (
@@ -229,28 +244,49 @@ impl RbacSystem {
         tx.commit().await
     }
 
-    /// What: delete everything inside an organization: its users' sessions, API keys, files and
-    /// preferences, its users, its deployments' DNS/theme/log rows and its deployments, plus the
-    /// `org_deleted_cascade` audit row, in one transaction. The organization row itself stays (spec lists
-    /// only the nested records). Children are deleted before the rows they are found through.
-    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
-    pub async fn delete_organization(&self, org_id: i32) -> Result<(), sqlx::Error> {
+    /// What: delete an organization (RBAC-06, amended 2026-11-10). Gate: the caller's membership row for
+    /// `org_id` has role 'owner'; otherwise `NotFound` (404), so a global admin or the owner of another org
+    /// can neither delete it nor learn that it exists. Cascade, in one transaction with the audit row: its
+    /// deployments with their DNS records, theme configs and logs; API keys whose org_id is this org; all
+    /// its invitations; its membership rows; the organization row. NEVER a user account, a session or a
+    /// personal API key (org_id NULL): a user may belong to several orgs, and deleting an account is
+    /// `delete_user`. In: the verified caller (from the server's session, never from request input) and the
+    /// org id. Out: deleted_items {deployments, api_keys, invitations, memberships, ...}, or `NotFound` /
+    /// `Internal` (rolled back). Why: review on PR 19: the old cascade deleted every member's account
+    /// and anyone could call it. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
+    pub async fn delete_organization(&self, caller: &User, org_id: i32) -> Result<serde_json::Value, RbacError> {
+        self.delete_organization_tx(caller, org_id).await.map_err(|e| match e {
+            OrgDeleteError::NotFound => RbacError::NotFound,
+            OrgDeleteError::Db(_) => RbacError::Internal,
+        })
+    }
+
+    /// What: the transaction behind `delete_organization`; any error drops the transaction, which rolls
+    /// it back. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
+    async fn delete_organization_tx(&self, caller: &User, org_id: i32) -> Result<serde_json::Value, OrgDeleteError> {
         let mut tx = self.db.begin().await?;
-        let of_users = "IN (SELECT id FROM users WHERE organization_id = ?)";
-        let sessions = Self::delete(&mut tx, &format!("DELETE FROM sessions WHERE user_id {}", of_users), org_id).await?;
-        let api_keys = Self::delete(&mut tx, &format!("DELETE FROM api_keys WHERE user_id {}", of_users), org_id).await?;
-        let files = Self::delete(&mut tx, &format!("DELETE FROM files WHERE user_id {}", of_users), org_id).await?;
-        let preferences = Self::delete(&mut tx, &format!("DELETE FROM preferences WHERE user_id {}", of_users), org_id).await?;
-        let users = Self::delete(&mut tx, "DELETE FROM users WHERE organization_id = ?", org_id).await?;
+        let role: Option<String> = sqlx::query_scalar("SELECT role FROM memberships WHERE org_id = ? AND user_id = ?")
+            .bind(org_id)
+            .bind(caller.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if role.as_deref() != Some("owner") {
+            return Err(OrgDeleteError::NotFound);
+        }
         let of_deployments = "IN (SELECT id FROM deployments WHERE organization_id = ?)";
         let dns = Self::delete(&mut tx, &format!("DELETE FROM dns_records WHERE deployment_id {}", of_deployments), org_id).await?;
         let themes = Self::delete(&mut tx, &format!("DELETE FROM theme_configs WHERE deployment_id {}", of_deployments), org_id).await?;
         let logs = Self::delete(&mut tx, &format!("DELETE FROM deployment_logs WHERE deployment_id {}", of_deployments), org_id).await?;
         let deployments = Self::delete(&mut tx, "DELETE FROM deployments WHERE organization_id = ?", org_id).await?;
-        let details = json!({ "org_id": org_id, "deployments": deployments, "users": users, "api_keys": api_keys, "sessions": sessions,
-            "files": files, "preferences": preferences, "dns_records": dns, "theme_configs": themes, "deployment_logs": logs });
-        self.log_audit(&mut *tx, "org_deleted_cascade", None, None, None, None, "PASS", Some(details)).await?;
-        tx.commit().await
+        let api_keys = Self::delete(&mut tx, "DELETE FROM api_keys WHERE org_id = ?", org_id).await?;
+        let invitations = Self::delete(&mut tx, "DELETE FROM invitations WHERE org_id = ?", org_id).await?;
+        let memberships = Self::delete(&mut tx, "DELETE FROM memberships WHERE org_id = ?", org_id).await?;
+        let organizations = Self::delete(&mut tx, "DELETE FROM organizations WHERE id = ?", org_id).await?;
+        let details = json!({ "org_id": org_id, "deployments": deployments, "api_keys": api_keys, "invitations": invitations,
+            "memberships": memberships, "organizations": organizations, "dns_records": dns, "theme_configs": themes, "deployment_logs": logs });
+        self.log_audit(&mut *tx, "org_deleted_cascade", Some(caller.id), None, None, None, "PASS", Some(details.clone())).await?;
+        tx.commit().await?;
+        Ok(details)
     }
 
     /// What: append one audit row through any executor (the pool, or a cascade's transaction).
@@ -288,13 +324,31 @@ impl RbacSystem {
     }
 }
 
-/// What: why access was refused; `Internal` when the audit row could not be written (fail closed).
+/// What: why the organization cascade stopped (internal to `delete_organization`).
 /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+#[derive(Debug)]
+enum OrgDeleteError {
+    NotFound,
+    Db(sqlx::Error),
+}
+
+/// What: `From<sqlx::Error>` for `OrgDeleteError`. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+impl From<sqlx::Error> for OrgDeleteError {
+    /// What: wrap a database error. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+    fn from(e: sqlx::Error) -> Self {
+        OrgDeleteError::Db(e)
+    }
+}
+
+/// What: why access was refused; `Internal` when the audit row could not be written (fail closed) or a
+/// cascade failed and was rolled back; `NotFound` (added 2026-11-10, RBAC-06) when the caller is not an
+/// owner of the organization. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RbacError {
     OwnerOnly,
     AdminOnly,
     AuthenticationRequired,
+    NotFound,
     Internal,
 }
 
@@ -329,6 +383,15 @@ impl RbacError {
                 })
                 .to_string(),
                 401,
+            ),
+            RbacError::NotFound => (
+                json!({
+                    "error": "not_found",
+                    "message": "Not found",
+                    "code": 404
+                })
+                .to_string(),
+                404,
             ),
             RbacError::Internal => (
                 json!({

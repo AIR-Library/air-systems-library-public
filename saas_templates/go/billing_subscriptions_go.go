@@ -55,12 +55,17 @@ func envOr(k, def string) string {
 const WebhookTolerance = 5 * time.Minute
 
 // StripeAPI is the part of Stripe this template calls. CreateSubscription subscribes a customer to
-// a price; ChangeSubscriptionPrice swaps the subscription's item to a new price with prorations and
-// returns the proration credit in cents (positive = credit to the customer).
-// Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: network, money.
+// a price; RetrieveSubscription reads a subscription with its items; UpdateSubscription sends
+// stripe.subscriptions.update with the given params and returns the proration credit in cents
+// (positive = credit to the customer).
+// Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Changed the same day (Phase B, BILL-03):
+// retrieve and update are separate calls, so ChangePlan itself picks the existing item id and refuses
+// a subscription without exactly one item before any update, and a test can see the exact params.
+// Touches: network, money.
 type StripeAPI interface {
 	CreateSubscription(ctx context.Context, customerID, priceID string) (*stripe.Subscription, error)
-	ChangeSubscriptionPrice(ctx context.Context, subscriptionID, priceID string) (prorationCredit int64, err error)
+	RetrieveSubscription(ctx context.Context, subscriptionID string) (*stripe.Subscription, error)
+	UpdateSubscription(ctx context.Context, subscriptionID string, params *stripe.SubscriptionParams) (prorationCredit int64, err error)
 }
 
 // StripeClient is the production StripeAPI on stripe-go v76.
@@ -86,33 +91,30 @@ func (c *StripeClient) CreateSubscription(ctx context.Context, customerID, price
 	return c.api.Subscriptions.New(params)
 }
 
-// ChangeSubscriptionPrice replaces the first item's price (reusing its id, so no second item is
-// added) with proration_behavior=create_prorations, then reads the upcoming invoice and returns the
-// credit from its negative proration lines. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.
-// Touches: network, money.
-func (c *StripeClient) ChangeSubscriptionPrice(ctx context.Context, subscriptionID, priceID string) (int64, error) {
+// RetrieveSubscription calls stripe.subscriptions.retrieve(id); the result carries its items.
+// In: the Stripe subscription id. Out: the subscription or Stripe's error.
+// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (BILL-03). Touches: network.
+func (c *StripeClient) RetrieveSubscription(ctx context.Context, subscriptionID string) (*stripe.Subscription, error) {
 	get := &stripe.SubscriptionParams{}
 	get.Context = ctx
-	sub, err := c.api.Subscriptions.Get(subscriptionID, get)
-	if err != nil {
-		return 0, err
-	}
-	if sub.Items == nil || len(sub.Items.Data) == 0 {
-		return 0, errors.New("stripe subscription has no items")
-	}
-	upd := &stripe.SubscriptionParams{
-		Items:             []*stripe.SubscriptionItemsParams{{ID: stripe.String(sub.Items.Data[0].ID), Price: stripe.String(priceID)}},
-		ProrationBehavior: stripe.String("create_prorations"),
-	}
-	upd.Context = ctx
-	if _, err := c.api.Subscriptions.Update(subscriptionID, upd); err != nil {
+	return c.api.Subscriptions.Get(subscriptionID, get)
+}
+
+// UpdateSubscription calls stripe.subscriptions.update(id, params), then reads the upcoming invoice
+// and returns the credit from its negative proration lines (0 if the preview fails: the plan has
+// already changed, the preview is informational only).
+// In: the Stripe subscription id and the update params. Out: the proration credit in cents.
+// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (BILL-03). Touches: network, money.
+func (c *StripeClient) UpdateSubscription(ctx context.Context, subscriptionID string, params *stripe.SubscriptionParams) (int64, error) {
+	params.Context = ctx
+	if _, err := c.api.Subscriptions.Update(subscriptionID, params); err != nil {
 		return 0, err
 	}
 	up := &stripe.InvoiceUpcomingParams{Subscription: stripe.String(subscriptionID)}
 	up.Context = ctx
 	inv, err := c.api.Invoices.Upcoming(up)
 	if err != nil {
-		return 0, nil // the plan changed; the preview is informational only
+		return 0, nil
 	}
 	var credit int64
 	if inv.Lines != nil {
@@ -269,9 +271,13 @@ func (s *BillingService) CreateSubscription(ctx context.Context, customerID, tie
 }
 
 // ChangePlan moves a subscription (Stripe id or local id) to newTier through Stripe, then records
-// it. Output: {success, subscription_id, old_tier, new_tier, effective_date, proration_credit};
-// 400 invalid_tier, 404 not_found. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.
-// Touches: Stripe (money), database.
+// it. Order (spec flow 2, amended 2026-11-10): unknown tier -> 400 invalid_tier; unknown subscription ->
+// 404 not_found; stripe.subscriptions.retrieve, and not exactly one item -> 409
+// subscription_item_ambiguous; only then stripe.subscriptions.update with
+// {items: [{id: current_item_id, price}], proration_behavior: "create_prorations"}, so Stripe swaps the
+// price instead of adding a second item that would bill both plans.
+// Output: {success, subscription_id, old_tier, new_tier, effective_date, proration_credit}.
+// Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (BILL-03). Touches: Stripe (money), database.
 func (s *BillingService) ChangePlan(ctx context.Context, subscriptionID, newTier string) (map[string]interface{}, error) {
 	price, ok := PriceID[newTier]
 	if !ok {
@@ -287,7 +293,18 @@ func (s *BillingService) ChangePlan(ctx context.Context, subscriptionID, newTier
 	if err != nil {
 		return nil, err
 	}
-	credit, err := s.stripe.ChangeSubscriptionPrice(ctx, stripeSubID, price)
+	current, err := s.stripe.RetrieveSubscription(ctx, stripeSubID)
+	if err != nil {
+		return nil, &APIError{Code: "stripe_error", Message: "Stripe could not read the subscription", Status: http.StatusBadGateway}
+	}
+	if current == nil || current.Items == nil || len(current.Items.Data) != 1 || current.Items.Data[0] == nil {
+		return nil, &APIError{Code: "subscription_item_ambiguous",
+			Message: "the subscription does not have exactly one item", Status: http.StatusConflict}
+	}
+	credit, err := s.stripe.UpdateSubscription(ctx, stripeSubID, &stripe.SubscriptionParams{
+		Items:             []*stripe.SubscriptionItemsParams{{ID: stripe.String(current.Items.Data[0].ID), Price: stripe.String(price)}},
+		ProrationBehavior: stripe.String("create_prorations"),
+	})
 	if err != nil {
 		return nil, &APIError{Code: "stripe_error", Message: "Stripe rejected the plan change", Status: http.StatusBadGateway}
 	}

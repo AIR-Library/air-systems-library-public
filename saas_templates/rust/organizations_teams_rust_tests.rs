@@ -175,6 +175,7 @@ mod tests {
     }
 
     /// Spec: a non-member cannot read another org's members (IDOR by id); they get "not found".
+    // ORG-01
     #[test]
     fn test_non_member_cannot_read_members_of_another_org() {
         for use_sql in [false, true] {
@@ -194,6 +195,7 @@ mod tests {
     }
 
     /// Spec: a member cannot invite; an admin can (but cannot invite an owner).
+    // ORG-02
     #[test]
     fn test_member_cannot_invite_admin_can() {
         for use_sql in [false, true] {
@@ -212,6 +214,7 @@ mod tests {
 
     /// Spec: an admin cannot remove or demote the owner; the last owner cannot leave or be demoted;
     /// change_role on a non-member is "not found".
+    // ORG-03
     #[test]
     fn test_admin_cannot_remove_owner_and_last_owner_cannot_leave() {
         for use_sql in [false, true] {
@@ -237,6 +240,7 @@ mod tests {
     }
 
     /// Spec: an invitation works once; the second use fails.
+    // ORG-04
     #[test]
     fn test_invitation_works_once_second_use_fails() {
         for use_sql in [false, true] {
@@ -252,6 +256,7 @@ mod tests {
     }
 
     /// Spec: an expired invitation fails; accepting with a different email fails.
+    // ORG-05
     #[test]
     fn test_expired_invitation_and_different_email_fail() {
         for use_sql in [false, true] {
@@ -269,6 +274,7 @@ mod tests {
     }
 
     /// Spec: the raw token is not stored anywhere in the database; its SHA-256 is.
+    // ORG-06
     #[test]
     fn test_raw_token_not_stored_in_database() {
         for use_sql in [false, true] {

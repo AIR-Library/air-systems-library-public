@@ -2,8 +2,10 @@
 //!
 //! What: `JobQueue` stores jobs in SQLite, a worker thread claims due jobs one at a time with a single
 //! atomic UPDATE, runs the registered task handler, reports progress ("X/Y") while it runs, and records
-//! the result; a failed attempt is retried with exponential backoff (1 s, 2 s, 4 s, ...) until
-//! `max_retries` attempts have failed. Jobs can be scheduled for later, cancelled before they start,
+//! the result; a failed attempt is retried with exponential backoff: retry n waits 2^(n-1) s (1 s, 2 s,
+//! 4 s, ...) as 'enqueued' with retry_count = n, and `max_retries` counts the retries after the first
+//! attempt, so a job runs at most max_retries + 1 times and then is 'failed' with retry_count =
+//! max_retries (2026-11-10 amendment, JOBS-03/04, session_012zDydZCZ4AChqhEZ4oVtaP). Jobs can be scheduled for later, cancelled before they start,
 //! listed, re-enqueued after failure, and every attempt is written to `job_runs`.
 //! Why: the old file did not compile (`NO_PARAMS` and `query_named` are gone from the SQLite crate,
 //! `JobStatus` had both derived and hand-written serde impls, errors without `From`), and held a
@@ -67,8 +69,8 @@ impl From<r2d2::Error> for JobError {
     }
 }
 
-/// What: a job's state. `Failed` with a `next_retry_at` is waiting for its next attempt; without one
-/// it is final. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+/// What: a job's state. A job waiting for a retry is `Enqueued` with `next_retry_at` set; `Failed` is
+/// final (changed 2026-11-10, JOBS-03/04). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum JobStatus {
@@ -135,7 +137,7 @@ pub struct EnqueueRequest {
     pub max_retries: i32,
 }
 
-/// What: default attempts for a job. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+/// What: default retries after the first attempt (3 -> up to 4 runs). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
 fn default_max_retries() -> i32 {
     3
 }
@@ -185,6 +187,7 @@ pub struct JobQueue {
     tasks: RwLock<HashMap<String, TaskFn>>,
     backoff_base: StdDuration,
     poll_interval: StdDuration,
+    clock: Box<dyn Fn() -> DateTime<Utc> + Send + Sync>,
 }
 
 /// What: a time as stored (RFC 3339, milliseconds, `Z`), so text order is time order.
@@ -210,10 +213,24 @@ impl JobQueue {
             tasks: RwLock::new(HashMap::new()),
             backoff_base: StdDuration::from_secs(1),
             poll_interval: StdDuration::from_millis(50),
+            clock: Box::new(Utc::now),
         };
         q.run_migrations()?;
         q.register_builtin_tasks();
         Ok(q)
+    }
+
+    /// What: replace the clock (tests of backoff and scheduling). In: the clock. Out: the queue.
+    /// Why: deterministic tests (specs README: injectable clock). 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+    pub fn with_clock(mut self, clock: Box<dyn Fn() -> DateTime<Utc> + Send + Sync>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// What: the queue's current time. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the clock.
+    fn now(&self) -> DateTime<Utc> {
+        (self.clock)()
     }
 
     /// What: a pooled connection. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the pool.
@@ -287,21 +304,22 @@ impl JobQueue {
         }
     }
 
-    /// What: add a job (spec endpoint 1). Unknown task types and negative retries are refused.
-    /// In: request. Out: id and status enqueued. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
-    /// Touches: database.
+    /// What: add a job (spec endpoint 1). Unknown task types and negative retries are refused
+    /// (max_retries = 0 is allowed since 2026-11-10: it counts retries after the first attempt, so 0
+    /// means "run once"). In: request. Out: id and status enqueued.
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database, clock.
     pub fn enqueue(&self, req: EnqueueRequest) -> Result<EnqueueResponse, JobError> {
         if !self.tasks.read().map(|t| t.contains_key(&req.task_type)).unwrap_or(false) {
             return Err(JobError::Invalid(format!("unknown task type {:?}", req.task_type)));
         }
-        if req.max_retries < 1 {
-            return Err(JobError::Invalid("max_retries must be at least 1".into()));
+        if req.max_retries < 0 {
+            return Err(JobError::Invalid("max_retries must not be negative".into()));
         }
         let conn = self.conn()?;
         conn.execute(
             "INSERT INTO jobs (task_type, params, status, created_at, max_retries, scheduled_at)
              VALUES (?1, ?2, 'enqueued', ?3, ?4, ?5)",
-            params![req.task_type, req.params.to_string(), ts(Utc::now()), req.max_retries, req.scheduled_at.map(ts)],
+            params![req.task_type, req.params.to_string(), ts(self.now()), req.max_retries, req.scheduled_at.map(ts)],
         )?;
         Ok(EnqueueResponse { success: true, job_id: conn.last_insert_rowid(), status: JobStatus::Enqueued })
     }
@@ -358,12 +376,13 @@ impl JobQueue {
         Ok((jobs, total))
     }
 
-    /// What: cancel a job that has not started (spec endpoint 4). Out: cancelled, or `Invalid` when it
-    /// already started or finished. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
+    /// What: cancel a job that has not started (spec endpoint 4); a job waiting for a retry is enqueued
+    /// and can be cancelled too. Out: cancelled, or `Invalid` when it is running or finished.
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database, clock.
     pub fn cancel(&self, job_id: i64) -> Result<CancelResponse, JobError> {
         let n = self.conn()?.execute(
-            "UPDATE jobs SET status = 'cancelled', completed_at = ?2 WHERE id = ?1 AND status = 'enqueued'",
-            params![job_id, ts(Utc::now())],
+            "UPDATE jobs SET status = 'cancelled', completed_at = ?2, next_retry_at = NULL WHERE id = ?1 AND status = 'enqueued'",
+            params![job_id, ts(self.now())],
         )?;
         if n == 1 {
             return Ok(CancelResponse { success: true, status: JobStatus::Cancelled });
@@ -376,7 +395,7 @@ impl JobQueue {
     /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
     pub fn retry(&self, job_id: i64) -> Result<RetryResponse, JobError> {
         let job = self.get(job_id)?;
-        if job.status != JobStatus::Failed || job.next_retry_at.is_some() {
+        if job.status != JobStatus::Failed {
             return Err(JobError::Invalid("only a job that has finally failed can be retried".into()));
         }
         let resp = self.enqueue(EnqueueRequest { task_type: job.task_type, params: job.params, scheduled_at: None, max_retries: job.max_retries })?;
@@ -410,21 +429,23 @@ impl JobQueue {
         });
     }
 
-    /// What: claim the oldest due job with one atomic UPDATE (an enqueued job whose `scheduled_at` has
-    /// passed, or a failed job whose retry time has come), run it without holding a connection, and
-    /// record the outcome; failures schedule the next attempt after 1 s, 2 s, 4 s, ... until
-    /// `max_retries` attempts have failed. Out: whether a job was processed.
-    /// Why: spec worker, "Atomic updates", "Scheduled jobs", "Retry". 2026-11-10,
-    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database, the task handler.
+    /// What: claim the oldest due job with one atomic UPDATE (an enqueued job whose `scheduled_at` and
+    /// `next_retry_at` have both passed), run it without holding a connection, and record the outcome.
+    /// A failure while retries remain (retry_count < max_retries) puts the job back to 'enqueued' with
+    /// retry_count = n and next_retry_at = failed_at + 2^(n-1) x the backoff base (1 s, 2 s, 4 s, ...);
+    /// the worker skips it until then. When attempt max_retries + 1 fails the job is 'failed' with
+    /// retry_count = max_retries. Out: whether a job was processed.
+    /// Why: spec worker, "Atomic updates", "Scheduled jobs", "Retry" (amended 2026-11-10, JOBS-03/04).
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database, the task handler, clock.
     pub fn process_one_job(&self) -> Result<bool, JobError> {
-        let now = ts(Utc::now());
+        let now = ts(self.now());
         let claimed: Option<Job> = {
             let conn = self.conn()?;
             conn.query_row(
                 "UPDATE jobs SET status = 'running', started_at = ?1, next_retry_at = NULL
                  WHERE id = (SELECT id FROM jobs
-                     WHERE (status = 'enqueued' AND (scheduled_at IS NULL OR scheduled_at <= ?1))
-                        OR (status = 'failed' AND next_retry_at IS NOT NULL AND next_retry_at <= ?1)
+                     WHERE status = 'enqueued' AND (scheduled_at IS NULL OR scheduled_at <= ?1)
+                       AND (next_retry_at IS NULL OR next_retry_at <= ?1)
                      ORDER BY id LIMIT 1)
                  RETURNING *",
                 params![now],
@@ -450,7 +471,8 @@ impl JobQueue {
             }
             None => Err(format!("no handler for task type {}", job.task_type)),
         };
-        let finished = ts(Utc::now());
+        let failed_at = self.now();
+        let finished = ts(failed_at);
         let conn = self.conn()?;
         match outcome {
             Ok(result) => {
@@ -462,18 +484,20 @@ impl JobQueue {
                     params![run_id, finished, result.to_string()])?;
             }
             Err(error) => {
-                let retry_count = job.retry_count + 1;
-                let next = if retry_count < job.max_retries {
-                    let delay = self.backoff_base * 2u32.saturating_pow((retry_count - 1) as u32);
-                    Some(ts(Utc::now() + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::seconds(1))))
+                if job.retry_count < job.max_retries {
+                    let n = job.retry_count + 1;
+                    let delay = self.backoff_base.saturating_mul(2u32.saturating_pow((n - 1) as u32));
+                    let next = failed_at + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::days(365));
+                    conn.execute(
+                        "UPDATE jobs SET status = 'enqueued', error = ?2, retry_count = ?3, next_retry_at = ?4 WHERE id = ?1",
+                        params![job.id, error, n, ts(next)],
+                    )?;
                 } else {
-                    None
-                };
-                conn.execute(
-                    "UPDATE jobs SET status = 'failed', error = ?2, retry_count = ?3, next_retry_at = ?4,
-                        completed_at = CASE WHEN ?4 IS NULL THEN ?5 ELSE NULL END WHERE id = ?1",
-                    params![job.id, error, retry_count, next, finished],
-                )?;
+                    conn.execute(
+                        "UPDATE jobs SET status = 'failed', error = ?2, retry_count = ?3, next_retry_at = NULL, completed_at = ?4 WHERE id = ?1",
+                        params![job.id, error, job.max_retries, finished],
+                    )?;
+                }
                 conn.execute("UPDATE job_runs SET status = 'failed', completed_at = ?2, result = ?3 WHERE id = ?1",
                     params![run_id, finished, json!({ "error": error }).to_string()])?;
             }

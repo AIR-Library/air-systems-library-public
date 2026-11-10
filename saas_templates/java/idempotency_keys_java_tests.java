@@ -44,6 +44,7 @@ public class idempotency_keys_java_tests {
         }
     }
 
+    // IDEM-01
     public static void testFirstCallRunsOperationOnce() {
         TestFixture f = new TestFixture();
         IdempotencyKeys.HttpResponse res = f.service.handle(
@@ -56,6 +57,7 @@ public class idempotency_keys_java_tests {
         assertEquals(1, f.opCount.get());
     }
 
+    // IDEM-02
     public static void testIdenticalRetryReplaysStoredResponse() {
         TestFixture f = new TestFixture();
         IdempotencyKeys.HttpResponse res1 = f.service.handle(
@@ -72,6 +74,7 @@ public class idempotency_keys_java_tests {
         assertEquals(1, f.opCount.get());
     }
 
+    // IDEM-03
     public static void testSameKeyDifferentBodyIs422() {
         TestFixture f = new TestFixture();
         f.service.handle("client-a", "key-1", "POST", "/charges", "{\"amount\":100}", f::nextOp);
@@ -85,6 +88,7 @@ public class idempotency_keys_java_tests {
         assertEquals(1, f.opCount.get());
     }
 
+    // IDEM-04
     public static void testSameKeyWhileInProgressIs409() {
         TestFixture f = new TestFixture();
         AtomicReference<IdempotencyKeys.HttpResponse> innerRes = new AtomicReference<>();
@@ -108,6 +112,7 @@ public class idempotency_keys_java_tests {
         assertEquals(1, f.opCount.get());
     }
 
+    // IDEM-05
     public static void testRequiredMethodWithoutKeyIs400() {
         TestFixture f = new TestFixture();
         IdempotencyKeys.HttpResponse resNull = f.service.handle(
@@ -128,6 +133,7 @@ public class idempotency_keys_java_tests {
         assertEquals(0, f.opCount.get());
     }
 
+    // IDEM-06
     public static void testSameKeyInTwoScopesRunsTwice() {
         TestFixture f = new TestFixture();
         IdempotencyKeys.HttpResponse res1 = f.service.handle(
@@ -145,6 +151,7 @@ public class idempotency_keys_java_tests {
         assertEquals(2, f.opCount.get());
     }
 
+    // IDEM-07
     public static void testExpiredKeyRunsOperationAgain() {
         TestFixture f = new TestFixture();
         f.service.handle("client-a", "key-1", "POST", "/charges", "{\"amount\":100}", f::nextOp);
@@ -160,9 +167,15 @@ public class idempotency_keys_java_tests {
         assertEquals(2, f.opCount.get());
     }
 
+    /**
+     * IDEM-08: an operation that raises OperationFailedException frees the key, so a retry runs it. Changed 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP: it threw a plain RuntimeException, which under the amended spec leaves the key
+     * 'uncertain' (IDEM-10, tested below); a definite failure is now OperationFailedException.
+     */
+    // IDEM-08
     public static void testRaisingOperationFreesTheKey() {
         TestFixture f = new TestFixture();
-        RuntimeException boom = new RuntimeException("Operation failed");
+        RuntimeException boom = new IdempotencyKeys.OperationFailedException("card declined");
         
         try {
             f.service.handle("client-a", "key-1", "POST", "/charges", "{\"amount\":100}", () -> {
@@ -189,6 +202,7 @@ public class idempotency_keys_java_tests {
         assertEquals(1, f.opCount.get());
     }
 
+    // IDEM-09
     public static void testErrorResponsesAreProblemJson() {
         TestFixture f = new TestFixture();
         
@@ -276,6 +290,23 @@ public class idempotency_keys_java_tests {
             @Override
             public int purgeExpired(long now) {
                 return f.store.purgeExpired(now);
+            }
+            // Delegates for the Store methods added 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP).
+            @Override
+            public void markUncertain(String scope, String idemKey, long createdAt) {
+                f.store.markUncertain(scope, idemKey, createdAt);
+            }
+            @Override
+            public boolean release(String scope, String idemKey, long now) {
+                return f.store.release(scope, idemKey, now);
+            }
+            @Override
+            public boolean resolve(String scope, String idemKey, int st, String body, long now, long exp) {
+                return f.store.resolve(scope, idemKey, st, body, now, exp);
+            }
+            @Override
+            public java.util.List<IdempotencyKeys.IdempotencyRecord> listUncertain(int limit, long now) {
+                return f.store.listUncertain(limit, now);
             }
         };
         IdempotencyKeys.IdempotencyOptions opts = new IdempotencyKeys.IdempotencyOptions();
@@ -381,6 +412,130 @@ public class idempotency_keys_java_tests {
         assertFalse(customService.isRequired("POST", "/charges"));
     }
 
+    /** Asserts a 409 outcome_unknown problem response. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+    private static void assertOutcomeUnknown(IdempotencyKeys.HttpResponse r) {
+        assertEquals(409, r.status());
+        assertEquals("application/problem+json", r.contentType());
+        assertTrue(r.body().contains("/outcome_unknown\""));
+    }
+
+    /**
+     * IDEM-07 (second half): an in_progress record past expires_at (a crashed process) is uncertain: a retry gets 409
+     * outcome_unknown and does not run, purge_expired keeps it, list_uncertain shows it. Added 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+     */
+    // IDEM-07
+    public static void testInProgressPastExpiryIsOutcomeUnknown() {
+        TestFixture f = new TestFixture();
+        long t0 = f.clockVal.get();
+        String fp = IdempotencyKeys.computeFingerprint("POST", "/charges", "{\"amount\":100}");
+        // The process that claimed this key died: the row is still in_progress.
+        assertTrue(f.store.tryClaim(new IdempotencyKeys.IdempotencyRecord("client-a", "key-1", fp, "in_progress", null, null, t0, t0 + 86400), t0));
+        f.clockVal.set(t0 + 86400);
+        assertOutcomeUnknown(f.service.handle("client-a", "key-1", "POST", "/charges", "{\"amount\":100}", f::nextOp));
+        assertEquals(0, f.opCount.get());
+        assertEquals(0, f.service.purgeExpired());
+        assertEquals(1, f.service.listUncertain(10).size());
+        assertEquals("key-1", f.service.listUncertain(10).get(0).get("idem_key"));
+        // Before expiry the same row is an ordinary in-progress request.
+        f.clockVal.set(t0 + 10);
+        IdempotencyKeys.HttpResponse during = f.service.handle("client-a", "key-1", "POST", "/charges", "{\"amount\":100}", f::nextOp);
+        assertEquals(409, during.status());
+        assertFalse(during.body().contains("/outcome_unknown"));
+    }
+
+    /**
+     * IDEM-10: any other error leaves the key uncertain: a retry gets 409 outcome_unknown and the operation count stays
+     * at 1; after release() a retry runs it. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+     */
+    // IDEM-10
+    public static void testOtherErrorLeavesKeyUncertainUntilRelease() {
+        TestFixture f = new TestFixture();
+        RuntimeException timeout = new RuntimeException("provider timed out");
+        try {
+            f.service.handle("client-a", "key-1", "POST", "/charges", "{\"amount\":100}", () -> {
+                f.opCount.incrementAndGet();
+                throw timeout;
+            });
+            throw new AssertionError("Expected the error to propagate");
+        } catch (RuntimeException e) {
+            assertTrue(e == timeout);
+        }
+        assertEquals("uncertain", f.store.get("client-a", "key-1").status());
+        assertOutcomeUnknown(f.service.handle("client-a", "key-1", "POST", "/charges", "{\"amount\":100}", f::nextOp));
+        assertEquals(1, f.opCount.get());
+        // Uncertain records never expire.
+        f.clockVal.addAndGet(10 * 86400);
+        assertEquals(0, f.service.purgeExpired());
+        assertOutcomeUnknown(f.service.handle("client-a", "key-1", "POST", "/charges", "{\"amount\":100}", f::nextOp));
+        assertEquals(1, f.opCount.get());
+        assertTrue(f.service.release("client-a", "key-1"));
+        assertFalse(f.service.release("client-a", "key-1"));
+        IdempotencyKeys.HttpResponse rerun = f.service.handle("client-a", "key-1", "POST", "/charges", "{\"amount\":100}", f::nextOp);
+        assertEquals(201, rerun.status());
+        assertEquals(2, f.opCount.get());
+        // release() on a completed key changes nothing.
+        assertFalse(f.service.release("client-a", "key-1"));
+    }
+
+    /**
+     * IDEM-11: resolve() on an uncertain key stores the given response; a retry returns it without running the
+     * operation; a second resolve() or release() returns false. Also: of many concurrent resolve() calls exactly one
+     * returns true. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+     */
+    // IDEM-11
+    public static void testResolveStoresOutcomeOnce() throws Exception {
+        TestFixture f = new TestFixture();
+        try {
+            f.service.handle("client-a", "key-1", "POST", "/charges", "{\"amount\":100}", () -> {
+                throw new IllegalStateException("connection reset");
+            });
+        } catch (IllegalStateException expected) {
+            // the outcome is unknown
+        }
+        assertEquals(1, f.service.listUncertain(10).size());
+        assertTrue(f.service.resolve("client-a", "key-1", 201, "{\"charge\":\"ch_1\"}"));
+        IdempotencyKeys.IdempotencyRecord rec = f.store.get("client-a", "key-1");
+        assertEquals("completed", rec.status());
+        assertEquals(f.clockVal.get() + 86400, rec.expiresAt());
+        IdempotencyKeys.HttpResponse replay = f.service.handle("client-a", "key-1", "POST", "/charges", "{\"amount\":100}", f::nextOp);
+        assertEquals(201, replay.status());
+        assertEquals("{\"charge\":\"ch_1\"}", replay.body());
+        assertEquals(0, f.opCount.get());
+        assertFalse(f.service.resolve("client-a", "key-1", 500, "{}"));
+        assertFalse(f.service.release("client-a", "key-1"));
+        assertEquals(0, f.service.listUncertain(10).size());
+
+        // Concurrent resolve(): exactly one wins.
+        try {
+            f.service.handle("client-a", "key-2", "POST", "/charges", "{}", () -> { throw new RuntimeException("timeout"); });
+        } catch (RuntimeException expected) {
+            // uncertain
+        }
+        int threads = 8;
+        java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
+        AtomicInteger wins = new AtomicInteger();
+        java.util.List<Thread> ts = new java.util.ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            final int n = i;
+            Thread t = new Thread(() -> {
+                try {
+                    start.await();
+                    boolean won = n % 2 == 0 ? f.service.resolve("client-a", "key-2", 201, "{\"n\":" + n + "}")
+                                             : f.service.release("client-a", "key-2");
+                    if (won) wins.incrementAndGet();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            ts.add(t);
+            t.start();
+        }
+        start.countDown();
+        for (Thread t : ts) t.join();
+        assertEquals(1, wins.get());
+    }
+
     public static void main(String[] args) {
         try {
             testFirstCallRunsOperationOnce();
@@ -398,6 +553,9 @@ public class idempotency_keys_java_tests {
             testNoRerunAfterOperationReturned();
             testFingerprintVectors();
             testInputValidationAndPassThrough();
+            testInProgressPastExpiryIsOutcomeUnknown();
+            testOtherErrorLeavesKeyUncertainUntilRelease();
+            testResolveStoresOutcomeOnce();
             System.out.println("All tests passed successfully!");
         } catch (Throwable t) {
             t.printStackTrace();

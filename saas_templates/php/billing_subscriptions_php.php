@@ -50,10 +50,21 @@ interface StripeGateway
     public function createSubscription(array $params): object;
 
     /**
+     * Read a subscription (stripe.subscriptions.retrieve).
+     *
+     * @param string $subscriptionId Stripe subscription id.
+     * @return object With items->data, a list of items that each have an id.
+     *
+     * Why: BILL-03 as amended; changePlan reads the current item id before any update.
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the network (Stripe API) in StripeSdkGateway; reads only.
+     */
+    public function retrieveSubscription(string $subscriptionId): object;
+
+    /**
      * Change a subscription's price.
      *
      * @param string $subscriptionId Stripe subscription id.
-     * @param array  $params         {items: list<{price: string}>}
+     * @param array  $params         {items: list<{id: string, price: string}>, proration_behavior: string}
      * @return object With at least id and current_period_end; proration_details optional.
      *
      * Why: the StripeGateway seam; the SDK version replaces the current item instead of adding a second one. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the network (Stripe API) and real money in StripeSdkGateway.
@@ -89,19 +100,26 @@ final class StripeSdkGateway implements StripeGateway
     }
 
     /**
-     * Calls subscriptions->update. Stripe adds a second item when an item has no id, so an
-     * item given only as {price} replaces the subscription's current first item, with
-     * prorations created.
+     * Calls subscriptions->retrieve.
      *
-     * Why: the StripeGateway seam; the SDK version replaces the current item instead of adding a second one. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the network (Stripe API) and real money in StripeSdkGateway.
+     * Why: BILL-03 as amended (the item id is read in BillingSystem::changePlan, where the
+     * exactly-one-item rule is enforced). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the network (Stripe API); reads only.
+     */
+    public function retrieveSubscription(string $subscriptionId): object
+    {
+        return $this->client->subscriptions->retrieve($subscriptionId);
+    }
+
+    /**
+     * Calls subscriptions->update with $params unchanged. changePlan always sends the current item's
+     * id with the new price (a bare {price} would make Stripe ADD a second item and bill both plans).
+     *
+     * Why: the StripeGateway seam. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: it used to fill in the first
+     * item's id itself, which hid the "exactly one item" rule from changePlan and its tests.
+     * Touches: the network (Stripe API) and real money.
      */
     public function updateSubscription(string $subscriptionId, array $params): object
     {
-        if (isset($params['items'][0]) && !isset($params['items'][0]['id'])) {
-            $current = $this->client->subscriptions->retrieve($subscriptionId);
-            $params['items'][0]['id'] = $current->items->data[0]->id;
-            $params['proration_behavior'] = $params['proration_behavior'] ?? 'create_prorations';
-        }
         return $this->client->subscriptions->update($subscriptionId, $params);
     }
 }
@@ -286,11 +304,17 @@ SQL;
      * @param string $subscriptionId Stripe subscription id (must be in our records).
      * @param string $newTier        solo | team | enterprise.
      * @return array {success, subscription_id, old_tier, new_tier, effective_date, proration_credit}
-     *               or {error: invalid_tier | subscription_not_found | stripe_not_configured | stripe_error, message}
+     *               or {error: invalid_tier (400) | subscription_not_found | stripe_not_configured |
+     *               subscription_item_ambiguous (409) | stripe_error, message}
      *
-     * Why: old_tier now comes from our record (it was Stripe's plan nickname of the *new* plan).
-     * 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches Stripe (changes what the
-     * customer pays), the database and the audit log.
+     * Order (BILL-03 as amended): unknown tier -> invalid_tier; retrieve the subscription; not exactly one
+     * item -> subscription_item_ambiguous; both before any update. Then
+     * update(id, {items: [{id: current_item_id, price}], proration_behavior: 'create_prorations'}).
+     *
+     * Why: old_tier now comes from our record (it was Stripe's plan nickname of the *new* plan);
+     * the item id and the one-item check are 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (a bare {price} adds
+     * a second item and bills both plans). Touches Stripe (changes what the customer pays), the
+     * database and the audit log.
      */
     public static function changePlan(string $subscriptionId, string $newTier): array
     {
@@ -305,8 +329,19 @@ SQL;
             return ['error' => 'stripe_not_configured', 'message' => 'Stripe is not configured'];
         }
         try {
+            $remote = self::$stripe->retrieveSubscription($subscriptionId);
+        } catch (Throwable) {
+            return ['error' => 'stripe_error', 'message' => 'The payment provider rejected the request'];
+        }
+        $items = self::listItems($remote);
+        if (count($items) !== 1 || !is_string($items[0]) || $items[0] === '') {
+            return ['error' => 'subscription_item_ambiguous', 'status' => 409,
+                'message' => 'The subscription does not have exactly one item'];
+        }
+        try {
             $subscription = self::$stripe->updateSubscription($subscriptionId, [
-                'items' => [['price' => self::PRICE_IDS[$newTier]]],
+                'items' => [['id' => $items[0], 'price' => self::PRICE_IDS[$newTier]]],
+                'proration_behavior' => 'create_prorations',
             ]);
         } catch (Throwable) {
             return ['error' => 'stripe_error', 'message' => 'The payment provider rejected the request'];
@@ -552,6 +587,23 @@ SQL;
                 self::auditLog('subscription_cancelled', ['customer_id' => $object->customer]);
                 break;
         }
+    }
+
+    /**
+     * The item ids of a retrieved Stripe subscription, in order (accepts SDK objects, stdClass or arrays).
+     *
+     * Input: the retrieved subscription. Output: list of item ids (null for an item without one).
+     * Why: changePlan's exactly-one-item rule (BILL-03). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+     */
+    private static function listItems(mixed $subscription): array
+    {
+        $items = is_array($subscription) ? ($subscription['items'] ?? null) : ($subscription->items ?? null);
+        $data = is_array($items) ? ($items['data'] ?? []) : ($items->data ?? []);
+        $ids = [];
+        foreach ((is_iterable($data) ? $data : []) as $item) {
+            $ids[] = is_array($item) ? ($item['id'] ?? null) : ($item->id ?? null);
+        }
+        return $ids;
     }
 
     /**

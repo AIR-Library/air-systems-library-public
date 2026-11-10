@@ -13,12 +13,23 @@ import {
 // Mock Stripe
 // ---------------------------------------------------------------------------
 
+/**
+ * Fake Stripe. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: also answers retrieveSubscription (ADMIN-12 reads the
+ * current item first); `items` sets what it returns, by default one item "si_current".
+ */
 class MockStripeClient implements StripeClient {
-  public calls: { subscriptionId: string; params: { items: { price: string }[] } }[] = [];
+  public calls: { subscriptionId: string; params: { items: { id?: string; price: string }[]; proration_behavior?: string } }[] = [];
+  public retrieved: string[] = [];
+  public items: { id: string }[] = [{ id: 'si_current' }];
+
+  async retrieveSubscription(subscriptionId: string): Promise<{ id: string; items: { data: { id: string }[] } }> {
+    this.retrieved.push(subscriptionId);
+    return { id: subscriptionId, items: { data: this.items } };
+  }
 
   async updateSubscription(
     subscriptionId: string,
-    params: { items: { price: string }[] }
+    params: { items: { id?: string; price: string }[]; proration_behavior?: string }
   ): Promise<{ id: string; effective_date: string }> {
     this.calls.push({ subscriptionId, params });
     return { id: subscriptionId, effective_date: new Date().toISOString() };
@@ -530,6 +541,7 @@ describe('AdminSystem', () => {
   // -- USERS DOMAIN ---------------------------------------------------------
 
   describe('createUser', () => {
+    // ADMIN-01
     it('happy path: user created + invite sent', async () => {
       const result = await admin.createUser(ownerCtx, 'valid-csrf-token', {
         email: 'new@example.com',
@@ -548,6 +560,7 @@ describe('AdminSystem', () => {
       expect(email.invites[0].email).toBe('new@example.com');
     });
 
+    // ADMIN-02
     it('duplicate email returns 409 email_exists', async () => {
       await expect(
         admin.createUser(ownerCtx, 'valid-csrf-token', {
@@ -559,6 +572,7 @@ describe('AdminSystem', () => {
       ).rejects.toMatchObject({ code: 'email_exists', status: 409 });
     });
 
+    // ADMIN-03
     it('non-owner returns 403 owner_only', async () => {
       await expect(
         admin.createUser(adminCtx, 'valid-csrf-token', {
@@ -572,6 +586,7 @@ describe('AdminSystem', () => {
   });
 
   describe('resetPassword', () => {
+    // ADMIN-04
     it('happy path: email sent', async () => {
       const result = await admin.resetPassword(ownerCtx, 'valid-csrf-token', { user_id: 2 });
 
@@ -581,6 +596,7 @@ describe('AdminSystem', () => {
       expect(email.resets[0].email).toBe('admin@example.com');
     });
 
+    // ADMIN-05
     it('own account returns 400 cannot_reset_own_password', async () => {
       await expect(
         admin.resetPassword(ownerCtx, 'valid-csrf-token', { user_id: 1 })
@@ -589,6 +605,7 @@ describe('AdminSystem', () => {
   });
 
   describe('changeRole', () => {
+    // ADMIN-06
     it('happy path: role changed + audit logged', async () => {
       const result = await admin.changeRole(ownerCtx, 'valid-csrf-token', { user_id: 2, new_tier: 'enterprise' });
 
@@ -603,9 +620,47 @@ describe('AdminSystem', () => {
         admin.changeRole(ownerCtx, 'valid-csrf-token', { user_id: 1, new_tier: 'basic' })
       ).rejects.toMatchObject({ code: 'cannot_change_own_role', status: 400 });
     });
+
+    /**
+     * ADMIN-07: demoting the last active owner is 400 cannot_demote_last_owner and the tier is unchanged. Set up
+     * as the other languages do: a second owner is added and the acting owner is then suspended, so the second
+     * owner is the only ACTIVE owner. In: the mock pool. Out: assertions only. Why: ADMIN-07 had no test here.
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: fakes only.
+     */
+    // ADMIN-07
+    it('demoting the last active owner returns 400 cannot_demote_last_owner', async () => {
+      const owner2 = pool.seedUser({ email: 'owner2@example.com', name: 'Owner 2', tier: 'enterprise', status: 'active' });
+      await pool.execute("UPDATE users SET status = 'suspended' WHERE id = ?", [1]);
+      await expect(
+        admin.changeRole(ownerCtx, 'valid-csrf-token', { user_id: owner2, new_tier: 'basic' })
+      ).rejects.toMatchObject({ code: 'cannot_demote_last_owner', status: 400 });
+      const [rows] = await pool.execute('SELECT id, tier, status FROM users WHERE id = ?', [owner2]);
+      expect(rows[0].tier).toBe('enterprise');
+    });
+
+    /**
+     * ADMIN-03: the gate reads the caller's tier from the users table: a context that CLAIMS the owner tier for a
+     * basic user is still 403 owner_only, and a wrong CSRF token is 403 csrf_mismatch. In: forged contexts.
+     * Out: assertions only. Why: identity must come from the verified caller, never client-shaped input; the gate
+     * used to trust ctx.tier. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: fakes only.
+     */
+    // ADMIN-03
+    it('a context claiming owner for a basic user is refused; a wrong CSRF token is refused', async () => {
+      const forged: AdminContext = { ...userCtx, tier: 'enterprise' };
+      await expect(
+        admin.changeRole(forged, 'valid-csrf-token', { user_id: 2, new_tier: 'basic' })
+      ).rejects.toMatchObject({ code: 'owner_only', status: 403 });
+      await expect(
+        admin.changeRole(ownerCtx, 'valid-csrf-tokeX', { user_id: 2, new_tier: 'basic' })
+      ).rejects.toMatchObject({ code: 'csrf_mismatch', status: 403 });
+      await expect(
+        admin.changeRole(ownerCtx, '', { user_id: 2, new_tier: 'basic' })
+      ).rejects.toMatchObject({ code: 'csrf_mismatch', status: 403 });
+    });
   });
 
   describe('suspendUser', () => {
+    // ADMIN-08
     it('happy path: user suspended + audit logged', async () => {
       const result = await admin.suspendUser(ownerCtx, 'valid-csrf-token', { user_id: 3, reason: 'abuse' });
 
@@ -613,6 +668,7 @@ describe('AdminSystem', () => {
       expect(pool.getAuditLog().length).toBeGreaterThan(0);
     });
 
+    // ADMIN-09
     it('own account returns 400 cannot_suspend_yourself', async () => {
       await expect(
         admin.suspendUser(ownerCtx, 'valid-csrf-token', { user_id: 1, reason: 'test' })
@@ -623,6 +679,7 @@ describe('AdminSystem', () => {
   // -- CUSTOMERS DOMAIN -----------------------------------------------------
 
   describe('customers', () => {
+    // ADMIN-10
     it('list: pagination works and all fields are present', async () => {
       pool.seedCustomer({ email: 'one@example.com', name: 'One', tier: 'pro' });
       pool.seedCustomer({ email: 'two@example.com', name: 'Two', tier: 'basic' });
@@ -644,6 +701,7 @@ describe('AdminSystem', () => {
       await expect(admin.listCustomers(userCtx, {})).rejects.toBeInstanceOf(AdminError);
     });
 
+    // ADMIN-11
     it('detail: all fields are present', async () => {
       const id = pool.seedCustomer({ email: 'one@example.com', name: 'One', tier: 'pro' });
 
@@ -652,6 +710,7 @@ describe('AdminSystem', () => {
       expect(detail).toMatchObject({ success: true, customer_id: id, email: 'one@example.com', tier: 'pro' });
     });
 
+    // ADMIN-12
     it('changePlan: Stripe is called and the change is audited', async () => {
       const id = pool.seedCustomer({
         email: 'one@example.com', name: 'One', tier: 'basic', stripe_subscription_id: 'sub_123',
@@ -663,9 +722,36 @@ describe('AdminSystem', () => {
       expect(stripe.calls).toHaveLength(1);
       expect(stripe.calls[0].subscriptionId).toBe('sub_123');
       expect(stripe.calls[0].params.items[0].price).toBe('price_pro');
+      // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: ADMIN-12 amendment: the update names the existing item, so
+      // Stripe replaces it instead of adding a second one, and prorates.
+      expect(stripe.calls[0].params).toEqual({ items: [{ id: 'si_current', price: 'price_pro' }], proration_behavior: 'create_prorations' });
       expect(pool.getAuditLog().length).toBeGreaterThan(0);
     });
 
+    /**
+     * ADMIN-12: a subscription with zero or two items is 409 subscription_item_ambiguous and nothing is updated,
+     * in Stripe or in the database; an unknown tier is 400 invalid_tier before Stripe is even read.
+     * In: the fakes. Out: assertions only. Why: ADMIN-12 amendment (same rule as billing change_plan).
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: fakes only.
+     */
+    // ADMIN-12
+    it('changePlan refuses an ambiguous subscription and an unknown tier before any update', async () => {
+      const id = pool.seedCustomer({ email: 'one@example.com', name: 'One', tier: 'basic', stripe_subscription_id: 'sub_123' });
+      await expect(
+        admin.changePlan(ownerCtx, 'valid-csrf-token', id, { new_tier: 'platinum' })
+      ).rejects.toMatchObject({ code: 'invalid_tier', status: 400 });
+      expect(stripe.retrieved).toHaveLength(0);
+      for (const items of [[], [{ id: 'si_a' }, { id: 'si_b' }]]) {
+        stripe.items = items;
+        await expect(
+          admin.changePlan(ownerCtx, 'valid-csrf-token', id, { new_tier: 'pro' })
+        ).rejects.toMatchObject({ code: 'subscription_item_ambiguous', status: 409 });
+      }
+      expect(stripe.calls).toHaveLength(0);
+      expect((await admin.getCustomer(adminCtx, id)).tier).toBe('basic');
+    });
+
+    // ADMIN-13
     it('queueRefund: a refund record is created with status queued', async () => {
       const customerId = pool.seedCustomer({ email: 'one@example.com', name: 'One', tier: 'pro' });
       const invoiceId = pool.seedInvoice({ customer_id: customerId, amount: 100, status: 'succeeded' });
@@ -682,6 +768,7 @@ describe('AdminSystem', () => {
   // -- DEPLOYMENTS DOMAIN ---------------------------------------------------
 
   describe('deployments', () => {
+    // ADMIN-14
     it('createDeployment: the deployment and its config are created', async () => {
       const customerId = pool.seedCustomer({ email: 'one@example.com', name: 'One', tier: 'pro' });
 
@@ -693,6 +780,7 @@ describe('AdminSystem', () => {
       expect(result.deployment_id).toBeDefined();
     });
 
+    // ADMIN-15
     it('publishDeployment: the double gate is checked and the status becomes live', async () => {
       const customerId = pool.seedCustomer({ email: 'one@example.com', name: 'One', tier: 'pro' });
       const id = pool.seedDeployment({
@@ -719,6 +807,7 @@ describe('AdminSystem', () => {
     const seedAction = () =>
       pool.seedGovernanceAction({ action_type: 'refund', actor: 2, target_resource_id: 1, reason: 'requested' });
 
+    // ADMIN-16
     it('approve: the action is executed and its status changes', async () => {
       // suspend_user has a handler, so the test can see the action really run (refund has none). From review.
       const id = pool.seedGovernanceAction({ action_type: 'suspend_user', actor: 2, target_resource_id: 3, reason: 'abuse' });
@@ -730,6 +819,7 @@ describe('AdminSystem', () => {
       expect(target?.status).toBe('suspended');
     });
 
+    // ADMIN-17
     it('reject: the action is rejected and the reason is kept', async () => {
       const id = seedAction();
 
@@ -753,9 +843,13 @@ describe('AdminSystem', () => {
   // -- AUDIT DOMAIN ---------------------------------------------------------
 
   describe('searchAuditLog', () => {
+    // ADMIN-18
     it('applies its filters and pagination', async () => {
       await admin.suspendUser(ownerCtx, 'valid-csrf-token', { user_id: 3, reason: 'abuse' });
-      await admin.changeRole(ownerCtx, 'valid-csrf-token', { user_id: 2, new_tier: 'basic' });
+      // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: changes user 3's role, not user 2's. The gate now reads the
+      // caller's tier from the database, so demoting user 2 (the admin) and then searching AS user 2 is rightly
+      // refused; the old gate trusted the context's stale 'pro'. The filters checked are unchanged.
+      await admin.changeRole(ownerCtx, 'valid-csrf-token', { user_id: 3, new_tier: 'free' });
       const everything = await admin.searchAuditLog(adminCtx, {});
       expect(everything.total).toBeGreaterThanOrEqual(2);
 

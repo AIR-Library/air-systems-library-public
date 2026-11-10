@@ -22,6 +22,7 @@ function assertDetails(d, value, reason, variant, errorCode) {
   assert.strictEqual(d.flag_key, d.flag_key);
 }
 
+// FLAG-01
 test('S1 unknown_flag_returns_default', () => {
   const store = new InMemoryFlagStore();
   const client = new FeatureFlagClient(store);
@@ -33,6 +34,7 @@ test('S1 unknown_flag_returns_default', () => {
   assert.strictEqual(v1, 'fallback');
 });
 
+// FLAG-02
 test('S2 string_method_on_boolean_flag_is_type_mismatch', () => {
   const store = new InMemoryFlagStore();
   const client = new FeatureFlagClient(store, { clock: () => 1767225600 });
@@ -54,6 +56,7 @@ test('S2 string_method_on_boolean_flag_is_type_mismatch', () => {
   assertDetails(d3, 'fallback', 'ERROR', null, 'TYPE_MISMATCH');
 });
 
+// FLAG-03
 test('S3 disabled_flag_returns_caller_default', () => {
   const store = new InMemoryFlagStore();
   const client = new FeatureFlagClient(store, { clock: () => 1767225600 });
@@ -79,6 +82,7 @@ test('S3 disabled_flag_returns_caller_default', () => {
   assert.strictEqual(v2, 1);
 });
 
+// FLAG-04
 test('S4 matching_rule_and_non_matching_rule', () => {
   const store = new InMemoryFlagStore();
   const client = new FeatureFlagClient(store, { clock: () => 1767225600 });
@@ -95,6 +99,7 @@ test('S4 matching_rule_and_non_matching_rule', () => {
   assertDetails(d3, false, 'DEFAULT', null, null);
 });
 
+// FLAG-05
 test('S5 rollout_30_percent_deterministic_and_distributed', () => {
   const store = new InMemoryFlagStore();
   const client = new FeatureFlagClient(store, { clock: () => 1767225600 });
@@ -123,6 +128,7 @@ test('S5 rollout_30_percent_deterministic_and_distributed', () => {
   assertDetails(d2, false, 'DEFAULT', null, null);
 });
 
+// FLAG-06
 test('S6 user_outside_rollout_falls_through', () => {
   const store = new InMemoryFlagStore();
   const client = new FeatureFlagClient(store, { clock: () => 1767225600 });
@@ -142,6 +148,7 @@ test('S6 user_outside_rollout_falls_through', () => {
   assertDetails(d4, 'classic', 'DEFAULT', null, null);
 });
 
+// FLAG-07
 test('S7 corrupt_rules_returns_parse_error', () => {
   const badRules = [
     `[{"conditions": [`,
@@ -187,6 +194,7 @@ test('S7 corrupt_rules_returns_parse_error', () => {
   assert.strictEqual(audits.length, 0);
 });
 
+// FLAG-08
 test('S8 set_flag_writes_audit_rows', () => {
   let clockVal = 1767225600;
   const store = new InMemoryFlagStore();

@@ -76,40 +76,40 @@ interface IndexDocument {
   tokens: string[];
 }
 
-const STOP_WORDS = new Set([
-  "the", "a", "an", "and", "or", "but", "is", "are", "to", "of", "in", "for", "with", "on", "at", "by"
-]);
-
-const EDGE_PUNCTUATION = /^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu;
-
-/** True for the char codes of a-z and 0-9 (text is lowercased first). Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. */
-function isAsciiWordChar(code: number): boolean {
-  return (code >= 97 && code <= 122) || (code >= 48 && code <= 57);
-}
+/** A word: a maximal run of Unicode letters and digits (spec SEARCH-03 amendment). */
+const WORD_RUN = /[\p{L}\p{N}]+/gu;
 
 /**
- * Splits text into search terms, as the spec says: on whitespace, lowercased, common words removed. Punctuation at
- * the very start or end of a word ("hello," "(draft)") is dropped; punctuation inside a word is kept, so
- * "john@example.com" and "stripe-integration-long-name" stay one term each.
- * In: any text. Out: the terms in order (repeats kept).
- * Why: it split on every non-alphanumeric character, so "stripe-integration-long-name" contained the exact term
- * "stripe" and could not rank below the document that is exactly "stripe" (spec TIER_2 system 6, "Tokenization: split
- * on whitespace"; the JavaScript and Go templates do the same). Changed 2026-11-10, session
- * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+ * Splits text into search words as the spec now says: a word is a maximal run of Unicode letters and digits
+ * (\p{L}, \p{N}); everything else separates words; each word is lower-cased with toLowerCase (JavaScript's
+ * locale-independent default); there are no stop words. Queries are split the same way.
+ * In: any text. Out: the words in order (repeats kept). ASCII-only text takes a fast character scan; anything
+ * else uses the Unicode regex, so "café" is one word.
+ * Why: SEARCH-03/09 amendment 2026-11-10 (review on PR 19). The previous rule split on whitespace only and removed
+ * stop words, so "john@example.com" was one term and "the" was unsearchable, unlike the other languages.
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
  */
 export function tokenize(text: string): string[] {
   if (!text) return [];
-  const words = text.toLowerCase().split(/\s+/);
   const result: string[] = [];
-  for (let i = 0; i < words.length; i++) {
-    let w = words[i];
-    if (w.length === 0) continue;
-    // Most words start and end with a-z/0-9; only the others need the Unicode-aware trim.
-    if (!isAsciiWordChar(w.charCodeAt(0)) || !isAsciiWordChar(w.charCodeAt(w.length - 1))) {
-      w = w.replace(EDGE_PUNCTUATION, '');
-    }
-    if (w.length > 0 && !STOP_WORDS.has(w)) {
-      result.push(w);
+  let ascii = true;
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) > 127) { ascii = false; break; }
+  }
+  if (!ascii) {
+    for (const m of text.matchAll(WORD_RUN)) result.push(m[0].toLowerCase());
+    return result;
+  }
+  const lower = text.toLowerCase();
+  let start = -1;
+  for (let i = 0; i <= lower.length; i++) {
+    const c = i < lower.length ? lower.charCodeAt(i) : 32;
+    const word = (c >= 97 && c <= 122) || (c >= 48 && c <= 57);
+    if (word) {
+      if (start < 0) start = i;
+    } else if (start >= 0) {
+      result.push(lower.slice(start, i));
+      start = -1;
     }
   }
   return result;
@@ -204,10 +204,13 @@ function charMask(term: string): number {
   return mask;
 }
 
-/** Relevance of one query word against one term: exact > prefix > contained (spec: "exact match > partial match"). */
+/**
+ * Relevance of one query word against one word: equal > prefix (spec SEARCH-09). A word that only CONTAINS the
+ * query word no longer matches at all (SEARCH-03: "ripe" does not find "stripe"); amended 2026-11-10,
+ * session_012zDydZCZ4AChqhEZ4oVtaP.
+ */
 const SCORE_EXACT = 1.0;
 const SCORE_PREFIX = 0.75;
-const SCORE_CONTAINS = 0.5;
 
 /**
  * Index of `value` in the ascending array `list`, or of where it would go. In: a sorted number array and a number.
@@ -277,9 +280,10 @@ function unionSorted(lists: number[][]): number[] {
 /**
  * In-memory full-text search engine (spec TIER_2 system 6): an inverted index (term -> ascending list of document
  * numbers), a metadata index (field -> value -> list) for filters and facets, and a per-type list.
- * - Matching: every query word must match a term of the document exactly, as a prefix or inside it ("stri" finds
- *   "stripe"). Only the vocabulary groups whose characters could contain a query word are scanned.
- * - Relevance: the mean over query words of the best match in the document (1 exact, 0.75 prefix, 0.5 contained).
+ * - Matching: every query word must equal a word of the document or be a prefix of one ("stri" finds "stripe";
+ *   "ripe" does not). Only the vocabulary groups whose characters could contain a query word are scanned.
+ * - Relevance: the mean over query words of the best match in the document (1 equal, 0.75 prefix).
+ *   (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: words inside other words no longer match, SEARCH-03/09.)
  * - Order: relevance, highest first; ties in the order the documents were (last) indexed, earliest first.
  *   The lists are intersected in one pass that builds no intermediate list; only offset + limit results are kept (a
  *   bounded heap); the total and the facets count every match.
@@ -475,11 +479,9 @@ export class FullTextSearchService {
           const qt = queryTokens[q];
           for (let g = 0; g < group.length; g++) {
             const term = group[g];
-            // One substring test per term; only the few that contain the word are graded.
-            if (term.length < qt.length || !term.includes(qt) || !this.invertedIndex.has(term)) continue;
-            if (term.length === qt.length) matches[q].set(term, SCORE_EXACT);
-            else if (term.startsWith(qt)) matches[q].set(term, SCORE_PREFIX);
-            else matches[q].set(term, SCORE_CONTAINS);
+            // A word matches when it equals the query word or starts with it (never when it only contains it).
+            if (term.length < qt.length || !term.startsWith(qt) || !this.invertedIndex.has(term)) continue;
+            matches[q].set(term, term.length === qt.length ? SCORE_EXACT : SCORE_PREFIX);
           }
         }
       }

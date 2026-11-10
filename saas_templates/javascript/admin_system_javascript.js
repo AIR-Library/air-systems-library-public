@@ -15,7 +15,7 @@
  * (GET /admin/csrf-token hands it to the signed-in page). It is compared in constant time.
  *
  * Outside services sit behind small interfaces so the template runs with no network: `stripe` (anything with
- * `subscriptions.update`, normally the stripe package's client) and `mailer` (anything with `send({to, subject, text})`;
+ * `subscriptions.retrieve` and `subscriptions.update`, normally the stripe package's client) and `mailer` (anything with `send({to, subject, text})`;
  * InMemoryMailer is the fake the tests use).
  *
  * Repair, 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Fifteen of eighteen tests answered 403 because a global
@@ -640,6 +640,9 @@ function createAdminSystem(options = {}) {
   /**
    * POST /admin/customers/:id/action (owner): change_plan (Stripe subscription update) | queue_refund (against
    * a succeeded invoice of this customer, never more than its amount). Out: { success: true, ... } or { error, message }.
+   * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] change_plan follows billing flow 2 (ADMIN-12 amended): 400 invalid_tier,
+   * then stripe.subscriptions.retrieve and 409 subscription_item_ambiguous unless exactly one item, then
+   * update({items: [{id: current_item_id, price}], proration_behavior: 'create_prorations'}).
    * Why: spec endpoint; rebuilt 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP behind the token gate (see module header). Touches: database, Stripe (money).
    */
   app.post('/admin/customers/:id/action', requireOwner, route(async (req) => {
@@ -654,8 +657,17 @@ function createAdminSystem(options = {}) {
       if (!newTier) throw new AdminError(400, 'missing_params', 'new_tier required');
       if (!validateTier(newTier)) throw new AdminError(400, 'invalid_tier', 'Invalid tier');
       if (!stripe) throw new AdminError(503, 'billing_not_configured', 'Billing provider is not configured');
+      // [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] ADMIN-12 / billing flow 2: read the subscription's one item and
+      // update THAT item to the new price. A bare {price} makes Stripe add a second item and bill both plans. Zero or
+      // several items -> 409 subscription_item_ambiguous, before any update.
+      const current = await stripe.subscriptions.retrieve(customer.stripe_subscription_id);
+      const items = current && current.items && Array.isArray(current.items.data) ? current.items.data : [];
+      if (items.length !== 1 || !items[0] || !items[0].id) {
+        throw new AdminError(409, 'subscription_item_ambiguous', 'The subscription must have exactly one item');
+      }
       await stripe.subscriptions.update(customer.stripe_subscription_id, {
-        items: [{ price: priceIds[newTier] }],
+        items: [{ id: items[0].id, price: priceIds[newTier] }],
+        proration_behavior: 'create_prorations',
       });
       await knex.transaction(async (trx) => {
         await trx('customers').where({ id: customerId }).update({ tier: newTier });

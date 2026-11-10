@@ -35,14 +35,22 @@ public class Webhooks {
         }
     }
 
+    /**
+     * One event sent for one org (webhook_messages row). Its id is the webhook-id header on every attempt.
+     *
+     * <p>2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: gained orgId (HOOK-06, spec "send_event(org_id, ...)"),
+     * so a message can only fan out to its own org's endpoints. Touches: memory only.
+     */
     public static class WebhookMessage {
         public final String id;
+        public final String orgId;
         public final String eventType;
         public final String payload;
         public final long createdAt;
 
-        public WebhookMessage(String id, String eventType, String payload, long createdAt) {
+        public WebhookMessage(String id, String orgId, String eventType, String payload, long createdAt) {
             this.id = id;
+            this.orgId = orgId;
             this.eventType = eventType;
             this.payload = payload;
             this.createdAt = createdAt;
@@ -78,7 +86,12 @@ public class Webhooks {
     public interface Storage {
         void createEndpoint(WebhookEndpoint endpoint);
         WebhookEndpoint getEndpoint(String id);
-        List<WebhookEndpoint> listActiveEndpoints(String eventType);
+        /**
+         * Active endpoints of ONE org subscribed to eventType, in creation order.
+         * In: orgId, eventType. Out: matching endpoints. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP:
+         * now scoped by org (HOOK-06; before, every tenant's endpoint got every event). Touches: the store.
+         */
+        List<WebhookEndpoint> listActiveEndpoints(String orgId, String eventType);
         void updateEndpoint(WebhookEndpoint endpoint);
 
         void createMessage(WebhookMessage message);
@@ -93,9 +106,10 @@ public class Webhooks {
     /* ---------- In-Memory Store ---------- */
 
     public static class InMemoryStorage implements Storage {
-        private final ConcurrentMap<String, WebhookEndpoint> endpoints = new ConcurrentHashMap<>();
-        private final ConcurrentMap<String, WebhookMessage> messages = new ConcurrentHashMap<>();
-        private final ConcurrentMap<String, WebhookDelivery> deliveries = new ConcurrentHashMap<>();
+        // LinkedHashMap (synchronized) keeps insertion order, so lists are deterministic (spec: ties by insertion order).
+        private final Map<String, WebhookEndpoint> endpoints = Collections.synchronizedMap(new LinkedHashMap<>());
+        private final Map<String, WebhookMessage> messages = Collections.synchronizedMap(new LinkedHashMap<>());
+        private final Map<String, WebhookDelivery> deliveries = Collections.synchronizedMap(new LinkedHashMap<>());
 
         @Override
         public void createEndpoint(WebhookEndpoint endpoint) {
@@ -108,10 +122,10 @@ public class Webhooks {
         }
 
         @Override
-        public List<WebhookEndpoint> listActiveEndpoints(String eventType) {
+        public synchronized List<WebhookEndpoint> listActiveEndpoints(String orgId, String eventType) {
             List<WebhookEndpoint> result = new ArrayList<>();
-            for (WebhookEndpoint ep : endpoints.values()) {
-                if (ep.active && ep.eventTypes.contains(eventType)) {
+            for (WebhookEndpoint ep : new ArrayList<>(endpoints.values())) {
+                if (ep.active && ep.orgId.equals(orgId) && ep.eventTypes.contains(eventType)) {
                     result.add(ep);
                 }
             }
@@ -149,9 +163,9 @@ public class Webhooks {
         }
 
         @Override
-        public List<WebhookDelivery> listDeliveriesByMessage(String messageId) {
+        public synchronized List<WebhookDelivery> listDeliveriesByMessage(String messageId) {
             List<WebhookDelivery> result = new ArrayList<>();
-            for (WebhookDelivery d : deliveries.values()) {
+            for (WebhookDelivery d : new ArrayList<>(deliveries.values())) {
                 if (d.messageId.equals(messageId)) {
                     result.add(d);
                 }
@@ -179,7 +193,7 @@ public class Webhooks {
         }
 
         @Override
-        public List<WebhookEndpoint> listActiveEndpoints(String eventType) {
+        public List<WebhookEndpoint> listActiveEndpoints(String orgId, String eventType) {
             return Collections.emptyList();
         }
 
@@ -230,10 +244,23 @@ public class Webhooks {
     private final Base64.Decoder base64Decoder = Base64.getDecoder();
 
     private final long[] backoffDelays = new long[]{5, 300, 1800, 7200, 18000, 36000, 36000};
+    private final java.util.function.LongSupplier clock;
 
+    /** Real clock (epoch seconds). */
     public Webhooks(Storage storage, Sender sender) {
+        this(storage, sender, () -> Instant.now().getEpochSecond());
+    }
+
+    /**
+     * Webhooks with an injectable clock.
+     * In: storage, sender (the only way out to the network), clock returning unix seconds.
+     * Why: spec "Deterministic: time comes from an injectable clock"; 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches: nothing until called.
+     */
+    public Webhooks(Storage storage, Sender sender, java.util.function.LongSupplier clock) {
         this.storage = storage;
         this.sender = sender;
+        this.clock = clock;
     }
 
     /* ---------- Public API ---------- */
@@ -245,7 +272,7 @@ public class Webhooks {
         String id = "ep_" + randomHex(8);
         String secret = generateSecret();
         Set<String> eventSet = new HashSet<>(eventTypes);
-        long now = Instant.now().getEpochSecond();
+        long now = clock.getAsLong();
         WebhookEndpoint ep = new WebhookEndpoint(id, orgId, url, secret, eventSet, true, 0, now);
         storage.createEndpoint(ep);
         Map<String, String> result = new HashMap<>();
@@ -254,13 +281,23 @@ public class Webhooks {
         return result;
     }
 
-    public String sendEvent(String eventType, String payload) {
-        String msgId = "msg_" + randomHex(8);
-        long now = Instant.now().getEpochSecond();
-        WebhookMessage msg = new WebhookMessage(msgId, eventType, payload, now);
+    /**
+     * send_event: creates ONE message for orgId and a pending delivery for every active endpoint OF THAT ORG
+     * subscribed to eventType.
+     * In: orgId, eventType, payload (raw JSON body). Out: the message id ("msg_" + 16 random bytes in hex).
+     * Why: HOOK-06 / spec amendment 2026-09-26 (an org's events never reach another org's endpoints);
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the store only (no network; deliver() sends).
+     */
+    public String sendEvent(String orgId, String eventType, String payload) {
+        if (orgId == null || orgId.isEmpty()) {
+            throw new IllegalArgumentException("org_id is required");
+        }
+        String msgId = "msg_" + randomHex(16);
+        long now = clock.getAsLong();
+        WebhookMessage msg = new WebhookMessage(msgId, orgId, eventType, payload, now);
         storage.createMessage(msg);
 
-        List<WebhookEndpoint> endpoints = storage.listActiveEndpoints(eventType);
+        List<WebhookEndpoint> endpoints = storage.listActiveEndpoints(orgId, eventType);
         for (WebhookEndpoint ep : endpoints) {
             String deliveryId = msgId + "_" + ep.id;
             WebhookDelivery delivery = new WebhookDelivery(deliveryId, msgId, ep.id, 1);
@@ -285,6 +322,15 @@ public class Webhooks {
         }
     }
 
+    /**
+     * deliver: POSTs the message to the endpoint through the injected sender, records the status, and on any
+     * non-2xx (or a sender that throws) schedules the next attempt on the 5s, 5m, 30m, 2h, 5h, 10h, 10h ladder.
+     * In: the delivery. Out: none (the delivery row is updated). The webhook-id header is the MESSAGE id on every
+     * attempt (HOOK-07). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: uses the injected clock; a success resets
+     * the endpoint's consecutive-failure count and only a fully-failed message (all retries spent) counts toward
+     * disabling it (spec: "Disable an endpoint after 5 consecutive fully-failed messages"). Touches: network via
+     * the sender, the store.
+     */
     public void deliver(WebhookDelivery delivery) {
         try {
             WebhookMessage msg = storage.getMessage(delivery.messageId);
@@ -292,7 +338,7 @@ public class Webhooks {
             if (msg == null || ep == null) {
                 return;
             }
-            long timestamp = Instant.now().getEpochSecond();
+            long timestamp = clock.getAsLong();
             String signature = sign(ep.secret, msg.id, timestamp, msg.payload);
             Map<String, String> headers = new HashMap<>();
             headers.put("webhook-id", msg.id);
@@ -304,6 +350,10 @@ public class Webhooks {
             if (status >= 200 && status <= 299) {
                 delivery.success = true;
                 delivery.deliveredAt = timestamp;
+                delivery.nextAttemptAt = null;
+                delivery.error = null;
+                ep.failureCount = 0;
+                storage.updateEndpoint(ep);
             } else {
                 delivery.success = false;
                 delivery.error = "HTTP " + status;
@@ -326,8 +376,8 @@ public class Webhooks {
             if (msgId == null || tsStr == null || sigHeader == null) {
                 return false;
             }
-            long ts = Long.parseLong(tsStr);
-            long now = Instant.now().getEpochSecond();
+            long ts = Long.parseLong(tsStr.trim());
+            long now = clock.getAsLong();
             if (Math.abs(now - ts) > toleranceSeconds) {
                 return false;
             }
@@ -376,12 +426,21 @@ public class Webhooks {
         return "whsec_" + base64Encoder.encodeToString(bytes);
     }
 
+    /**
+     * After a failed attempt: schedule retry n (n = attempts so far) after backoffDelays[n-1]; when all seven retries
+     * are spent the message is fully failed (nextAttemptAt null) and the endpoint's consecutive-failure count goes up,
+     * disabling it at 5. In: the delivery. Out: none. Why: spec retry ladder and "5 consecutive fully-failed messages";
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (before, every failed ATTEMPT counted, so one bad message disabled
+     * an endpoint). Touches: the store.
+     */
     private void scheduleRetry(WebhookDelivery delivery) {
-        delivery.attempt += 1;
-        int idx = delivery.attempt - 1;
-        long delay = idx < backoffDelays.length ? backoffDelays[idx] : backoffDelays[backoffDelays.length - 1];
-        long now = Instant.now().getEpochSecond();
-        delivery.nextAttemptAt = now + delay;
+        int failedAttempt = delivery.attempt;
+        if (failedAttempt <= backoffDelays.length) {
+            delivery.attempt = failedAttempt + 1;
+            delivery.nextAttemptAt = clock.getAsLong() + backoffDelays[failedAttempt - 1];
+            return;
+        }
+        delivery.nextAttemptAt = null;
         WebhookEndpoint ep = storage.getEndpoint(delivery.endpointId);
         if (ep != null) {
             ep.failureCount += 1;

@@ -14,23 +14,33 @@ describe('Auth System Tests', () => {
   const ip = '1.2.3.4';
   const device = 'device123';
 
+  // AUTH-01
   test('signup happy path', async () => {
     const res = await signup('user@example.com', 'StrongPassword123456', 'Alice', ip);
     expect(res.success).toBe(true);
     expect(res.status).toBe('pending_verification');
   });
 
+  // AUTH-02
   test('signup duplicate email', async () => {
     await signup('dup@example.com', 'StrongPassword123456', 'Bob', ip);
     const res = await signup('dup@example.com', 'StrongPassword123456', 'Bob', ip);
     expect(res.error).toBe('email_already_exists');
   });
 
+  // AUTH-03
+  // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the spec's code is password_rejected with a reason (was password_too_weak).
   test('signup weak password', async () => {
     const res = await signup('weak@example.com', 'short', 'Carol', ip);
-    expect(res.error).toBe('password_too_weak');
+    expect(res.error).toBe('password_rejected');
+    expect(res.reason).toBe('too_short');
+    // first failure wins: "password123" is too_short, not blocklisted
+    expect((await signup('weak2@example.com', 'password123', 'Carol', ip)).reason).toBe('too_short');
+    expect((await signup('weak3@example.com', 'x'.repeat(65), 'Carol', ip)).reason).toBe('too_long');
+    expect((await signup('weak4@example.com', 'weak4@example.com-padding', 'Carol', ip)).reason).toBe('blocklisted');
   });
 
+  // AUTH-04
   test('signup IP rate limit', async () => {
     for (let i = 0; i < 5; i++) {
       await signup(`rate${i}@example.com`, 'StrongPassword123456', 'Dave', ip);
@@ -39,6 +49,7 @@ describe('Auth System Tests', () => {
     expect(res.error).toBe('too_many_signups_from_ip');
   });
 
+  // AUTH-05
   test('verify_email happy path', async () => {
     const email = 'verify@example.com';
     await signup(email, 'StrongPassword123456', 'Eve', ip);
@@ -50,6 +61,7 @@ describe('Auth System Tests', () => {
     expect(res.status).toBe('verified');
   });
 
+  // AUTH-06
   test('verify_email expired code', async () => {
     const email = 'expire@example.com';
     await signup(email, 'StrongPassword123456', 'Frank', ip);
@@ -61,6 +73,7 @@ describe('Auth System Tests', () => {
     expect(res.error).toBe('code_expired');
   });
 
+  // AUTH-07
   test('login happy path (no MFA)', async () => {
     const email = 'login@example.com';
     await signup(email, 'StrongPassword123456', 'Grace', ip);
@@ -74,6 +87,7 @@ describe('Auth System Tests', () => {
     expect(res.token).toBeDefined();
   });
 
+  // AUTH-08
   test('login with MFA enabled', async () => {
     const email = 'mfa@example.com';
     await signup(email, 'StrongPassword123456', 'Heidi', ip);
@@ -89,6 +103,7 @@ describe('Auth System Tests', () => {
     expect(res.challenge_id).toBeDefined();
   });
 
+  // AUTH-09
   test('login invalid password', async () => {
     const email = 'badpass@example.com';
     await signup(email, 'StrongPassword123456', 'Ivan', ip);
@@ -100,6 +115,7 @@ describe('Auth System Tests', () => {
     expect(res.error).toBe('invalid_credentials');
   });
 
+  // AUTH-10
   test('oauth_callback happy path (new user)', async () => {
     const email = 'oauthnew@example.com';
     const res = await oauth_callback('google', email, 'state123', ip, device);
@@ -108,6 +124,7 @@ describe('Auth System Tests', () => {
     expect(res.user.email).toBe(email);
   });
 
+  // AUTH-11
   test('oauth_callback existing user', async () => {
     const email = 'oauthexist@example.com';
     await signup(email, 'StrongPassword123456', 'Judy', ip);
@@ -121,6 +138,7 @@ describe('Auth System Tests', () => {
     expect(res.user.email).toBe(email);
   });
 
+  // AUTH-12
   test('mfa_challenge happy path', async () => {
     const email = 'mfa2@example.com';
     await signup(email, 'StrongPassword123456', 'Ken', ip);
@@ -139,6 +157,7 @@ describe('Auth System Tests', () => {
     expect(res.token).toBeDefined();
   });
 
+  // AUTH-13
   test('mfa_challenge wrong code', async () => {
     const email = 'mfa3@example.com';
     await signup(email, 'StrongPassword123456', 'Leo', ip);
@@ -154,6 +173,7 @@ describe('Auth System Tests', () => {
     expect(res.error).toBe('invalid_code');
   });
 
+  // AUTH-14
   test('token_refresh happy path', async () => {
     const email = 'refresh@example.com';
     await signup(email, 'StrongPassword123456', 'Mia', ip);
@@ -169,6 +189,7 @@ describe('Auth System Tests', () => {
     expect(res.token).toBeDefined();
   });
 
+  // AUTH-15
   test('token_refresh banned user', async () => {
     const email = 'banned@example.com';
     await signup(email, 'StrongPassword123456', 'Nina', ip);

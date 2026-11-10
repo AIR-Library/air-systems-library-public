@@ -21,6 +21,8 @@ name or in a comment on the line above it (for example `# NOTIF-01`), so a missi
 | `NOTIF-08` | Retry: failed email retries and eventually succeeds |
 | `NOTIF-09` | Unsubscribe: user unsubscribed, future emails skipped |
 | `NOTIF-10` | User preferences honored: channels_enabled respected |
+| `NOTIF-11` | Unsubscribe link: POST with a valid token sets channels_enabled[channel] false; GET changes nothing; a missing, short, non-hex or altered token, or an unknown channel, gets 403 invalid_unsubscribe_token and the user stays subscribed |
+| `NOTIF-12` | Scheduled send: a send 30 days ahead is not sent now; deliver_due sends it once due, exactly once (a second deliver_due sends nothing); a user who unsubscribed meanwhile is skipped; a row stuck at 'sending' over 300 s is re-queued |
 
 ## Contract
 
@@ -32,7 +34,9 @@ Track: sent, opened, clicked, bounced.
 
 SCHEMA:
 notification_templates (key, subject, body_text, body_html, channels_default, variables)
-notification_logs (id, user_id, template_key, channel, vars_used, sent_at, opened_at, clicked_at, bounced, error)
+notification_logs (id, user_id, template_key, channel, vars_used, status, scheduled_at NULL, claimed_at NULL,
+                   sent_at, opened_at, clicked_at, bounced, error)
+- status: 'queued' | 'sending' | 'sent' | 'skipped' | 'failed' (plus 'opened', 'clicked', 'bounced' tracking)
 user_notification_preferences (user_id, do_not_disturb, quiet_hours_start, quiet_hours_end, channels_enabled [JSON])
 
 TEMPLATES (pre-defined, editable):
@@ -75,7 +79,7 @@ ENDPOINTS:
 
 4. Get user preferences
    GET /users/:user_id/notification-preferences
-   Response: { user_id, do_not_disturb: false, quiet_hours_start: '22:00', quiet_hours_end: '08:00', channels_enabled: { email: true, sms: false, in_app: true } }
+   Response: { user_id, do_not_disturb: false, quiet_hours_start: null, quiet_hours_end: null, channels_enabled: { email: true, sms: false, in_app: true } }
 
 5. Update user preferences
    PUT /users/:user_id/notification-preferences
@@ -86,11 +90,38 @@ IMPLEMENTATION:
 - Email: Use SMTP or third-party (Sendgrid, AWS SES)
 - SMS: Use Twilio or AWS SNS
 - In-app: Store in notification_logs, fetch via /notifications endpoint
-- Quiet hours: Check before sending, queue for quiet_hours_end if in quiet hours
+- Quiet hours: Check before sending; in quiet hours the message is stored 'queued' with scheduled_at =
+  quiet_hours_end and sent by deliver_due (below)
 - Do-not-disturb: Skip sending if enabled, log as 'skipped'
 - Templating: Simple variable substitution {variable_name} → value
 - Retry: Email/SMS failures retry 3x with exponential backoff
-- Unsubscribe: Include unsubscribe link in emails (legal requirement)
+- Unsubscribe: Include unsubscribe link in emails (legal requirement). The link is
+  <base_url>/unsubscribe?user_id=<id>&channel=<channel>&token=<token> with
+  token = lowercase hex of HMAC-SHA256(secret, "unsubscribe:" + user_id + ":" + channel), the secret
+  coming from configuration (never hard-coded). The unsubscribe handler recomputes the token and compares
+  it in constant time; a missing or wrong token is refused (403) and changes nothing. An unsigned link lets
+  anyone unsubscribe anyone. Amended 2026-11-10 after review on PR 19.
+  - The service refuses to start with a secret shorter than 32 bytes (an empty key makes a forgeable HMAC).
+  - A token that is not exactly 64 characters of [0-9a-f], an unknown channel, or a mismatch all get the same
+    403 {error: "invalid_unsubscribe_token"}, before any user lookup. (Comparing unequal lengths must not
+    throw: Node's timingSafeEqual does, which would be a 500.)
+  - GET on the link only shows a confirmation; the change happens on POST, so a mail scanner that follows
+    links cannot unsubscribe anyone (RFC 8058 one-click uses POST). Success sets channels_enabled[channel]
+    = false.
+- Default preferences for a user who has set none: do_not_disturb false, no quiet hours, channels_enabled
+  {email: true, sms: false, in_app: true}. SMS is opt-in: it costs money per message and marketing texts
+  need the recipient's prior consent in many countries, so it is never on until the user turns it on.
+- Scheduled sends (scheduled_at in the future) are stored as 'queued' with their scheduled_at and sent by
+  deliver_due(now), never by an in-process timer (lost on restart). deliver_due(now), in order:
+  1. 'sending' rows with claimed_at + 300 s < now go back to 'queued' (a crashed worker);
+  2. 'queued' rows with scheduled_at <= now, by scheduled_at then insertion order, are claimed one by one:
+     UPDATE ... SET status = 'sending', claimed_at = now WHERE id = ? AND status = 'queued' (a row another
+     worker claimed first is skipped);
+  3. preferences are checked NOW, not when the message was queued: unsubscribed, channel off or
+     do-not-disturb -> 'skipped';
+  4. the final write is UPDATE ... WHERE id = ? AND status = 'sending' AND claimed_at = <this claim>.
+  That sends each message exactly once when no worker crashes, and at least once after a crash. A single
+  send must finish in under 300 s. Amended 2026-11-10 after an independent security review.
 
 TESTS:
 - **NOTIF-01** Send email with template variables
@@ -103,4 +134,6 @@ TESTS:
 - **NOTIF-08** Retry: failed email retries and eventually succeeds
 - **NOTIF-09** Unsubscribe: user unsubscribed, future emails skipped
 - **NOTIF-10** User preferences honored: channels_enabled respected
+- **NOTIF-11** Unsubscribe link: POST with a valid token sets channels_enabled[channel] false; GET changes nothing; a missing, short, non-hex or altered token, or an unknown channel, gets 403 invalid_unsubscribe_token and the user stays subscribed
+- **NOTIF-12** Scheduled send: a send 30 days ahead is not sent now; deliver_due sends it once due, exactly once (a second deliver_due sends nothing); a user who unsubscribed meanwhile is skipped; a row stuck at 'sending' over 300 s is re-queued
 ```

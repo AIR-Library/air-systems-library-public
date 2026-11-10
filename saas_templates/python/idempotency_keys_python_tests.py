@@ -4,7 +4,7 @@ import threading
 import pytest
 from idempotency_keys_python import (
     IdempotencyService, IdempotencyOptions, InMemoryStore, SqlStore,
-    IdempotencyError, IdempotencyRecord, Store, compute_fingerprint
+    IdempotencyError, IdempotencyRecord, Store, compute_fingerprint, OperationFailed
 )
 
 T0 = 1700000000
@@ -30,6 +30,22 @@ def make_op():
         return {"status": 201, "body": json.dumps({"n": state["count"]})}
     return op, state
 
+def both_stores():
+    """Yield a fresh InMemoryStore, then a fresh SqlStore on an in-memory SQLite database (usable from threads).
+    2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches memory only."""
+    yield InMemoryStore()
+    yield SqlStore(sqlite3.connect(":memory:", check_same_thread=False))
+
+
+def problem_type(result):
+    """The last path segment of a problem response's type, e.g. "outcome_unknown". 2026-11-10,
+    session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing."""
+    assert result["content_type"] == "application/problem+json"
+    body = json.loads(result["body"])
+    assert set(body) == {"type", "title", "detail"}
+    return body["type"].rsplit("/", 1)[-1]
+
+
 def run_all_stores(test_fn):
     def wrapper():
         # InMemoryStore
@@ -40,6 +56,7 @@ def run_all_stores(test_fn):
         test_fn(store, FakeClock)
     return wrapper
 
+# IDEM-01
 def test_first_call_runs_operation_once():
     for StoreCls in [InMemoryStore, SqlStore]:
         if StoreCls == SqlStore:
@@ -56,6 +73,7 @@ def test_first_call_runs_operation_once():
         assert json.loads(result["body"]) == {"n": 1}
         assert state["count"] == 1
 
+# IDEM-02
 def test_identical_retry_replays_stored_response():
     for StoreCls in [InMemoryStore, SqlStore]:
         if StoreCls == SqlStore:
@@ -72,6 +90,7 @@ def test_identical_retry_replays_stored_response():
         assert json.loads(r2["body"]) == {"n": 1}
         assert state["count"] == 1
 
+# IDEM-03
 def test_same_key_different_body_is_422():
     for StoreCls in [InMemoryStore, SqlStore]:
         if StoreCls == SqlStore:
@@ -93,6 +112,7 @@ def test_same_key_different_body_is_422():
         }
         assert state["count"] == 1
 
+# IDEM-04
 def test_same_key_while_in_progress_is_409():
     for StoreCls in [InMemoryStore, SqlStore]:
         if StoreCls == SqlStore:
@@ -120,6 +140,7 @@ def test_same_key_while_in_progress_is_409():
         assert json.loads(result["body"]) == {"n": 1}
         assert op2_ran["count"] == 1
 
+# IDEM-05
 def test_required_method_without_key_is_400():
     for StoreCls in [InMemoryStore, SqlStore]:
         if StoreCls == SqlStore:
@@ -142,6 +163,7 @@ def test_required_method_without_key_is_400():
         assert r2["status"] == 400
         assert state["count"] == 0
 
+# IDEM-06
 def test_same_key_in_two_scopes_runs_twice():
     for StoreCls in [InMemoryStore, SqlStore]:
         if StoreCls == SqlStore:
@@ -160,6 +182,7 @@ def test_same_key_in_two_scopes_runs_twice():
         assert json.loads(r2["body"]) == {"n": 2}
         assert state["count"] == 2
 
+# IDEM-07
 def test_expired_key_runs_operation_again():
     for StoreCls in [InMemoryStore, SqlStore]:
         if StoreCls == SqlStore:
@@ -177,7 +200,40 @@ def test_expired_key_runs_operation_again():
         assert json.loads(result["body"]) == {"n": 2}
         assert state["count"] == 2
 
+
+# IDEM-07
+def test_in_progress_record_past_expires_at_is_uncertain():
+    """An in_progress record past expires_at (a killed process) gets 409 outcome_unknown and never runs again,
+    is listed for reconciliation, survives purge_expired, and is freed only by release().
+    In: both stores, a record claimed and never finished. Out: assertions. Why: IDEM-07 as amended 2026-11-10.
+    2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches memory only."""
+    for store in both_stores():
+        clock = FakeClock()
+        svc, _, _ = make_service(store, clock)
+        assert store.try_claim(IdempotencyRecord("client-a", "key-1", compute_fingerprint("POST", "/charges", '{"amount":100}'),
+                                                 "in_progress", None, None, T0, T0 + 86400), T0)
+        op, state = make_op()
+        assert svc.handle("client-a", "key-1", "POST", "/charges", '{"amount":100}', op)["status"] == 409
+        assert problem_type(svc.handle("client-a", "key-1", "POST", "/charges", '{"amount":100}', op)) == "idempotency-request-outstanding"
+        assert svc.list_uncertain() == []
+        clock.t = T0 + 86400
+        result = svc.handle("client-a", "key-1", "POST", "/charges", '{"amount":100}', op)
+        assert result["status"] == 409 and problem_type(result) == "outcome_unknown"
+        assert state["count"] == 0
+        assert svc.purge_expired() == 0
+        assert svc.list_uncertain() == [{"scope": "client-a", "idem_key": "key-1", "created_at": T0}]
+        assert svc.release("client-a", "key-1") is True
+        assert svc.handle("client-a", "key-1", "POST", "/charges", '{"amount":100}', op)["status"] == 201
+        assert state["count"] == 1
+
+
+# IDEM-08
+# [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] The operation now raises OperationFailed: under the amended spec only
+# a definite failure frees the key; a plain Exception leaves it 'uncertain' (see the IDEM-10 test).
 def test_raising_operation_frees_the_key():
+    """An operation that raises OperationFailed frees the key; a retry runs once and is then replayed.
+    In: the test fixtures. Out: assertions. Why: IDEM-08. Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: raises OperationFailed (a plain Exception now leaves the key uncertain).
+    Touches: memory and in-memory SQLite."""
     for StoreCls in [InMemoryStore, SqlStore]:
         if StoreCls == SqlStore:
             conn = sqlite3.connect(":memory:")
@@ -186,7 +242,7 @@ def test_raising_operation_frees_the_key():
             store = StoreCls()
         clock = FakeClock()
         svc, _, _ = make_service(store, clock)
-        boom = Exception("boom")
+        boom = OperationFailed("card declined")
         def failing_op():
             raise boom
         with pytest.raises(Exception) as exc_info:
@@ -202,6 +258,99 @@ def test_raising_operation_frees_the_key():
         assert json.loads(result3["body"]) == {"n": 1}
         assert state["count"] == 1
 
+# IDEM-10
+def test_other_error_leaves_key_uncertain_until_release():
+    """An operation that raises anything but OperationFailed leaves the key 'uncertain': the error is re-raised, a
+    retry gets 409 outcome_unknown without running, purge keeps it, and after release() a retry runs.
+    In: both stores. Out: assertions. Why: IDEM-10 (spec amended 2026-11-10).
+    2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches memory only."""
+    for store in both_stores():
+        clock = FakeClock()
+        svc, _, _ = make_service(store, clock)
+        calls = {"n": 0}
+
+        def timeout_op():
+            calls["n"] += 1
+            raise TimeoutError("provider timed out after the charge was sent")
+
+        with pytest.raises(TimeoutError):
+            svc.handle("client-a", "key-1", "POST", "/charges", '{"amount":100}', timeout_op)
+        for _ in range(2):
+            result = svc.handle("client-a", "key-1", "POST", "/charges", '{"amount":100}', timeout_op)
+            assert result["status"] == 409
+            assert problem_type(result) == "outcome_unknown"
+        assert calls["n"] == 1
+        # a different body is still 422 (fingerprint check comes first)
+        assert svc.handle("client-a", "key-1", "POST", "/charges", '{"amount":5}', timeout_op)["status"] == 422
+        clock.t = T0 + 10 * 86400
+        assert svc.purge_expired() == 0
+        assert svc.handle("client-a", "key-1", "POST", "/charges", '{"amount":100}', timeout_op)["status"] == 409
+        assert svc.list_uncertain() == [{"scope": "client-a", "idem_key": "key-1", "created_at": T0}]
+        assert svc.release("client-a", "key-1") is True
+        assert svc.release("client-a", "key-1") is False
+        op, state = make_op()
+        assert svc.handle("client-a", "key-1", "POST", "/charges", '{"amount":100}', op)["status"] == 201
+        assert state["count"] == 1
+        assert svc.release("client-a", "key-1") is False  # completed keys are not released
+
+
+# IDEM-11
+def test_resolve_stores_reconciled_response():
+    """resolve() on an 'uncertain' key stores the response as completed (expires 24 h later); a retry returns it
+    without running; a second resolve() or a release() returns False; resolve() on other keys returns False.
+    In: both stores. Out: assertions. Why: IDEM-11 (spec amended 2026-11-10).
+    2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches memory only."""
+    for store in both_stores():
+        clock = FakeClock()
+        svc, _, _ = make_service(store, clock)
+
+        def crash_op():
+            raise ConnectionError("connection reset")
+
+        with pytest.raises(ConnectionError):
+            svc.handle("client-a", "key-1", "POST", "/charges", '{"amount":100}', crash_op)
+        assert svc.resolve("client-a", "missing", 201, '{"n":7}') is False
+        clock.t = T0 + 100
+        assert svc.resolve("client-a", "key-1", 201, '{"charge":"ch_1"}') is True
+        assert svc.resolve("client-a", "key-1", 201, '{"charge":"ch_2"}') is False
+        assert svc.release("client-a", "key-1") is False
+        op, state = make_op()
+        result = svc.handle("client-a", "key-1", "POST", "/charges", '{"amount":100}', op)
+        assert result == {"status": 201, "content_type": "application/json", "body": '{"charge":"ch_1"}'}
+        assert state["count"] == 0
+        assert store.get("client-a", "key-1").expires_at == T0 + 100 + 86400
+        assert svc.list_uncertain() == []
+
+
+# IDEM-10
+def test_concurrent_release_exactly_one_wins():
+    """Two threads releasing the same uncertain key: exactly one gets True (one conditional write each).
+    In: both stores, 2 threads x 20 rounds. Out: assertions. Why: IDEM-10/11 caller rule (spec amended
+    2026-11-10). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches memory only."""
+    for store in both_stores():
+        clock = FakeClock()
+        svc, _, _ = make_service(store, clock)
+        for i in range(20):
+            key = f"key-{i}"
+            with pytest.raises(RuntimeError):
+                svc.handle("client-a", key, "POST", "/charges", "{}", lambda: (_ for _ in ()).throw(RuntimeError("x")))
+            barrier = threading.Barrier(2)
+            results = []
+
+            def worker(fn):
+                barrier.wait()
+                results.append(fn())
+
+            threads = [threading.Thread(target=worker, args=(lambda: svc.release("client-a", key),)),
+                       threading.Thread(target=worker, args=(lambda: svc.resolve("client-a", key, 200, "{}"),))]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            assert sorted(results) == [False, True]
+
+
+# IDEM-09
 def test_error_responses_are_problem_json():
     for StoreCls in [InMemoryStore, SqlStore]:
         if StoreCls == SqlStore:

@@ -9,19 +9,33 @@ import com.auth0.jwt.algorithms.Algorithm;
 
 public class AuthSystemTests {
 
+    // The token tests sign with this key, so the service must use it (it no longer has a hard-coded one).
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    static final String TEST_JWT_SECRET = "test-only-jwt-secret-0123456789abcdef";
+    static final java.util.List<String> SENT = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+
+    static {
+        System.setProperty("AUTH_JWT_SECRET", TEST_JWT_SECRET);
+    }
+
     @BeforeAll
     public static void setup() {
         // Register dummy OAuth provider
         AuthSystem.OAuthProviderRegistry.register("google", new AuthSystem.DummyOAuthProvider("newuser@example.com"));
+        AuthSystem.setEmailSender((email, code) -> SENT.add(email));
     }
 
+    // AUTH-01
     @Test
     public void testSignupHappyPath() {
         Map<String, Object> res = AuthSystem.signup("john@example.com", "StrongPassword123456", "John", "1.2.3.4");
         assertTrue((Boolean)res.get("success"));
         assertEquals("pending_verification", res.get("status"));
+        // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the row says "email sent" (through the injected sender).
+        assertTrue(SENT.contains("john@example.com"));
     }
 
+    // AUTH-02
     @Test
     public void testSignupDuplicateEmail() {
         AuthSystem.signup("dup@example.com", "StrongPassword123456", "Dup", "1.2.3.4");
@@ -30,14 +44,21 @@ public class AuthSystemTests {
         assertEquals("email_already_exists", res.get("error"));
     }
 
+    // AUTH-03
     @Test
     public void testSignupWeakPassword() {
         Map<String, Object> res = AuthSystem.signup("weak@example.com", "short", "Weak", "1.2.3.6");
         assertFalse((Boolean)res.get("success"));
         assertEquals("password_rejected", res.get("error"));
         assertEquals("too_short", res.get("message"));
+        assertEquals("too_short", res.get("reason"));
+        // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-03 amendment): length is checked before the blocklist.
+        res = AuthSystem.signup("weak2@example.com", "password123", "Weak", "1.2.3.66");
+        assertEquals("password_rejected", res.get("error"));
+        assertEquals("too_short", res.get("reason"));
     }
 
+    // AUTH-04
     @Test
     public void testSignupIpRateLimit() {
         for (int i = 0; i < 5; i++) {
@@ -48,6 +69,7 @@ public class AuthSystemTests {
         assertEquals("too_many_signups_from_ip", res.get("error"));
     }
 
+    // AUTH-05
     @Test
     public void testVerifyEmailHappyPath() {
         Map<String, Object> signup = AuthSystem.signup("verify@example.com", "StrongPassword123456", "Verify", "1.2.3.7");
@@ -57,6 +79,7 @@ public class AuthSystemTests {
         assertEquals("verified", res.get("status"));
     }
 
+    // AUTH-06
     @Test
     public void testVerifyEmailExpiredCode() {
         Map<String, Object> signup = AuthSystem.signup("expire@example.com", "StrongPassword123456", "Expire", "1.2.3.8");
@@ -65,9 +88,12 @@ public class AuthSystemTests {
         expireCode(code);
         Map<String, Object> res = AuthSystem.verifyEmail("expire@example.com", code);
         assertFalse((Boolean)res.get("success"));
-        assertEquals("code_invalid", res.get("error"));
+        // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the spec's AUTH-06 answer is code_expired (it asserted
+        // code_invalid, which the implementation gave for every failure).
+        assertEquals("code_expired", res.get("error"));
     }
 
+    // AUTH-07
     @Test
     public void testLoginHappyPathNoMfa() {
         Map<String, Object> signup = AuthSystem.signup("login@example.com", "StrongPassword123456", "Login", "1.2.3.9");
@@ -79,6 +105,7 @@ public class AuthSystemTests {
         assertNotNull(res.get("token"));
     }
 
+    // AUTH-08
     @Test
     public void testLoginWithMfaEnabled() {
         Map<String, Object> signup = AuthSystem.signup("mfa@example.com", "StrongPassword123456", "MFA", "1.2.3.10");
@@ -91,6 +118,7 @@ public class AuthSystemTests {
         assertNotNull(res.get("challenge_id"));
     }
 
+    // AUTH-09
     @Test
     public void testLoginInvalidPassword() {
         Map<String, Object> signup = AuthSystem.signup("badpass@example.com", "StrongPassword123456", "BadPass", "1.2.3.11");
@@ -101,14 +129,19 @@ public class AuthSystemTests {
         assertEquals("invalid_credentials", res.get("error"));
     }
 
+    // AUTH-10
     @Test
     public void testOauthCallbackHappyPathNewUser() {
         Map<String, Object> res = AuthSystem.oauthCallback("google", "code123", "state123");
         assertTrue((Boolean)res.get("success"));
         assertEquals("authenticated", res.get("status"));
         assertNotNull(res.get("token"));
+        // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: "user created + oauth linked" checked in the database.
+        assertEquals(1, countRows("SELECT COUNT(*) FROM users WHERE email = ?", "newuser@example.com"));
+        assertEquals(1, countRows("SELECT COUNT(*) FROM oauth_links WHERE provider = 'google' AND user_id = (SELECT id FROM users WHERE email = ?)", "newuser@example.com"));
     }
 
+    // AUTH-11
     @Test
     public void testOauthCallbackExistingUser() {
         // Register a provider that returns the existing user's email
@@ -120,8 +153,27 @@ public class AuthSystemTests {
         Map<String, Object> res = AuthSystem.oauthCallback("google_existing", "code123", "state123");
         assertTrue((Boolean)res.get("success"));
         assertEquals("authenticated", res.get("status"));
+        // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: "linked to existing account" checked in the database: still one
+        // user with that email, and the provider link points at it.
+        assertEquals(1, countRows("SELECT COUNT(*) FROM users WHERE email = ?", "existing@example.com"));
+        assertEquals(1, countRows("SELECT COUNT(*) FROM oauth_links WHERE provider = 'google_existing' AND user_id = (SELECT id FROM users WHERE email = ?)", "existing@example.com"));
     }
 
+    /** COUNT(*) of a one-parameter query on the test database. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: reads H2. */
+    private int countRows(String sql, String param) {
+        try (java.sql.Connection conn = java.sql.DriverManager.getConnection("jdbc:h2:mem:authdb;DB_CLOSE_DELAY=-1");
+             java.sql.PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, param);
+            try (java.sql.ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                return rs.getInt(1);
+            }
+        } catch (java.sql.SQLException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    // AUTH-12
     @Test
     public void testMfaChallengeHappyPath() {
         Map<String, Object> signup = AuthSystem.signup("mfa2@example.com", "StrongPassword123456", "MFA2", "1.2.3.13");
@@ -137,6 +189,7 @@ public class AuthSystemTests {
         assertNotNull(res.get("token"));
     }
 
+    // AUTH-13
     @Test
     public void testMfaChallengeWrongCode() {
         Map<String, Object> signup = AuthSystem.signup("mfa3@example.com", "StrongPassword123456", "MFA3", "1.2.3.14");
@@ -150,6 +203,7 @@ public class AuthSystemTests {
         assertEquals("invalid_code", res.get("error"));
     }
 
+    // AUTH-14
     @Test
     public void testTokenRefreshHappyPath() {
         Map<String, Object> signup = AuthSystem.signup("refresh@example.com", "StrongPassword123456", "Refresh", "1.2.3.15");
@@ -164,6 +218,7 @@ public class AuthSystemTests {
         assertNotNull(res.get("token"));
     }
 
+    // AUTH-15
     @Test
     public void testTokenRefreshBannedUser() {
         Map<String, Object> signup = AuthSystem.signup("ban@example.com", "StrongPassword123456", "Ban", "1.2.3.16");
@@ -225,31 +280,37 @@ public class AuthSystemTests {
         assertEquals("user_banned", res.get("error"));
     }
 
+    /**
+     * Blocklisted passwords are rejected with reason "blocklisted". Changed 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-03 amendment: too_short, too_long, blocklisted in that order): the common
+     * password, the name and the service name used here were shorter than 15 characters, so they are now too_short;
+     * the test uses 15+ character values for the blocklist cases and expects too_short for "auth_system".
+     */
     @Test
     public void testPasswordBlocklistRejection() {
         // Test common password rejection
-        Map<String, Object> res = AuthSystem.signup("block1@example.com", "password123456", "Block1", "1.2.3.19");
+        Map<String, Object> res = AuthSystem.signup("block1@example.com", "passwordpassword", "Block1", "1.2.3.19");
         assertFalse((Boolean)res.get("success"));
         assertEquals("password_rejected", res.get("error"));
-        assertEquals("blocklisted", res.get("message"));
+        assertEquals("blocklisted", res.get("reason"));
 
         // Test email as password rejection
         res = AuthSystem.signup("block2@example.com", "block2@example.com", "Block2", "1.2.3.20");
         assertFalse((Boolean)res.get("success"));
         assertEquals("password_rejected", res.get("error"));
-        assertEquals("blocklisted", res.get("message"));
+        assertEquals("blocklisted", res.get("reason"));
 
         // Test name as password rejection
-        res = AuthSystem.signup("block3@example.com", "Block3", "Block3", "1.2.3.21");
+        res = AuthSystem.signup("block3@example.com", "Blocked Name Person", "Blocked Name Person", "1.2.3.21");
         assertFalse((Boolean)res.get("success"));
         assertEquals("password_rejected", res.get("error"));
-        assertEquals("blocklisted", res.get("message"));
+        assertEquals("blocklisted", res.get("reason"));
 
-        // Test service name as password rejection
+        // The service name is shorter than 15 characters, so the first failing check is the length.
         res = AuthSystem.signup("block4@example.com", "auth_system", "Block4", "1.2.3.22");
         assertFalse((Boolean)res.get("success"));
         assertEquals("password_rejected", res.get("error"));
-        assertEquals("blocklisted", res.get("message"));
+        assertEquals("too_short", res.get("reason"));
     }
 
     @Test
@@ -265,6 +326,7 @@ public class AuthSystemTests {
         assertFalse((Boolean)res.get("success"));
         assertEquals("password_rejected", res.get("error"));
         assertEquals("too_long", res.get("message"));
+        assertEquals("too_long", res.get("reason"));
     }
 
     @Test
@@ -365,7 +427,7 @@ public class AuthSystemTests {
 
     private String createExpiredToken(long userId) {
         try {
-            Algorithm alg = Algorithm.HMAC256("secret");
+            Algorithm alg = Algorithm.HMAC256(TEST_JWT_SECRET);
             return JWT.create()
                     .withClaim("user_id", userId)
                     .withClaim("tier", "basic")

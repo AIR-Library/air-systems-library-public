@@ -37,16 +37,19 @@ class FileUploadServiceTest {
         return "MZ".getBytes();
     }
 
+    // UPLOAD-01
     @Test void exeRejected() {
         assertThrows(FileUploadService.UploadException.class, () ->
             service.upload(userId, orgId, "malware.exe", exeBytes(), "application/octet-stream"));
     }
 
+    // UPLOAD-01
     @Test void exeRenamedToPngRejectedByMagic() {
         assertThrows(FileUploadService.UploadException.class, () ->
             service.upload(userId, orgId, "malware.png", exeBytes(), "image/png"));
     }
 
+    // UPLOAD-02
     @Test void realPngAcceptedStoredUnderGeneratedName() throws Exception {
         FileUploadService.UploadResult result = service.upload(userId, orgId, "image.png", pngBytes(), "image/png");
         assertNotNull(result.fileId());
@@ -56,6 +59,7 @@ class FileUploadServiceTest {
         assertArrayEquals(pngBytes(), Files.readAllBytes(stored));
     }
 
+    // UPLOAD-03
     @Test void pathTraversalInFilenameStoredSafely() throws Exception {
         FileUploadService.UploadResult result = service.upload(userId, orgId, "../../etc/passwd.png", pngBytes(), "image/png");
         FileUploadService.FileMeta meta = getMeta(result.fileId());
@@ -64,17 +68,20 @@ class FileUploadServiceTest {
         assertFalse(meta.originalName().contains("/"));
     }
 
+    // UPLOAD-04
     @Test void fileOverSizeLimitRejected() throws Exception {
         byte[] large = new byte[11 * 1024 * 1024];
         assertThrows(FileUploadService.UploadException.class, () ->
             service.upload(userId, orgId, "large.png", large, "image/png"));
     }
 
+    // UPLOAD-05
     @Test void nonMemberCannotUpload() {
         assertThrows(FileUploadService.UploadException.class, () ->
             service.upload(otherUserId, orgId, "test.png", pngBytes(), "image/png"));
     }
 
+    // UPLOAD-05
     @Test void nonMemberCannotDownload() throws Exception {
         FileUploadService.UploadResult result = service.upload(userId, orgId, "test.png", pngBytes(), "image/png");
         FileUploadService.DownloadLink link = service.createDownloadLink(userId, result.fileId(), 300);
@@ -82,6 +89,7 @@ class FileUploadServiceTest {
             service.download(otherUserId, link.token()));
     }
 
+    // UPLOAD-06
     @Test void expiredLinkRejected() throws Exception {
         FileUploadService.UploadResult result = service.upload(userId, orgId, "test.png", pngBytes(), "image/png");
         FileUploadService.DownloadLink link = service.createDownloadLink(userId, result.fileId(), -10);
@@ -97,6 +105,7 @@ class FileUploadServiceTest {
      * this session's runs). It now changes a character five from the end, which always alters the signature.
      * Touches: the test's temporary database and storage.
      */
+    // UPLOAD-06
     @Test void tamperedLinkRejected() throws Exception {
         FileUploadService.UploadResult result = service.upload(userId, orgId, "test.png", pngBytes(), "image/png");
         FileUploadService.DownloadLink link = service.createDownloadLink(userId, result.fileId(), 300);
@@ -115,6 +124,7 @@ class FileUploadServiceTest {
         assertArrayEquals(pngBytes(), downloaded);
     }
 
+    // UPLOAD-07
     @Test void softDeleteWorks() throws Exception {
         FileUploadService.UploadResult result = service.upload(userId, orgId, "test.png", pngBytes(), "image/png");
         FileUploadService.DownloadLink linkBeforeDelete = service.createDownloadLink(userId, result.fileId(), 300);

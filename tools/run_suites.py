@@ -19,6 +19,11 @@ How it works
       BROKEN   a file does not parse: every template is parsed first, with the language's own parser.
     Either one fails the run even when the suite is listed in the baseline. A suite that exits
     cleanly without running a single test is a plain FAIL, not a PASS.
+  * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Every system has a spec in docs/specs/<system>.md whose
+    "Required tests" table lists test ids (e.g. HOOK-01). Owner: "fully working and not missing anything".
+      INCOMPLETE  the tests file never names one of its system's spec ids, so a required test is missing.
+    It fails the run like MISSING and BROKEN, even for a suite listed in the baseline. The suite still runs: a
+    suite that fails keeps FAIL, with the missing ids added to its detail.
 
 Usage
   python tools/run_suites.py --lang python                     # all systems, one language
@@ -50,7 +55,7 @@ EXT = {"python": "py", "javascript": "js", "typescript": "ts", "go": "go", "php"
        "java": "java", "csharp": "cs", "rust": "rs"}
 TIMEOUT = 300
 BUDGET_SECONDS = 75 * 60   # stop starting new suites after this, so the summary and JSON are always written
-NEVER_EXCUSED = {"MISSING", "BROKEN"}   # these fail the run even for a suite listed in the baseline
+NEVER_EXCUSED = {"MISSING", "BROKEN", "INCOMPLETE"}   # these fail the run even for a suite listed in the baseline
 
 # One test = one function the contract names (test*/Test*), used when a framework gives no count.
 TEST_FN = {
@@ -613,6 +618,29 @@ def declared_systems() -> set[str]:
     return set(re.findall(r"^\|\s*([a-z0-9_]+)\s*\|\s*\[[a-z0-9_]+\.md\]", index.read_text(encoding="utf-8"), re.M))
 
 
+def spec_ids(system: str) -> list[str]:
+    """The test ids a system's spec requires, in table order.
+
+    In: a system name. Out: ids such as ["HOOK-01", ...] read from the "| `HOOK-01` | ... |" rows of
+    docs/specs/<system>.md; [] when the system has no spec file (a new system starts without one).
+    Why: owner, 2026-11-10, "fully working and not missing anything": the spec says which tests every
+    language must have, and this is how the runner knows. Written 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    Touches: reads one file."""
+    f = TEMPLATES.parent / "docs" / "specs" / f"{system}.md"
+    if not f.is_file():
+        return []
+    return re.findall(r"^\|\s*`([A-Z]+-\d+)`\s*\|", f.read_text(encoding="utf-8"), re.M)
+
+
+def missing_spec_ids(system: str, tests_code: str) -> list[str]:
+    """The spec ids a tests file never names. In: a system and its tests file's text. Out: the missing ids.
+
+    A test names its id in its name or in a comment next to it (docs/specs/README.md); a whole-word match
+    anywhere in the file counts, so HOOK-1 does not satisfy HOOK-10. Written 2026-11-10,
+    session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing."""
+    return [i for i in spec_ids(system) if not re.search(rf"(?<![A-Z0-9-]){re.escape(i)}(?![0-9])", tests_code)]
+
+
 def systems_for(lang: str) -> list[str]:
     """Every system with an implementation or a tests file, plus every declared system. In: a language. Out: sorted names.
     Both kinds count, so a tests file whose implementation is gone shows as MISSING too (2026-11-05, session f3daac6e).
@@ -631,7 +659,7 @@ def key(lang: str, system: str) -> str:
 
 
 def render_summary(lang: str, res: dict, baseline: set[str], regress: list[str], fixed: list[str]) -> str:
-    icon = {"PASS": "✅", "FAIL": "❌", "MISSING": "⛔", "BROKEN": "⛔"}
+    icon = {"PASS": "✅", "FAIL": "❌", "MISSING": "⛔", "BROKEN": "⛔", "INCOMPLETE": "⛔"}
     rows = ["| system | status | tests | known failing |", "|---|---|---|---|"]
     for system, r in sorted(res.items()):
         rows.append(f"| {system} | {icon.get(r['status'], '❔')} {r['status']} | {r['tests']} | "
@@ -639,7 +667,7 @@ def render_summary(lang: str, res: dict, baseline: set[str], regress: list[str],
     npass = sum(1 for r in res.values() if r["status"] == "PASS")
     out = [f"### {lang}: {npass}/{len(res)} suites pass", "", *rows, ""]
     if regress:
-        out += ["**Regressions (not passing, and either not in the baseline or MISSING/BROKEN, which it cannot "
+        out += ["**Regressions (not passing, and either not in the baseline or MISSING/BROKEN/INCOMPLETE, which it cannot "
                 "excuse):** " + ", ".join(regress), ""]
     if fixed:
         out += ["**Newly passing: remove from `ci/baseline.json` (the run fails until they are removed):** "
@@ -708,6 +736,13 @@ def main() -> int:
                     r = result("FAIL", 0, "exited cleanly without running a single test")
                 if r["status"] == "PASS":
                     break
+            # [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] The suite runs first, so its own result is always
+            # known; a suite whose tests pass but never name a spec id is INCOMPLETE (a required test is missing).
+            gaps = missing_spec_ids(s, tests.read_text(encoding="utf-8", errors="replace"))
+            if gaps:
+                note = f"no test names these spec ids (docs/specs/{s}.md): " + ", ".join(gaps)
+                r = result("INCOMPLETE", r["tests"], note) if r["status"] == "PASS" else \
+                    result(r["status"], r["tests"], note + "\n" + (r["detail"] or ""))
         res[s] = r
         print(f"{s:<28} {r['status']:<8} tests={r['tests']:<3} "
               f"{r['detail'].splitlines()[0][:80] if r['detail'] else ''}", flush=True)
@@ -725,7 +760,7 @@ def main() -> int:
         p = Path(a.update_baseline)
         keep = set(json.loads(p.read_text())["known_failing"]) if p.is_file() else set()
         keep = {k for k in keep if not k.endswith(f"/{a.lang}")}
-        keep |= {key(a.lang, s) for s, r in res.items() if r["status"] == "FAIL"}   # MISSING and BROKEN are never listed
+        keep |= {key(a.lang, s) for s, r in res.items() if r["status"] == "FAIL"}   # MISSING, BROKEN, INCOMPLETE never listed
         p.write_text(json.dumps({"known_failing": sorted(keep)}, indent=2) + "\n")
     print(f"\n{a.lang}: {sum(r['status'] == 'PASS' for r in res.values())}/{len(res)} pass; "
           f"regressions={len(regress)}; newly passing={len(fixed)}")

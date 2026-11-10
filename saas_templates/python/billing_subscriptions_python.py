@@ -153,6 +153,16 @@ class BillingSystem:
         }
 
     def change_plan(self, subscription_id: str, new_tier: str) -> Dict[str, Any]:
+        """Move a subscription to another tier by replacing the price on its one existing item.
+
+        In: the Stripe subscription id and the new tier. Out: {success, subscription_id, old_tier, new_tier,
+        effective_date, proration_credit}, or {error: "invalid_tier"} (400), {error: "subscription_not_found"},
+        {error: "subscription_item_ambiguous"} (409, the subscription does not have exactly one item) or
+        {error: "stripe_error"}. invalid_tier and subscription_item_ambiguous are both decided before any update.
+        Why: BILL-03 as amended 2026-11-10 after review on PR 19: an update with a bare {price} makes Stripe ADD a
+        second item and bill both plans, so the update names the current item id. 2026-11-10,
+        session_012zDydZCZ4AChqhEZ4oVtaP. Touches: Stripe (retrieve + update; money), SQLite (subscriptions,
+        audit_log)."""
         if new_tier not in PRICE_IDS:
             return {"error": "invalid_tier", "message": f"Tier '{new_tier}' is not valid."}
 
@@ -165,9 +175,18 @@ class BillingSystem:
 
         old_tier, old_status = sub_record
         try:
+            current = stripe.Subscription.retrieve(subscription_id)
+        except StripeError as e:
+            return {"error": "stripe_error", "message": str(e)}
+        items = current["items"]["data"]
+        if len(items) != 1:
+            return {"error": "subscription_item_ambiguous",
+                    "message": "The subscription does not have exactly one item; change it by hand."}
+        current_item_id = items[0]["id"]
+        try:
             stripe_sub = stripe.Subscription.modify(
                 subscription_id,
-                items=[{"price": PRICE_IDS[new_tier]}],
+                items=[{"id": current_item_id, "price": PRICE_IDS[new_tier]}],
                 proration_behavior="create_prorations",
             )
         except StripeError as e:

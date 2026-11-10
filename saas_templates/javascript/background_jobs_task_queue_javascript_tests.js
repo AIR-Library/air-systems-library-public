@@ -32,6 +32,7 @@ describe('Background Jobs & Task Queue API', () => {
         db.close();
     });
 
+    // JOBS-01
     test('Enqueue job, worker picks it up, status becomes running', async () => {
         const res = await request(app)
             .post('/jobs/enqueue')
@@ -45,6 +46,7 @@ describe('Background Jobs & Task Queue API', () => {
         expect(['running', 'completed']).toContain(statusRes.body.status);
     });
 
+    // JOBS-02
     test('Job completes, status becomes completed, results available', async () => {
         const res = await request(app)
             .post('/jobs/enqueue')
@@ -60,6 +62,7 @@ describe('Background Jobs & Task Queue API', () => {
         expect(resultsRes.body.result).toHaveProperty('exported', 30);
     });
 
+    // JOBS-03
     test('Job fails, auto-retries with exponential backoff', async () => {
         // Create a task that throws error to trigger retry
         jobManager.db.prepare(`
@@ -87,6 +90,7 @@ describe('Background Jobs & Task Queue API', () => {
         expect(job.retry_count).toBe(2);
     });
 
+    // JOBS-04
     test('Job exceeds max_retries, status becomes failed', async () => {
         // Insert job with max_retries = 1
         const id = 'max-retry-job';
@@ -101,6 +105,71 @@ describe('Background Jobs & Task Queue API', () => {
         expect(job.retry_count).toBe(1);
     });
 
+    /**
+     * JOBS-03: exact backoff. Retry n waits 2^(n-1) s from the failed attempt: retry 1 runs 1 s after the first
+     * failure (not at 999 ms), retry 2 runs 2 s after the second; while it waits the job is 'enqueued' with
+     * retry_count = n and the worker skips it. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec amended).
+     * Touches: the test's in-memory database only.
+     */
+    // JOBS-03
+    test('Retry n waits 2^(n-1) s and the worker skips the job until next_retry_at', async () => {
+        const id = 'backoff-exact';
+        jobManager.db.prepare(`
+            INSERT INTO jobs (id, task_type, params, status, created_at, max_retries, retry_count)
+            VALUES (?, 'nonexistent_task', '{}', 'enqueued', ?, 3, 0)
+        `).run(id, now());
+        const runs = () => jobManager.db.prepare('SELECT COUNT(*) AS n FROM job_runs WHERE job_id = ?').get(id).n;
+
+        await jobManager.tick();
+        const failedAt = clock;
+        let job = jobManager.get(id);
+        expect(runs()).toBe(1);
+        expect(job.status).toBe('enqueued');
+        expect(job.retry_count).toBe(1);
+        expect(Date.parse(job.next_retry_at)).toBe(failedAt + 1000);
+
+        await advanceClock(999);
+        expect(runs()).toBe(1);
+        await advanceClock(1);
+        job = jobManager.get(id);
+        expect(runs()).toBe(2);
+        expect(job.retry_count).toBe(2);
+        expect(Date.parse(job.next_retry_at)).toBe(failedAt + 1000 + 2000);
+
+        await advanceClock(1999);
+        expect(runs()).toBe(2);
+        await advanceClock(1);
+        expect(runs()).toBe(3);
+        expect(jobManager.get(id).retry_count).toBe(3);
+    });
+
+    /**
+     * JOBS-04: max_retries counts retries after the first attempt, so max_retries = 3 runs the job 4 times; after the
+     * 4th failure the status is 'failed' with retry_count = 3 and it never runs again.
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec amended). Touches: the test's in-memory database only.
+     */
+    // JOBS-04
+    test('max_retries = 3 runs the job 4 times, then failed with retry_count = 3', async () => {
+        const id = 'four-runs';
+        jobManager.db.prepare(`
+            INSERT INTO jobs (id, task_type, params, status, created_at, max_retries, retry_count)
+            VALUES (?, 'nonexistent_task', '{}', 'enqueued', ?, 3, 0)
+        `).run(id, now());
+        const runs = () => jobManager.db.prepare('SELECT COUNT(*) AS n FROM job_runs WHERE job_id = ?').get(id).n;
+        await jobManager.tick();
+        await advanceClock(1000 + 2000 + 4000);
+        let job = jobManager.get(id);
+        expect(runs()).toBe(4);
+        expect(job.status).toBe('failed');
+        expect(job.retry_count).toBe(3);
+        await advanceClock(20000);
+        job = jobManager.get(id);
+        expect(runs()).toBe(4);
+        expect(job.status).toBe('failed');
+        expect(job.retry_count).toBe(3);
+    });
+
+    // JOBS-05
     test('User cancels before job starts, status becomes cancelled', async () => {
         const res = await request(app)
             .post('/jobs/enqueue')
@@ -115,6 +184,7 @@ describe('Background Jobs & Task Queue API', () => {
         expect(statusRes.body.status).toBe('cancelled');
     });
 
+    // JOBS-06
     test('Progress tracking updates in real-time', async () => {
         const res = await request(app)
             .post('/jobs/enqueue')
@@ -142,6 +212,7 @@ describe('Background Jobs & Task Queue API', () => {
         expect(updates[14]).toBe('15/15');
     });
 
+    // JOBS-07
     test('Scheduled jobs only run after scheduled_at time', async () => {
         const future = new Date(clock + 5000).toISOString();
         const res = await request(app)
@@ -159,10 +230,12 @@ describe('Background Jobs & Task Queue API', () => {
         expect(['running', 'completed']).toContain(statusRes.body.status);
     });
 
+    // JOBS-08
     test('Bulk job processes many items without blocking request', async () => {
         const res = await request(app)
             .post('/jobs/enqueue')
-            .send({ task_type: 'send_bulk_email', params: { total: 1000 } });
+            // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: JOBS-08 names 10,000 items; this used 1,000.
+            .send({ task_type: 'send_bulk_email', params: { total: 10000 } });
         const jobId = res.body.job_id;
 
         // Immediately after enqueue, request should have returned
@@ -174,8 +247,10 @@ describe('Background Jobs & Task Queue API', () => {
         await advanceClock(8000);
         const statusRes = await request(app).get(`/jobs/${jobId}`);
         expect(statusRes.body.status).toBe('completed');
+        expect(statusRes.body.progress).toBe('10000/10000');
     });
 
+    // JOBS-09
     test('Results available after completion', async () => {
         const res = await request(app)
             .post('/jobs/enqueue')

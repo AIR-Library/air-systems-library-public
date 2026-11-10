@@ -26,6 +26,9 @@ mod tests {
         dir
     }
 
+    /// Changed 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): UPLOAD-01 also needs a plain .exe refused;
+    /// that assertion was added.
+    // UPLOAD-01
     #[test]
     fn test_exe_rejected_by_magic_bytes() {
         let storage_dir = setup_test_dir("exe");
@@ -40,8 +43,11 @@ mod tests {
         let exe_bytes = b"MZ\x90\x00"; // DOS header
         let res = uploader.upload("user1", "org1", "malicious.png", exe_bytes, "image/png");
         assert_eq!(res.err().unwrap(), FileUploadError::InvalidMagicBytes);
+        let res = uploader.upload("user1", "org1", "malicious.exe", exe_bytes, "application/octet-stream");
+        assert_eq!(res.err().unwrap(), FileUploadError::InvalidExtension);
     }
 
+    // UPLOAD-02
     #[test]
     fn test_png_accepted_and_stored_under_generated_name() {
         let storage_dir = setup_test_dir("png");
@@ -79,6 +85,9 @@ mod tests {
         assert_eq!(stored_bytes, png_bytes);
     }
 
+    /// Changed 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): UPLOAD-03 "stored safely" is now asserted
+    /// (the stored file sits directly in the storage directory under a generated name).
+    // UPLOAD-03
     #[test]
     fn test_path_traversal_sanitized() {
         let storage_dir = setup_test_dir("traversal");
@@ -95,8 +104,11 @@ mod tests {
 
         let record = store.get_file(&file_id).unwrap();
         assert_eq!(record.original_name, "etc_passwd.png");
+        assert!(!record.stored_name.contains('/') && !record.stored_name.contains("..") && !record.stored_name.contains("passwd"));
+        assert!(storage_dir.join(&record.stored_name).exists());
     }
 
+    // UPLOAD-04
     #[test]
     fn test_file_over_size_limit_rejected() {
         let storage_dir = setup_test_dir("size");
@@ -117,6 +129,7 @@ mod tests {
     /// amendment 2026-09-26), the member and non-member services share one store (with two separate
     /// stores the non-member could never even find the file, so the membership check was not tested),
     /// and the allowlist is cloned instead of used after a move.
+    // UPLOAD-05
     #[test]
     fn test_non_member_cannot_upload_or_download() {
         let storage_dir = setup_test_dir("nonmember");
@@ -147,6 +160,7 @@ mod tests {
     /// Corrected 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): a manual clock advanced by 2 s replaces
     /// `thread::sleep(2 s)` on the wall clock (rule: no dependence on wall-clock timing); `download`
     /// takes the caller.
+    // UPLOAD-06
     #[test]
     fn test_expired_link_rejected() {
         let storage_dir = setup_test_dir("expired");
@@ -171,6 +185,7 @@ mod tests {
     }
 
     /// Corrected 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): `download` takes the caller.
+    // UPLOAD-06
     #[test]
     fn test_link_with_changed_character_rejected() {
         let storage_dir = setup_test_dir("tampered");
@@ -198,6 +213,7 @@ mod tests {
     /// deleted file, which contradicts the assertion just above it. The "pre-delete link" is now created
     /// before the delete, as its comment intended; the second delete of an already-deleted file is
     /// asserted to fail instead of unwrapped.
+    // UPLOAD-07
     #[test]
     fn test_after_delete_file_can_no_longer_be_linked_or_downloaded() {
         let storage_dir = setup_test_dir("deleted");

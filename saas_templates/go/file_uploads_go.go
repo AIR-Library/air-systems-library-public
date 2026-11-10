@@ -29,12 +29,25 @@ var (
 	ErrStorageError         = errors.New("storage error")
 )
 
+// Config holds the upload settings. Now is the injectable clock used for link expiry; nil means
+// time.Now (added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, so expiry tests need no sleep: spec
+// README "Time comes from an injectable clock"). Touches nothing by itself.
 type Config struct {
 	StorageDir        string
 	MaxFileSize       int64
 	AllowedExtensions map[string]bool
 	HMACKey           []byte
 	DefaultLinkTTL    int
+	Now               func() time.Time
+}
+
+// now returns the configured clock's time, or time.Now when no clock is set.
+// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+func (c Config) now() time.Time {
+	if c.Now != nil {
+		return c.Now()
+	}
+	return time.Now()
 }
 
 func DefaultConfig(storageDir string, hmacKey []byte) Config {
@@ -339,7 +352,7 @@ func (fu *FileUploads) CreateDownloadLink(userID, fileID string, ttlSeconds int)
 		return "", ErrUnauthorized
 	}
 
-	expiresAt := time.Now().Add(time.Duration(ttlSeconds) * time.Second).Unix()
+	expiresAt := fu.config.now().Add(time.Duration(ttlSeconds) * time.Second).Unix()
 	expiresAtStr := strconv.FormatInt(expiresAt, 10)
 	payload := fileID + "." + expiresAtStr
 	sig := hmac.New(sha256.New, fu.config.HMACKey)
@@ -350,7 +363,18 @@ func (fu *FileUploads) CreateDownloadLink(userID, fileID string, ttlSeconds int)
 	return token, nil
 }
 
-func (fu *FileUploads) Download(token string) ([]byte, error) {
+// Download returns a file's bytes for a valid, unexpired signed link, after re-checking that the
+// caller may see the file.
+//
+// In: the verified caller's user id and the link token from CreateDownloadLink. Out: the bytes, or
+// ErrInvalidToken (malformed or wrong signature), ErrTokenExpired, ErrFileNotFound (unknown or deleted),
+// or ErrUnauthorized (the caller is not a member of the file's org).
+// Why: file_uploads spec "download(user, token)": download() re-checks the caller may see the file
+// (UPLOAD-05). Before 2026-11-10 the Go Download took only the token, so anyone holding a link could
+// read the file. The signature is checked (constant time) before the expiry, so a forged token never
+// learns whether its expiry passed. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+// Touches: the files store and the storage directory (reads one file).
+func (fu *FileUploads) Download(userID, token string) ([]byte, error) {
 	decoded, err := base64.RawURLEncoding.DecodeString(token)
 	if err != nil {
 		return nil, ErrInvalidToken
@@ -373,10 +397,6 @@ func (fu *FileUploads) Download(token string) ([]byte, error) {
 		return nil, ErrInvalidToken
 	}
 
-	if time.Now().Unix() > expiresAt {
-		return nil, ErrTokenExpired
-	}
-
 	payload := fileID + "." + expiresAtStr
 	sigExpected := hmac.New(sha256.New, fu.config.HMACKey)
 	sigExpected.Write([]byte(payload))
@@ -386,12 +406,24 @@ func (fu *FileUploads) Download(token string) ([]byte, error) {
 		return nil, ErrInvalidToken
 	}
 
+	if fu.config.now().Unix() > expiresAt {
+		return nil, ErrTokenExpired
+	}
+
 	file, err := fu.store.GetFileByID(fileID)
 	if err != nil {
 		return nil, err
 	}
 	if file.DeletedAt != nil {
 		return nil, ErrFileNotFound
+	}
+
+	isMember, err := fu.store.IsUserMemberOfOrg(userID, file.OrgID)
+	if err != nil {
+		return nil, err
+	}
+	if !isMember {
+		return nil, ErrUnauthorized
 	}
 
 	storagePath := filepath.Join(fu.config.StorageDir, file.StoredName)
@@ -424,30 +456,35 @@ func (fu *FileUploads) DeleteFile(userID, fileID string) error {
 	return nil
 }
 
+// validateMagicBytes checks that a file's leading bytes are the FULL signature for its extension.
+//
+// In: the lower-case extension and the file bytes. Out: nil, or ErrInvalidMagicBytes.
+// Why: file_uploads spec (amended 2026-09-26): PNG 89 50 4E 47 0D 0A 1A 0A, JPEG FF D8 FF, GIF "GIF87a"
+// or "GIF89a", PDF "%PDF-", docx/xlsx 50 4B 03 04; text types must not contain NUL. Go checked 4-byte
+// PNG/GIF/PDF prefixes until 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
 func validateMagicBytes(ext string, data []byte) error {
-	if len(data) < 4 {
-		return ErrInvalidMagicBytes
+	has := func(sig []byte) bool {
+		return len(data) >= len(sig) && bytesEqual(data[:len(sig)], sig)
 	}
-
 	switch ext {
 	case "png":
-		if !bytesEqual(data[:4], []byte{0x89, 0x50, 0x4E, 0x47}) {
+		if !has([]byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}) {
 			return ErrInvalidMagicBytes
 		}
 	case "jpg", "jpeg":
-		if !bytesEqual(data[:3], []byte{0xFF, 0xD8, 0xFF}) {
+		if !has([]byte{0xFF, 0xD8, 0xFF}) {
 			return ErrInvalidMagicBytes
 		}
 	case "gif":
-		if !bytesEqual(data[:4], []byte{0x47, 0x49, 0x46, 0x38}) {
+		if !has([]byte("GIF87a")) && !has([]byte("GIF89a")) {
 			return ErrInvalidMagicBytes
 		}
 	case "pdf":
-		if !bytesEqual(data[:4], []byte{0x25, 0x50, 0x44, 0x46}) {
+		if !has([]byte("%PDF-")) {
 			return ErrInvalidMagicBytes
 		}
 	case "docx", "xlsx":
-		if !bytesEqual(data[:4], []byte{0x50, 0x4B, 0x03, 0x04}) {
+		if !has([]byte{0x50, 0x4B, 0x03, 0x04}) {
 			return ErrInvalidMagicBytes
 		}
 	case "txt", "csv":
@@ -456,6 +493,8 @@ func validateMagicBytes(ext string, data []byte) error {
 				return ErrInvalidMagicBytes
 			}
 		}
+	default:
+		return ErrInvalidExtension
 	}
 	return nil
 }
@@ -503,7 +542,13 @@ func generateID() string {
 	return hex.EncodeToString(b)
 }
 
+// parseInt64 parses a link's decimal expiry. In: the text. Out: the number, or an error for empty,
+// non-digit or over-long input (a malformed link is an ordinary invalid-link error, spec file_uploads).
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: "" used to parse as 0. Touches nothing.
 func parseInt64(s string) (int64, error) {
+	if s == "" || len(s) > 18 {
+		return 0, errors.New("not a number")
+	}
 	var n int64
 	for _, c := range s {
 		if c < '0' || c > '9' {

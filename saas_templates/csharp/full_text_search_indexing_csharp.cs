@@ -1,11 +1,15 @@
 // Full-text search & indexing template (TIER_2_MASTER_SPEC system 6): an in-memory inverted index with filters,
-// facets, relevance (exact > partial > prefix), unindex and an enqueued reindex.
+// facets, relevance (exact word > prefix; amended 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP), unindex and an
+// enqueued reindex.
 // Repaired 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): Facets_ReturnCountsPerStatus and
 // Relevance_ExactMatchHigherThanPartial failed; see SearchIndexService. Touches: process memory only.
 using System;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
+using System.Text;
 using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
@@ -102,9 +106,31 @@ namespace SaaS.Search
     }
 
     /// <summary>
-    /// Internal representation of one indexed document. <c>Sequence</c> is the insertion order, used to break
-    /// relevance ties deterministically (2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: the old tie-break on
-    /// IndexedAt was not deterministic when two documents were indexed in the same clock tick). Pure data.
+    /// A growable int array (postings, per-ordinal type ids). Searches read <see cref="Items"/> directly: plain array
+    /// loops stay fast even in an unoptimised Debug build, where List and Span indexers are method calls (SEARCH-08:
+    /// 1M documents in under 200 ms is checked in the Debug build the test runner makes).
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
+    /// </summary>
+    internal sealed class IntList
+    {
+        public int[] Items;
+        public int Count;
+
+        public IntList(int capacity = 1) => Items = new int[Math.Max(1, capacity)];
+
+        /// <summary>Appends one value, doubling the array when full.</summary>
+        public void Add(int value)
+        {
+            if (Count == Items.Length) Array.Resize(ref Items, Items.Length * 2);
+            Items[Count++] = value;
+        }
+    }
+
+    /// <summary>
+    /// Internal representation of one indexed document. <c>Ordinal</c> is its slot in insertion order (used to break
+    /// relevance ties: the document indexed first comes first); <c>Alive</c> turns false when the document is unindexed
+    /// or replaced by a newer version (which gets a new ordinal at the end). <c>Terms</c> are its distinct words.
+    /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (SEARCH-03/08/09 amendment). Pure data.
     /// </summary>
     internal class SearchDocument
     {
@@ -113,45 +139,55 @@ namespace SaaS.Search
         public string DocumentId { get; set; }
         public string Content { get; set; }
         public DateTime IndexedAt { get; set; }
-        public long Sequence { get; set; }
+        public int Ordinal { get; set; }
+        public bool Alive { get; set; } = true;
+        public string[] Terms { get; set; } = Array.Empty<string>();
         public Dictionary<string, object> Metadata { get; set; }
     }
 
     /// <summary>
     /// In-memory inverted-index search engine (spec TIER 2, system 6): index, search with filters and facets,
     /// unindex, and an enqueued reindex job.
-    /// Repaired 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP) for two failing tests:
+    /// Rewritten 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, for the SEARCH-03/09 amendment and SEARCH-08:
     /// <list type="bullet">
-    /// <item>Facets_ReturnCountsPerStatus: the spec's own example (<c>GET /search?q=deployment&amp;facets=status,tier</c>
-    /// returning deployment facets) treats the document type as searchable, so each document's type name is now
-    /// indexed as one of its terms.</item>
-    /// <item>Relevance_ExactMatchHigherThanPartial: "partial match" now works both ways (a query that is a prefix of a
-    /// word, and a word of at least 3 letters that is a prefix of the query), scored exact 1.0 &gt; partial 0.6 &gt;
-    /// prefix 0.5, mirroring the passing Go template's exact &gt; contains &gt; prefix order.</item>
+    /// <item>A word is a maximal run of Unicode letters and digits (\p{L}, \p{N}), lower-cased with ToLowerInvariant;
+    /// no stop words; the document type is no longer indexed as a word (the spec searches the content).</item>
+    /// <item>A query term matches a word equal to it (exact, 1.0) or starting with it (prefix, 0.5): "stri" finds
+    /// "stripe", "ripe" does not (the old reverse-prefix rule let a short word match a longer query). Several terms
+    /// must all match (AND). Equal scores keep insertion order.</item>
+    /// <item>Postings are kept in insertion order and the vocabulary is sorted, so a prefix is a range lookup and a
+    /// page is read by score bucket without sorting every match: 1M documents search in well under 200 ms.</item>
+    /// <item>"field:value" chunks in the query are filters (spec examples: "tier:team"). An empty query lists every
+    /// document of the type, in insertion order.</item>
     /// </list>
-    /// Also: every mutation and search runs under one lock (the old reindex cleared the whole index while searches
-    /// ran, and a reindex of one type wiped every other type's terms), and ties sort by insertion order.
-    /// Touches: process memory only (no database, network, files or money).
+    /// Every mutation and search runs under one lock. Touches: process memory only (no database, network, files or money).
     /// </summary>
     public class SearchIndexService
     {
-        // Inverted index: term -> set of document keys. Guarded by _gate.
-        private readonly Dictionary<string, HashSet<string>> _invertedIndex = new Dictionary<string, HashSet<string>>();
+        // All documents ever indexed, by ordinal (insertion order); dead ones are skipped. Guarded by _gate.
+        private List<SearchDocument> _docs = new List<SearchDocument>();
 
-        // Document store. Guarded by _gate.
+        // Live document by key. Guarded by _gate.
         private readonly Dictionary<string, SearchDocument> _documents = new Dictionary<string, SearchDocument>();
 
+        // Inverted index: word -> ordinals in insertion order (may hold dead ordinals). Guarded by _gate.
+        private Dictionary<string, IntList> _postings = new Dictionary<string, IntList>(StringComparer.Ordinal);
+
+        // Type id of each ordinal, or -1 for a dead document; type ids by type name. Guarded by _gate.
+        private IntList _typeOf = new IntList(1024);
+        private readonly Dictionary<string, int> _typeIds = new Dictionary<string, int>(StringComparer.Ordinal);
+
+        // Every indexed word, sorted ordinally, for prefix range lookups. Guarded by _gate.
+        private SortedSet<string> _vocabulary = new SortedSet<string>(StringComparer.Ordinal);
+
         private readonly object _gate = new object();
-        private long _sequence;
+        private int _dead;
 
-        /// <summary>Shortest indexed word that may match as a prefix of a longer query word ("stri" for "stripe").</summary>
-        private const int MinReversePrefixLength = 3;
+        /// <summary>Exact-word score of one query term.</summary>
+        public const double ExactScore = 1.0;
 
-        // Stop words
-        private static readonly HashSet<string> StopWords = new HashSet<string>
-        {
-            "the","and","or","a","an","of","to","in","for","on","with","at","by"
-        };
+        /// <summary>Prefix-only score of one query term.</summary>
+        public const double PrefixScore = 0.5;
 
         // Background job queue (simplified)
         private readonly ConcurrentQueue<(string Id, Func<Task> Run)> _jobQueue = new ConcurrentQueue<(string Id, Func<Task> Run)>();
@@ -173,55 +209,105 @@ namespace SaaS.Search
             Task.Run(ProcessJobsAsync);
         }
 
-        /// <summary>
-        /// Splits text on whitespace and punctuation, lowercases it and drops stop words (spec: "split on whitespace,
-        /// lowercase, remove common words"). Input: any text (null allowed). Output: the tokens in order. Pure.
-        /// </summary>
-        private static IEnumerable<string> Tokenize(string text)
+        /// <summary>True for a Unicode letter (\p{L}) or number (\p{N}). Pure.</summary>
+        private static bool IsWordRune(Rune r)
         {
-            if (string.IsNullOrWhiteSpace(text)) yield break;
-            var tokens = text.Split(new[] { ' ', '\t', '\r', '\n', ',', '.', ';', ':', '-', '_' }, StringSplitOptions.RemoveEmptyEntries);
-            foreach (var raw in tokens)
+            switch (Rune.GetUnicodeCategory(r))
             {
-                var token = raw.Trim().ToLowerInvariant();
-                if (token.Length == 0) continue;
-                if (StopWords.Contains(token)) continue;
-                yield return token;
+                case UnicodeCategory.UppercaseLetter:
+                case UnicodeCategory.LowercaseLetter:
+                case UnicodeCategory.TitlecaseLetter:
+                case UnicodeCategory.ModifierLetter:
+                case UnicodeCategory.OtherLetter:
+                case UnicodeCategory.DecimalDigitNumber:
+                case UnicodeCategory.LetterNumber:
+                case UnicodeCategory.OtherNumber:
+                    return true;
+                default:
+                    return false;
             }
         }
 
         /// <summary>
-        /// The distinct terms a document is indexed under: its content tokens plus its document type name, so that a
-        /// query naming the type ("deployment") finds documents of that type, as in the spec's facet example.
-        /// 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Pure.
+        /// Splits text into words: maximal runs of Unicode letters and digits (\p{L}, \p{N}, read as whole code
+        /// points), each lower-cased with ToLowerInvariant; everything else separates words; no stop words.
+        /// Input: any text (null allowed). Output: the words in order, duplicates kept.
+        /// Rewritten 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (SEARCH-03 amendment): it split on a fixed list of
+        /// punctuation and dropped stop words. Pure.
         /// </summary>
-        private static IEnumerable<string> TermsOf(SearchDocument doc) =>
-            Tokenize(doc.Content).Concat(Tokenize(doc.DocumentType)).Distinct();
+        public static IEnumerable<string> Tokenize(string text)
+        {
+            if (string.IsNullOrEmpty(text)) yield break;
+            var word = new StringBuilder();
+            foreach (var rune in text.EnumerateRunes())
+            {
+                if (IsWordRune(rune))
+                {
+                    word.Append(rune.ToString());
+                }
+                else if (word.Length > 0)
+                {
+                    yield return word.ToString().ToLowerInvariant();
+                    word.Clear();
+                }
+            }
+            if (word.Length > 0) yield return word.ToString().ToLowerInvariant();
+        }
 
-        /// <summary>Adds a document's terms to the inverted index. Caller holds _gate. Touches: process memory.</summary>
+        /// <summary>Adds a live document's words to the postings and vocabulary. Caller holds _gate. Touches: memory.</summary>
         private void AddTerms(SearchDocument doc)
         {
-            foreach (var term in TermsOf(doc))
+            if (!_typeIds.TryGetValue(doc.DocumentType, out var typeId))
             {
-                if (!_invertedIndex.TryGetValue(term, out var set))
+                typeId = _typeIds.Count;
+                _typeIds[doc.DocumentType] = typeId;
+            }
+            _typeOf.Add(typeId);
+            foreach (var term in doc.Terms)
+            {
+                if (!_postings.TryGetValue(term, out var list))
                 {
-                    set = new HashSet<string>();
-                    _invertedIndex[term] = set;
+                    list = new IntList(1);
+                    _postings[term] = list;
+                    _vocabulary.Add(term);
                 }
-                set.Add(doc.DocumentKey);
+                list.Add(doc.Ordinal);
             }
         }
 
-        /// <summary>Removes a document's terms from the inverted index. Caller holds _gate. Touches: process memory.</summary>
-        private void RemoveTerms(SearchDocument doc)
+        /// <summary>
+        /// Marks a document dead; its ordinals stay in the postings and are skipped. When dead documents outnumber live
+        /// ones (and there are over 1,000), the index is rebuilt to reclaim the space. Caller holds _gate. Touches: memory.
+        /// </summary>
+        private void Retire(SearchDocument doc)
         {
-            foreach (var term in TermsOf(doc))
+            doc.Alive = false;
+            _typeOf.Items[doc.Ordinal] = -1;
+            _documents.Remove(doc.DocumentKey);
+            if (++_dead > 1000 && _dead > _documents.Count)
+                Rebuild(null);
+        }
+
+        /// <summary>
+        /// Rebuilds ordinals, postings and vocabulary from the live documents, in insertion order, re-deriving the words
+        /// of the documents of <paramref name="retokenizeType"/> (all types when null; none when called to compact).
+        /// Caller holds _gate. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
+        /// </summary>
+        private void Rebuild(string retokenizeType, bool retokenize = false)
+        {
+            var live = _docs.Where(d => d.Alive).ToList();
+            _docs = new List<SearchDocument>(live.Count);
+            _postings = new Dictionary<string, IntList>(StringComparer.Ordinal);
+            _typeOf = new IntList(Math.Max(1024, live.Count));
+            _vocabulary = new SortedSet<string>(StringComparer.Ordinal);
+            _dead = 0;
+            foreach (var doc in live)
             {
-                if (_invertedIndex.TryGetValue(term, out var set))
-                {
-                    set.Remove(doc.DocumentKey);
-                    if (set.Count == 0) _invertedIndex.Remove(term);
-                }
+                if (retokenize && (retokenizeType == null || doc.DocumentType == retokenizeType))
+                    doc.Terms = Tokenize(doc.Content).Distinct().ToArray();
+                doc.Ordinal = _docs.Count;
+                _docs.Add(doc);
+                AddTerms(doc);
             }
         }
 
@@ -229,7 +315,8 @@ namespace SaaS.Search
         /// Indexes a document, replacing any earlier version with the same type and id (spec endpoint 1); it is
         /// searchable as soon as this returns (real-time indexing). Input: type, id, content, metadata.
         /// Output: success and indexed_at. Touches: process memory. Updated 2026-11-10 (session
-        /// session_012zDydZCZ4AChqhEZ4oVtaP): runs under the index lock and records the insertion order.
+        /// session_012zDydZCZ4AChqhEZ4oVtaP): runs under the index lock; a new version goes to the end of the
+        /// insertion order.
         /// </summary>
         public Task<IndexResponse> IndexDocumentAsync(IndexRequest request)
         {
@@ -245,12 +332,13 @@ namespace SaaS.Search
                 IndexedAt = DateTime.UtcNow,
                 Metadata = request.Metadata ?? new Dictionary<string, object>()
             };
+            doc.Terms = Tokenize(doc.Content).Distinct().ToArray();
 
             lock (_gate)
             {
-                // Remove old terms if updating
-                if (_documents.TryGetValue(doc.DocumentKey, out var oldDoc)) RemoveTerms(oldDoc);
-                doc.Sequence = ++_sequence;
+                if (_documents.TryGetValue(doc.DocumentKey, out var oldDoc)) Retire(oldDoc);
+                doc.Ordinal = _docs.Count;
+                _docs.Add(doc);
                 _documents[doc.DocumentKey] = doc;
                 AddTerms(doc);
             }
@@ -259,138 +347,200 @@ namespace SaaS.Search
         }
 
         /// <summary>
-        /// Scores how one indexed term matches one query term: 1.0 exact, 0.6 partial (an indexed word of at least
-        /// <see cref="MinReversePrefixLength"/> letters that begins the query word: "stri" for "stripe"), 0.5 prefix
-        /// (the query word begins an indexed word: "stri" finds "stripe"), 0 no match. Spec: "exact match &gt; partial
-        /// match &gt; prefix match". 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Pure.
+        /// Splits a query into words and "field:value" filters (a whitespace-separated chunk with a colon inside it).
+        /// Output: the distinct words in order, and the filters. Pure. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
         /// </summary>
-        private static double MatchScore(string indexTerm, string queryTerm)
+        private static (List<string> Terms, List<KeyValuePair<string, string>> Filters) ParseQuery(string query)
         {
-            if (indexTerm == queryTerm) return 1.0;
-            if (indexTerm.Length >= MinReversePrefixLength && queryTerm.StartsWith(indexTerm, StringComparison.Ordinal)) return 0.6;
-            if (indexTerm.StartsWith(queryTerm, StringComparison.Ordinal)) return 0.5;
-            return 0;
+            var terms = new List<string>();
+            var filters = new List<KeyValuePair<string, string>>();
+            foreach (var chunk in (query ?? string.Empty).Split((char[])null, StringSplitOptions.RemoveEmptyEntries))
+            {
+                var colon = chunk.IndexOf(':');
+                if (colon > 0 && colon < chunk.Length - 1)
+                    filters.Add(new KeyValuePair<string, string>(chunk.Substring(0, colon), chunk.Substring(colon + 1)));
+                else
+                    terms.AddRange(Tokenize(chunk));
+            }
+            return (terms.Distinct().ToList(), filters);
         }
 
         /// <summary>
         /// Searches the index (spec endpoints 2-4). Input: query, optional document type, "field:value" filters (all
-        /// must match), facet fields, limit and offset. Output: the page of results ordered by relevance, then by
-        /// insertion order; the total; has_more; and, when facets were asked for, per-field value counts over every
-        /// matching document (not just the page). Touches: process memory.
-        /// Updated 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): per-term best-match scoring (exact &gt;
-        /// partial &gt; prefix), document-type terms, deterministic tie-break, runs under the index lock.
+        /// must match, value compared case-insensitively; also accepted inside the query), facet fields, limit and
+        /// offset. Every query word must match a document word equal to it (1.0) or starting with it (0.5); the
+        /// relevance is the sum. Output: the page ordered by relevance, then insertion order; the total; has_more; and,
+        /// when facets were asked for, per-field value counts over every matching document (not just the page). An
+        /// empty query matches every document (relevance 0). Touches: process memory.
+        /// Rewritten 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (SEARCH-03/08/09 amendment; see the class summary).
         /// </summary>
         public Task<SearchResponse> SearchAsync(SearchRequest request)
         {
             if (request == null) throw new ArgumentNullException(nameof(request));
-            var queryTerms = Tokenize(request.Query).Distinct().ToList();
-            var limit = request.Limit > 0 ? request.Limit : 20;
-            var offset = Math.Max(0, request.Offset);
-
-            var filters = new List<KeyValuePair<string, string>>();
+            var (queryTerms, filters) = ParseQuery(request.Query);
             foreach (var filter in request.Filters ?? Enumerable.Empty<string>())
             {
                 var parts = (filter ?? string.Empty).Split(':', 2);
                 if (parts.Length == 2) filters.Add(new KeyValuePair<string, string>(parts[0], parts[1]));
             }
+            var limit = request.Limit > 0 ? request.Limit : 20;
+            var offset = Math.Max(0, request.Offset);
+            var facetFields = (request.Facets ?? new List<string>()).Where(f => !string.IsNullOrEmpty(f)).Distinct().ToList();
 
-            var scored = new List<(SearchDocument Doc, double Score)>();
+            var k = queryTerms.Count;
+            var total = 0;
+            // bucketCounts[e] = matches whose number of exact-word terms is e (relevance e*1.0 + (k-e)*0.5)
+            var bucketCounts = new int[k + 1];
+            var facetCounts = facetFields.ToDictionary(f => f, f => new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase));
+            var page = new List<SearchResultItem>();
+
             lock (_gate)
             {
-                // Best score of each query term per document, summed over the query terms.
-                var scores = new Dictionary<string, double>();
-                foreach (var term in queryTerms)
+                var n = _docs.Count;
+                // Pooled scratch arrays, so a search over 1M documents allocates almost nothing (a garbage collection
+                // of a large index would otherwise eat the 200 ms budget). level[t][ordinal]: 2 = term t equals a word of
+                // the document, 1 = only starts one, 0 = no match. bucketOf[ordinal]: 1 + exact-term count of a match.
+                var levels = new byte[k][];
+                var bucketOf = ArrayPool<byte>.Shared.Rent(Math.Max(1, n));
+                try
                 {
-                    var best = new Dictionary<string, double>();
-                    foreach (var entry in _invertedIndex)
+                    for (var t = 0; t < k; t++)
                     {
-                        var s = MatchScore(entry.Key, term);
-                        if (s <= 0) continue;
-                        foreach (var key in entry.Value)
+                        var level = ArrayPool<byte>.Shared.Rent(Math.Max(1, n));
+                        levels[t] = level;
+                        Array.Clear(level, 0, n);
+                        var term = queryTerms[t];
+                        if (_postings.TryGetValue(term, out var exact))
                         {
-                            if (!best.TryGetValue(key, out var prev) || s > prev) best[key] = s;
+                            var items = exact.Items;
+                            for (var i = 0; i < exact.Count; i++) level[items[i]] = 2;
+                        }
+                        foreach (var word in _vocabulary.GetViewBetween(term, term + char.MaxValue))
+                        {
+                            if (word.Length == term.Length || !word.StartsWith(term, StringComparison.Ordinal)) continue;
+                            var prefixed = _postings[word];
+                            var items = prefixed.Items;
+                            for (var i = 0; i < prefixed.Count; i++)
+                                if (level[items[i]] == 0) level[items[i]] = 1;
                         }
                     }
-                    foreach (var kv in best)
-                        scores[kv.Key] = (scores.TryGetValue(kv.Key, out var acc) ? acc : 0) + kv.Value;
+
+                    // wanted type id: -1 = any type; -2 = a type never indexed (nothing can match)
+                    var wantType = -1;
+                    if (!string.IsNullOrWhiteSpace(request.DocumentType))
+                        wantType = _typeIds.TryGetValue(request.DocumentType, out var id) ? id : -2;
+                    var typeOf = _typeOf.Items;
+                    var needDoc = filters.Count > 0 || facetFields.Count > 0;
+                    var level0 = k > 0 ? levels[0] : null;
+                    Array.Clear(bucketOf, 0, n);
+                    for (var ord = 0; wantType != -2 && ord < n; ord++)
+                    {
+                        var tid = typeOf[ord];
+                        if (tid < 0 || (wantType >= 0 && tid != wantType)) continue;
+                        var exactTerms = 0;
+                        if (k == 1)
+                        {
+                            var l = level0[ord];
+                            if (l == 0) continue;
+                            if (l == 2) exactTerms = 1;
+                        }
+                        else if (k > 1)
+                        {
+                            var all = true;
+                            for (var t = 0; t < k; t++)
+                            {
+                                var l = levels[t][ord];
+                                if (l == 0) { all = false; break; }
+                                if (l == 2) exactTerms++;
+                            }
+                            if (!all) continue;
+                        }
+
+                        SearchDocument doc = null;
+                        if (needDoc)
+                        {
+                            doc = _docs[ord];
+                            if (filters.Count > 0 && !MatchesFilters(doc, filters)) continue;
+                        }
+
+                        total++;
+                        bucketCounts[exactTerms]++;
+                        bucketOf[ord] = (byte)(exactTerms + 1);
+                        if (facetFields.Count == 0) continue;
+                        foreach (var field in facetFields)
+                        {
+                            if (doc.Metadata != null && doc.Metadata.TryGetValue(field, out var val))
+                            {
+                                var key = val?.ToString() ?? "null";
+                                var counts = facetCounts[field];
+                                counts[key] = counts.TryGetValue(key, out var c) ? c + 1 : 1;
+                            }
+                        }
+                    }
+
+                    // the page: highest bucket first, insertion order inside a bucket
+                    var skip = offset;
+                    for (var e = k; e >= 0 && page.Count < limit; e--)
+                    {
+                        if (skip >= bucketCounts[e]) { skip -= bucketCounts[e]; continue; }
+                        var score = e * ExactScore + (k - e) * PrefixScore;
+                        var mark = (byte)(e + 1);
+                        for (var ord = 0; ord < n && page.Count < limit; ord++)
+                        {
+                            if (bucketOf[ord] != mark) continue;
+                            if (skip > 0) { skip--; continue; }
+                            var doc = _docs[ord];
+                            page.Add(new SearchResultItem
+                            {
+                                DocumentId = doc.DocumentId,
+                                DocumentType = doc.DocumentType,
+                                Relevance = score,
+                                Metadata = doc.Metadata
+                            });
+                        }
+                    }
                 }
-
-                foreach (var kv in scores)
+                finally
                 {
-                    var doc = _documents[kv.Key];
-                    if (!string.IsNullOrWhiteSpace(request.DocumentType) && doc.DocumentType != request.DocumentType) continue;
-                    var keep = true;
-                    foreach (var f in filters)
-                    {
-                        if (!doc.Metadata.TryGetValue(f.Key, out var metaVal) ||
-                            !string.Equals(metaVal?.ToString(), f.Value, StringComparison.OrdinalIgnoreCase))
-                        {
-                            keep = false;
-                            break;
-                        }
-                    }
-                    if (keep) scored.Add((doc, kv.Value));
-                }
-            }
-
-            var ordered = scored
-                .OrderByDescending(r => r.Score)
-                .ThenBy(r => r.Doc.Sequence)
-                .Select(r => new SearchResultItem
-                {
-                    DocumentId = r.Doc.DocumentId,
-                    DocumentType = r.Doc.DocumentType,
-                    Relevance = r.Score,
-                    Metadata = r.Doc.Metadata
-                })
-                .ToList();
-
-            var total = ordered.Count;
-
-            // Facets: COUNT(*) GROUP BY metadata field over every matching document.
-            Dictionary<string, Dictionary<string, int>> facets = null;
-            if (request.Facets != null && request.Facets.Any())
-            {
-                facets = new Dictionary<string, Dictionary<string, int>>();
-                foreach (var facetField in request.Facets)
-                {
-                    var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-                    foreach (var item in ordered)
-                    {
-                        if (item.Metadata != null && item.Metadata.TryGetValue(facetField, out var val))
-                        {
-                            var key = val?.ToString() ?? "null";
-                            counts[key] = counts.TryGetValue(key, out var c) ? c + 1 : 1;
-                        }
-                    }
-                    facets[facetField] = counts;
+                    foreach (var level in levels)
+                        if (level != null) ArrayPool<byte>.Shared.Return(level);
+                    ArrayPool<byte>.Shared.Return(bucketOf);
                 }
             }
 
             return Task.FromResult(new SearchResponse
             {
-                Results = ordered.Skip(offset).Take(limit).ToList(),
+                Results = page,
                 Total = total,
-                HasMore = offset + limit < total,
-                Facets = facets
+                HasMore = offset + page.Count < total,
+                Facets = facetFields.Count > 0 ? facetCounts : null
             });
+        }
+
+        /// <summary>True when every filter's field is in the document's metadata with that value (case-insensitive). Pure.</summary>
+        private static bool MatchesFilters(SearchDocument doc, List<KeyValuePair<string, string>> filters)
+        {
+            foreach (var f in filters)
+            {
+                if (doc.Metadata == null || !doc.Metadata.TryGetValue(f.Key, out var metaVal) ||
+                    !string.Equals(metaVal?.ToString(), f.Value, StringComparison.OrdinalIgnoreCase))
+                    return false;
+            }
+            return true;
         }
 
         /// <summary>
         /// Removes a document from the index (spec endpoint 5). Input: type and id. Output: success (also when it was
         /// not indexed: deleting is idempotent). Touches: process memory. Updated 2026-11-10 (session
-        /// session_012zDydZCZ4AChqhEZ4oVtaP): runs under the index lock and removes the type term too.
+        /// session_012zDydZCZ4AChqhEZ4oVtaP): runs under the index lock; the document is retired (skipped by every
+        /// search) and its postings are reclaimed by the next compaction.
         /// </summary>
         public Task<UnindexResponse> UnindexDocumentAsync(string documentType, string documentId)
         {
             var key = $"{documentType}:{documentId}";
             lock (_gate)
             {
-                if (_documents.TryGetValue(key, out var doc))
-                {
-                    RemoveTerms(doc);
-                    _documents.Remove(key);
-                }
+                if (_documents.TryGetValue(key, out var doc)) Retire(doc);
             }
             return Task.FromResult(new UnindexResponse { Success = true });
         }
@@ -409,14 +559,7 @@ namespace SaaS.Search
             {
                 lock (_gate)
                 {
-                    var docs = _documents.Values
-                        .Where(d => documentType == null || d.DocumentType == documentType)
-                        .ToList();
-                    foreach (var doc in docs)
-                    {
-                        RemoveTerms(doc);
-                        AddTerms(doc);
-                    }
+                    Rebuild(documentType, retokenize: true);
                 }
                 return Task.CompletedTask;
             }));

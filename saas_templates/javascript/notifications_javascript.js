@@ -44,6 +44,9 @@ CREATE TABLE IF NOT EXISTS notification_logs (
   template_key  TEXT NOT NULL,
   channel       TEXT NOT NULL,
   vars_used     TEXT,
+  status        TEXT NOT NULL,      -- queued | sending | sent | skipped | failed (2026-11-10, NOTIF-12)
+  scheduled_at  TEXT,               -- when a queued message is due (scheduled send or quiet_hours_end)
+  claimed_at    TEXT,               -- when deliver_due claimed it ('sending')
   sent_at       TEXT,
   opened_at     TEXT,
   clicked_at    TEXT,
@@ -202,32 +205,38 @@ function buildUnsubscribeUrl(baseUrl, secret, userId, channel) {
   return `${baseUrl}/unsubscribe?${q.toString()}`;
 }
 
-/**
- * Compares two strings in constant time. In: two values. Out: true only for equal strings of equal length.
- * Why: unsubscribe tokens must not leak through timing (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
- * Touches: nothing.
- */
-function safeEqual(a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string') return false;
-  const ab = Buffer.from(a);
-  const bb = Buffer.from(b);
-  return ab.length === bb.length && crypto.timingSafeEqual(ab, bb);
-}
-
 const CHANNELS = ['email', 'sms', 'in_app'];
 
 /**
- * The preferences of a user who has saved none: every channel on, no do-not-disturb, no quiet hours.
- * Out: a fresh object. Why: defaults used to switch SMS off and impose 22:00-08:00 quiet hours in the server's time
- * zone, which made sends depend on the time of day (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). Touches: nothing.
+ * The preferences of a user who has saved none: no do-not-disturb, no quiet hours, channels {email: true, sms: false,
+ * in_app: true}. SMS is opt-in: it costs money per message and marketing texts need prior consent in many countries.
+ * Out: a fresh object. Why: spec "Default preferences" (amended 2026-11-10; this file had turned SMS on by default).
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
  */
 function defaultPreferences() {
   return {
     do_not_disturb: false,
     quiet_hours_start: null,
     quiet_hours_end: null,
-    channels_enabled: { email: true, sms: true, in_app: true },
+    channels_enabled: { email: true, sms: false, in_app: true },
   };
+}
+
+/** Seconds after which a 'sending' claim is treated as a crashed worker and re-queued (spec deliver_due step 1). */
+const CLAIM_TIMEOUT_MS = 300 * 1000;
+
+/** A well-formed unsubscribe token: exactly 64 lowercase hex characters. */
+const TOKEN_RE = /^[0-9a-f]{64}$/;
+
+/**
+ * Normalizes a time given as a Date, epoch ms or ISO string to a Date; null/undefined -> null.
+ * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+ */
+function toDate(value) {
+  if (value == null) return null;
+  const d = value instanceof Date ? new Date(value.getTime()) : new Date(value);
+  if (Number.isNaN(d.getTime())) throw new Error('invalid time');
+  return d;
 }
 
 function buildTrackUrl(baseUrl, messageId, action) {
@@ -240,9 +249,12 @@ function buildTrackUrl(baseUrl, messageId, action) {
 /**
  * The notification service.
  * In (constructor options): baseUrl, maxRetries (default 3), retryBaseDelayMs (default 100), nowFn (clock returning a
- * Date; quiet hours and timestamps use it), sleep, unsubscribeSecret (default env NOTIFICATIONS_UNSUBSCRIBE_SECRET,
- * else random per process), emailSender, smsSender, inAppSender. Events: 'sent', 'failed' (the log entry).
- * Why: spec SYSTEM 2. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: unsubscribeSecret added, every timestamp taken from nowFn.
+ * Date; quiet hours and timestamps use it), sleep, unsubscribeSecret (else env NOTIFICATIONS_UNSUBSCRIBE_SECRET),
+ * emailSender, smsSender, inAppSender. Events: 'sent', 'failed' (the log entry).
+ * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] The constructor throws unless the unsubscribe secret is at least 32
+ * bytes (NOTIF-11: an empty or short key makes a forgeable HMAC; a random per-process key broke every link at the
+ * next restart). Queued messages live in the logs (status, scheduled_at, claimed_at) and go out through
+ * deliverDue(now) (NOTIF-12), never an in-process timer.
  * Touches: memory; the injected senders (e-mail, SMS providers).
  */
 class NotificationService extends EventEmitter {
@@ -253,8 +265,11 @@ class NotificationService extends EventEmitter {
     this.maxRetries = opts.maxRetries != null ? opts.maxRetries : 3;
     this.retryBaseDelayMs = opts.retryBaseDelayMs != null ? opts.retryBaseDelayMs : 100;
     this.nowFn = opts.nowFn || (() => new Date());
-    this.unsubscribeSecret = opts.unsubscribeSecret || process.env.NOTIFICATIONS_UNSUBSCRIBE_SECRET
-      || crypto.randomBytes(32).toString('hex');
+    const secret = opts.unsubscribeSecret != null ? opts.unsubscribeSecret : process.env.NOTIFICATIONS_UNSUBSCRIBE_SECRET;
+    if (typeof secret !== 'string' || Buffer.byteLength(secret, 'utf8') < 32) {
+      throw new Error('unsubscribeSecret (or NOTIFICATIONS_UNSUBSCRIBE_SECRET) must be at least 32 bytes');
+    }
+    this.unsubscribeSecret = secret;
     this.sleep = opts.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
 
     // In-memory stores
@@ -262,7 +277,6 @@ class NotificationService extends EventEmitter {
     this.logs = new Map();
     this.preferences = new Map();
     this.unsubscribes = new Set();
-    this.queue = [];
 
     // Channel senders (overridable for testing / real providers)
     this.emailSender = opts.emailSender || this._defaultEmailSender.bind(this);
@@ -328,7 +342,11 @@ class NotificationService extends EventEmitter {
     }
     if (u.channels_enabled && typeof u.channels_enabled === 'object') {
       for (const ch of CHANNELS) {
-        if (typeof u.channels_enabled[ch] === 'boolean') merged.channels_enabled[ch] = u.channels_enabled[ch];
+        if (typeof u.channels_enabled[ch] === 'boolean') {
+          merged.channels_enabled[ch] = u.channels_enabled[ch];
+          // The user turning a channel back on is their own new consent: it clears an earlier unsubscribe.
+          if (u.channels_enabled[ch]) this.unsubscribes.delete(`${userId}:${ch}`);
+        }
       }
     }
     this.preferences.set(userId, merged);
@@ -340,9 +358,42 @@ class NotificationService extends EventEmitter {
     return this.unsubscribes.has(`${userId}:${channel}`);
   }
 
+  /**
+   * Unsubscribes a user from one channel: records it and sets channels_enabled[channel] = false (spec NOTIF-11).
+   * In: user id, channel. Out: { success: true }. [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] now also turns the
+   * channel off in the preferences, as the amended spec says. Touches: memory.
+   */
   unsubscribe(userId, channel) {
+    if (!CHANNELS.includes(channel)) throw new Error(`Unknown channel: ${channel}`);
     this.unsubscribes.add(`${userId}:${channel}`);
+    const existing = this.preferences.get(userId) || defaultPreferences();
+    this.preferences.set(userId, {
+      ...existing,
+      channels_enabled: { ...existing.channels_enabled, [channel]: false },
+    });
     return { success: true };
+  }
+
+  /**
+   * Checks an unsubscribe link's parameters BEFORE any user lookup. In: { user_id, channel, token } as strings from
+   * the query. Out: { userId, channel } when the token is exactly 64 lowercase hex characters, the channel is known
+   * and the token equals HMAC-SHA256(secret, "unsubscribe:" + user_id + ":" + channel) (constant-time compare of
+   * two equal-length values, so nothing throws); otherwise null. Every refusal is the same.
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-11). Touches nothing.
+   */
+  verifyUnsubscribe(query) {
+    const q = query || {};
+    const rawUser = q.user_id;
+    const channel = q.channel;
+    const token = q.token;
+    if (typeof rawUser !== 'string' && typeof rawUser !== 'number') return null;
+    if (String(rawUser).length === 0) return null;
+    if (typeof channel !== 'string' || !CHANNELS.includes(channel)) return null;
+    if (typeof token !== 'string' || !TOKEN_RE.test(token)) return null;
+    const expected = unsubscribeToken(this.unsubscribeSecret, String(rawUser), channel);
+    if (!crypto.timingSafeEqual(Buffer.from(token, 'utf8'), Buffer.from(expected, 'utf8'))) return null;
+    const userId = /^\d+$/.test(String(rawUser)) ? Number(rawUser) : String(rawUser);
+    return { userId, channel };
   }
 
   /* ---- Channel resolution ---- */
@@ -374,7 +425,8 @@ class NotificationService extends EventEmitter {
    * In: { user_id, template_key, channel ('email'|'sms'|'in_app'|null for auto), vars, scheduled_at }.
    * Out: { success, message_id, status: 'sent'|'queued'|'skipped'|'failed' }; throws on a missing user, unknown
    * template or unknown channel. Order: do-not-disturb, unsubscribe, channel turned off (all 'skipped'), then
-   * scheduled_at and quiet hours ('queued'), then delivery with retries.
+   * scheduled_at and quiet hours ('queued' in the log with scheduled_at, for deliverDue), then delivery with retries.
+   * [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] queued messages are log rows (NOTIF-05/12), not an in-memory queue.
    * Why: spec endpoint 1. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: unknown channels refused; the user's channel choice is honoured even when the caller
    * names the channel. Touches: memory, the senders.
    */
@@ -410,6 +462,9 @@ class NotificationService extends EventEmitter {
       bounced: false,
       error: null,
       status: 'pending',
+      scheduled_at: null,
+      claimed_at: null,
+      seq: this._seq = (this._seq || 0) + 1,
     };
     this.logs.set(messageId, log);
 
@@ -435,28 +490,25 @@ class NotificationService extends EventEmitter {
       return { success: true, message_id: messageId, status: 'skipped' };
     }
 
-    // Scheduled delivery
+    // Scheduled delivery: stored 'queued' with its scheduled_at; deliverDue() sends it (no in-process timer).
+    const now = this.nowFn();
     if (payload.scheduled_at) {
-      const scheduled = new Date(payload.scheduled_at);
-      const now = this.nowFn();
+      const scheduled = toDate(payload.scheduled_at);
       if (scheduled > now) {
         log.status = 'queued';
-        this.queue.push({ messageId, payload, channel, template, prefs, vars, scheduledAt: scheduled });
-        this.queue.sort((a, b) => a.scheduledAt - b.scheduledAt);
+        log.scheduled_at = scheduled.toISOString();
         return { success: true, message_id: messageId, status: 'queued' };
       }
     }
 
-    // Quiet hours: queue for quiet_hours_end
-    const now = this.nowFn();
+    // Quiet hours: stored 'queued' with scheduled_at = quiet_hours_end (the next one after now).
     if (inQuietHours(prefs.quiet_hours_start, prefs.quiet_hours_end, now)) {
       log.status = 'queued';
       const endMin = parseTimeToMinutes(prefs.quiet_hours_end);
       const release = new Date(now);
       release.setHours(Math.floor(endMin / 60), endMin % 60, 0, 0);
       if (release <= now) release.setDate(release.getDate() + 1);
-      this.queue.push({ messageId, payload, channel, template, prefs, vars, scheduledAt: release });
-      this.queue.sort((a, b) => a.scheduledAt - b.scheduledAt);
+      log.scheduled_at = release.toISOString();
       return { success: true, message_id: messageId, status: 'queued' };
     }
 
@@ -468,16 +520,21 @@ class NotificationService extends EventEmitter {
   /**
    * Delivers with up to maxRetries retries, waiting retryBaseDelayMs x 2^(n-1) between attempts.
    * In: message id, channel, template, vars, user id. Out: { success, message_id, status }.
-   * Why: spec "Retry: Email/SMS failures retry 3x with exponential backoff". 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: sent_at from nowFn.
+   * Why: spec "Retry: Email/SMS failures retry 3x with exponential backoff". 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: sent_at from nowFn;
+   * optional claim (the claimed_at of a deliverDue claim) makes the final write conditional on that claim.
    * Touches: memory, the senders.
    */
-  async _deliverWithRetry(messageId, channel, template, vars, userId) {
+  async _deliverWithRetry(messageId, channel, template, vars, userId, claim = null) {
     const log = this.logs.get(messageId);
+    // With a claim (deliverDue), every final write is conditional on the row still being ours: status 'sending' and
+    // the same claimed_at (spec deliver_due step 4). A claim that lost the row writes nothing.
+    const stillOurs = () => claim === null || (log.status === 'sending' && log.claimed_at === claim);
     let attempt = 0;
     let lastError = null;
     while (attempt <= this.maxRetries) {
       try {
         await this._deliverOnce(messageId, channel, template, vars, userId);
+        if (!stillOurs()) return { success: false, message_id: messageId, status: 'lost_claim' };
         log.status = 'sent';
         log.sent_at = this.nowFn().toISOString();
         log.error = null;
@@ -492,6 +549,7 @@ class NotificationService extends EventEmitter {
         await this.sleep(delay);
       }
     }
+    if (!stillOurs()) return { success: false, message_id: messageId, status: 'lost_claim' };
     log.status = 'failed';
     log.error = lastError ? lastError.message : 'unknown';
     log.bounced = true;
@@ -578,6 +636,7 @@ class NotificationService extends EventEmitter {
     else if (log.status === 'failed') status = 'failed';
     else if (log.status === 'skipped') status = 'skipped';
     else if (log.status === 'queued') status = 'queued';
+    else if (log.status === 'sending') status = 'sending';
     return {
       message_id: log.id,
       user_id: log.user_id,
@@ -630,44 +689,62 @@ class NotificationService extends EventEmitter {
     return out;
   }
 
-  /* ---- Process queued (scheduled / quiet-hours) messages ---- */
+  /* ---- Deliver due (scheduled / quiet-hours) messages ---- */
   /**
-   * Delivers queued messages (scheduled or held by quiet hours) whose time has come, re-checking do-not-disturb,
-   * unsubscribe and channel choices first, since the user may have changed them while the message waited.
-   * Out: an array of send results. Why: spec "queue for quiet_hours_end". 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the re-checks.
-   * Touches: memory, the senders.
+   * deliverDue(now) -> [{ success, message_id, status }]: sends every queued message that is due, in the spec's four
+   * steps (NOTIF-12, amended 2026-11-10):
+   *   1. 'sending' rows whose claimed_at + 300 s < now go back to 'queued' (a crashed worker);
+   *   2. 'queued' rows with scheduled_at <= now, by scheduled_at then insertion order, are claimed one by one with a
+   *      conditional write (status 'queued' -> 'sending', claimed_at = now); a row claimed first elsewhere is skipped;
+   *   3. preferences are checked NOW: do-not-disturb, unsubscribed or channel off -> 'skipped';
+   *   4. the final write is conditional on status 'sending' and the same claimed_at.
+   * Each message is sent once when no worker crashes, at least once after a crash. In: now (Date, ms or ISO; default
+   * the clock). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (replaces processQueue's in-memory queue).
+   * Touches: memory (the logs), the senders.
    */
-  async processQueue() {
-    const now = this.nowFn();
-    const due = [];
-    this.queue = this.queue.filter((item) => {
-      if (item.scheduledAt <= now) {
-        due.push(item);
-        return false;
+  async deliverDue(now) {
+    const at = now == null ? this.nowFn() : toDate(now);
+    const nowMs = at.getTime();
+    for (const log of this.logs.values()) {
+      if (log.status === 'sending' && log.claimed_at && Date.parse(log.claimed_at) + CLAIM_TIMEOUT_MS < nowMs) {
+        log.status = 'queued';
+        log.claimed_at = null;
       }
-      return true;
-    });
+    }
+    const due = Array.from(this.logs.values())
+      .filter((log) => log.status === 'queued' && log.scheduled_at && Date.parse(log.scheduled_at) <= nowMs)
+      .sort((a, b) => (Date.parse(a.scheduled_at) - Date.parse(b.scheduled_at)) || (a.seq - b.seq))
+      .map((log) => log.id);
     const results = [];
-    for (const item of due) {
-      const log = this.logs.get(item.messageId);
-      if (!log) continue;
-      // Preferences may have changed while the message waited: check them again before delivering.
-      const prefs = this.getPreferences(item.payload.user_id);
+    for (const id of due) {
+      const log = this.logs.get(id);
+      if (!log || log.status !== 'queued') continue; // claimed by someone else meanwhile
+      const claim = at.toISOString();
+      log.status = 'sending';
+      log.claimed_at = claim;
+      const prefs = this.getPreferences(log.user_id);
       let skip = null;
       if (prefs.do_not_disturb) skip = 'do_not_disturb';
-      else if ((item.channel === 'email' || item.channel === 'sms')
-        && this.isUnsubscribed(item.payload.user_id, item.channel)) skip = 'unsubscribed';
-      else if (prefs.channels_enabled[item.channel] === false) skip = 'channel_disabled';
+      else if (this.isUnsubscribed(log.user_id, log.channel)) skip = 'unsubscribed';
+      else if (prefs.channels_enabled[log.channel] !== true) skip = 'channel_disabled';
       if (skip) {
-        log.status = 'skipped';
-        log.error = skip;
-        results.push({ success: true, message_id: item.messageId, status: 'skipped' });
+        if (log.status === 'sending' && log.claimed_at === claim) {
+          log.status = 'skipped';
+          log.error = skip;
+        }
+        results.push({ success: true, message_id: id, status: 'skipped' });
         continue;
       }
-      const res = await this._deliverWithRetry(item.messageId, item.channel, item.template, item.vars, item.payload.user_id);
-      results.push(res);
+      const template = this.getTemplate(log.template_key);
+      const vars = JSON.parse(log.vars_used || '{}');
+      results.push(await this._deliverWithRetry(id, log.channel, template, vars, log.user_id, claim));
     }
     return results;
+  }
+
+  /** Kept for callers of the old name: deliverDue() at the clock's now. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+  async processQueue() {
+    return this.deliverDue(this.nowFn());
   }
 
   /* ---- DDL export ---- */
@@ -681,8 +758,9 @@ class NotificationService extends EventEmitter {
  * ========================================================================== */
 /**
  * Framework-free router over the service, with the spec's routes plus tracking and unsubscribe.
- * In: a NotificationService. Out: { routes, handle(method, path, { query, body }) } resolving to { status, body }.
- * Authenticate callers before handle(): the preference routes act on the user id in the path.
+ * In: a NotificationService. Out: { routes, handle(method, path, { query, body, user }) } resolving to { status, body }.
+ * `user` is the verified caller from your auth layer; the preference and in-app routes answer 404 unless it is the
+ * user in the path (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). /unsubscribe: GET confirms, POST unsubscribes.
  * Why: spec ENDPOINTS. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: /unsubscribe needs the signed token; bad preference input answers 400.
  * Touches: as the service.
  */
@@ -723,15 +801,23 @@ function createRouter(service) {
     return { status: 200, body: res };
   });
 
+  // The caller is the VERIFIED user the auth layer put on the request (req.user), never the id in the path: a user
+  // reads and changes only their own preferences and in-app messages (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
+  const isSelf = (req) => req.user != null && req.user.id != null && String(req.user.id) === String(req.params.user_id);
+  const notFound = { status: 404, body: { success: false, error: 'not_found' } };
+
   add('GET', '/notifications/in-app/:user_id', async (req) => {
+    if (!isSelf(req)) return notFound;
     return { status: 200, body: { user_id: Number(req.params.user_id), notifications: service.getInAppNotifications(Number(req.params.user_id)) } };
   });
 
   add('GET', '/users/:user_id/notification-preferences', async (req) => {
+    if (!isSelf(req)) return notFound;
     return { status: 200, body: service.getPreferences(Number(req.params.user_id)) };
   });
 
   add('PUT', '/users/:user_id/notification-preferences', async (req) => {
+    if (!isSelf(req)) return notFound;
     try {
       service.updatePreferences(Number(req.params.user_id), req.body || {});
     } catch (err) {
@@ -750,20 +836,21 @@ function createRouter(service) {
     return { status: res.success ? 200 : 404, body: res };
   });
 
-  // Unsubscribe link from an e-mail: only a token signed by this service for that user and channel is accepted
-  // (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP; it used to accept any user_id).
+  // Unsubscribe link from an e-mail (NOTIF-11, amended 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). The token is
+  // checked before any user lookup; a missing, malformed, wrong or unknown-channel token is the same 403. GET only
+  // confirms (a mail scanner following the link changes nothing); POST unsubscribes (RFC 8058 one-click).
+  const invalidToken = { status: 403, body: { success: false, error: 'invalid_unsubscribe_token' } };
   add('GET', '/unsubscribe', async (req) => {
-    const q = req.query || {};
-    const channel = q.channel || 'email';
-    if (q.user_id == null || !CHANNELS.includes(channel)) {
-      return { status: 400, body: { success: false, error: 'user_id and a valid channel required' } };
-    }
-    const userId = Number(q.user_id);
-    if (!safeEqual(q.token, unsubscribeToken(service.unsubscribeSecret, userId, channel))) {
-      return { status: 403, body: { success: false, error: 'invalid_token' } };
-    }
-    service.unsubscribe(userId, channel);
-    return { status: 200, body: { success: true } };
+    const ok = service.verifyUnsubscribe(req.query);
+    if (!ok) return invalidToken;
+    return { status: 200, body: { success: true, confirm: true, channel: ok.channel, method: 'POST' } };
+  });
+
+  add('POST', '/unsubscribe', async (req) => {
+    const ok = service.verifyUnsubscribe({ ...(req.body || {}), ...(req.query || {}) });
+    if (!ok) return invalidToken;
+    service.unsubscribe(ok.userId, ok.channel);
+    return { status: 200, body: { success: true, channel: ok.channel } };
   });
 
   return {
@@ -775,7 +862,7 @@ function createRouter(service) {
         if (!m) continue;
         const params = {};
         r.keys.forEach((k, i) => { params[k] = m[i + 1]; });
-        const out = await r.handler({ params, query: req.query, body: req.body });
+        const out = await r.handler({ params, query: (req && req.query) || {}, body: req && req.body, user: req && req.user });
         return out;
       }
       return { status: 404, body: { success: false, error: 'not_found' } };
@@ -792,4 +879,6 @@ module.exports = {
   inQuietHours,
   generateId,
   buildUnsubscribeUrl,
+  unsubscribeToken,
+  defaultPreferences,
 };

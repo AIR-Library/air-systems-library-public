@@ -8,7 +8,8 @@ use chrono::{TimeZone, Utc};
 use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
 use quotas_rate_limiting_rust::{
     check_api_quota, check_api_quota_at, check_feature_gate, check_rate_limit_per_ip_at,
-    check_rate_limit_per_user_at, check_storage_quota, init_db, month_of, QuotaError, Tier, User,
+    check_rate_limit_per_user_at, check_storage_quota, check_storage_quota_at, init_db, month_of, storage_usage, QuotaError, Tier, User,
+    UNLIMITED,
 };
 
 /// What: a fixed instant (2026-03-31 12:00:00 UTC) for time-based tests. 2026-11-10,
@@ -27,6 +28,7 @@ async fn setup_pool() -> SqlitePool {
     pool
 }
 
+// QUOTA-01
 #[tokio::test]
 async fn api_quota_pass() {
     let pool = setup_pool().await;
@@ -37,6 +39,9 @@ async fn api_quota_pass() {
     check_api_quota(&pool, &user).await.unwrap();
 }
 
+/// What: the refusal and its HTTP status (429). Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the status assertion was added.
+/// Touches: in-memory SQLite.
+// QUOTA-02
 #[tokio::test]
 async fn api_quota_fail() {
     let pool = setup_pool().await;
@@ -47,6 +52,7 @@ async fn api_quota_fail() {
     }
     // Next call should fail
     let err = check_api_quota(&pool, &user).await.unwrap_err();
+    assert_eq!(err.http_status(), 429); // spec status (assertion added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
     match err {
         QuotaError::QuotaExceeded { current, limit, .. } => {
             assert_eq!(current, 1_000);
@@ -56,6 +62,7 @@ async fn api_quota_fail() {
     }
 }
 
+// QUOTA-03
 #[tokio::test]
 async fn storage_quota_pass() {
     let pool = setup_pool().await;
@@ -66,6 +73,9 @@ async fn storage_quota_pass() {
     check_storage_quota(&pool, &user, 50_000_000_000).await.unwrap();
 }
 
+/// What: the refusal and its HTTP status (413). Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the status assertion was added.
+/// Touches: in-memory SQLite.
+// QUOTA-04
 #[tokio::test]
 async fn storage_quota_fail() {
     let pool = setup_pool().await;
@@ -74,6 +84,7 @@ async fn storage_quota_fail() {
     check_storage_quota(&pool, &user, 900_000_000).await.unwrap();
     // Upload 200 MB should fail
     let err = check_storage_quota(&pool, &user, 200_000_000).await.unwrap_err();
+    assert_eq!(err.http_status(), 413); // spec status (assertion added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
     match err {
         QuotaError::StorageQuotaExceeded { usage, limit } => {
             assert_eq!(usage, 900_000_000);
@@ -83,6 +94,7 @@ async fn storage_quota_fail() {
     }
 }
 
+// QUOTA-05
 #[tokio::test]
 async fn rate_limit_per_user_pass() {
     let pool = setup_pool().await;
@@ -92,6 +104,9 @@ async fn rate_limit_per_user_pass() {
     }
 }
 
+/// What: the refusal and its HTTP status (429). Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the status assertion was added.
+/// Touches: in-memory SQLite.
+// QUOTA-06
 #[tokio::test]
 async fn rate_limit_per_user_fail() {
     let pool = setup_pool().await;
@@ -100,6 +115,7 @@ async fn rate_limit_per_user_fail() {
         check_rate_limit_per_user_at(&pool, &user, t0()).await.unwrap();
     }
     let err = check_rate_limit_per_user_at(&pool, &user, t0()).await.unwrap_err();
+    assert_eq!(err.http_status(), 429); // spec status (assertion added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
     match err {
         QuotaError::RateLimitExceeded { reset_seconds } => {
             assert_eq!(reset_seconds, 60);
@@ -108,6 +124,7 @@ async fn rate_limit_per_user_fail() {
     }
 }
 
+// QUOTA-07
 #[tokio::test]
 async fn rate_limit_per_ip_pass() {
     let pool = setup_pool().await;
@@ -117,6 +134,9 @@ async fn rate_limit_per_ip_pass() {
     }
 }
 
+/// What: the refusal and its HTTP status (429). Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the status assertion was added.
+/// Touches: in-memory SQLite.
+// QUOTA-08
 #[tokio::test]
 async fn rate_limit_per_ip_fail() {
     let pool = setup_pool().await;
@@ -125,6 +145,7 @@ async fn rate_limit_per_ip_fail() {
         check_rate_limit_per_ip_at(&pool, ip, t0()).await.unwrap();
     }
     let err = check_rate_limit_per_ip_at(&pool, ip, t0()).await.unwrap_err();
+    assert_eq!(err.http_status(), 429); // spec status (assertion added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
     match err {
         QuotaError::IpRateLimitExceeded { reset_seconds } => {
             assert_eq!(reset_seconds, 1);
@@ -133,6 +154,7 @@ async fn rate_limit_per_ip_fail() {
     }
 }
 
+// QUOTA-09
 #[tokio::test]
 async fn feature_gate_pass() {
     let user = User { id: 7, tier: Tier::Team };
@@ -140,10 +162,14 @@ async fn feature_gate_pass() {
     check_feature_gate(&user, "feature_c").await.unwrap();
 }
 
+/// What: the refusal and its HTTP status (403). Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the status assertion was added.
+/// Touches: in-memory SQLite.
+// QUOTA-10
 #[tokio::test]
 async fn feature_gate_fail() {
     let user = User { id: 8, tier: Tier::Solo };
     let err = check_feature_gate(&user, "feature_a").await.unwrap_err();
+    assert_eq!(err.http_status(), 403); // spec status (assertion added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
     match err {
         QuotaError::FeatureNotAvailable { tier, minimum_tier, .. } => {
             assert_eq!(tier, Tier::Solo);
@@ -153,6 +179,7 @@ async fn feature_gate_fail() {
     }
 }
 
+// QUOTA-11
 #[tokio::test]
 async fn month_rollover() {
     let pool = setup_pool().await;
@@ -189,6 +216,7 @@ async fn month_rollover() {
     assert_eq!(count, 1);
 }
 
+// QUOTA-12
 #[tokio::test]
 async fn tier_upgrade() {
     let pool = setup_pool().await;
@@ -258,4 +286,32 @@ async fn stale_rows_of_other_buckets_are_pruned() {
     }
     assert!(matches!(check_rate_limit_per_user_at(&pool, &user, later).await.unwrap_err(), QuotaError::RateLimitExceeded { .. }));
     assert_eq!(count("user:42").await, 100);
+}
+
+/// What: QUOTA-13: a limit of -1 is unlimited. Enterprise's limits are -1; an enterprise storage upload
+/// of any size (5 PB, then the largest u64) is stored, and enterprise API calls past every other tier's
+/// limit (10,001 calls in one month) never get 429 from the quota and are still counted.
+/// In: none. Out: panics on a refusal. Why: 2026-11-10 amendment (QUOTA-13).
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite.
+// QUOTA-13
+#[tokio::test]
+async fn unlimited_limit_is_minus_one() {
+    let pool = setup_pool().await;
+    let user = User { id: 13, tier: Tier::Enterprise };
+    assert_eq!(Tier::Enterprise.limits(), (UNLIMITED, UNLIMITED));
+    assert_eq!(UNLIMITED, -1);
+    check_storage_quota_at(&pool, &user, 5_000_000_000_000_000, t0()).await.unwrap();
+    assert_eq!(storage_usage(&pool, &user).await.unwrap(), 5_000_000_000_000_000);
+    check_storage_quota_at(&pool, &user, u64::MAX, t0()).await.unwrap();
+    for _ in 0..10_001 {
+        check_api_quota_at(&pool, &user, t0()).await.unwrap();
+    }
+    let count: i64 = sqlx::query("SELECT call_count FROM usage_metrics WHERE user_id = ? AND month = ?")
+        .bind(user.id)
+        .bind(&month_of(t0()))
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("call_count");
+    assert_eq!(count, 10_001);
 }

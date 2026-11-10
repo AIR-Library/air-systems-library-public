@@ -18,6 +18,10 @@
 // 2026-11-10 (same session, CodeRabbit review on PR 19): a completed deletion also deletes the user's export files and
 // export_requests rows first (a failed cleanup leaves the deletion approved, to be retried), and a download link is
 // refused once its export request or file is gone, so a deleted user's unexpired link no longer works.
+// 2026-11-10 (same session, spec amendment EXPORT-05/12/13/14): a statutory reason (gdpr_request,
+// gdpr_right_to_be_forgotten) has no grace period and confirm() runs the cascade at once; the confirmation token
+// expires after 24 h; the cascade logs 'user_deleted_cascade' then calls the injected audit eraser's erase_subject LAST,
+// and deletion_requests.user_id is set NULL on completion; time comes from ComplianceClock.
 // Touches: the compliance database; the user data store (reads, and deletes on a completed deletion); export storage;
 // email (through IComplianceMailer: network in production).
 #nullable enable
@@ -108,6 +112,9 @@ namespace ComplianceModule
     {
         [JsonProperty("success"), STJ.JsonPropertyName("success")] public bool Success { get; set; }
         [JsonProperty("deletion_scheduled_for"), STJ.JsonPropertyName("deletion_scheduled_for")] public string? DeletionScheduledFor { get; set; }
+
+        /// <summary>The deletion's status after confirm: 'approved' (grace period running) or, for a statutory reason, 'completed'. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.</summary>
+        [JsonProperty("status"), STJ.JsonPropertyName("status")] public string? Status { get; set; }
     }
 
     /// <summary>Admin list of export requests. Pure data.</summary>
@@ -148,13 +155,15 @@ namespace ComplianceModule
 
     /// <summary>
     /// deletion_requests row. Status: pending (awaiting email confirmation), approved (confirmed, waiting out the grace
-    /// period), cancelled, completed, failed. The confirmation token is stored only as its SHA-256 hash and never
-    /// serialised. Pure data.
+    /// period), cancelled, completed, failed. The confirmation token is stored only as its SHA-256 hash, valid until
+    /// TokenExpiresAt (24 h), and never serialised. UserId is set NULL when the deletion completes (EXPORT-13), so the
+    /// row cannot re-identify erased audit entries. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: nullable
+    /// UserId, TokenExpiresAt. Pure data.
     /// </summary>
     public class DeletionRequest
     {
         [JsonProperty("id"), STJ.JsonPropertyName("id")] public Guid Id { get; set; }
-        [JsonProperty("user_id"), STJ.JsonPropertyName("user_id")] public Guid UserId { get; set; }
+        [JsonProperty("user_id"), STJ.JsonPropertyName("user_id")] public Guid? UserId { get; set; }
         [JsonProperty("requested_at"), STJ.JsonPropertyName("requested_at")] public DateTime RequestedAt { get; set; }
         [JsonProperty("status"), STJ.JsonPropertyName("status")] public string Status { get; set; } = "pending";
         [JsonProperty("reason"), STJ.JsonPropertyName("reason")] public string Reason { get; set; } = "";
@@ -162,14 +171,20 @@ namespace ComplianceModule
         [JsonProperty("confirmed_at"), STJ.JsonPropertyName("confirmed_at")] public DateTime? ConfirmedAt { get; set; }
         [JsonProperty("deleted_at"), STJ.JsonPropertyName("deleted_at")] public DateTime? DeletedAt { get; set; }
         [JsonIgnore, STJ.JsonIgnore] public byte[]? ConfirmationTokenHash { get; set; }
+        [JsonIgnore, STJ.JsonIgnore] public DateTime? TokenExpiresAt { get; set; }
         [JsonIgnore, STJ.JsonIgnore] public long Sequence { get; set; }
     }
 
-    /// <summary>audit_logs row: kept when a user is deleted (legal requirement). Pure data.</summary>
+    /// <summary>
+    /// audit_logs row: kept when a user is deleted (legal requirement, EXPORT-08). When the user's deletion completes,
+    /// the audit eraser removes the link to the person: UserId becomes Guid.Empty, ActorId null, PersonalErased true;
+    /// the event itself stays. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-13). Pure data.
+    /// </summary>
     public class AuditLog
     {
         public Guid Id { get; set; }
         public Guid UserId { get; set; }
+        public bool PersonalErased { get; set; }
         public Guid? ActorId { get; set; }
         public string Action { get; set; } = "";
         public string Details { get; set; } = "{}";
@@ -411,6 +426,48 @@ namespace ComplianceModule
 
     #endregion
 
+    /// <summary>
+    /// The audit system's erase_subject(user_id), injected like the audit logger (EXPORT-13). The deletion cascade calls
+    /// it LAST, after the user's rows are deleted and 'user_deleted_cascade' is logged. Production wires it to the audit
+    /// logging system's erase_subject; an implementation may stage its changes in the compliance unit of work (saved
+    /// with the deletion) or call the audit system. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// </summary>
+    public interface IAuditEraser
+    {
+        Task EraseSubjectAsync(Guid userId, CancellationToken ct);
+    }
+
+    /// <summary>
+    /// Default <see cref="IAuditEraser"/> for this template's own audit_logs: every row of the user (saved, and staged
+    /// in this unit of work) keeps its event but loses the link to the person (UserId Guid.Empty, ActorId null,
+    /// PersonalErased true). Changes are staged on the scoped context and saved with the deletion (one SaveChanges).
+    /// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: audit_logs (staged updates).
+    /// </summary>
+    public class LocalAuditEraser : IAuditEraser
+    {
+        private readonly ComplianceDbContext _db;
+
+        public LocalAuditEraser(ComplianceDbContext db) => _db = db;
+
+        /// <summary>Stages the erasure of the user's link in every audit row. Touches: audit_logs.</summary>
+        public async Task EraseSubjectAsync(Guid userId, CancellationToken ct)
+        {
+            var saved = await _db.AuditLogs.Where(a => a.UserId == userId || a.ActorId == userId).ToListAsync(ct);
+            foreach (var row in saved.Concat(_db.AuditLogs.Local.Where(a => a.UserId == userId || a.ActorId == userId)).Distinct().ToList())
+            {
+                if (row.UserId == userId) row.UserId = Guid.Empty;
+                if (row.ActorId == userId) row.ActorId = null;
+                row.PersonalErased = true;
+            }
+        }
+    }
+
+    /// <summary>The clock the compliance services read (UTC); tests move it. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.</summary>
+    public class ComplianceClock
+    {
+        public Func<DateTime> Now { get; set; } = () => DateTime.UtcNow;
+    }
+
     #region Core services
 
     /// <summary>Writes audit_logs rows (added to the caller's unit of work; the caller saves). Touches: audit_logs.</summary>
@@ -454,6 +511,12 @@ namespace ComplianceModule
         public static readonly string[] Formats = { "json", "csv" };
         public static readonly string[] Reasons = { "user_requested", "gdpr_request", "gdpr_right_to_be_forgotten", "other" };
         public static readonly TimeSpan GracePeriod = TimeSpan.FromDays(30);
+
+        /// <summary>Reasons that are a statutory erasure request: no grace period (EXPORT-12).</summary>
+        public static readonly string[] StatutoryReasons = { "gdpr_request", "gdpr_right_to_be_forgotten" };
+
+        /// <summary>How long a deletion confirmation token works.</summary>
+        public static readonly TimeSpan ConfirmationTokenLifetime = TimeSpan.FromHours(24);
         private static long _sequence;
 
         /// <summary>Next value of the process-wide sequence that breaks ties between rows written in the same tick
@@ -465,12 +528,20 @@ namespace ComplianceModule
         private readonly ComplianceDbContext _db;
         private readonly IUserDataStore _users;
         private readonly IComplianceMailer _mailer;
+        private readonly ExportProcessor _processor;
+        private readonly ComplianceClock _clock;
 
-        public ComplianceService(ComplianceDbContext db, IUserDataStore users, IComplianceMailer mailer)
+        /// <summary>
+        /// In: the database, the user data store, the mailer, the processor (runs a statutory deletion's cascade at
+        /// confirm) and the clock. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: processor and clock. Touches nothing.
+        /// </summary>
+        public ComplianceService(ComplianceDbContext db, IUserDataStore users, IComplianceMailer mailer, ExportProcessor processor, ComplianceClock clock)
         {
             _db = db;
             _users = users;
             _mailer = mailer;
+            _processor = processor;
+            _clock = clock;
         }
 
         /// <summary>
@@ -511,9 +582,12 @@ namespace ComplianceModule
         }
 
         /// <summary>
-        /// Endpoint 3: records a pending deletion (will run 30 days later once confirmed), emails a one-time
-        /// confirmation token (32 random bytes; only its SHA-256 is stored) and audits deletion_requested. Only one
-        /// open deletion per user. Touches: deletion_requests, audit_logs, the mailer.
+        /// Endpoint 3: records a pending deletion, emails a one-time confirmation token (32 random bytes; only its
+        /// SHA-256 is stored, valid 24 h, bound to this deletion id) and audits deletion_requested. will_delete_at =
+        /// requested_at + 30 days for user_requested / other (EXPORT-05), = requested_at for gdpr_request /
+        /// gdpr_right_to_be_forgotten (EXPORT-12: no grace period). Only one open deletion per user. Nothing is deleted
+        /// before confirm. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (statutory reasons, token expiry, clock).
+        /// Touches: deletion_requests, audit_logs, the mailer.
         /// </summary>
         public async Task<ServiceResult<DeletionResponse>> RequestDeletionAsync(Guid userId, string? reason, CancellationToken ct)
         {
@@ -523,12 +597,14 @@ namespace ComplianceModule
             var email = await _users.GetEmailAsync(userId, ct);
             if (email == null) return new(null, "user_not_found", 404);
 
-            var now = DateTime.UtcNow;
+            var now = _clock.Now();
             var token = Base64Url(RandomNumberGenerator.GetBytes(32));
             var deletion = new DeletionRequest
             {
                 Id = Guid.NewGuid(), UserId = userId, RequestedAt = now, Status = "pending", Reason = reason,
-                ScheduledFor = now.Add(GracePeriod), ConfirmationTokenHash = SHA256.HashData(Encoding.UTF8.GetBytes(token)),
+                ScheduledFor = StatutoryReasons.Contains(reason) ? now : now.Add(GracePeriod),
+                ConfirmationTokenHash = SHA256.HashData(Encoding.UTF8.GetBytes(token)),
+                TokenExpiresAt = now.Add(ConfirmationTokenLifetime),
                 Sequence = NextSequence()
             };
             _db.DeletionRequests.Add(deletion);
@@ -542,31 +618,43 @@ namespace ComplianceModule
         }
 
         /// <summary>
-        /// Endpoint 4: the owner confirms with the emailed token (constant-time comparison of hashes). A wrong token is
-        /// invalid_token (400) and changes nothing. Output: when the deletion will run. Touches: deletion_requests,
-        /// audit_logs.
+        /// Endpoint 4 (EXPORT-09/14): the owner confirms with the emailed token. Another user's request is 404; a request
+        /// not pending (already confirmed: a reused token) is 409; a wrong token or one over 24 h old is 400
+        /// invalid_token and changes nothing. The comparison is constant-time over the SHA-256 hashes; the token is
+        /// cleared on use (single use). For a statutory reason confirm() runs the cascade before returning:
+        /// deletion_scheduled_for = deleted_at = now and status 'completed' (if the export cleanup fails it stays
+        /// 'approved' and the worker retries). Otherwise the deletion runs after the grace period.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (expiry, statutory cascade, clock). Touches:
+        /// deletion_requests, audit_logs; for a statutory reason everything the cascade touches.
         /// </summary>
         public async Task<ServiceResult<DeletionConfirmationResponse>> ConfirmDeletionAsync(Guid userId, Guid deletionId, string? token, CancellationToken ct)
         {
             var d = await _db.DeletionRequests.FirstOrDefaultAsync(x => x.Id == deletionId, ct);
             if (d == null || d.UserId != userId) return new(null, "not_found", 404);
             if (d.Status != "pending") return new(null, "not_pending", 409);
+            var now = _clock.Now();
             var provided = SHA256.HashData(Encoding.UTF8.GetBytes(token ?? ""));
-            if (d.ConfirmationTokenHash == null || !CryptographicOperations.FixedTimeEquals(d.ConfirmationTokenHash, provided))
+            var matches = d.ConfirmationTokenHash != null && CryptographicOperations.FixedTimeEquals(d.ConfirmationTokenHash, provided);
+            if (!matches || d.TokenExpiresAt == null || now > d.TokenExpiresAt.Value)
             {
-                Audit.Add(_db, userId, userId, "deletion_confirmation_rejected", new { deletion_id = d.Id });
+                Audit.Add(_db, userId, userId, "deletion_confirmation_rejected", new { deletion_id = d.Id, expired = matches });
                 await _db.SaveChangesAsync(ct);
                 return new(null, "invalid_token", 400);
             }
             d.Status = "approved";
-            d.ConfirmedAt = DateTime.UtcNow;
+            d.ConfirmedAt = now;
             d.ConfirmationTokenHash = null; // single use
+            d.TokenExpiresAt = null;
+            var statutory = StatutoryReasons.Contains(d.Reason);
+            if (statutory) d.ScheduledFor = now;
             Audit.Add(_db, userId, userId, "deletion_confirmed", new { deletion_id = d.Id });
             await _db.SaveChangesAsync(ct);
-            return new(new DeletionConfirmationResponse { Success = true, DeletionScheduledFor = Iso(d.ScheduledFor) });
+            if (statutory)
+                await _processor.RunCascadeAsync(d, now, ct);
+            return new(new DeletionConfirmationResponse { Success = true, DeletionScheduledFor = Iso(d.ScheduledFor), Status = d.Status });
         }
 
-        /// <summary>Endpoint 5: the owner cancels a pending or approved deletion before it runs. Touches: deletion_requests, audit_logs.</summary>
+        /// <summary>Endpoint 5: the owner cancels a pending or approved deletion before it runs; anyone else's is 404. Touches: deletion_requests, audit_logs.</summary>
         public async Task<ServiceResult<object>> CancelDeletionAsync(Guid userId, Guid deletionId, CancellationToken ct)
         {
             var d = await _db.DeletionRequests.FirstOrDefaultAsync(x => x.Id == deletionId, ct);
@@ -574,6 +662,7 @@ namespace ComplianceModule
             if (d.Status != "pending" && d.Status != "approved") return new(null, "cannot_cancel", 409);
             d.Status = "cancelled";
             d.ConfirmationTokenHash = null;
+            d.TokenExpiresAt = null;
             Audit.Add(_db, userId, userId, "deletion_cancelled", new { deletion_id = d.Id });
             await _db.SaveChangesAsync(ct);
             return new(new { success = true, status = "cancelled" });
@@ -623,14 +712,22 @@ namespace ComplianceModule
         private readonly IExportStorage _storage;
         private readonly IComplianceMailer _mailer;
         private readonly ILogger<ExportProcessor> _logger;
+        private readonly IAuditEraser _auditEraser;
 
-        public ExportProcessor(ComplianceDbContext db, IUserDataStore users, IExportStorage storage, IComplianceMailer mailer, ILogger<ExportProcessor> logger)
+        /// <summary>
+        /// In: the database, the user data store, export storage, the mailer, a logger and the audit eraser (default:
+        /// <see cref="LocalAuditEraser"/> over the same context). Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP:
+        /// the audit eraser (EXPORT-13). Touches nothing.
+        /// </summary>
+        public ExportProcessor(ComplianceDbContext db, IUserDataStore users, IExportStorage storage, IComplianceMailer mailer, ILogger<ExportProcessor> logger,
+            IAuditEraser? auditEraser = null)
         {
             _db = db;
             _users = users;
             _storage = storage;
             _mailer = mailer;
             _logger = logger;
+            _auditEraser = auditEraser ?? new LocalAuditEraser(db);
         }
 
         /// <summary>Builds every pending export, oldest first. Output: how many were processed. Touches: see the class summary.</summary>
@@ -681,49 +778,66 @@ namespace ComplianceModule
         public static string StorageKeyFor(ExportRequest export) => $"exports/{export.UserId}/{export.Id}.{export.Format}";
 
         /// <summary>
-        /// Runs every approved deletion whose grace period has ended at <paramref name="now"/>. For each: first the
-        /// user's export files are deleted from storage and their export_requests rows removed (so no signed link can
-        /// download them any more); if that cleanup fails the deletion stays approved, audited as
-        /// deletion_export_cleanup_failed, and the next pass retries it. Then the user's data is cascaded through
-        /// <see cref="IUserDataStore.DeleteUserAsync"/> and the deletion marked completed. audit_logs are kept
-        /// (EXPORT-08). Input: the time to judge the grace period by. Output: how many due deletions were attempted.
-        /// Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit review on PR 19: export files and
-        /// rows survived the deletion). Touches: deletion_requests, export_requests, audit_logs, export storage, the
-        /// user data store.
+        /// Runs every approved deletion whose time has come at <paramref name="now"/> (after the grace period; at once for a
+        /// statutory reason), oldest first, through <see cref="RunCascadeAsync"/>. Input: the time to judge by. Output:
+        /// how many due deletions were attempted. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit
+        /// review on PR 19, and EXPORT-13: the cascade moved to RunCascadeAsync). Touches: see RunCascadeAsync.
         /// </summary>
         public async Task<int> ProcessDueDeletionsAsync(DateTime now, CancellationToken ct)
         {
             var due = await _db.DeletionRequests.Where(d => d.Status == "approved" && d.ScheduledFor <= now)
                 .OrderBy(d => d.ScheduledFor).ThenBy(d => d.Sequence).ToListAsync(ct);
             foreach (var deletion in due)
-            {
-                try
-                {
-                    await DeleteExportsOfAsync(deletion.UserId, ct);
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException)
-                {
-                    _logger.LogError("Deletion {DeletionId}: export cleanup failed, will retry: {Error}", deletion.Id, ex.GetType().Name);
-                    Audit.Add(_db, deletion.UserId, null, "deletion_export_cleanup_failed", new { deletion_id = deletion.Id, error = ex.GetType().Name });
-                    await _db.SaveChangesAsync(ct);
-                    continue; // still "approved": the next pass retries it
-                }
-                try
-                {
-                    await _users.DeleteUserAsync(deletion.UserId, ct);
-                    deletion.Status = "completed";
-                    deletion.DeletedAt = now;
-                    Audit.Add(_db, deletion.UserId, null, "deletion_completed", new { deletion_id = deletion.Id });
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException)
-                {
-                    _logger.LogError("Deletion {DeletionId} failed: {Error}", deletion.Id, ex.GetType().Name);
-                    deletion.Status = "failed";
-                    Audit.Add(_db, deletion.UserId, null, "deletion_failed", new { deletion_id = deletion.Id, error = ex.GetType().Name });
-                }
-                await _db.SaveChangesAsync(ct);
-            }
+                await RunCascadeAsync(deletion, now, ct);
             return due.Count;
+        }
+
+        /// <summary>
+        /// The deletion cascade of one approved request (EXPORT-07/08/13), in order:
+        /// (0) the user's export files are deleted from storage and their export_requests rows staged for removal; if
+        ///     storage fails, the deletion stays 'approved' (audited deletion_export_cleanup_failed) and is retried;
+        /// (1) the user's rows are deleted through <see cref="IUserDataStore.DeleteUserAsync"/> (never the audit tables);
+        /// (2) 'user_deleted_cascade' is logged with the user as subject;
+        /// (3) the audit eraser's erase_subject(user_id) is called LAST;
+        /// then the request is 'completed' with deleted_at = now and user_id NULL, and every database change of the
+        /// cascade is saved in one SaveChanges. Nothing is logged for the user after step 3. A failure in (1)-(3) marks
+        /// the request 'failed' (audited). Input: the tracked request, the time. Written 2026-11-10,
+        /// session_012zDydZCZ4AChqhEZ4oVtaP (an independent security review found nothing erased the user's audit
+        /// personal data, and 'deletion_completed' was logged for the user after the cascade). Touches: export storage,
+        /// export_requests, the user data store, audit_logs, deletion_requests, the audit eraser.
+        /// </summary>
+        public async Task RunCascadeAsync(DeletionRequest deletion, DateTime now, CancellationToken ct)
+        {
+            if (deletion.Status != "approved" || deletion.UserId is not Guid userId) return;
+            try
+            {
+                await DeleteExportsOfAsync(userId, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogError("Deletion {DeletionId}: export cleanup failed, will retry: {Error}", deletion.Id, ex.GetType().Name);
+                foreach (var entry in _db.ChangeTracker.Entries<ExportRequest>().Where(e => e.State == EntityState.Deleted).ToList())
+                    entry.State = EntityState.Unchanged;
+                Audit.Add(_db, userId, null, "deletion_export_cleanup_failed", new { deletion_id = deletion.Id, error = ex.GetType().Name });
+                await _db.SaveChangesAsync(ct);
+                return; // still "approved": the next pass retries it
+            }
+            try
+            {
+                await _users.DeleteUserAsync(userId, ct);
+                Audit.Add(_db, userId, null, "user_deleted_cascade", new { deletion_id = deletion.Id });
+                await _auditEraser.EraseSubjectAsync(userId, ct);
+                deletion.Status = "completed";
+                deletion.DeletedAt = now;
+                deletion.UserId = null;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogError("Deletion {DeletionId} failed: {Error}", deletion.Id, ex.GetType().Name);
+                deletion.Status = "failed";
+                Audit.Add(_db, userId, null, "deletion_failed", new { deletion_id = deletion.Id, error = ex.GetType().Name });
+            }
+            await _db.SaveChangesAsync(ct);
         }
 
         /// <summary>
@@ -797,7 +911,7 @@ namespace ComplianceModule
                     using var scope = _sp.CreateScope();
                     var processor = scope.ServiceProvider.GetRequiredService<ExportProcessor>();
                     await processor.ProcessPendingExportsAsync(stoppingToken);
-                    await processor.ProcessDueDeletionsAsync(DateTime.UtcNow, stoppingToken);
+                    await processor.ProcessDueDeletionsAsync(scope.ServiceProvider.GetRequiredService<ComplianceClock>().Now(), stoppingToken);
                 }
                 catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
                 {
@@ -922,6 +1036,9 @@ namespace ComplianceModule
                 services.AddSingleton<IComplianceMailer>(sp => sp.GetRequiredService<DevelopmentComplianceMailer>());
             }
 
+            if (!services.Any(d => d.ServiceType == typeof(IAuditEraser)))
+                services.AddScoped<IAuditEraser, LocalAuditEraser>();
+            services.AddSingleton<ComplianceClock>();
             services.AddScoped<ComplianceService>();
             services.AddScoped<ExportProcessor>();
             services.AddHostedService<ComplianceWorker>();

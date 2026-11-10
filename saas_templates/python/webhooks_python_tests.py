@@ -17,6 +17,7 @@ from webhooks_python import (
 import sqlite3
 
 
+# HOOK-01
 def test_sign_verify_roundtrip():
     store = InMemoryStore()
     secret = generate_secret()
@@ -36,6 +37,7 @@ def test_sign_verify_roundtrip():
     assert result is True, f"Expected True, got {result}"
 
 
+# HOOK-02
 def test_changed_body_or_timestamp_fails():
     store = InMemoryStore()
     secret = generate_secret()
@@ -64,6 +66,7 @@ def test_changed_body_or_timestamp_fails():
     assert result != True, f"Expected failure for changed timestamp, got {result}"
 
 
+# HOOK-03
 def test_old_timestamp_rejected():
     store = InMemoryStore()
     secret = generate_secret()
@@ -85,6 +88,7 @@ def test_old_timestamp_rejected():
     assert result is True, f"Expected success with larger tolerance, got {result}"
 
 
+# HOOK-04
 def test_multiple_signatures_one_matches():
     store = InMemoryStore()
     secret1 = generate_secret()
@@ -117,11 +121,15 @@ def test_multiple_signatures_one_matches():
     assert result != True, f"Expected failure for secret3, got {result}"
 
 
+# HOOK-05
 def test_response_codes_success_and_retry():
+    """2xx marks success; 301, 400 and 500 schedule a retry.
+    In: the test fixtures. Out: assertions. Why: HOOK-05. Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: send_event now takes the org id.
+    Touches: the in-memory store."""
     store = InMemoryStore()
     endpoint_data = create_endpoint("org1", "https://example.com/webhook", ["event.test"], store)
     endpoint_id = endpoint_data["id"]
-    message_id = send_event("event.test", {"data": "test"}, store)
+    message_id = send_event("org1", "event.test", {"data": "test"}, store)
 
     delivery = store.get_pending_deliveries(time.time() + 1)[0]
     assert delivery.attempt == 0
@@ -138,7 +146,7 @@ def test_response_codes_success_and_retry():
     assert updated.next_attempt_at is None
 
     # 301 -> failure, retry scheduled
-    message_id2 = send_event("event.test", {"data": "test2"}, store)
+    message_id2 = send_event("org1", "event.test", {"data": "test2"}, store)
     delivery2 = store.get_pending_deliveries(time.time() + 1)[0]
 
     def sender_301(url, headers, body):
@@ -152,7 +160,7 @@ def test_response_codes_success_and_retry():
     assert updated2.next_attempt_at > time.time()
 
     # 400 -> failure, retry scheduled
-    message_id3 = send_event("event.test", {"data": "test3"}, store)
+    message_id3 = send_event("org1", "event.test", {"data": "test3"}, store)
     delivery3 = store.get_pending_deliveries(time.time() + 1)[0]
 
     def sender_400(url, headers, body):
@@ -165,7 +173,7 @@ def test_response_codes_success_and_retry():
     assert updated3.next_attempt_at is not None
 
     # 500 -> failure, retry scheduled
-    message_id4 = send_event("event.test", {"data": "test4"}, store)
+    message_id4 = send_event("org1", "event.test", {"data": "test4"}, store)
     delivery4 = store.get_pending_deliveries(time.time() + 1)[0]
 
     def sender_500(url, headers, body):
@@ -178,16 +186,25 @@ def test_response_codes_success_and_retry():
     assert updated4.next_attempt_at is not None
 
 
+# HOOK-07
 def test_webhook_id_same_across_retries():
+    """The webhook-id header the receiver sees is the same on every retry.
+    In: the test fixtures. Out: assertions. Why: HOOK-07 (header now recorded). Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: send_event now takes the org id.
+    Touches: the in-memory store."""
     store = InMemoryStore()
     endpoint_data = create_endpoint("org1", "https://example.com/webhook", ["event.test"], store)
     endpoint_id = endpoint_data["id"]
-    message_id = send_event("event.test", {"data": "test"}, store)
+    message_id = send_event("org1", "event.test", {"data": "test"}, store)
 
     delivery = store.get_pending_deliveries(time.time() + 1)[0]
     original_msg_id = delivery.message_id
 
+    # [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] The sender now records the webhook-id header it receives,
+    # so HOOK-07 checks the header the receiver sees, not only the stored message_id.
+    seen_ids = []
+
     def sender_fail(url, headers, body):
+        seen_ids.append(headers["webhook-id"])
         return (500, b"Error")
 
     # First attempt
@@ -209,8 +226,31 @@ def test_webhook_id_same_across_retries():
     deliver(next_delivery2, store, sender_fail)
     updated3 = store.get_delivery(next_delivery2.id)
     assert updated3.message_id == original_msg_id
+    assert seen_ids == [message_id, message_id, message_id]
 
 
+# HOOK-06
+def test_event_for_org_a_creates_no_delivery_for_org_b():
+    """An event sent for org A creates deliveries only for org A's endpoints, in both stores.
+
+    In: org A and org B each with an active endpoint subscribed to "invoice.paid" (and an org A endpoint on
+    another type). Out: asserts exactly one delivery, to org A's subscribed endpoint, and none to org B's.
+    Why: HOOK-06 (spec amended 2026-09-26: send_event takes org_id); the Python send_event had no org_id and
+    fanned out to every tenant. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory and
+    in-memory SQLite stores only, no network.
+    """
+    for store in (InMemoryStore(), SqliteStore(sqlite3.connect(":memory:"))):
+        ep_a = create_endpoint("org_a", "https://a.example.com/hook", ["invoice.paid"], store)["id"]
+        create_endpoint("org_a", "https://a.example.com/other", ["invoice_paid"], store)
+        ep_b = create_endpoint("org_b", "https://b.example.com/hook", ["invoice.paid"], store)["id"]
+        message_id = send_event("org_a", "invoice.paid", {"amount": 10}, store)
+        pending = store.get_pending_deliveries(time.time() + 1)
+        assert [(d.message_id, d.endpoint_id) for d in pending] == [(message_id, ep_a)]
+        assert all(d.endpoint_id != ep_b for d in pending)
+        assert store.get_message(message_id).org_id == "org_a"
+
+
+# HOOK-08
 def test_generated_secret_format():
     secret = generate_secret()
     assert secret.startswith("whsec_"), f"Secret doesn't start with whsec_: {secret}"
@@ -225,6 +265,9 @@ def test_generated_secret_format():
 
 
 def test_endpoint_disabled_after_5_failures():
+    """Five failed deliveries disable the endpoint.
+    In: the test fixtures. Out: assertions. Why: spec retry rule. Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: send_event now takes the org id.
+    Touches: the in-memory store."""
     store = InMemoryStore()
     endpoint_data = create_endpoint("org1", "https://example.com/webhook", ["event.test"], store)
     endpoint_id = endpoint_data["id"]
@@ -233,7 +276,7 @@ def test_endpoint_disabled_after_5_failures():
         return (500, b"Error")
 
     for i in range(5):
-        message_id = send_event("event.test", {"data": f"test{i}"}, store)
+        message_id = send_event("org1", "event.test", {"data": f"test{i}"}, store)
         delivery = store.get_pending_deliveries(time.time() + 1)[0]
         deliver(delivery, store, sender_fail)
 
@@ -243,6 +286,9 @@ def test_endpoint_disabled_after_5_failures():
 
 
 def test_sqlite_store_persistence():
+    """The SQLite store round-trips a delivery and its signature verifies.
+    In: the test fixtures. Out: assertions. Why: spec schema. Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: send_event now takes the org id.
+    Touches: the in-memory store."""
     conn = sqlite3.connect(":memory:")
     store = SqliteStore(conn)
 
@@ -250,7 +296,7 @@ def test_sqlite_store_persistence():
     endpoint_id = endpoint_data["id"]
     secret = endpoint_data["secret"]
 
-    message_id = send_event("event.test", {"data": "test"}, store)
+    message_id = send_event("org1", "event.test", {"data": "test"}, store)
 
     delivery = store.get_pending_deliveries(time.time() + 1)[0]
     assert delivery.message_id == message_id
@@ -312,9 +358,12 @@ def test_rotate_secret():
 
 
 def test_sender_exception_handled():
+    """A sender that raises is a failed attempt with a retry, not an error.
+    In: the test fixtures. Out: assertions. Why: spec deliver rule. Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: send_event now takes the org id.
+    Touches: the in-memory store."""
     store = InMemoryStore()
     endpoint_data = create_endpoint("org1", "https://example.com/webhook", ["event.test"], store)
-    message_id = send_event("event.test", {"data": "test"}, store)
+    message_id = send_event("org1", "event.test", {"data": "test"}, store)
     delivery = store.get_pending_deliveries(time.time() + 1)[0]
 
     def sender_raises(url, headers, body):

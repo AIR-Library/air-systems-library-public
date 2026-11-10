@@ -46,6 +46,7 @@ namespace SaaSLibrary.ApiKeys.Tests
             _dbName.Dispose();
         }
 
+        // KEYS-01
         [Fact]
         public async Task CreateApiKey_WithValidRequest_ReturnsApiKeyResponse()
         {
@@ -383,6 +384,7 @@ namespace SaaSLibrary.ApiKeys.Tests
             Assert.Equal(HttpStatusCode.Unauthorized, result.StatusCode);
         }
 
+        // KEYS-07
         [Fact]
         public async Task ValidateApiKey_ExpiredKey_ReturnsInvalidWithUnauthorized()
         {
@@ -411,6 +413,7 @@ namespace SaaSLibrary.ApiKeys.Tests
             Assert.Equal(HttpStatusCode.Unauthorized, result.StatusCode);
         }
 
+        // KEYS-05
         [Fact]
         public async Task ValidateApiKey_ValidKeyButInsufficientScope_ReturnsInvalidWithForbidden()
         {
@@ -513,6 +516,7 @@ namespace SaaSLibrary.ApiKeys.Tests
             Assert.Equal(200, usage.Status);
         }
 
+        // KEYS-08
         [Fact]
         public async Task GetApiKeyUsageAsync_ForExistingKey_ReturnsUsageStats()
         {
@@ -587,6 +591,7 @@ namespace SaaSLibrary.ApiKeys.Tests
                 _service.GetApiKeyUsageAsync(_testUserId, apiKey.Id, null, null));
         }
 
+        // KEYS-09
         [Fact]
         public async Task AdminListApiKeysAsync_NoFilters_ReturnsAllKeys()
         {
@@ -661,6 +666,108 @@ namespace SaaSLibrary.ApiKeys.Tests
             Assert.Equal(1, result.Total);
             Assert.Contains(result.Keys, k => k.Name == "Revoked Key");
             Assert.DoesNotContain(result.Keys, k => k.Name == "Active Key");
+        }
+
+        /// <summary>
+        /// KEYS-02: a request carrying "Authorization: Bearer &lt;key&gt;" succeeds; no header or another scheme is 401.
+        /// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (no test covered the header). Touches: in-memory EF, mocked Redis.
+        /// </summary>
+        // KEYS-02
+        [Fact]
+        public async Task AuthorizationHeader_BearerKey_Succeeds()
+        {
+            var created = await _service.CreateApiKeyAsync(_testUserId,
+                new CreateApiKeyRequest { Name = "Header", Scopes = new List<string> { "read:deployments" }, RateLimit = 1000 });
+            _redisDatabaseMock.Setup(r => r.StringIncrementAsync(It.IsAny<RedisKey>(), It.IsAny<long>(), It.IsAny<CommandFlags>()))
+                .ReturnsAsync(1L);
+
+            var ok = await _service.ValidateAuthorizationHeaderAsync("Bearer " + created.Key, "/api/deployments", HttpMethod.Get);
+            Assert.True(ok.IsValid);
+
+            var missing = await _service.ValidateAuthorizationHeaderAsync(null, "/api/deployments", HttpMethod.Get);
+            Assert.False(missing.IsValid);
+            Assert.Equal(HttpStatusCode.Unauthorized, missing.StatusCode);
+
+            var basic = await _service.ValidateAuthorizationHeaderAsync("Basic " + created.Key, "/api/deployments", HttpMethod.Get);
+            Assert.False(basic.IsValid);
+            Assert.Equal(HttpStatusCode.Unauthorized, basic.StatusCode);
+        }
+
+        /// <summary>
+        /// KEYS-03: a key that worked is refused with 401 once revoked. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP
+        /// (the revoke test only checked the is_active flag, not a later request). Touches: in-memory EF, mocked Redis.
+        /// </summary>
+        // KEYS-03
+        [Fact]
+        public async Task RevokedKey_SubsequentRequest_Returns401()
+        {
+            var created = await _service.CreateApiKeyAsync(_testUserId,
+                new CreateApiKeyRequest { Name = "Revoke me", Scopes = new List<string> { "read:deployments" }, RateLimit = 1000 });
+            _redisDatabaseMock.Setup(r => r.StringIncrementAsync(It.IsAny<RedisKey>(), It.IsAny<long>(), It.IsAny<CommandFlags>()))
+                .ReturnsAsync(1L);
+            Assert.True((await _service.ValidateAuthorizationHeaderAsync("Bearer " + created.Key, "/deployments", HttpMethod.Get)).IsValid);
+
+            await _service.RevokeApiKeyAsync(_testUserId, Guid.Parse(created.ApiKeyId));
+
+            var after = await _service.ValidateAuthorizationHeaderAsync("Bearer " + created.Key, "/deployments", HttpMethod.Get);
+            Assert.False(after.IsValid);
+            Assert.Equal(HttpStatusCode.Unauthorized, after.StatusCode);
+        }
+
+        /// <summary>
+        /// KEYS-04: with rate_limit 1000, the 1000th request in the hour passes and the 1001st is 429, and the hit is
+        /// counted in usage stats. Redis is mocked to report the hour's counter at 1000 and then 1001 (running 1001
+        /// bcrypt checks would take minutes). Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory EF, mocked Redis.
+        /// </summary>
+        // KEYS-04
+        [Fact]
+        public async Task RateLimit_1001stRequestInHour_Returns429()
+        {
+            var created = await _service.CreateApiKeyAsync(_testUserId,
+                new CreateApiKeyRequest { Name = "Limit", Scopes = new List<string> { "read:deployments" }, RateLimit = 1000 });
+            _redisDatabaseMock.SetupSequence(r => r.StringIncrementAsync(It.IsAny<RedisKey>(), It.IsAny<long>(), It.IsAny<CommandFlags>()))
+                .ReturnsAsync(1000L)
+                .ReturnsAsync(1001L);
+
+            var thousandth = await _service.ValidateApiKeyAsync(created.Key, "/deployments", HttpMethod.Get);
+            var next = await _service.ValidateApiKeyAsync(created.Key, "/deployments", HttpMethod.Get);
+
+            Assert.True(thousandth.IsValid);
+            Assert.False(next.IsValid);
+            Assert.Equal((HttpStatusCode)429, next.StatusCode);
+            var stats = await _service.GetApiKeyUsageAsync(_testUserId, Guid.Parse(created.ApiKeyId), null, null);
+            Assert.Equal(1, stats.RateLimitHits);
+        }
+
+        /// <summary>
+        /// KEYS-06: after rotation the new key works at once and the old key keeps working until the 24 h grace period
+        /// ends, then gets 401. Uses the injectable clock. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (the rotate
+        /// test never used either key). Touches: in-memory EF, mocked Redis.
+        /// </summary>
+        // KEYS-06
+        [Fact]
+        public async Task Rotate_NewKeyWorks_OldKeyStopsAfterGracePeriod()
+        {
+            var now = new DateTime(2026, 11, 10, 12, 0, 0, DateTimeKind.Utc);
+            var service = new ApiKeysService(_dbName, _redisMock.Object, _loggerMock.Object, () => now);
+            _redisDatabaseMock.Setup(r => r.StringIncrementAsync(It.IsAny<RedisKey>(), It.IsAny<long>(), It.IsAny<CommandFlags>()))
+                .ReturnsAsync(1L);
+            var created = await service.CreateApiKeyAsync(_testUserId,
+                new CreateApiKeyRequest { Name = "Rotate", Scopes = new List<string> { "read:deployments" }, RateLimit = 1000 });
+
+            var rotated = await service.RotateApiKeyAsync(_testUserId, Guid.Parse(created.ApiKeyId));
+            Assert.Equal(now.AddHours(24), rotated.GracePeriodEndsAt);
+            Assert.True((await service.ValidateApiKeyAsync(rotated.NewKey, "/deployments", HttpMethod.Get)).IsValid);
+            Assert.True((await service.ValidateApiKeyAsync(created.Key, "/deployments", HttpMethod.Get)).IsValid);
+
+            now = now.AddHours(23).AddMinutes(59);
+            Assert.True((await service.ValidateApiKeyAsync(created.Key, "/deployments", HttpMethod.Get)).IsValid);
+
+            now = now.AddMinutes(2);
+            var old = await service.ValidateApiKeyAsync(created.Key, "/deployments", HttpMethod.Get);
+            Assert.False(old.IsValid);
+            Assert.Equal(HttpStatusCode.Unauthorized, old.StatusCode);
+            Assert.True((await service.ValidateApiKeyAsync(rotated.NewKey, "/deployments", HttpMethod.Get)).IsValid);
         }
 
         // Helper methods
