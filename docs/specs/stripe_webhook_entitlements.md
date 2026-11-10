@@ -157,7 +157,9 @@ SUBSCRIPTION(sub, hint, rank), with event_at = event.created:
                                                                             -> "stale"
      a row exists, rank is 0 or 1, and (event_at, rank) EQUALS (row.event_at, row.event_rank): two events of
      one second and one kind, and nothing in them says which is newer. Do not guess from arrival order:
-     sub = stripe_client.retrieve_subscription(sub.id), what Stripe holds now, and continue with that object.
+     sub = stripe_client.retrieve_subscription(sub.id), what Stripe holds now, and continue with that object:
+     rule b (price_id and plan) is applied again to the fetched object, so the row ends with Stripe's current
+     price and plan. (Ruled 2026-11-10 after the Python, TypeScript and PHP implementers read it that way.)
      If the client raises, step 9 answers 500 and Stripe sends the event again.
      (Rank 2 needs no fetch: the status is "canceled" either way. checkout.session.completed has just
      fetched the subscription: it does not fetch a second time.)

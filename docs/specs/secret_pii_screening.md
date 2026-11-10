@@ -449,11 +449,14 @@ a label is start-end.
     E8 = 600 backslashes followed by the letter n
         reject: 422, unresolved_escape encoded
         strip: 422, unresolved_escape encoded
+  Note (2026-11-10, found by the Python and TypeScript implementers): detector 13 followed literally is
+  quadratic on "token=$" * 28571 (18 s). Compute where each value ends once (a lookup table) and run the
+  instant refusals first; the answers must not change, only the time. That input is now in SCREEN-14.
   SCREEN-14: screen_text("x", "mask") -> 400 invalid_mode. categories [] and ["secret", "keys"] -> 400
     invalid_categories. With max_bytes = 9, "\u00e9" * 5 (10 bytes) -> 413
     text_too_large; with max_bytes = 10 it is ok. Each of these, in strip mode, returns in under 2 seconds:
     "a." * 100000, ("-----BEGIN " + "PRIVATE KEY-----") * 7400, "1234-" * 40000, "eyJ" * 66666, "xeyJ-" * 40000,
-    "xsk-" * 50000, "password" + " " * 199990, "token=[REDACTED:" * 12500, "a://b:" * 33000, "ab:" * 66000,
+    "xsk-" * 50000, "password" + " " * 199990, "token=[REDACTED:" * 12500, "token=$" * 28571, "a://b:" * 33000, "ab:" * 66000,
     "1.1." * 50000, "\\n" * 100000, B + "\n" * 199969, B + ("\n" + "A" * 64) * 3000
     Extra, not a required id (a Rust &str cannot hold such a text): where the language can build it, an
     unpaired surrogate (JavaScript, TypeScript, Java, C#, Python) or the byte FF (PHP, Go) is 400 invalid_text.
