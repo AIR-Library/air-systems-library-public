@@ -283,11 +283,19 @@ namespace NotificationsTests
 
             // the user clicks the link in the message: it is marked opened (NOTIF-07; added 2026-11-10,
             // session_012zDydZCZ4AChqhEZ4oVtaP: nothing could mark a message opened before)
-            (await _client.GetAsync($"/notifications/open/{messageId}")).EnsureSuccessStatusCode();
+            // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, spec "Opening"): the answer is 204 every
+            // time (it was asserted only as a success, and an unknown id as 404); a second call changes nothing.
+            Assert.Equal(HttpStatusCode.NoContent, (await _client.GetAsync($"/notifications/open/{messageId}")).StatusCode);
             var opened = await Track(messageId!);
             Assert.Equal("opened", opened.GetProperty("status").GetString());
             Assert.Equal(JsonValueKind.String, opened.GetProperty("opened_at").ValueKind);
-            Assert.Equal(HttpStatusCode.NotFound, (await _client.GetAsync($"/notifications/open/{Guid.NewGuid()}")).StatusCode);
+            var firstOpenedAt = opened.GetProperty("opened_at").GetString();
+            await Task.Delay(20);
+            Assert.Equal(HttpStatusCode.NoContent, (await _client.GetAsync($"/notifications/open/{messageId}")).StatusCode);
+            var again = await Track(messageId!);
+            Assert.Equal("opened", again.GetProperty("status").GetString());
+            Assert.Equal(firstOpenedAt, again.GetProperty("opened_at").GetString());
+            Assert.Equal(HttpStatusCode.NoContent, (await _client.GetAsync($"/notifications/open/{Guid.NewGuid()}")).StatusCode);
         }
 
         [Fact]
@@ -526,7 +534,9 @@ namespace NotificationsTests
 
         /// <summary>
         /// NOTIF-08: an email whose gateway fails twice is retried after 1 s and 2 s and then sent (3 attempts); a gateway
-        /// that never works ends 'failed' after 3 attempts.
+        /// that never works is retried 3 times (after 1 s, 2 s and 4 s) and ends 'failed' after the 4th attempt.
+        /// Corrected 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2: the spec now counts up to 3 retries after the
+        /// first attempt, at most 4 attempts; this test asserted 'failed' after 3). Touches: process memory only.
         /// </summary>
         // NOTIF-08
         [Fact]
@@ -554,8 +564,77 @@ namespace NotificationsTests
             var doomed = await InScope(sp, (svc, _) => svc.SendAsync(8, "welcome_email", "email", AppVars, null));
             foreach (var at in new[] { 0, 1, 3 })
                 await worker.DeliverDueAsync(t0.AddSeconds(10 + at), CancellationToken.None);
+            // after 3 failed attempts the 3rd retry waits 4 s (2026-11-10, Phase B.2: this was asserted 'failed')
+            var third = await Log(sp, doomed.MessageId!);
+            Assert.Equal(("queued", 3, t0.AddSeconds(17)), (third.Status, third.Attempts, third.NextAttemptAt!.Value));
+            Assert.Equal(0, await worker.DeliverDueAsync(t0.AddSeconds(16.999), CancellationToken.None)); // still waiting
+            Assert.Equal(3, (await Log(sp, doomed.MessageId!)).Attempts);
+            await worker.DeliverDueAsync(t0.AddSeconds(17), CancellationToken.None);
             var failed = await Log(sp, doomed.MessageId!);
-            Assert.Equal(("failed", 3), (failed.Status, failed.Attempts));
+            Assert.Equal(("failed", 4), (failed.Status, failed.Attempts));
+            Assert.Equal(DeliveryWorker.MaxAttempts, failed.Attempts);
+        }
+
+        /// <summary>
+        /// NOTIF-08 (Phase B.2 amendment): a gateway that fails three times is retried after 1 s, 2 s and 4 s and the 4th
+        /// attempt succeeds: the message is 'sent' after exactly 4 calls. In: nothing. Out: asserts. Added 2026-11-10,
+        /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: process memory only.
+        /// </summary>
+        // NOTIF-08
+        [Fact]
+        public async Task Retry_ThreeFailures_FourthAttemptSucceeds()
+        {
+            FlakyEmail? flaky = null;
+            var (sp, clock, outbox, worker) = Build(o => flaky = new FlakyEmail(o, 3));
+            using var _ = sp;
+            var t0 = clock.Now();
+            var r = await InScope(sp, (svc, _) => svc.SendAsync(9, "welcome_email", "email", AppVars, null));
+            await worker.DeliverDueAsync(t0, CancellationToken.None);
+            Assert.Equal(t0.AddSeconds(1), (await Log(sp, r.MessageId!)).NextAttemptAt);
+            await worker.DeliverDueAsync(t0.AddSeconds(1), CancellationToken.None);
+            Assert.Equal(t0.AddSeconds(3), (await Log(sp, r.MessageId!)).NextAttemptAt);
+            await worker.DeliverDueAsync(t0.AddSeconds(3), CancellationToken.None);
+            Assert.Equal(t0.AddSeconds(7), (await Log(sp, r.MessageId!)).NextAttemptAt);
+            Assert.Equal(1, await worker.DeliverDueAsync(t0.AddSeconds(7), CancellationToken.None));
+            var log = await Log(sp, r.MessageId!);
+            Assert.Equal(("sent", 3), (log.Status, log.Attempts)); // three failed attempts counted, the 4th sent it
+            Assert.Equal(4, flaky!.Calls);
+            Assert.Single(outbox.Messages);
+        }
+
+        /// <summary>
+        /// NOTIF-05 (Phase B.2 amendment, deliver_due step 3): a message queued for 12:00 whose user then sets quiet hours
+        /// 11:00-13:00 (UTC, same day) is not sent at 12:00 but goes back to 'queued' with scheduled_at = 13:00, and is
+        /// sent then. A window crossing midnight (22:00-07:00) holds a message due at 02:00 until 07:00 the same morning.
+        /// In: nothing. Out: asserts. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: process memory only.
+        /// </summary>
+        // NOTIF-05
+        [Fact]
+        public async Task QuietHours_DeliverDueRequeuesUntilQuietHoursEnd()
+        {
+            var (sp, _, outbox, worker) = Build();
+            using var __ = sp;
+            var noon = new DateTime(2026, 11, 11, 12, 0, 0, DateTimeKind.Utc);
+            var r = await InScope(sp, (svc, _) => svc.SendAsync(31, "welcome_email", "email", AppVars, noon));
+            Assert.Equal(noon, (await Log(sp, r.MessageId!)).ScheduledAt);
+            Assert.Null(await InScope(sp, (svc, _) => svc.UpdatePreferencesAsync(31, new UpdatePrefRequest { QuietHoursStart = "11:00", QuietHoursEnd = "13:00" })));
+
+            Assert.Equal(0, await worker.DeliverDueAsync(noon, CancellationToken.None));
+            var held = await Log(sp, r.MessageId!);
+            Assert.Equal(("queued", noon.AddHours(1)), (held.Status, held.ScheduledAt));
+            Assert.Null(held.ClaimedAt);
+            Assert.Empty(outbox.Messages);
+            Assert.Equal(0, await worker.DeliverDueAsync(noon.AddMinutes(59), CancellationToken.None));
+            Assert.Equal(1, await worker.DeliverDueAsync(noon.AddHours(1), CancellationToken.None));
+            Assert.Equal("sent", (await Log(sp, r.MessageId!)).Status);
+
+            var twoAm = new DateTime(2026, 11, 12, 2, 0, 0, DateTimeKind.Utc);
+            var night = await InScope(sp, (svc, _) => svc.SendAsync(32, "welcome_email", "email", AppVars, twoAm));
+            Assert.Null(await InScope(sp, (svc, _) => svc.UpdatePreferencesAsync(32, new UpdatePrefRequest { QuietHoursStart = "22:00", QuietHoursEnd = "07:00" })));
+            Assert.Equal(0, await worker.DeliverDueAsync(twoAm, CancellationToken.None));
+            Assert.Equal(new DateTime(2026, 11, 12, 7, 0, 0, DateTimeKind.Utc), (await Log(sp, night.MessageId!)).ScheduledAt);
+            Assert.Equal(1, await worker.DeliverDueAsync(new DateTime(2026, 11, 12, 7, 0, 0, DateTimeKind.Utc), CancellationToken.None));
+            Assert.Equal(2, outbox.Messages.Count);
         }
 
         /// <summary>

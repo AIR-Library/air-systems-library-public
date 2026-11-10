@@ -108,7 +108,7 @@ public class AdminControllerTests
         {
             CustomerId = customerId,
             Domain = domain,
-            Tier = Role.User,
+            Tier = "team", // a deployment's tier is its plan (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, Phase B.2; was Role.User)
             ThemeId = Guid.NewGuid(),
             DomainVerified = true // publish now checks it (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
         };
@@ -259,9 +259,16 @@ public class AdminControllerTests
 
         var owner2 = CreateOwner("owner2@example.com");
         owner.Status = "suspended";
+        // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, ADMIN-19): this step made the target the last
+        // ACTIVE owner by suspending the acting owner. A suspended caller is now refused before any gate with 403
+        // account_suspended, so that is what this step proves, and the target is unchanged. (With an active acting
+        // owner the target is never the last active owner, so the last-owner refusal for another user cannot be
+        // reached through the API any more; reported in the Phase B.2 handoff.)
         var ex = Assert.Throws<ApiException>(() =>
             _controller.ResetPassword(csrf, owner2.UserId));
-        Assert.Equal("cannot_reset_last_owner", ex.Code);
+        Assert.Equal("account_suspended", ex.Code);
+        Assert.Equal(403, ex.Status);
+        Assert.Null(owner2.PasswordTokenHash);
     }
 
     // ADMIN-06
@@ -315,10 +322,15 @@ public class AdminControllerTests
 
         var owner2 = CreateOwner("owner2@example.com");
         owner.Status = "suspended";
+        // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, ADMIN-19): this step made the target the last
+        // ACTIVE owner by suspending the acting owner. A suspended caller is now refused before any gate with 403
+        // account_suspended, so that is what this step proves, and the target is unchanged. (With an active acting
+        // owner the target is never the last active owner, so the last-owner refusal for another user cannot be
+        // reached through the API any more; reported in the Phase B.2 handoff.)
         var ex = Assert.Throws<ApiException>(() =>
             _controller.ChangeUserRole(csrf, owner2.UserId, "Admin"));
-        Assert.Equal("cannot_demote_last_owner", ex.Code);
-        Assert.Equal(400, ex.Status);
+        Assert.Equal("account_suspended", ex.Code);
+        Assert.Equal(403, ex.Status);
         Assert.Equal(Role.Owner, owner2.Tier);
     }
 
@@ -382,9 +394,15 @@ public class AdminControllerTests
 
         var owner2 = CreateOwner("owner2@example.com");
         owner.Status = "suspended";
+        // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, ADMIN-19): this step made the target the last
+        // ACTIVE owner by suspending the acting owner. A suspended caller is now refused before any gate with 403
+        // account_suspended, so that is what this step proves, and the target is unchanged. (With an active acting
+        // owner the target is never the last active owner, so the last-owner refusal for another user cannot be
+        // reached through the API any more; reported in the Phase B.2 handoff.)
         var ex = Assert.Throws<ApiException>(() =>
             _controller.SuspendUser(csrf, owner2.UserId, "Last"));
-        Assert.Equal("cannot_suspend_last_owner", ex.Code);
+        Assert.Equal("account_suspended", ex.Code);
+        Assert.Equal(403, ex.Status);
         Assert.Equal("active", owner2.Status);
     }
 
@@ -604,14 +622,19 @@ public class AdminControllerTests
         var cust = CreateCustomer();
 
         var themeId = Guid.NewGuid();
-        var result = _controller.CreateDeployment(csrf, cust.CustomerId, "newsite.com", "User", themeId);
+        // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, admin spec TIERS): the tier is a plan; this
+        // test passed the staff role "User", which is now 400 invalid_tier.
+        var result = _controller.CreateDeployment(csrf, cust.CustomerId, "newsite.com", "team", themeId);
         Assert.True(((dynamic)result).success);
         Assert.Equal("newsite.com", ((dynamic)result).domain);
+        Assert.Equal("team", ((dynamic)result).tier);
         // ADMIN-14 "deployment created + config initialized" (asserts added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
         var dep = Assert.Single(Database.Deployments);
         Assert.Equal(DeploymentStatus.Draft, dep.Status);
         Assert.Equal("newsite.com", dep.Config["domain"]);
         Assert.Equal(themeId.ToString(), dep.Config["theme_id"]);
+        Assert.Equal("team", dep.Tier);
+        Assert.False(dep.DomainVerified); // a new deployment's domain is not verified yet (Phase B.2)
     }
 
     [Fact]
@@ -830,5 +853,108 @@ public class AdminControllerTests
         var ex = Assert.Throws<ApiException>(() =>
             _controller.CreateUser(csrf1, "test2@example.com", "Test2", "User", false));
         Assert.Equal("csrf_invalid", ex.Code);
+    }
+
+    /// <summary>
+    /// ADMIN-19: an owner whose account was suspended (by another owner) is refused by every admin action with 403
+    /// account_suspended, before any gate (even with a wrong CSRF token), and nothing changes: no user, customer,
+    /// deployment, refund, governance or audit record. In: nothing. Out: asserts. Added 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2). Touches: the in-memory admin state.
+    /// </summary>
+    // ADMIN-19
+    [Fact]
+    public void SuspendedOwner_EveryAction_AccountSuspended_NothingChanged()
+    {
+        var owner1 = CreateOwner("owner1@example.com");
+        var owner2 = CreateOwner("owner2@example.com");
+        var target = CreateUser("target@example.com");
+        var cust = CreateCustomer();
+        var inv = CreateInvoice(cust.CustomerId);
+        var dep = CreateDeployment(cust.CustomerId, "suspended-owner.com");
+        var ga = new GovernanceAction { ActionType = "suspend_user", ActorId = owner2.UserId, TargetResourceId = target.UserId, Reason = "abuse" };
+        Database.GovernanceActions.Add(ga);
+
+        SetupAuth(owner2);
+        _controller.SuspendUser(GetCsrfToken(owner2), owner1.UserId, "compromised");
+        var auditBefore = Database.AuditLog.Count;
+
+        SetupAuth(owner1);
+        var csrf = GetCsrfToken(owner1);
+        var actions = new List<Func<object>>
+        {
+            () => _controller.CreateUser(csrf, "new@example.com", "New", "User", false),
+            () => _controller.CreateUser("wrong-csrf", "new@example.com", "New", "User", false),
+            () => _controller.ResetPassword(csrf, target.UserId),
+            () => _controller.ChangeUserRole(csrf, target.UserId, "Admin"),
+            () => _controller.SuspendUser(csrf, target.UserId, "x"),
+            () => _controller.SuspendUser(csrf, owner2.UserId, "revenge"),
+            () => _controller.ListCustomers(csrf),
+            () => _controller.GetCustomerDetail(csrf, cust.CustomerId),
+            () => _controller.ChangeCustomerPlan(csrf, cust.CustomerId, "team"),
+            () => _controller.QueueRefund(csrf, inv.InvoiceId, 10m, "x"),
+            () => _controller.ListDeployments(csrf),
+            () => _controller.CreateDeployment(csrf, cust.CustomerId, "another.com", "team", Guid.NewGuid()),
+            () => _controller.PublishDeployment(csrf, dep.DeploymentId),
+            () => _controller.SuspendDeployment(csrf, dep.DeploymentId, "x"),
+            () => _controller.RetireDeployment(csrf, dep.DeploymentId),
+            () => _controller.ListGovernanceActions(csrf),
+            () => _controller.DecideGovernanceAction(csrf, ga.ActionId, "approve"),
+            () => _controller.SearchAuditLog(csrf),
+        };
+        foreach (var action in actions)
+        {
+            var ex = Assert.Throws<ApiException>(() => action());
+            Assert.Equal("account_suspended", ex.Code);
+            Assert.Equal(403, ex.Status);
+        }
+
+        Assert.Equal(3, Database.Users.Count);
+        Assert.Equal(Role.User, target.Tier);
+        Assert.Equal("active", target.Status);
+        Assert.Equal("active", owner2.Status);
+        Assert.Null(target.PasswordTokenHash);
+        Assert.Equal("solo", cust.Tier);
+        Assert.Empty(_stripe.Updates);
+        Assert.Empty(Database.Refunds);
+        Assert.Single(Database.Deployments);
+        Assert.Equal(DeploymentStatus.Draft, dep.Status);
+        Assert.Equal("pending", ga.Status);
+        Assert.Equal(auditBefore, Database.AuditLog.Count);
+        Assert.Empty(_mailer.Sent);
+    }
+
+    /// <summary>
+    /// Admin spec TIERS (Phase B.2): users.tier is the staff role and a customer's or deployment's tier is the plan;
+    /// a plan given where a role is expected, or a role where a plan is expected, is 400 invalid_tier and changes
+    /// nothing. In: nothing. Out: asserts. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory
+    /// admin state.
+    /// </summary>
+    // ADMIN-14
+    [Fact]
+    public void Tiers_RoleAndPlanAreNeverMixed_InvalidTier()
+    {
+        var owner = CreateOwner();
+        SetupAuth(owner);
+        var csrf = GetCsrfToken(owner);
+        var user = CreateUser();
+        var cust = CreateCustomer();
+
+        void InvalidTier(Func<object> action)
+        {
+            var ex = Assert.Throws<ApiException>(() => action());
+            Assert.Equal("invalid_tier", ex.Code);
+            Assert.Equal(400, ex.Status);
+        }
+        InvalidTier(() => _controller.CreateUser(csrf, "plan@example.com", "Plan", "team", false));
+        InvalidTier(() => _controller.ChangeUserRole(csrf, user.UserId, "enterprise"));
+        InvalidTier(() => _controller.ChangeCustomerPlan(csrf, cust.CustomerId, "admin"));
+        InvalidTier(() => _controller.CreateDeployment(csrf, cust.CustomerId, "role.com", "admin", Guid.NewGuid()));
+        InvalidTier(() => _controller.CreateDeployment(csrf, cust.CustomerId, "role.com", "user", Guid.NewGuid()));
+
+        Assert.Equal(2, Database.Users.Count);
+        Assert.Equal(Role.User, user.Tier);
+        Assert.Equal("solo", cust.Tier);
+        Assert.Empty(Database.Deployments);
+        Assert.Empty(Database.AuditLog);
     }
 }

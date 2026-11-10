@@ -178,6 +178,12 @@ VALUES (@UserId, @Month, 0, @Used, @Now);
             Assert.True(success);
         }
 
+        /// <summary>
+        /// QUOTA-10: a solo user asking for feature_a (team and up) gets 403 {error: "feature_not_available_in_tier",
+        /// tier: "solo", minimum_tier: "team", upgrade_url}. In: nothing. Out: asserts. Changed 2026-11-10,
+        /// session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2: the spec now names this exact body in every language; the tier
+        /// field is now asserted too). Touches: the test's in-memory database.
+        /// </summary>
         // QUOTA-10
         [Fact]
         public async Task FeatureGate_Fail()
@@ -189,6 +195,7 @@ VALUES (@UserId, @Month, 0, @Used, @Now);
             Assert.Equal(403, status);
             Assert.Contains("\"upgrade_url\":", json);
             Assert.Contains("\"minimum_tier\":\"team\"", json);
+            Assert.Contains("\"tier\":\"solo\"", json);
         }
 
         // QUOTA-11

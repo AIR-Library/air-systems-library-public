@@ -4,6 +4,9 @@
 // that nothing had issued, which a correct callback must refuse (spec gate state_valid), and now obtain one from
 // CreateOAuthStateAsync; VerifyEmail_HappyPath re-read the user through the context that still tracked the old
 // instance and now reads through a fresh one. Three tests were added for verify_access_token and the login lock.
+// Phase B.2 (2026-11-10, same session): verification codes, MFA challenge ids and OAuth states are seeded as their
+// SHA-256 (CodeHash; the Code column is gone), the OAuth mocks answer the single ExchangeCodeAsync call that replaced
+// GetEmailFromCodeAsync + IsEmailVerifiedAsync, and AUTH-16 tests were added.
 // Touches: EF InMemory databases and an in-memory cache only.
 using System;
 using System.Collections.Generic;
@@ -116,7 +119,7 @@ namespace AuthSystemTests
             db.VerificationCodes.Add(new VerificationCode
             {
                 UserId = user.Id,
-                Code = code,
+                CodeHash = AuthService.HashSecret(code), // stored only as its hash (AUTH-16, 2026-11-10)
                 Type = "email",
                 CreatedAt = DateTime.UtcNow,
                 ExpiresAt = DateTime.UtcNow.AddMinutes(15)
@@ -148,7 +151,7 @@ namespace AuthSystemTests
             db.VerificationCodes.Add(new VerificationCode
             {
                 UserId = user.Id,
-                Code = code,
+                CodeHash = AuthService.HashSecret(code), // stored only as its hash (AUTH-16, 2026-11-10)
                 Type = "email",
                 CreatedAt = DateTime.UtcNow.AddMinutes(-20),
                 ExpiresAt = DateTime.UtcNow.AddMinutes(-5)
@@ -216,8 +219,9 @@ namespace AuthSystemTests
         [Fact]
         public async Task OAuthCallback_NewUser_CreatesUserAndLinksProvider()
         {
-            _oauthProviderMock.Setup(o => o.GetEmailFromCodeAsync("google", "code")).ReturnsAsync("newuser@example.com");
-            _oauthProviderMock.Setup(o => o.IsEmailVerifiedAsync("google", "code")).ReturnsAsync(true);
+            // one exchange of the code through the injected client (Phase B.2, 2026-11-10; was two calls with the same code)
+            _oauthProviderMock.Setup(o => o.ExchangeCodeAsync("google", "code"))
+                .ReturnsAsync(new OAuthIdentity { ProviderUserId = "g-1", Email = "newuser@example.com", EmailVerified = true });
 
             var service = CreateService();
             var state = await service.CreateOAuthStateAsync();
@@ -241,8 +245,9 @@ namespace AuthSystemTests
             db.Users.Add(user);
             await db.SaveChangesAsync();
 
-            _oauthProviderMock.Setup(o => o.GetEmailFromCodeAsync("google", "code")).ReturnsAsync("existing@example.com");
-            _oauthProviderMock.Setup(o => o.IsEmailVerifiedAsync("google", "code")).ReturnsAsync(true);
+            // one exchange of the code through the injected client (Phase B.2, 2026-11-10; was two calls with the same code)
+            _oauthProviderMock.Setup(o => o.ExchangeCodeAsync("google", "code"))
+                .ReturnsAsync(new OAuthIdentity { ProviderUserId = "g-2", Email = "existing@example.com", EmailVerified = true });
 
             var service = CreateService();
             var state = await service.CreateOAuthStateAsync();
@@ -274,7 +279,7 @@ namespace AuthSystemTests
             db.VerificationCodes.Add(new VerificationCode
             {
                 UserId = user.Id,
-                Code = challengeId,
+                CodeHash = AuthService.HashSecret(challengeId), // stored only as its hash (Phase B.2, 2026-11-10)
                 Type = "mfa",
                 CreatedAt = DateTime.UtcNow,
                 ExpiresAt = DateTime.UtcNow.AddMinutes(5)
@@ -307,7 +312,7 @@ namespace AuthSystemTests
             db.VerificationCodes.Add(new VerificationCode
             {
                 UserId = user.Id,
-                Code = challengeId,
+                CodeHash = AuthService.HashSecret(challengeId), // stored only as its hash (Phase B.2, 2026-11-10)
                 Type = "mfa",
                 CreatedAt = DateTime.UtcNow,
                 ExpiresAt = DateTime.UtcNow.AddMinutes(5)
@@ -434,6 +439,120 @@ namespace AuthSystemTests
                 Assert.Equal("invalid_credentials", ((dynamic)await service.LoginAsync("test@example.com", "WrongPassword", "device1", "10.0.0.1")).error);
             var locked = await service.LoginAsync("test@example.com", "ThisIsAVeryLongPassword123!", "device1", "10.0.0.1");
             Assert.Equal("too_many_attempts", ((dynamic)locked).error);
+        }
+
+        /// <summary>
+        /// AUTH-16: login returns a refresh_token that token_refresh accepts; the sessions table holds only its SHA-256
+        /// (no stored column equals the token); and the signup verification code is stored only as its SHA-256 (the
+        /// code emailed to the user is not in the table, and it still verifies). In: nothing. Out: asserts. Added
+        /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2). Touches: the in-memory database and cache.
+        /// </summary>
+        // AUTH-16
+        [Fact]
+        public async Task Login_RefreshTokenAccepted_OnlyHashesAtRest()
+        {
+            string emailedCode = null;
+            _emailSenderMock.Setup(e => e.SendVerificationEmailAsync("hash@example.com", It.IsAny<string>()))
+                .Callback<string, string>((_, c) => emailedCode = c).Returns(Task.CompletedTask);
+            var service = CreateService();
+            Assert.Equal("pending_verification", ((dynamic)await service.SignupAsync("hash@example.com", "a long passphrase nobody guesses", "Hash")).status);
+            Assert.NotNull(emailedCode);
+            using (var db = CreateDb())
+            {
+                var stored = await db.VerificationCodes.SingleAsync(v => v.Type == "email");
+                Assert.Equal(AuthService.HashSecret(emailedCode), stored.CodeHash);
+                Assert.NotEqual(emailedCode, stored.CodeHash);
+                Assert.Equal(64, stored.CodeHash.Length);
+            }
+            Assert.Equal("verified", ((dynamic)await CreateService().VerifyEmailAsync("hash@example.com", emailedCode)).status);
+
+            var login = await CreateService().LoginAsync("hash@example.com", "a long passphrase nobody guesses", "device1", "127.0.0.1");
+            Assert.Equal("authenticated", ((dynamic)login).status);
+            string refreshToken = ((dynamic)login).refresh_token;
+            Assert.False(string.IsNullOrEmpty(refreshToken));
+
+            using (var db = CreateDb())
+            {
+                var session = await db.Sessions.AsNoTracking().SingleAsync();
+                Assert.Equal(AuthService.HashSecret(refreshToken), session.RefreshTokenHash);
+                Assert.Null(session.RefreshToken); // not mapped: a database read never hands out the token
+                Assert.DoesNotContain(refreshToken, new[] { session.RefreshTokenHash, session.Ip, session.DeviceId });
+            }
+
+            var refreshed = await CreateService().TokenRefreshAsync(refreshToken);
+            Assert.Equal("ok", ((dynamic)refreshed).status);
+            Assert.Equal("ok", ((dynamic)await CreateService().VerifyAccessTokenAsync((string)((dynamic)refreshed).token)).status);
+            // the stored hash itself is not a usable refresh token
+            using (var db = CreateDb())
+                Assert.Equal("invalid_token", ((dynamic)await CreateService().TokenRefreshAsync((await db.Sessions.SingleAsync()).RefreshTokenHash)).error);
+        }
+
+        /// <summary>
+        /// AUTH-16 (with "Secrets at rest"): MFA verify and the OAuth callback also return a refresh_token that
+        /// token_refresh accepts; the MFA challenge id and the OAuth state are stored only as their SHA-256; the OAuth
+        /// state is single use and expires after 10 minutes; the callback exchanges the provider's code exactly once
+        /// through the injected client and takes the identity from that exchange, never from the code (a code the
+        /// provider refuses signs nobody in). In: nothing. Out: asserts. Added 2026-11-10,
+        /// session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2). Touches: the in-memory database and cache.
+        /// </summary>
+        // AUTH-16
+        [Fact]
+        public async Task MfaAndOAuth_ReturnRefreshToken_StateAndChallengeHashed_StateSingleUseAndExpiring()
+        {
+            using (var db = CreateDb())
+            {
+                db.Users.Add(new User { Email = "mfa@example.com", PasswordHash = BCrypt.Net.BCrypt.HashPassword("a long passphrase nobody guesses"), Status = "verified", MfaEnabled = true, MfaSecret = "JBSWY3DPEHPK3PXP" });
+                await db.SaveChangesAsync();
+            }
+            var mfaLogin = await CreateService().LoginAsync("mfa@example.com", "a long passphrase nobody guesses", "device1", "127.0.0.1");
+            string challengeId = ((dynamic)mfaLogin).challenge_id;
+            using (var db = CreateDb())
+            {
+                var row = await db.VerificationCodes.SingleAsync(v => v.Type == "mfa");
+                Assert.Equal(AuthService.HashSecret(challengeId), row.CodeHash);
+                Assert.Equal("invalid_challenge", ((dynamic)await CreateService().MfaChallengeAsync(row.CodeHash, "000000")).error);
+            }
+            var mfa = await CreateService().MfaChallengeAsync(challengeId, new Totp(Base32Encoding.ToBytes("JBSWY3DPEHPK3PXP")).ComputeTotp());
+            Assert.Equal("authenticated", ((dynamic)mfa).status);
+            Assert.Equal("ok", ((dynamic)await CreateService().TokenRefreshAsync((string)((dynamic)mfa).refresh_token)).status);
+
+            _oauthProviderMock.Setup(o => o.ExchangeCodeAsync("google", "good-code"))
+                .ReturnsAsync(new OAuthIdentity { ProviderUserId = "g-9", Email = "oauth@example.com", EmailVerified = true });
+            _oauthProviderMock.Setup(o => o.ExchangeCodeAsync("google", "refused-code")).ReturnsAsync((OAuthIdentity)null);
+
+            var service = CreateService();
+            var state = await service.CreateOAuthStateAsync();
+            using (var db = CreateDb())
+            {
+                var row = await db.VerificationCodes.SingleAsync(v => v.Type == "oauth_state");
+                Assert.Equal(AuthService.HashSecret(state), row.CodeHash);
+                Assert.NotEqual(state, row.CodeHash);
+                Assert.InRange(row.ExpiresAt - row.CreatedAt, TimeSpan.FromMinutes(10) - TimeSpan.FromSeconds(1), TimeSpan.FromMinutes(10) + TimeSpan.FromSeconds(1));
+            }
+            var oauth = await service.OAuthCallbackAsync("google", "good-code", state);
+            Assert.Equal("authenticated", ((dynamic)oauth).status);
+            Assert.Equal("oauth@example.com", ((dynamic)oauth).user.email);
+            Assert.Equal("ok", ((dynamic)await CreateService().TokenRefreshAsync((string)((dynamic)oauth).refresh_token)).status);
+            _oauthProviderMock.Verify(o => o.ExchangeCodeAsync("google", "good-code"), Times.Once);
+
+            // single use: the same state again is refused before the provider is asked
+            Assert.Equal("invalid_state", ((dynamic)await CreateService().OAuthCallbackAsync("google", "good-code", state)).error);
+            _oauthProviderMock.Verify(o => o.ExchangeCodeAsync("google", "good-code"), Times.Once);
+
+            // a code the provider refuses signs nobody in (the code is never an identity)
+            var state2 = await CreateService().CreateOAuthStateAsync();
+            Assert.Equal("oauth_exchange_failed", ((dynamic)await CreateService().OAuthCallbackAsync("google", "refused-code", state2)).error);
+
+            // expired: a state older than 10 minutes is refused
+            var state3 = await CreateService().CreateOAuthStateAsync();
+            using (var db = CreateDb())
+            {
+                var row = await db.VerificationCodes.SingleAsync(v => v.Type == "oauth_state" && v.CodeHash == AuthService.HashSecret(state3));
+                row.ExpiresAt = DateTime.UtcNow.AddSeconds(-1);
+                await db.SaveChangesAsync();
+            }
+            Assert.Equal("invalid_state", ((dynamic)await CreateService().OAuthCallbackAsync("google", "good-code", state3)).error);
+            _oauthProviderMock.Verify(o => o.ExchangeCodeAsync("google", "good-code"), Times.Once);
         }
 }
 }

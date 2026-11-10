@@ -13,6 +13,12 @@ namespace TrialAbusePrevention
     {
         public GateDecision Decision { get; set; }
         public string Reason { get; set; }
+        /// <summary>
+        /// The spec's error code for a FAIL where the gate names one (null otherwise), e.g. "user_not_found" or
+        /// "trial_ended_no_payment_cannot_retry" from trial_payment_timing. Added 2026-11-10,
+        /// session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2: an unknown user is FAIL {error: "user_not_found"}). Touches: nothing.
+        /// </summary>
+        public string Error { get; set; }
         public int? RetryAfterSeconds { get; set; }
         public string ChallengeType { get; set; } // For CHALLENGE: "captcha" or "email_confirm"
     }
@@ -170,10 +176,13 @@ namespace TrialAbusePrevention
         /// (the payment date is now). trial_end = created_at + trial_days; days_after_trial = floor((now - trial_end) in
         /// days), rounding toward negative infinity (negative while the trial runs); earlier_payment = the ledger already
         /// has a payment_added_date for this user. PASS if days_after_trial &lt; 5; FAIL if &gt;= 90 and no earlier
-        /// payment; CHALLENGE otherwise. An unknown user is FAIL.
-        /// In: the user id. Out: the decision and a reason ("days_after_trial=N, earlier_payment=true|false").
+        /// payment; CHALLENGE otherwise. A user with no users row is FAIL with Error "user_not_found" (fail closed); a
+        /// user with no ledger row is judged from users.created_at with no earlier payment. A timing FAIL carries Error
+        /// "trial_ended_no_payment_cannot_retry".
+        /// In: the user id. Out: the decision, a reason ("days_after_trial=N, earlier_payment=true|false") and, on FAIL,
+        /// the error code.
         /// Rewritten 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the old rules defaulted to PASS for most cases and
-        /// truncated days. Touches: reads users and the ledger.
+        /// truncated days. Changed the same day (Phase B.2): the error codes. Touches: reads users and the ledger.
         /// </summary>
         public async Task<GateCheckResult> CheckTrialPaymentTiming(string userId)
         {
@@ -182,7 +191,7 @@ namespace TrialAbusePrevention
             {
                 var notFoundReason = $"User {userId} not found";
                 _logger.LogWarning("Gate check: trial_payment_timing, user_id={UserId}, reason={Reason}", userId, notFoundReason);
-                return new GateCheckResult { Decision = GateDecision.Fail, Reason = notFoundReason };
+                return new GateCheckResult { Decision = GateDecision.Fail, Reason = notFoundReason, Error = "user_not_found" };
             }
 
             var trialEnd = user.CreatedAt.AddDays(_trialDays);
@@ -199,7 +208,11 @@ namespace TrialAbusePrevention
             _logger.LogInformation("Gate check: trial_payment_timing, user_id={UserId}, trial_duration={TrialDuration}, payment_delay={PaymentDelay}, decision={Decision}",
                 userId, _trialDays, daysAfterTrial, decision);
 
-            return new GateCheckResult { Decision = decision, Reason = reason };
+            return new GateCheckResult
+            {
+                Decision = decision, Reason = reason,
+                Error = decision == GateDecision.Fail ? "trial_ended_no_payment_cannot_retry" : null
+            };
         }
 
         /// <summary>

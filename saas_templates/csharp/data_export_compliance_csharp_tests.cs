@@ -392,7 +392,9 @@ namespace ComplianceModule.Tests
             Assert.True(confirm.Success);
             using var againContent = new StringContent(JsonConvert.SerializeObject(new ConfirmDeletionDto { ConfirmationToken = token }), Encoding.UTF8, "application/json");
             var again = await _client.PostAsync($"/compliance/delete/{deletion.DeletionId}/confirm", againContent);
-            Assert.Equal(HttpStatusCode.Conflict, again.StatusCode);
+            // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, EXPORT-15): was Conflict; a reused token now gets
+            // the same 400 invalid_confirmation_token as a wrong or expired one.
+            Assert.Equal(HttpStatusCode.BadRequest, again.StatusCode);
 
             var store = _factory.Services.GetRequiredService<InMemoryUserDataStore>();
             using var scope = _factory.Services.CreateScope();
@@ -663,8 +665,10 @@ namespace ComplianceModule.Tests
 
         /// <summary>
         /// EXPORT-14: nothing is deleted before confirm; a wrong token is refused (400) and changes nothing; a token over
-        /// 24 h old is refused (400); a reused token is refused (409, already confirmed); another user's request is 404 for
-        /// confirm and cancel. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Moves the shared clock and restores it.
+        /// 24 h old is refused (400); a reused token is refused (400); another user's request is 404 for confirm and
+        /// cancel. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Moves the shared clock and restores it.
+        /// Corrected 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a reused token was asserted 409; the spec
+        /// now gives a wrong, reused or expired token the one answer 400 invalid_confirmation_token (EXPORT-15).
         /// </summary>
         // EXPORT-14
         [Fact]
@@ -696,8 +700,102 @@ namespace ComplianceModule.Tests
             Assert.True(store.Exists(_userId)); // nothing deleted by any refused attempt
 
             (await Confirm(_client, deletion.DeletionId, token)).EnsureSuccessStatusCode();
-            Assert.Equal(HttpStatusCode.Conflict, (await Confirm(_client, deletion.DeletionId, token)).StatusCode);
+            // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): was Conflict; a reused token is 400 now (EXPORT-15).
+            Assert.Equal(HttpStatusCode.BadRequest, (await Confirm(_client, deletion.DeletionId, token)).StatusCode);
             Assert.True(store.Exists(_userId)); // approved, waiting out the grace period
+        }
+
+        /// <summary>Reads the "error" code of a refused response. In: the response. Out: the code. Why: EXPORT-15 asserts
+        /// codes, not only statuses. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.</summary>
+        private static async Task<string> ErrorOf(HttpResponseMessage response) =>
+            (string)JObject.Parse(await response.Content.ReadAsStringAsync())["error"];
+
+        /// <summary>
+        /// EXPORT-15: a wrong, a reused and an expired (over 24 h) token all get the same 400
+        /// {error: "invalid_confirmation_token"}; confirm and cancel of a cancelled request are 409 {error:
+        /// "deletion_not_pending"}; another user's request is 404 {error: "not_found"}, and so is a completed request,
+        /// to every caller (it has no owner, EXPORT-13; spec clarified in 3abb340, 2026-11-10). Added 2026-11-10,
+        /// session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2). Touches: the test host's in-memory database and user store;
+        /// moves the shared clock and restores it.
+        /// </summary>
+        // EXPORT-15
+        [Fact]
+        public async Task DeletionConfirmation_OneAnswerForBadTokens_409WhenNotPending()
+        {
+            var deletion = await PostAs<DeletionResponse>(_client, "/compliance/delete", new DeletionRequestDto { Reason = "user_requested" });
+            var token = TokenOf(deletion.DeletionId);
+
+            var wrong = await Confirm(_client, deletion.DeletionId, token.Substring(0, token.Length - 1) + (token.EndsWith("A") ? "B" : "A"));
+            Assert.Equal(HttpStatusCode.BadRequest, wrong.StatusCode);
+            Assert.Equal("invalid_confirmation_token", await ErrorOf(wrong));
+
+            var clock = _factory.Services.GetRequiredService<ComplianceClock>();
+            var original = clock.Now;
+            try
+            {
+                clock.Now = () => DateTime.UtcNow.AddHours(24).AddMinutes(1);
+                var expired = await Confirm(_client, deletion.DeletionId, token);
+                Assert.Equal(HttpStatusCode.BadRequest, expired.StatusCode);
+                Assert.Equal("invalid_confirmation_token", await ErrorOf(expired));
+            }
+            finally
+            {
+                clock.Now = original;
+            }
+
+            var stranger = _factory.CreateClient();
+            stranger.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", CustomWebApplicationFactory<ComplianceModule.Startup>.Token(Guid.NewGuid()));
+            var foreign = await Confirm(stranger, deletion.DeletionId, token);
+            Assert.Equal(HttpStatusCode.NotFound, foreign.StatusCode);
+            Assert.Equal("not_found", await ErrorOf(foreign));
+
+            (await Confirm(_client, deletion.DeletionId, token)).EnsureSuccessStatusCode();
+            var reused = await Confirm(_client, deletion.DeletionId, token);
+            Assert.Equal(HttpStatusCode.BadRequest, reused.StatusCode);
+            Assert.Equal("invalid_confirmation_token", await ErrorOf(reused));
+
+            // cancelled: confirm and cancel are both 409 deletion_not_pending
+            (await _client.DeleteAsync($"/compliance/delete/{deletion.DeletionId}")).EnsureSuccessStatusCode();
+            var confirmCancelled = await Confirm(_client, deletion.DeletionId, token);
+            Assert.Equal(HttpStatusCode.Conflict, confirmCancelled.StatusCode);
+            Assert.Equal("deletion_not_pending", await ErrorOf(confirmCancelled));
+            var cancelCancelled = await _client.DeleteAsync($"/compliance/delete/{deletion.DeletionId}");
+            Assert.Equal(HttpStatusCode.Conflict, cancelCancelled.StatusCode);
+            Assert.Equal("deletion_not_pending", await ErrorOf(cancelCancelled));
+
+            // completed: 404 not_found to every caller, even with the owner's id still on the row (spec clarified in
+            // 3abb340, 2026-11-10: a completed request has no owner, EXPORT-13). The status is set directly here so the
+            // row keeps its user_id; a request the cascade really completes is checked below.
+            var closed = await PostAs<DeletionResponse>(_client, "/compliance/delete", new DeletionRequestDto { Reason = "user_requested" });
+            using (var scope = _factory.Services.CreateScope())
+            {
+                var db = scope.ServiceProvider.GetRequiredService<ComplianceDbContext>();
+                var row = await db.DeletionRequests.SingleAsync(d => d.Id == Guid.Parse(closed.DeletionId));
+                row.Status = "completed";
+                await db.SaveChangesAsync();
+            }
+            var confirmOwnCompleted = await Confirm(_client, closed.DeletionId, TokenOf(closed.DeletionId));
+            Assert.Equal(HttpStatusCode.NotFound, confirmOwnCompleted.StatusCode);
+            Assert.Equal("not_found", await ErrorOf(confirmOwnCompleted));
+            var cancelOwnCompleted = await _client.DeleteAsync($"/compliance/delete/{closed.DeletionId}");
+            Assert.Equal(HttpStatusCode.NotFound, cancelOwnCompleted.StatusCode);
+            Assert.Equal("not_found", await ErrorOf(cancelOwnCompleted));
+
+            // completed by the cascade (a statutory reason runs it at confirm): user_id is NULL, so it is 404 not_found
+            var userId = Guid.NewGuid();
+            _factory.Services.GetRequiredService<InMemoryUserDataStore>().Seed(userId, SampleUser(userId));
+            var client = _factory.CreateClient();
+            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", CustomWebApplicationFactory<ComplianceModule.Startup>.Token(userId));
+            var gdpr = await PostAs<DeletionResponse>(client, "/compliance/delete", new DeletionRequestDto { Reason = "gdpr_request" });
+            var gdprToken = TokenOf(gdpr.DeletionId);
+            var done = JsonConvert.DeserializeObject<DeletionConfirmationResponse>(await (await Confirm(client, gdpr.DeletionId, gdprToken)).Content.ReadAsStringAsync());
+            Assert.Equal("completed", done.Status);
+            var confirmCompleted = await Confirm(client, gdpr.DeletionId, gdprToken);
+            Assert.Equal(HttpStatusCode.NotFound, confirmCompleted.StatusCode);
+            Assert.Equal("not_found", await ErrorOf(confirmCompleted));
+            var cancelCompleted = await client.DeleteAsync($"/compliance/delete/{gdpr.DeletionId}");
+            Assert.Equal(HttpStatusCode.NotFound, cancelCompleted.StatusCode);
+            Assert.Equal("not_found", await ErrorOf(cancelCompleted));
         }
 
         /// <summary>

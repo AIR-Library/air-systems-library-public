@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
 using System.ComponentModel.DataAnnotations.Schema;
 using System.Linq;
+using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -319,9 +320,20 @@ namespace SaaSLibrary.ApiKeys
             };
         }
 
-        /// <summary>Admin list of API keys, optionally by user and "active"/"inactive" status (never the secrets or hashes). Changed 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): scopes deserialised with explicit options (CS0854). Touches: api_keys (read).</summary>
-        public async Task<AdminListApiKeysResponse> AdminListApiKeysAsync(Guid? userId, string status)
+        /// <summary>
+        /// Admin list of API keys (KEYS-09, GET /admin/api-keys), optionally by user and "active"/"inactive" status
+        /// (never the secrets or hashes). In: the authenticated caller, the user filter and the status filter. Out: the
+        /// keys and their total. A caller that is not an admin (no "admin" role claim, or no caller at all) is refused
+        /// with <see cref="ApiKeysForbiddenException"/> (403 admin_only) before anything is read.
+        /// Changed 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): scopes deserialised with explicit options
+        /// (CS0854). Changed again 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 bug: the method had no admin
+        /// check of its own and relied on the route): the caller parameter and the check. Touches: api_keys (read).
+        /// </summary>
+        public async Task<AdminListApiKeysResponse> AdminListApiKeysAsync(ClaimsPrincipal? caller, Guid? userId, string status)
         {
+            if (caller?.Identity?.IsAuthenticated != true || !caller.IsInRole("admin"))
+                throw new ApiKeysForbiddenException("admin_only", "Only an admin may list every API key");
+
             var query = _dbContext.ApiKeys.AsQueryable();
 
             if (userId.HasValue)
@@ -545,6 +557,23 @@ namespace SaaSLibrary.ApiKeys
         public Dictionary<string, long> RequestsByEndpoint { get; set; } = default!;
         public long RateLimitHits { get; set; }
         public Dictionary<string, long> Errors { get; set; } = default!;
+    }
+
+    /// <summary>
+    /// A refused call: HTTP 403 with the spec-style error code (e.g. admin_only from <c>AdminListApiKeysAsync</c>).
+    /// In: the code and a message. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2: the admin list
+    /// refuses a non-admin itself). Touches nothing.
+    /// </summary>
+    public class ApiKeysForbiddenException : Exception
+    {
+        /// <summary>The error code, e.g. "admin_only".</summary>
+        public string Code { get; }
+
+        /// <summary>Always 403.</summary>
+        public int StatusCode => 403;
+
+        /// <summary>Builds the exception with its code and message. Pure.</summary>
+        public ApiKeysForbiddenException(string code, string message) : base(message) => Code = code;
     }
 
     public class AdminListApiKeysResponse

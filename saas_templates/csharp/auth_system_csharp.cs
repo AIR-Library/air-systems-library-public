@@ -1,6 +1,8 @@
 // Auth system template (GEMINI_DISPATCH_MASTER_SPEC template #1): signup, email verification, login with optional
 // TOTP MFA, OAuth callback, refresh and access-token verification, over EF Core, with bcrypt, HS256 JWTs and an
 // in-memory rate-limit cache. Repaired 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP); see AuthService.
+// Phase B.2 (2026-11-10, same session): every secret at rest is a SHA-256 (refresh tokens, email codes, MFA challenge
+// ids, OAuth states) and the OAuth callback exchanges the provider's code once through IOAuthProvider.ExchangeCodeAsync.
 // Touches: the auth database, the email sender and OAuth provider interfaces, the cache, stdout (why chain).
 using System;
 using System.Collections.Generic;
@@ -59,7 +61,8 @@ namespace AuthSystem
             modelBuilder.Entity<VerificationCode>(entity =>
             {
                 entity.HasKey(e => e.Id);
-                entity.Property(e => e.Code).IsRequired().HasMaxLength(255);
+                entity.Property(e => e.CodeHash).IsRequired().HasMaxLength(64);
+                entity.HasIndex(e => new { e.Type, e.CodeHash });
                 entity.Property(e => e.CreatedAt).IsRequired();
                 entity.Property(e => e.ExpiresAt).IsRequired();
                 entity.Property(e => e.Type).IsRequired().HasMaxLength(20);
@@ -119,12 +122,17 @@ namespace AuthSystem
     /// <summary>
     /// A one-time code: an email code, an MFA challenge or an OAuth state. UserId is null for an OAuth state, which
     /// exists before any user is known (2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP). Pure data.
+    /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, auth spec "Secrets at rest", AUTH-16): the value
+    /// is stored only as CodeHash, the lower-case hex SHA-256 of the code (<see cref="AuthService.HashSecret"/>); the
+    /// column was Code, holding the code itself, so a database read handed out usable codes and OAuth states.
     /// </summary>
     public class VerificationCode
     {
         public int Id { get; set; }
         public int? UserId { get; set; }
-        public string Code { get; set; }
+
+        /// <summary>SHA-256 (lower-case hex) of the email code, MFA challenge id or OAuth state; never the value itself.</summary>
+        public string CodeHash { get; set; }
         public DateTime CreatedAt { get; set; }
         public DateTime ExpiresAt { get; set; }
         public string Type { get; set; }
@@ -148,10 +156,30 @@ namespace AuthSystem
         Task SendVerificationEmailAsync(string email, string code);
     }
 
+    /// <summary>
+    /// Who the OAuth provider says signed in, from its token endpoint and user-info response: the provider's own user
+    /// id, the email and whether the provider verified it. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase
+    /// B.2, AUTH-16). Pure data.
+    /// </summary>
+    public class OAuthIdentity
+    {
+        public string ProviderUserId { get; set; }
+        public string Email { get; set; }
+        public bool EmailVerified { get; set; }
+    }
+
+    /// <summary>
+    /// The injected OAuth provider client. ExchangeCodeAsync redeems the authorization code at the provider's token
+    /// endpoint (server to server, with the client secret) and reads the signed-in identity; it returns null when the
+    /// provider refuses the code. The code is never an identity by itself, and it is exchanged once: providers accept
+    /// an authorization code a single time. In: the provider name and the code. Out: the identity or null. Changed
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, auth spec "Secrets at rest"): replaces
+    /// GetEmailFromCodeAsync + IsEmailVerifiedAsync, which redeemed the same single-use code twice. Touches: the
+    /// provider (network) in production.
+    /// </summary>
     public interface IOAuthProvider
     {
-        Task<string> GetEmailFromCodeAsync(string provider, string code);
-        Task<bool> IsEmailVerifiedAsync(string provider, string code);
+        Task<OAuthIdentity> ExchangeCodeAsync(string provider, string code);
     }
 
     /// <summary>
@@ -222,6 +250,7 @@ namespace AuthSystem
         /// (optional; omitted IPs share the <see cref="UnknownIp"/> bucket). Output: {status:"pending_verification",
         /// email, message} or {error}. Repaired 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): BCrypt.Net.BCrypt,
         /// cache Set instead of the non-existent SetAsync, email normalised before the uniqueness check, CSPRNG code.
+        /// Changed the same day (Phase B.2, AUTH-16): the code is stored only as its SHA-256.
         /// Touches: users, verification_codes, audit_log, the cache, the email sender (network in production).
         /// </summary>
         public async Task<object> SignupAsync(string email, string password, string name, string clientIp = null)
@@ -258,7 +287,7 @@ namespace AuthSystem
             _db.VerificationCodes.Add(new VerificationCode
             {
                 UserId = user.Id,
-                Code = code,
+                CodeHash = HashSecret(code), // only the hash is stored (AUTH-16, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
                 Type = "email",
                 CreatedAt = DateTime.UtcNow,
                 ExpiresAt = DateTime.UtcNow.AddMinutes(15)
@@ -277,8 +306,9 @@ namespace AuthSystem
         /// constant time; not expired). Marks email_verified_at and status 'verified' and deletes the code. Inputs:
         /// email, code. Output: {status:"verified", user_id, message} or {error: invalid_request | code_invalid |
         /// code_expired}. Repaired 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): sets status so login accepts
-        /// the user, constant-time comparison, wrong vs expired codes reported apart. Touches: users,
-        /// verification_codes, audit_log.
+        /// the user, constant-time comparison, wrong vs expired codes reported apart. Changed the same day (Phase B.2,
+        /// AUTH-16): the stored value is the code's SHA-256, compared in constant time with the hash of the code given.
+        /// Touches: users, verification_codes, audit_log.
         /// </summary>
         public async Task<object> VerifyEmailAsync(string email, string code)
         {
@@ -290,7 +320,8 @@ namespace AuthSystem
             var candidates = await _db.VerificationCodes
                 .Where(v => v.UserId == user.Id && v.Type == "email")
                 .ToListAsync();
-            var verification = candidates.FirstOrDefault(v => SecretEquals(v.Code, code));
+            var providedHash = code == null ? null : HashSecret(code);
+            var verification = candidates.FirstOrDefault(v => SecretEquals(v.CodeHash, providedHash));
             if (verification == null)
                 return new { error = "code_invalid" };
             if (verification.ExpiresAt <= DateTime.UtcNow)
@@ -311,8 +342,12 @@ namespace AuthSystem
         /// Flow 3, login. Gates: rate_limit (5 failures per 15 minutes per ip+email, checked first so a locked pair
         /// cannot keep guessing), user_exists_and_verified (status 'verified', as in the Go template),
         /// password_correct (bcrypt), mfa_gate. With MFA on, returns {status:"mfa_required", challenge_id} (a random
-        /// id valid 5 minutes); otherwise creates a session and returns {status:"authenticated", session_id, token,
-        /// expires_in, user}. Every failure answers invalid_credentials, so accounts cannot be enumerated.
+        /// id valid 5 minutes, stored only as its SHA-256); otherwise creates a session and returns {status:
+        /// "authenticated", session_id, token, refresh_token, expires_in, user} (AUTH-16: the refresh_token is the
+        /// value token_refresh takes). Every failure answers invalid_credentials, so accounts cannot be enumerated.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): the challenge id is hashed at rest. The
+        /// challenge id alone is not a credential (the TOTP code is still needed), but it is a bearer handle to a
+        /// half-finished login, so it is kept like the other secrets.
         /// Repaired 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): BCrypt.Net.BCrypt.Verify, the lock is now
         /// enforced (failures used to be counted and never checked), status gate. Touches: users, sessions,
         /// verification_codes, audit_log, the cache.
@@ -344,7 +379,7 @@ namespace AuthSystem
                 _db.VerificationCodes.Add(new VerificationCode
                 {
                     UserId = user.Id,
-                    Code = challengeId,
+                    CodeHash = HashSecret(challengeId),
                     Type = "mfa",
                     CreatedAt = DateTime.UtcNow,
                     ExpiresAt = DateTime.UtcNow.AddMinutes(5)
@@ -367,6 +402,7 @@ namespace AuthSystem
         /// consumed by <see cref="OAuthCallbackAsync"/> (spec gate state_valid: CSRF protection). Output: the state
         /// string, to be put in the redirect and bound to the browser session by the caller. Added 2026-11-10
         /// (session session_012zDydZCZ4AChqhEZ4oVtaP): the callback checked a state that nothing could create.
+        /// Changed the same day (Phase B.2, auth spec "Secrets at rest"): only the state's SHA-256 is stored.
         /// Touches: verification_codes.
         /// </summary>
         public async Task<string> CreateOAuthStateAsync()
@@ -375,7 +411,7 @@ namespace AuthSystem
             _db.VerificationCodes.Add(new VerificationCode
             {
                 UserId = null,
-                Code = state,
+                CodeHash = HashSecret(state),
                 Type = "oauth_state",
                 CreatedAt = DateTime.UtcNow,
                 ExpiresAt = DateTime.UtcNow.AddMinutes(10)
@@ -391,26 +427,33 @@ namespace AuthSystem
         /// {status:"authenticated", session_id, token, expires_in, user:{id,email,tier,status}} or {error}.
         /// Repaired 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): BCrypt.Net.BCrypt, the state is consumed
         /// before the provider is asked (a replayed state fails even if the provider call does), suspended/banned
-        /// users are refused, the audit actor is the user. Touches: users, sessions, verification_codes, audit_log, the
-        /// OAuth provider (network in production).
+        /// users are refused, the audit actor is the user. Changed the same day (Phase B.2, AUTH-16 and "Secrets at
+        /// rest"): the state is looked up by its SHA-256 (single use, 10 minutes); the code is exchanged ONCE through
+        /// the injected client (<see cref="IOAuthProvider.ExchangeCodeAsync"/>), never treated as an identity, and a
+        /// refused exchange is {error: "oauth_exchange_failed"}; the answer carries refresh_token.
+        /// Touches: users, sessions, verification_codes, audit_log, the OAuth provider (network in production).
         /// </summary>
         public async Task<object> OAuthCallbackAsync(string provider, string code, string state)
         {
             if (string.IsNullOrEmpty(state))
                 return new { error = "invalid_state" };
+            var stateHash = HashSecret(state);
             var stateVerification = await _db.VerificationCodes
-                .FirstOrDefaultAsync(v => v.Type == "oauth_state" && v.Code == state && v.ExpiresAt > DateTime.UtcNow);
+                .FirstOrDefaultAsync(v => v.Type == "oauth_state" && v.CodeHash == stateHash && v.ExpiresAt > DateTime.UtcNow);
             if (stateVerification == null)
                 return new { error = "invalid_state" };
             _db.VerificationCodes.Remove(stateVerification);
             await _db.SaveChangesAsync();
 
-            var email = await _oauthProvider.GetEmailFromCodeAsync(provider, code);
-            var isVerified = await _oauthProvider.IsEmailVerifiedAsync(provider, code);
-            if (!isVerified || string.IsNullOrWhiteSpace(email))
+            if (string.IsNullOrEmpty(code))
+                return new { error = "oauth_exchange_failed" };
+            var identity = await _oauthProvider.ExchangeCodeAsync(provider, code);
+            if (identity == null)
+                return new { error = "oauth_exchange_failed" };
+            if (!identity.EmailVerified || string.IsNullOrWhiteSpace(identity.Email))
                 return new { error = "email_not_verified_by_provider" };
 
-            var normalizedEmail = email.Trim().ToLowerInvariant();
+            var normalizedEmail = identity.Email.Trim().ToLowerInvariant();
             var user = await _db.Users.FirstOrDefaultAsync(u => u.Email == normalizedEmail);
             if (user == null)
             {
@@ -443,13 +486,17 @@ namespace AuthSystem
         /// of drift either way). After <see cref="MaxMfaAttemptsPerChallenge"/> wrong codes the challenge is deleted,
         /// so a 6-digit code cannot be brute-forced. Inputs: challenge id, code. Output: {status:"authenticated", ...}
         /// or {error: invalid_challenge | invalid_code}. Repaired 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP):
-        /// drift window narrowed from ±2 steps, attempt limit added. Touches: users, sessions, verification_codes,
-        /// audit_log, the cache.
+        /// drift window narrowed from ±2 steps, attempt limit added. Changed the same day (Phase B.2, AUTH-16): the
+        /// challenge is found by its id's SHA-256, and the answer carries refresh_token. Touches: users, sessions,
+        /// verification_codes, audit_log, the cache.
         /// </summary>
         public async Task<object> MfaChallengeAsync(string challengeId, string totpCode)
         {
+            if (string.IsNullOrEmpty(challengeId))
+                return new { error = "invalid_challenge" };
+            var challengeHash = HashSecret(challengeId);
             var challenge = await _db.VerificationCodes
-                .FirstOrDefaultAsync(v => v.Type == "mfa" && v.Code == challengeId && v.ExpiresAt > DateTime.UtcNow);
+                .FirstOrDefaultAsync(v => v.Type == "mfa" && v.CodeHash == challengeHash && v.ExpiresAt > DateTime.UtcNow);
             if (challenge == null || challenge.UserId == null)
                 return new { error = "invalid_challenge" };
 
@@ -572,7 +619,11 @@ namespace AuthSystem
             return new { status = "ok", user = new { id = user.Id, email = user.Email, tier = user.Tier } };
         }
 
-        /// <summary>The shared "authenticated" response of login, OAuth and MFA. Pure. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.</summary>
+        /// <summary>
+        /// The shared "authenticated" response of login, OAuth and MFA: status, session_id, refresh_token (the raw
+        /// token, handed out this once; token_refresh takes it), token, expires_in and the user. Pure. 2026-11-10,
+        /// session session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16: every flow that creates a session returns refresh_token).
+        /// </summary>
         private static object Authenticated(Session session, string token, User user) => new
         {
             status = "authenticated",
@@ -613,10 +664,17 @@ namespace AuthSystem
 
         /// <summary>
         /// SHA-256 of a refresh token as lower-case hex: what the sessions table stores and is searched by.
-        /// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Pure.
+        /// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Pure. Same as <see cref="HashSecret"/>.
         /// </summary>
-        public static string HashRefreshToken(string refreshToken) =>
-            Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(refreshToken))).ToLowerInvariant();
+        public static string HashRefreshToken(string refreshToken) => HashSecret(refreshToken);
+
+        /// <summary>
+        /// SHA-256 of a secret (refresh token, email code, MFA challenge id, OAuth state) as lower-case hex: the only
+        /// form in which any of them is stored (auth spec "Secrets at rest", AUTH-16). In: the secret. Out: 64 hex
+        /// characters. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2). Pure.
+        /// </summary>
+        public static string HashSecret(string secret) =>
+            Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(secret))).ToLowerInvariant();
 
         /// <summary>
         /// Creates a session with a random refresh token valid 7 days; only its hash is stored, the raw token is on the

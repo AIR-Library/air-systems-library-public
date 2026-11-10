@@ -30,8 +30,10 @@ namespace AuditLogging
 
     /// <summary>
     /// A refused call: the HTTP status and the error code of the spec (400 subject_required, 400 subject_mismatch, 400
-    /// metadata_key_not_allowed, 400 actor_user_required, 400 invalid_entry, 403 admin_only, 404 not_found).
-    /// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUDIT-10). Touches nothing.
+    /// metadata_key_not_allowed, 400 actor_user_required, 400 invalid_actor_type, 400 actor_required, 400
+    /// actor_service_required, 400 invalid_entry, 403 admin_only, 404 not_found).
+    /// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUDIT-10; the three actor codes added the same day, Phase B.2).
+    /// Touches nothing.
     /// </summary>
     public class AuditException : Exception
     {
@@ -222,8 +224,10 @@ namespace AuditLogging
         }
 
         /// <summary>
-        /// log(): appends one entry (AUDIT-01, AUDIT-10). Checks, in order: action, resource_type and actor_type present
-        /// (400 invalid_entry); a 'user' actor has an actor id (400 invalid_entry); an 'api_key' entry has actor_user_id
+        /// log(): appends one entry (AUDIT-01, AUDIT-10). Checks, in order: action and resource_type present (400
+        /// invalid_entry); actor_type one of user, service, api_key (missing or any other value: 400 invalid_actor_type);
+        /// a 'user' actor has an actor id (400 actor_required); a 'service' actor has actor_service (400
+        /// actor_service_required); an 'api_key' entry has actor_user_id
         /// (400 actor_user_required); metadata keys only feature_flag / erased_rows (400 metadata_key_not_allowed); the
         /// data subject: for resource_type 'user' the resource_id (a different subject_user_id is 400 subject_mismatch),
         /// otherwise subject_user_id is required (400 subject_required), a user id or "none".
@@ -231,16 +235,22 @@ namespace AuditLogging
         /// audit_log row (resource_id, old/new value and why_chain_id only when the subject is "none"), the 'actor' row
         /// {actor_id, ip, user_agent, request_id} for a user or api_key actor, and the 'subject' row {resource_id,
         /// old_value, new_value, why_chain_id}. Out: the new entry's id (random). Rewritten 2026-11-10,
-        /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: audit_log, audit_personal, audit_subjects.
+        /// session_012zDydZCZ4AChqhEZ4oVtaP. Changed the same day (Phase B.2, audit spec "Refusals by log()"): the codes
+        /// invalid_actor_type, actor_required and actor_service_required; a service entry no longer falls back to
+        /// actor_id or "service" for its name. Touches: audit_log, audit_personal, audit_subjects.
         /// </summary>
         public Task<string> LogMutationAsync(AuditLogEntry entry)
         {
             if (entry == null) throw new ArgumentNullException(nameof(entry));
-            if (string.IsNullOrWhiteSpace(entry.Action) || string.IsNullOrWhiteSpace(entry.ResourceType) || entry.ActorType == null)
-                throw new AuditException(400, "invalid_entry", "action, resource_type and actor_type are required");
+            if (string.IsNullOrWhiteSpace(entry.Action) || string.IsNullOrWhiteSpace(entry.ResourceType))
+                throw new AuditException(400, "invalid_entry", "action and resource_type are required");
+            if (entry.ActorType == null || !Enum.IsDefined(typeof(AuditLogging.ActorType), entry.ActorType.Value))
+                throw new AuditException(400, "invalid_actor_type", "actor_type must be 'user', 'service' or 'api_key'");
             var actorType = entry.ActorType.Value;
             if (actorType == AuditLogging.ActorType.User && string.IsNullOrWhiteSpace(entry.ActorId))
-                throw new AuditException(400, "invalid_entry", "a user actor needs actor_id");
+                throw new AuditException(400, "actor_required", "a user actor needs actor_id");
+            if (actorType == AuditLogging.ActorType.Service && string.IsNullOrWhiteSpace(entry.ActorService))
+                throw new AuditException(400, "actor_service_required", "a service actor needs actor_service");
             if (actorType == AuditLogging.ActorType.ApiKey && string.IsNullOrWhiteSpace(entry.ActorUserId))
                 throw new AuditException(400, "actor_user_required", "an api_key entry needs actor_user_id (the key's owner)");
             if (entry.Metadata != null && entry.Metadata.Keys.Any(k => !AllowedMetadataKeys.Contains(k)))
@@ -280,7 +290,7 @@ namespace AuditLogging
                                            old_value, new_value, why_chain_id, personal_roles, metadata)
                                        VALUES (@id, @ts, @at, @svc, @action, @rt, @rid, @old, @new, @why, @roles, @meta)", tx,
                        ("@id", id), ("@ts", Iso(now)), ("@at", ActorTypeText(actorType)),
-                       ("@svc", actorType == AuditLogging.ActorType.Service ? (entry.ActorService ?? entry.ActorId ?? "service") : null),
+                       ("@svc", actorType == AuditLogging.ActorType.Service ? entry.ActorService : null),
                        ("@action", entry.Action), ("@rt", entry.ResourceType),
                        ("@rid", subjectUser == null ? entry.ResourceId : null),
                        ("@old", subjectUser == null ? entry.OldValue?.GetRawText() : null),
@@ -432,8 +442,11 @@ namespace AuditLogging
         /// <summary>
         /// replay (admin only, AUDIT-02): the state an entry recorded (its old_value) and whether a later entry changed
         /// the same resource. For an entry whose subject data was erased: {erased: true, state null, has_diverged null}.
+        /// erased reflects the entry's own 'subject' row only: true when the entry was written with one and it is gone;
+        /// an entry whose actor alone was erased, or one with no subject, replays with erased false.
         /// Throws AuditException 404 for an unknown id. Rewritten 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
-        /// Touches: reads the database.
+        /// Changed the same day (Phase B.2, "replay erased reflects the entry's subject row"): the subject row is checked
+        /// directly instead of inferred from PersonalErased and a null resource_id. Touches: reads the database.
         /// </summary>
         public async Task<ReplayResult> ReplayAsync(AuditCaller caller, string logId)
         {
@@ -449,7 +462,13 @@ namespace AuditLogging
                 entry = ReadEntry(reader);
             }
 
-            if (entry.PersonalRoles.Split(',').Contains("subject") && entry.PersonalErased && entry.ResourceId == null)
+            bool subjectErased = false;
+            if (entry.PersonalRoles.Split(',').Contains("subject"))
+            {
+                using var subjectRow = Command("SELECT 1 FROM audit_personal WHERE log_id = @id AND role = 'subject'", null, ("@id", entry.Id));
+                subjectErased = await subjectRow.ExecuteScalarAsync() == null;
+            }
+            if (subjectErased)
                 return new ReplayResult { LogId = entry.Id, Timestamp = entry.Timestamp, Erased = true, ResourceStateAtTime = null, HasDiverged = null };
 
             using var diverge = Command(@"

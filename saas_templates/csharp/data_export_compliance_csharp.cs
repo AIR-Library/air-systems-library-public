@@ -618,28 +618,41 @@ namespace ComplianceModule
         }
 
         /// <summary>
-        /// Endpoint 4 (EXPORT-09/14): the owner confirms with the emailed token. Another user's request is 404; a request
-        /// not pending (already confirmed: a reused token) is 409; a wrong token or one over 24 h old is 400
-        /// invalid_token and changes nothing. The comparison is constant-time over the SHA-256 hashes; the token is
-        /// cleared on use (single use). For a statutory reason confirm() runs the cascade before returning:
-        /// deletion_scheduled_for = deleted_at = now and status 'completed' (if the export cleanup fails it stays
-        /// 'approved' and the worker retries). Otherwise the deletion runs after the grace period.
-        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (expiry, statutory cascade, clock). Touches:
-        /// deletion_requests, audit_logs; for a statutory reason everything the cascade touches.
+        /// True while a deletion request has not run or been cancelled: status 'pending' (awaiting confirm) or
+        /// 'approved' (confirmed, waiting out the grace period). Input: the request. Output: bool. Pure. Why: the spec's
+        /// "a cancelled request gets 409 deletion_not_pending" (EXPORT-15); a failed cascade is also no longer pending.
+        /// (A completed request is answered 404 before this is asked.) Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        /// </summary>
+        private static bool StillPending(DeletionRequest d) => d.Status == "pending" || d.Status == "approved";
+
+        /// <summary>
+        /// Endpoint 4 (EXPORT-09/14/15): the owner confirms with the emailed token. Inputs: the caller, the deletion id
+        /// and the token. Output: the confirmation, or an error. Another user's request (or none) is 404 not_found, and
+        /// so is a completed one, to every caller (it has no owner: user_id is NULL, EXPORT-13; spec clarified in
+        /// 3abb340); a cancelled (or failed) request is 409 deletion_not_pending, checked before the token; a wrong,
+        /// reused (the request is already approved and its hash cleared) or expired (over 24 h) token gets the one
+        /// answer 400 invalid_confirmation_token, so the reply never says which, and changes nothing. The comparison is
+        /// constant-time over the SHA-256 hashes; the token is cleared on use (single use). For a statutory reason
+        /// confirm() runs the cascade before returning: deletion_scheduled_for = deleted_at = now and status
+        /// 'completed' (if the export cleanup fails it stays 'approved' and the worker retries). Otherwise the
+        /// deletion runs after the grace period.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (expiry, statutory cascade, clock; Phase B.2 /
+        /// EXPORT-15: the error codes invalid_confirmation_token and deletion_not_pending, and a reused token is 400,
+        /// not 409). Touches: deletion_requests, audit_logs; for a statutory reason everything the cascade touches.
         /// </summary>
         public async Task<ServiceResult<DeletionConfirmationResponse>> ConfirmDeletionAsync(Guid userId, Guid deletionId, string? token, CancellationToken ct)
         {
             var d = await _db.DeletionRequests.FirstOrDefaultAsync(x => x.Id == deletionId, ct);
-            if (d == null || d.UserId != userId) return new(null, "not_found", 404);
-            if (d.Status != "pending") return new(null, "not_pending", 409);
+            if (d == null || d.UserId != userId || d.Status == "completed") return new(null, "not_found", 404);
+            if (!StillPending(d)) return new(null, "deletion_not_pending", 409);
             var now = _clock.Now();
             var provided = SHA256.HashData(Encoding.UTF8.GetBytes(token ?? ""));
-            var matches = d.ConfirmationTokenHash != null && CryptographicOperations.FixedTimeEquals(d.ConfirmationTokenHash, provided);
+            var matches = d.Status == "pending" && d.ConfirmationTokenHash != null && CryptographicOperations.FixedTimeEquals(d.ConfirmationTokenHash, provided);
             if (!matches || d.TokenExpiresAt == null || now > d.TokenExpiresAt.Value)
             {
                 Audit.Add(_db, userId, userId, "deletion_confirmation_rejected", new { deletion_id = d.Id, expired = matches });
                 await _db.SaveChangesAsync(ct);
-                return new(null, "invalid_token", 400);
+                return new(null, "invalid_confirmation_token", 400);
             }
             d.Status = "approved";
             d.ConfirmedAt = now;
@@ -654,12 +667,19 @@ namespace ComplianceModule
             return new(new DeletionConfirmationResponse { Success = true, DeletionScheduledFor = Iso(d.ScheduledFor), Status = d.Status });
         }
 
-        /// <summary>Endpoint 5: the owner cancels a pending or approved deletion before it runs; anyone else's is 404. Touches: deletion_requests, audit_logs.</summary>
+        /// <summary>
+        /// Endpoint 5: the owner cancels a pending or approved deletion before it runs. Inputs: the caller and the
+        /// deletion id. Output: {success, status:'cancelled'} or an error: anyone else's request (or none) is 404
+        /// not_found, and so is a completed one, to every caller (EXPORT-13/15, spec clarified in 3abb340); a cancelled
+        /// (or failed) one is 409 deletion_not_pending.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 / EXPORT-15: the code was cannot_cancel).
+        /// Touches: deletion_requests, audit_logs.
+        /// </summary>
         public async Task<ServiceResult<object>> CancelDeletionAsync(Guid userId, Guid deletionId, CancellationToken ct)
         {
             var d = await _db.DeletionRequests.FirstOrDefaultAsync(x => x.Id == deletionId, ct);
-            if (d == null || d.UserId != userId) return new(null, "not_found", 404);
-            if (d.Status != "pending" && d.Status != "approved") return new(null, "cannot_cancel", 409);
+            if (d == null || d.UserId != userId || d.Status == "completed") return new(null, "not_found", 404);
+            if (!StillPending(d)) return new(null, "deletion_not_pending", 409);
             d.Status = "cancelled";
             d.ConfirmationTokenHash = null;
             d.TokenExpiresAt = null;
