@@ -42,6 +42,7 @@ class FullTextSearchIndexingTests {
 
     // ─── Test 1: Index user, search finds it ─────────────────────────────────
 
+    // SEARCH-01
     @Test
     @DisplayName("Index user, search finds it")
     void testIndexUserAndSearch() {
@@ -76,6 +77,7 @@ class FullTextSearchIndexingTests {
 
     // ─── Test 2: Index deployment, query works ───────────────────────────────
 
+    // SEARCH-02
     @Test
     @DisplayName("Index deployment, query works")
     void testIndexDeploymentAndSearch() {
@@ -99,6 +101,7 @@ class FullTextSearchIndexingTests {
 
     // ─── Test 3: Partial match ───────────────────────────────────────────────
 
+    // SEARCH-03
     @Test
     @DisplayName("Partial match: 'stri' finds 'stripe'")
     void testPartialMatch() {
@@ -115,10 +118,18 @@ class FullTextSearchIndexingTests {
         FullTextSearchIndexing.SearchResponse resp = search.search("stri", "deployment", 20, 0);
         assertTrue(resp.total >= 1, "Partial match 'stri' should find 'stripe'");
         assertEquals("789", resp.results.get(0).documentId);
+        // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (SEARCH-03 amendment): a term matches only the START of a word,
+        // so "ripe" does not find "stripe"; words are runs of Unicode letters/digits ("café" is one word).
+        assertEquals(0, search.search("ripe", "deployment", 20, 0).total, "'ripe' must not find 'stripe'");
+        search.indexDocument("deployment", "790", "Café-Crème payments", metadata);
+        assertEquals("790", search.search("CAFÉ", "deployment", 20, 0).results.get(0).documentId);
+        assertEquals("790", search.search("crè", "deployment", 20, 0).results.get(0).documentId);
+        assertEquals(0, search.search("caf\u00e9x", "deployment", 20, 0).total);
     }
 
     // ─── Test 4: Filters ─────────────────────────────────────────────────────
 
+    // SEARCH-04
     @Test
     @DisplayName("Filters: tier:team returns only team tier")
     void testFilters() {
@@ -154,6 +165,7 @@ class FullTextSearchIndexingTests {
         assertTrue(resp.total >= 1);
     }
 
+    // SEARCH-04
     @Test
     @DisplayName("Filters via query syntax: tier:team")
     void testFiltersViaQuerySyntax() {
@@ -180,6 +192,7 @@ class FullTextSearchIndexingTests {
 
     // ─── Test 5: Facets ──────────────────────────────────────────────────────
 
+    // SEARCH-05
     @Test
     @DisplayName("Facets: shows count per status")
     void testFacets() {
@@ -226,6 +239,7 @@ class FullTextSearchIndexingTests {
 
     // ─── Test 6: Unindex ─────────────────────────────────────────────────────
 
+    // SEARCH-06
     @Test
     @DisplayName("Unindex: document no longer found after delete")
     void testUnindex() {
@@ -251,6 +265,7 @@ class FullTextSearchIndexingTests {
 
     // ─── Test 7: Real-time indexing ──────────────────────────────────────────
 
+    // SEARCH-07
     @Test
     @DisplayName("Real-time: index updated within 100ms of create")
     void testRealTimeIndexing() {
@@ -273,6 +288,7 @@ class FullTextSearchIndexingTests {
 
     // ─── Test 8: Performance ─────────────────────────────────────────────────
 
+    // SEARCH-08
     @Test
     @DisplayName("Performance: 1M documents, search returns <200ms")
     void testPerformance() {
@@ -305,6 +321,7 @@ class FullTextSearchIndexingTests {
 
     // ─── Test 9: Relevance ───────────────────────────────────────────────────
 
+    // SEARCH-09
     @Test
     @DisplayName("Relevance: exact match ranks higher than partial")
     void testRelevanceOrdering() {
@@ -337,6 +354,11 @@ class FullTextSearchIndexingTests {
                 "Exact match should rank highest, got: " + first.documentId);
         assertTrue(first.relevance > resp.results.get(1).relevance,
                 "Exact match relevance should be higher than next");
+        // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (SEARCH-09 amendment): "stripes" and "stripey" are both prefix
+        // matches, so they score the same and keep insertion order.
+        assertEquals("2", resp.results.get(1).documentId);
+        assertEquals("3", resp.results.get(2).documentId);
+        assertEquals(resp.results.get(1).relevance, resp.results.get(2).relevance);
     }
 
     // ─── Additional Tests ────────────────────────────────────────────────────
@@ -473,8 +495,12 @@ class FullTextSearchIndexingTests {
         assertTrue(afterNew.total >= 1);
     }
 
+    /**
+     * Common words are ordinary words. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the spec now says "there
+     * are no stop words" (SEARCH-03 amendment), so "the" finds the document; the test asserted the old stop-word list.
+     */
     @Test
-    @DisplayName("Stop words are ignored in search")
+    @DisplayName("Common words like 'the' are indexed (no stop words)")
     void testStopWords() {
         Map<String, Object> meta = new HashMap<>();
         meta.put("tier", "team");
@@ -482,9 +508,8 @@ class FullTextSearchIndexingTests {
 
         search.indexDocument("user", "1", "the quick brown fox", meta);
 
-        // "the" is a stop word, should not be indexed
         FullTextSearchIndexing.SearchResponse resp = search.search("the", "user", 20, 0);
-        assertEquals(0, resp.total, "Stop word 'the' should not match");
+        assertEquals(1, resp.total, "'the' is an ordinary word and must match");
 
         // "quick" should match
         FullTextSearchIndexing.SearchResponse resp2 = search.search("quick", "user", 20, 0);

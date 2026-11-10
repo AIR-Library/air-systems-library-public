@@ -70,6 +70,7 @@ public final class HealthCheckerTests {
     private static final long FIXED_CLOCK_MS = 1767225600000L;
     private static final String FIXED_TIME = "2026-01-01T00:00:00Z";
 
+    // HEALTH-01
     static void testAllChecksPassReturns200Pass() {
         HealthChecker.InMemoryCheckStore store = newStore();
         HealthChecker checker = newChecker(store, () -> FIXED_CLOCK_MS);
@@ -82,6 +83,7 @@ public final class HealthCheckerTests {
         assertEquals(expected, resp.body(), "body");
     }
 
+    // HEALTH-02
     static void testCriticalCheckFailsReturns503Fail() {
         HealthChecker.InMemoryCheckStore store = newStore();
         HealthChecker checker = newChecker(store, () -> FIXED_CLOCK_MS);
@@ -94,6 +96,7 @@ public final class HealthCheckerTests {
         assertEquals(expected, resp.body(), "body");
     }
 
+    // HEALTH-03
     static void testOnlyNonCriticalFailsReturns200Warn() {
         HealthChecker.InMemoryCheckStore store = newStore();
         HealthChecker checker = newChecker(store, () -> FIXED_CLOCK_MS);
@@ -106,6 +109,7 @@ public final class HealthCheckerTests {
         assertEquals(expected, resp.body(), "body");
     }
 
+    // HEALTH-04
     static void testSlowCheckPastTimeoutFailsThatCheck() {
         HealthChecker.InMemoryCheckStore store = newStore();
         HealthChecker checker = newChecker(store, () -> FIXED_CLOCK_MS);
@@ -118,6 +122,7 @@ public final class HealthCheckerTests {
         assertEquals(expected, resp.body(), "body");
     }
 
+    // HEALTH-05
     static void testLivenessPassesWhenDependencyWouldFail() {
         HealthChecker.InMemoryCheckStore store = newStore();
         AtomicInteger counter = new AtomicInteger(0);
@@ -133,6 +138,7 @@ public final class HealthCheckerTests {
         assertEquals(1, counter.get(), "counter after readiness");
     }
 
+    // HEALTH-06
     static void testOutputContainsNoConnectionString() {
         HealthChecker.InMemoryCheckStore store = newStore();
         HealthChecker checker = newChecker(store, () -> FIXED_CLOCK_MS);

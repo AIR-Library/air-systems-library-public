@@ -82,6 +82,7 @@ class BackgroundJobsTaskQueueTests {
     /**
      * Test 2: Job completes, status becomes completed, results available
      */
+    // JOBS-02
     @Test
     @Order(2)
     void testJobCompletesWithResults() throws Exception {
@@ -160,6 +161,7 @@ class BackgroundJobsTaskQueueTests {
     /**
      * Test 5: User cancels before job starts, status becomes cancelled
      */
+    // JOBS-05
     @Test
     @Order(5)
     void testCancelJobBeforeStart() throws Exception {
@@ -277,6 +279,7 @@ class BackgroundJobsTaskQueueTests {
     /**
      * Test 9: Results available after completion
      */
+    // JOBS-09
     @Test
     @Order(9)
     void testResultsAvailableAfterCompletion() throws Exception {
@@ -490,6 +493,212 @@ class BackgroundJobsTaskQueueTests {
         Map<String, Object> result = (Map<String, Object>) results.get("result");
         assertEquals(30, result.get("days_old"));
         assertNotNull(result.get("sessions_deleted"));
+    }
+
+    // ==================== Deterministic worker tests (2026-11-10) ====================
+
+    /** A clock tests move by hand. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing. */
+    static final class MutableClock extends java.time.Clock {
+        Instant now = Instant.parse("2026-01-01T00:00:00Z");
+
+        @Override public java.time.ZoneId getZone() { return java.time.ZoneOffset.UTC; }
+
+        @Override public java.time.Clock withZone(java.time.ZoneId zone) { return this; }
+
+        @Override public Instant instant() { return now; }
+    }
+
+    /**
+     * A queue on its own private database and a test clock, never started: the test runs the worker step itself with
+     * runReadyJobsOnce(), so nothing depends on sleeps or thread timing. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches: a private in-memory H2 database.
+     */
+    private static BackgroundJobsTaskQueue deterministicQueue(MutableClock clock) throws SQLException {
+        Connection c = DriverManager.getConnection(
+                "jdbc:h2:mem:jobs_det_" + java.util.UUID.randomUUID().toString().replace("-", "") + ";DB_CLOSE_DELAY=-1", "sa", "");
+        return new BackgroundJobsTaskQueue(c, 1, 50, clock);
+    }
+
+    /**
+     * JOBS-01: an enqueued job is picked up by the worker and its status is 'running' while its handler runs.
+     * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (the older test accepted "running or completed").
+     */
+    // JOBS-01
+    @Test
+    @Order(20)
+    void testWorkerPicksUpJobAndStatusIsRunning() throws Exception {
+        MutableClock clock = new MutableClock();
+        BackgroundJobsTaskQueue q = deterministicQueue(clock);
+        java.util.List<Object> seen = new java.util.ArrayList<>();
+        q.registerTaskHandler("observe", (context, job) -> {
+            seen.add(q.getJobStatus(job.id).get("status"));
+            context.markCompleted();
+        });
+        String jobId = (String) q.enqueueJob("observe", objectMapper.createObjectNode(), null, 3).get("job_id");
+        assertEquals("enqueued", q.getJobStatus(jobId).get("status"));
+        assertEquals(1, q.runReadyJobsOnce());
+        assertEquals(java.util.List.of("running"), seen);
+        assertEquals("completed", q.getJobStatus(jobId).get("status"));
+    }
+
+    /**
+     * JOBS-03: a failing job is retried with exponential backoff: retry 1 waits 1 s, retry 2 waits 2 s, status
+     * 'enqueued' and retry_count = n while it waits, and the worker skips it until next_retry_at.
+     * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec amendment; the older test only waited 10 s).
+     */
+    // JOBS-03
+    @Test
+    @Order(21)
+    void testRetryBackoffOneThenTwoSeconds() throws Exception {
+        MutableClock clock = new MutableClock();
+        BackgroundJobsTaskQueue q = deterministicQueue(clock);
+        AtomicRuns runs = new AtomicRuns();
+        q.registerTaskHandler("flaky", (context, job) -> {
+            if (runs.next() < 3) context.markFailed("boom"); else context.markCompleted();
+        });
+        String jobId = (String) q.enqueueJob("flaky", objectMapper.createObjectNode(), null, 3).get("job_id");
+        Instant t0 = clock.now;
+
+        assertEquals(1, q.runReadyJobsOnce());                       // attempt 1 fails
+        Map<String, Object> st = q.getJobStatus(jobId);
+        assertEquals("enqueued", st.get("status"));
+        assertEquals(1, st.get("retry_count"));
+        assertEquals(t0.plusSeconds(1).toString(), st.get("next_retry_at"));
+        clock.now = t0.plusMillis(999);
+        assertEquals(0, q.runReadyJobsOnce(), "skipped until next_retry_at");
+        clock.now = t0.plusSeconds(1);
+
+        assertEquals(1, q.runReadyJobsOnce());                       // retry 1 fails
+        st = q.getJobStatus(jobId);
+        assertEquals("enqueued", st.get("status"));
+        assertEquals(2, st.get("retry_count"));
+        assertEquals(t0.plusSeconds(3).toString(), st.get("next_retry_at"));
+        clock.now = t0.plusSeconds(2);
+        assertEquals(0, q.runReadyJobsOnce(), "retry 2 waits 2 s");
+        clock.now = t0.plusSeconds(3);
+
+        assertEquals(1, q.runReadyJobsOnce());                       // retry 2 succeeds
+        st = q.getJobStatus(jobId);
+        assertEquals("completed", st.get("status"));
+        assertEquals(2, st.get("retry_count"));
+        assertEquals(3, runs.count());
+    }
+
+    /**
+     * JOBS-04: with max_retries = 3 an always-failing job runs 4 times (1 + 3 retries), then status 'failed' with
+     * retry_count = 3, and it is never run again. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec amendment).
+     */
+    // JOBS-04
+    @Test
+    @Order(22)
+    void testMaxRetriesThreeRunsFourTimesThenFailed() throws Exception {
+        MutableClock clock = new MutableClock();
+        BackgroundJobsTaskQueue q = deterministicQueue(clock);
+        AtomicRuns runs = new AtomicRuns();
+        q.registerTaskHandler("always_fails", (context, job) -> {
+            runs.next();
+            context.markFailed("always");
+        });
+        String jobId = (String) q.enqueueJob("always_fails", objectMapper.createObjectNode(), null, 3).get("job_id");
+        for (int i = 0; i < 10; i++) {
+            q.runReadyJobsOnce();
+            clock.now = clock.now.plusSeconds(60);
+        }
+        Map<String, Object> st = q.getJobStatus(jobId);
+        assertEquals(4, runs.count());
+        assertEquals("failed", st.get("status"));
+        assertEquals(3, st.get("retry_count"));
+        assertNotNull(st.get("error"));
+    }
+
+    /**
+     * JOBS-06: progress written by a running job is visible to a status read while the job is still running
+     * (45/100), and ends at 100/100. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (the older test read progress
+     * after a 100 ms sleep, which depends on thread timing).
+     */
+    // JOBS-06
+    @Test
+    @Order(23)
+    void testProgressVisibleWhileRunning() throws Exception {
+        MutableClock clock = new MutableClock();
+        BackgroundJobsTaskQueue q = deterministicQueue(clock);
+        java.util.List<Object> midway = new java.util.ArrayList<>();
+        q.registerTaskHandler("progress", (context, job) -> {
+            for (int i = 1; i <= 100; i++) {
+                context.updateProgress(i + "/100");
+                if (i == 45) {
+                    Map<String, Object> st = q.getJobStatus(job.id);
+                    midway.add(st.get("status") + " " + st.get("progress"));
+                }
+            }
+            context.markCompleted();
+        });
+        String jobId = (String) q.enqueueJob("progress", objectMapper.createObjectNode(), null, 3).get("job_id");
+        q.runReadyJobsOnce();
+        assertEquals(java.util.List.of("running 45/100"), midway);
+        assertEquals("100/100", q.getJobStatus(jobId).get("progress"));
+    }
+
+    /**
+     * JOBS-07: a job scheduled for later is not run before scheduled_at and is run once it has passed.
+     * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (deterministic; the older test slept 1.5 s).
+     */
+    // JOBS-07
+    @Test
+    @Order(24)
+    void testScheduledJobWaitsForScheduledAt() throws Exception {
+        MutableClock clock = new MutableClock();
+        BackgroundJobsTaskQueue q = deterministicQueue(clock);
+        String jobId = (String) q.enqueueJob("daily_report_generate", objectMapper.createObjectNode(),
+                clock.now.plusSeconds(60), 3).get("job_id");
+        assertEquals(0, q.runReadyJobsOnce());
+        clock.now = clock.now.plusSeconds(59);
+        assertEquals(0, q.runReadyJobsOnce());
+        assertEquals("enqueued", q.getJobStatus(jobId).get("status"));
+        clock.now = clock.now.plusSeconds(1);
+        assertEquals(1, q.runReadyJobsOnce());
+        assertEquals("completed", q.getJobStatus(jobId).get("status"));
+    }
+
+    /**
+     * JOBS-08: enqueueing a 10,000-item job returns at once without running it (the request is not blocked), and
+     * the worker then processes all 10,000 items. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (the older test
+     * timed send_bulk_email, which processes however many users the stub returns, not 10,000).
+     */
+    // JOBS-08
+    @Test
+    @Order(25)
+    void testTenThousandItemsProcessedWithoutBlockingEnqueue() throws Exception {
+        MutableClock clock = new MutableClock();
+        BackgroundJobsTaskQueue q = deterministicQueue(clock);
+        AtomicRuns items = new AtomicRuns();
+        q.registerTaskHandler("bulk", (context, job) -> {
+            for (int i = 0; i < 10_000; i++) {
+                items.next();
+                if ((i + 1) % 1000 == 0) context.updateProgress((i + 1) + "/10000");
+            }
+            context.setResult(Map.of("processed", 10_000));
+            context.markCompleted();
+        });
+        Map<String, Object> resp = q.enqueueJob("bulk", objectMapper.createObjectNode(), null, 3);
+        assertEquals("enqueued", resp.get("status"));
+        assertEquals(0, items.count(), "enqueue must not run the job");
+        q.runReadyJobsOnce();
+        assertEquals(10_000, items.count());
+        String jobId = (String) resp.get("job_id");
+        assertEquals("completed", q.getJobStatus(jobId).get("status"));
+        @SuppressWarnings("unchecked")
+        Map<String, Object> result = (Map<String, Object>) q.getJobResults(jobId).get("result");
+        assertEquals(10_000, result.get("processed"));
+    }
+
+    /** A counter for handler runs. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+    static final class AtomicRuns {
+        private final java.util.concurrent.atomic.AtomicInteger n = new java.util.concurrent.atomic.AtomicInteger();
+
+        int next() { return n.incrementAndGet(); }
+
+        int count() { return n.get(); }
     }
 
     // ==================== Helper Methods ====================

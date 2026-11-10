@@ -88,6 +88,7 @@ public class BillingServiceTest {
     }
 
     /** Invalid tier rejected; happy path calls Stripe (fake) and stores the row. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: happy path added (spec TESTS). */
+    // BILL-01
     @Test
     void testCreateSubscriptionHappyPath() throws Exception {
         // Mock Stripe
@@ -119,6 +120,7 @@ public class BillingServiceTest {
         assertEquals(1, count("SELECT COUNT(*) FROM audit_log WHERE subscription_id = ? AND action = 'subscription_created'", subId));
     }
 
+    // BILL-02
     @Test
     void testCreateSubscriptionInvalidTier() {
         JsonObject response = billingService.createSubscription("cus_123", "invalid_tier");
@@ -126,6 +128,7 @@ public class BillingServiceTest {
     }
 
     /** Invalid tier rejected; happy path updates Stripe (fake) and computes the proration credit. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: happy path added. */
+    // BILL-03
     @Test
     void testChangePlanHappyPath() throws Exception {
         // Setup: Create a subscription in DB
@@ -157,9 +160,44 @@ public class BillingServiceTest {
         assertEquals(333L, changed.get("proration_credit").getAsLong()); // floor(999 * 10 / 30)
         assertEquals(BillingService.PRICE_IDS.get("team"), fakeStripe.priceOf("sub_123"));
         assertEquals(1, count("SELECT COUNT(*) FROM subscriptions WHERE stripe_subscription_id = ? AND tier = 'team'", "sub_123"));
+        // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (BILL-03 amendment): the update names the existing item, so
+        // the subscription still has exactly one item, now on the new price.
+        assertEquals(java.util.List.of("retrieve sub_123", "update sub_123 si_sub_123_1 " + BillingService.PRICE_IDS.get("team")),
+                fakeStripe.calls());
+        assertEquals(1, fakeStripe.itemCount("sub_123"));
+    }
+
+    /**
+     * BILL-03, refusals: an unknown tier is invalid_tier and a subscription with two items is
+     * subscription_item_ambiguous; neither reaches a Stripe update or changes the stored tier.
+     * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec flow 2 amendment). Touches: in-memory H2 and fake Stripe.
+     */
+    // BILL-03
+    @Test
+    void testChangePlanRefusesUnknownTierAndAmbiguousItemsBeforeUpdate() throws Exception {
+        try (PreparedStatement pstmt = connection.prepareStatement(
+                "INSERT INTO subscriptions (stripe_subscription_id, customer_id, tier, status, created_at) VALUES (?, ?, ?, 'active', NOW())")) {
+            pstmt.setString(1, "sub_two");
+            pstmt.setString(2, "cus_9");
+            pstmt.setString(3, "solo");
+            pstmt.executeUpdate();
+        }
+        long now = clock.instant().getEpochSecond();
+        fakeStripe.addExistingItems("sub_two", java.util.List.of(BillingService.PRICE_IDS.get("solo"), "price_addon"),
+                now - 86_400L, now + 86_400L);
+
+        assertEquals("invalid_tier", fakeBilling.changePlan("sub_two", "platinum").get("error").getAsString());
+        assertTrue(fakeStripe.calls().isEmpty(), "an unknown tier must not reach Stripe");
+
+        JsonObject ambiguous = fakeBilling.changePlan("sub_two", "team");
+        assertEquals("subscription_item_ambiguous", ambiguous.get("error").getAsString());
+        assertEquals(java.util.List.of("retrieve sub_two"), fakeStripe.calls());
+        assertEquals(2, fakeStripe.itemCount("sub_two"));
+        assertEquals(1, count("SELECT COUNT(*) FROM subscriptions WHERE stripe_subscription_id = ? AND tier = 'solo'", "sub_two"));
     }
 
     /** A refund is queued and stored. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: asserts the stored row. */
+    // BILL-04
     @Test
     void testQueueRefundHappyPath() throws Exception {
         // Setup: Create an invoice in DB
@@ -179,6 +217,7 @@ public class BillingServiceTest {
     }
 
     /** Refunds may not exceed the invoice, alone or together. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: cumulative case added. */
+    // BILL-05
     @Test
     void testQueueRefundExceedsInvoice() throws Exception {
         // Setup: Create an invoice in DB
@@ -200,6 +239,7 @@ public class BillingServiceTest {
     }
 
     /** Bad signature refused; a signed event marks the invoice succeeded and audits it. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: signed case added. */
+    // BILL-06
     @Test
     void testHandleWebhookPaymentSucceeded() throws Exception {
         // Create a valid webhook payload
@@ -253,6 +293,7 @@ public class BillingServiceTest {
     }
 
     /** Bad signature refused; a signed replay is acknowledged and not reprocessed. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: signed case added. */
+    // BILL-07
     @Test
     void testHandleWebhookDuplicateEvent() throws Exception {
         // Setup: Insert event into events table
@@ -292,6 +333,7 @@ public class BillingServiceTest {
     }
 
     /** Bad signature refused; a signed event updates tier and status. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: signed case added. */
+    // BILL-08
     @Test
     void testHandleWebhookSubscriptionUpdated() throws Exception {
         // Create a valid webhook payload
@@ -333,6 +375,7 @@ public class BillingServiceTest {
         assertEquals(1, count("SELECT COUNT(*) FROM subscriptions WHERE stripe_subscription_id = ? AND tier = 'team' AND status = 'active'", "sub_123"));
     }
 
+    // BILL-09
     @Test
     void testWebhookSignatureInvalid() {
         String payload = "{}";
@@ -340,6 +383,7 @@ public class BillingServiceTest {
         assertEquals("invalid_signature", response.get("error").getAsString());
     }
 
+    // BILL-10
     @Test
     void testWebhookResponseTime() {
         // Test that the response is returned quickly
@@ -351,5 +395,20 @@ public class BillingServiceTest {
         // Response should be returned quickly (less than 3 seconds)
         assertTrue(endTime - startTime < 3000);
         assertEquals("invalid_signature", response.get("error").getAsString());
+
+        // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the row asks for {received: true} within 3 s, so a correctly
+        // signed event is timed too (the refusal above alone never produced received).
+        String event = "{\"id\": \"evt_fast\", \"type\": \"invoice.payment_succeeded\", \"data\": {\"object\": "
+                + "{\"id\": \"inv_fast\", \"customer\": \"cus_123\", \"amount_paid\": 500}}}";
+        try {
+            String header = sign(event);
+            long t0 = System.nanoTime();
+            JsonObject ok = fakeBilling.handleStripeWebhook(event, header);
+            long ms = (System.nanoTime() - t0) / 1_000_000;
+            assertTrue(ok.get("received").getAsBoolean());
+            assertTrue(ms < 3000, "took " + ms + " ms");
+        } catch (Exception e) {
+            fail(e);
+        }
     }
 }

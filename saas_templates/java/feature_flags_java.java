@@ -9,6 +9,13 @@ public class FeatureFlags {
         Flag getFlag(String key);
         void setFlag(Flag flag);
         List<Audit> getAudits();
+
+        /**
+         * Appends one flag_audit row. In: flag key, action, old and new value, actor id. Out: none.
+         * Why: FLAG-08 "set_flag writes an audit row" for EVERY store (it used to be written for the in-memory store
+         * only); 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the store (database for SqlStore).
+         */
+        void addAudit(String flagKey, String action, String oldValue, String newValue, String actorId);
     }
 
     public static class Flag {
@@ -66,6 +73,7 @@ public class FeatureFlags {
             flags.put(flag.key, flag);
         }
 
+        @Override
         public synchronized void addAudit(String flagKey, String action, String oldValue, String newValue, String actorId) {
             audits.add(new Audit(++auditId, flagKey, action, oldValue, newValue, actorId, System.currentTimeMillis()));
         }
@@ -121,7 +129,25 @@ public class FeatureFlags {
                 stmt.setString(7, flag.updatedBy);
                 stmt.executeUpdate();
             } catch (SQLException e) {
-                // Silently fail
+                throw new IllegalStateException("could not save flag", e);
+            }
+        }
+
+        /** See {@link Store#addAudit}. Parameterized INSERT into flag_audit; 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database. */
+        @Override
+        public void addAudit(String flagKey, String action, String oldValue, String newValue, String actorId) {
+            try (Connection conn = DriverManager.getConnection(jdbcUrl);
+                 PreparedStatement stmt = conn.prepareStatement(
+                     "INSERT INTO flag_audit (flag_key, action, old_value, new_value, actor_id, at) VALUES (?, ?, ?, ?, ?, ?)")) {
+                stmt.setString(1, flagKey);
+                stmt.setString(2, action);
+                stmt.setString(3, oldValue);
+                stmt.setString(4, newValue);
+                stmt.setString(5, actorId);
+                stmt.setLong(6, System.currentTimeMillis());
+                stmt.executeUpdate();
+            } catch (SQLException e) {
+                throw new IllegalStateException("could not write flag audit", e);
             }
         }
 
@@ -155,24 +181,24 @@ public class FeatureFlags {
         this.store = store;
     }
 
+    /**
+     * Rollout bucket: the first 8 bytes of SHA-256(input) as an UNSIGNED big-endian integer, mod 100.
+     * In: flag_key + ":" + targeting_key. Out: 0..99.
+     * Why: FLAG-05 / spec "stable_hash is a FIXED algorithm ... and ONLY that". 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP: the old code took a SIGNED remainder (negative buckets, so a 30% rollout
+     * served about 65%) and fell back to FNV-1a, which the spec forbids. Touches: nothing.
+     */
     public static int stableHash(String input) {
         try {
             MessageDigest md = MessageDigest.getInstance("SHA-256");
             byte[] hashBytes = md.digest(input.getBytes(StandardCharsets.UTF_8));
-            // Take first 8 bytes as unsigned big-endian integer
             long value = 0;
             for (int i = 0; i < 8; i++) {
                 value = (value << 8) | (hashBytes[i] & 0xFF);
             }
-            return (int) (value % 100);
+            return (int) Long.remainderUnsigned(value, 100);
         } catch (NoSuchAlgorithmException e) {
-            // Fallback to FNV-1a 32-bit
-            int hash = 0x811c9dc5;
-            for (byte b : input.getBytes(StandardCharsets.UTF_8)) {
-                hash ^= (b & 0xFF);
-                hash *= 0x01000193;
-            }
-            return Math.abs(hash) % 100;
+            throw new IllegalStateException("SHA-256 is required for stable rollout buckets", e);
         }
     }
 
@@ -194,6 +220,13 @@ public class FeatureFlags {
         }
     }
 
+    /**
+     * Evaluates a flag; never throws (OpenFeature). In: key, the caller's default, context, the method's type.
+     * Out: details {value, variant, reason, error_code}. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: strict rules
+     * parsing (PARSE_ERROR), served-value type check (TYPE_MISMATCH), numeric rollout percentages, null context.
+     * Touches: reads the store.
+     */
+    @SuppressWarnings("unchecked")
     private EvaluationDetails evaluate(String flagKey, Object defaultValue, Map<String, Object> context, String expectedType) {
         try {
             Flag flag = store.getFlag(flagKey);
@@ -211,17 +244,21 @@ public class FeatureFlags {
 
             // Parse rules
             List<Map<String, Object>> rules = parseRules(flag.rules);
+            if (context == null) {
+                context = Collections.emptyMap();
+            }
             if (rules == null) {
                 return new EvaluationDetails(flagKey, defaultValue, null, "ERROR", "PARSE_ERROR", "Bad rules");
             }
 
-            String targetingKey = (String) context.get("targeting_key");
-            if (targetingKey == null) {
-                targetingKey = (String) context.get("user_id");
+            Object tk = context.get("targeting_key");
+            if (tk == null) {
+                tk = context.get("user_id");
             }
+            String targetingKey = tk == null ? null : String.valueOf(tk);
 
             for (Map<String, Object> rule : rules) {
-                List<Map<String, Object>> conditions = (List<Map<String, Object>>) rule.get("conditions");
+                List<Map<String, Object>> conditions = (List<Map<String, Object>>) rule.getOrDefault("conditions", new ArrayList<>());
                 boolean allMatch = true;
                 for (Map<String, Object> condition : conditions) {
                     String attribute = (String) condition.get("attribute");
@@ -239,13 +276,19 @@ public class FeatureFlags {
                     Map<String, Object> rollout = (Map<String, Object>) rule.get("rollout");
                     if (rollout == null) {
                         // No rollout - serve value
+                        if (!valueHasType(rule.get("value"), expectedType)) {
+                            return new EvaluationDetails(flagKey, defaultValue, null, "ERROR", "TYPE_MISMATCH", "Served value has the wrong type");
+                        }
                         return new EvaluationDetails(flagKey, rule.get("value"), (String) rule.get("variant"), "TARGETING_MATCH", null, null);
                     } else {
                         // Rollout
-                        Integer percentage = (Integer) rollout.get("percentage");
+                        double percentage = ((Number) rollout.get("percentage")).doubleValue();
                         if (targetingKey != null) {
                             int bucket = stableHash(flagKey + ":" + targetingKey);
                             if (bucket < percentage) {
+                                if (!valueHasType(rule.get("value"), expectedType)) {
+                                    return new EvaluationDetails(flagKey, defaultValue, null, "ERROR", "TYPE_MISMATCH", "Served value has the wrong type");
+                                }
                                 return new EvaluationDetails(flagKey, rule.get("value"), (String) rule.get("variant"), "SPLIT", null, null);
                             }
                         }
@@ -286,188 +329,68 @@ public class FeatureFlags {
         }
     }
 
+    private static final com.fasterxml.jackson.databind.ObjectMapper JSON = new com.fasterxml.jackson.databind.ObjectMapper();
+
+    /**
+     * Parses and validates the rules JSON (the one shape in the spec: a list of {conditions, variant, value, rollout}).
+     * In: the stored rules text (null or blank = no rules). Out: the rules, or null when the text is not valid JSON or
+     * not that shape (the caller then answers PARSE_ERROR). Why: FLAG-07; the hand-written parser it replaces accepted
+     * "not valid json" as an empty rule list and could not read in_list values or escaped strings.
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing (pure).
+     */
+    @SuppressWarnings("unchecked")
     private List<Map<String, Object>> parseRules(String rulesJson) {
-        if (rulesJson == null || rulesJson.isEmpty()) {
+        if (rulesJson == null || rulesJson.trim().isEmpty()) {
             return new ArrayList<>();
         }
-
         try {
-            // Simple JSON parser for the specific structure
-            return parseJsonArray(rulesJson);
+            Object parsed = JSON.readValue(rulesJson, Object.class);
+            if (!(parsed instanceof List)) {
+                return null;
+            }
+            List<Map<String, Object>> rules = new ArrayList<>();
+            for (Object r : (List<Object>) parsed) {
+                if (!(r instanceof Map)) {
+                    return null;
+                }
+                Map<String, Object> rule = (Map<String, Object>) r;
+                Object conds = rule.getOrDefault("conditions", new ArrayList<>());
+                if (!(conds instanceof List)) {
+                    return null;
+                }
+                for (Object c : (List<Object>) conds) {
+                    if (!(c instanceof Map) || !(((Map<String, Object>) c).get("attribute") instanceof String)
+                            || !(((Map<String, Object>) c).get("operator") instanceof String)) {
+                        return null;
+                    }
+                }
+                Object rollout = rule.get("rollout");
+                if (rollout != null && !(rollout instanceof Map && ((Map<String, Object>) rollout).get("percentage") instanceof Number)) {
+                    return null;
+                }
+                if (rule.get("variant") != null && !(rule.get("variant") instanceof String)) {
+                    return null;
+                }
+                rules.add(rule);
+            }
+            return rules;
         } catch (Exception e) {
             return null;
         }
     }
 
-    // Minimal JSON parsing for the rules structure
-    private List<Map<String, Object>> parseJsonArray(String json) {
-        List<Map<String, Object>> result = new ArrayList<>();
-        json = json.trim();
-        if (!json.startsWith("[") || !json.endsWith("]")) {
-            return result;
-        }
-
-        json = json.substring(1, json.length() - 1).trim();
-        if (json.isEmpty()) {
-            return result;
-        }
-
-        // Split by top-level objects
-        int depth = 0;
-        int start = 0;
-        for (int i = 0; i < json.length(); i++) {
-            char c = json.charAt(i);
-            if (c == '{') depth++;
-            else if (c == '}') depth--;
-            else if (c == ',' && depth == 0) {
-                String objStr = json.substring(start, i).trim();
-                if (!objStr.isEmpty()) {
-                    result.add(parseJsonObject(objStr));
-                }
-                start = i + 1;
-            }
-        }
-
-        String objStr = json.substring(start).trim();
-        if (!objStr.isEmpty()) {
-            result.add(parseJsonObject(objStr));
-        }
-
-        return result;
-    }
-
-    private Map<String, Object> parseJsonObject(String json) {
-        Map<String, Object> result = new HashMap<>();
-        json = json.trim();
-        if (!json.startsWith("{") || !json.endsWith("}")) {
-            return result;
-        }
-
-        json = json.substring(1, json.length() - 1).trim();
-        if (json.isEmpty()) {
-            return result;
-        }
-
-        // Parse key-value pairs
-        int i = 0;
-        while (i < json.length()) {
-            // Skip whitespace
-            while (i < json.length() && Character.isWhitespace(json.charAt(i))) i++;
-            if (i >= json.length()) break;
-
-            // Parse key
-            if (json.charAt(i) != '"') {
-                i++;
-                continue;
-            }
-            i++;
-            StringBuilder key = new StringBuilder();
-            while (i < json.length() && json.charAt(i) != '"') {
-                key.append(json.charAt(i));
-                i++;
-            }
-            i++; // Skip closing quote
-
-            // Skip whitespace and colon
-            while (i < json.length() && (Character.isWhitespace(json.charAt(i)) || json.charAt(i) == ':')) i++;
-
-            // Parse value
-            Object value = parseValue(json, i);
-            if (value instanceof ParsedValue) {
-                ParsedValue pv = (ParsedValue) value;
-                result.put(key.toString(), pv.value);
-                i = pv.nextIndex;
-            } else {
-                i++;
-            }
-
-            // Skip whitespace and comma
-            while (i < json.length() && (Character.isWhitespace(json.charAt(i)) || json.charAt(i) == ',')) i++;
-        }
-
-        return result;
-    }
-
-    private static class ParsedValue {
-        Object value;
-        int nextIndex;
-
-        ParsedValue(Object value, int nextIndex) {
-            this.value = value;
-            this.nextIndex = nextIndex;
-        }
-    }
-
-    private ParsedValue parseValue(String json, int i) {
-        // Skip whitespace
-        while (i < json.length() && Character.isWhitespace(json.charAt(i))) i++;
-        if (i >= json.length()) return new ParsedValue(null, i);
-
-        char c = json.charAt(i);
-        if (c == '"') {
-            i++;
-            StringBuilder sb = new StringBuilder();
-            while (i < json.length() && json.charAt(i) != '"') {
-                sb.append(json.charAt(i));
-                i++;
-            }
-            i++; // Skip closing quote
-            return new ParsedValue(sb.toString(), i);
-        } else if (c == '{') {
-            int depth = 0;
-            int start = i;
-            while (i < json.length()) {
-                if (json.charAt(i) == '{') depth++;
-                else if (json.charAt(i) == '}') {
-                    depth--;
-                    if (depth == 0) {
-                        i++;
-                        break;
-                    }
-                }
-                i++;
-            }
-            return new ParsedValue(parseJsonObject(json.substring(start, i)), i);
-        } else if (c == '[') {
-            int depth = 0;
-            int start = i;
-            while (i < json.length()) {
-                if (json.charAt(i) == '[') depth++;
-                else if (json.charAt(i) == ']') {
-                    depth--;
-                    if (depth == 0) {
-                        i++;
-                        break;
-                    }
-                }
-                i++;
-            }
-            return new ParsedValue(parseJsonArray(json.substring(start, i)), i);
-        } else if (c == 't') {
-            i += 4; // true
-            return new ParsedValue(true, i);
-        } else if (c == 'f') {
-            i += 5; // false
-            return new ParsedValue(false, i);
-        } else if (c == 'n') {
-            i += 4; // null
-            return new ParsedValue(null, i);
-        } else {
-            // Number
-            int start = i;
-            while (i < json.length() && (Character.isDigit(json.charAt(i)) || json.charAt(i) == '.' || json.charAt(i) == '-')) {
-                i++;
-            }
-            String numStr = json.substring(start, i);
-            try {
-                if (numStr.contains(".")) {
-                    return new ParsedValue(Double.parseDouble(numStr), i);
-                } else {
-                    return new ParsedValue(Integer.parseInt(numStr), i);
-                }
-            } catch (NumberFormatException e) {
-                return new ParsedValue(null, i);
-            }
+    /**
+     * True when a served rule value has the flag's declared type. In: value, type. Out: boolean.
+     * Why: spec "A served value whose type is not the flag's type -> caller's default, TYPE_MISMATCH";
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+     */
+    private static boolean valueHasType(Object value, String type) {
+        switch (type) {
+            case "boolean": return value instanceof Boolean;
+            case "string": return value instanceof String;
+            case "number": return value instanceof Number;
+            case "object": return value instanceof Map || value instanceof List;
+            default: return false;
         }
     }
 
@@ -536,6 +459,12 @@ public class FeatureFlags {
         return evaluate(flagKey, defaultValue, context, "object");
     }
 
+    /**
+     * set_flag: stores the flag and writes one audit row with the old and new default value, for every store.
+     * In: actor id, key, type, default value (text), enabled, rules JSON. Out: none.
+     * Why: FLAG-08; 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (audit used to be skipped for SqlStore).
+     * Touches: the store (database for SqlStore).
+     */
     public void setFlag(String actor, String key, String type, String defaultValue, boolean enabled, String rules) {
         Flag existing = store.getFlag(key);
         String oldValue = existing != null ? existing.defaultValue : null;
@@ -543,8 +472,6 @@ public class FeatureFlags {
         Flag newFlag = new Flag(key, type, defaultValue, enabled, rules, System.currentTimeMillis(), actor);
         store.setFlag(newFlag);
         
-        if (store instanceof InMemoryStore) {
-            ((InMemoryStore) store).addAudit(key, "set", oldValue, defaultValue, actor);
-        }
+        store.addAudit(key, "set", oldValue, defaultValue, actor);
     }
 }

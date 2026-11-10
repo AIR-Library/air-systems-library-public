@@ -75,6 +75,10 @@ public class DataExportCompliance {
     public static final Set<String> FORMATS = Set.of("json", "csv");
     public static final Set<String> DELETION_REASONS =
             Set.of("user_requested", "gdpr_request", "gdpr_right_to_be_forgotten", "other");
+    /** Statutory erasure reasons: no grace period, the cascade runs at confirmation (EXPORT-12, amended 2026-11-10). */
+    public static final Set<String> STATUTORY_REASONS = Set.of("gdpr_request", "gdpr_right_to_be_forgotten");
+    /** How long a deletion confirmation token is valid (EXPORT-14, amended 2026-11-10). */
+    public static final Duration CONFIRMATION_TOKEN_TTL = Duration.ofHours(24);
 
     private static final int TOKEN_BYTES = 32;
     private static final String EXPORT_COLUMNS =
@@ -168,9 +172,21 @@ public class DataExportCompliance {
         void run(Runnable task);
     }
 
-    /** The outside services this class uses. */
+    /**
+     * The audit system's erasure entry point (audit_logging.md erase_subject): removes the user's personal audit data.
+     * Called LAST in the deletion cascade (EXPORT-13). Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, after the
+     * security review found nothing erased the user's audit personal data. Touches: the audit store.
+     */
+    public interface AuditEraser {
+        void eraseSubject(UUID userId) throws Exception;
+    }
+
+    /**
+     * The outside services this class uses. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: auditEraser added (EXPORT-13);
+     * it is required, so a deployment cannot forget to erase audit personal data.
+     */
     public record Services(ObjectStore store, EmailSender email, AuditLog audit, UserData users, AdminCheck admins,
-                           TaskRunner tasks) {}
+                           TaskRunner tasks, AuditEraser auditEraser) {}
 
     private interface RowMapper<T> {
         T map(ResultSet row) throws SQLException;
@@ -219,17 +235,24 @@ public class DataExportCompliance {
             s.execute("""
                     CREATE TABLE IF NOT EXISTS deletion_requests (
                         id UUID PRIMARY KEY,
-                        user_id UUID NOT NULL,
+                        user_id UUID,
                         requested_at TIMESTAMP WITH TIME ZONE NOT NULL,
                         status VARCHAR(20) NOT NULL,
                         reason VARCHAR(50) NOT NULL,
                         confirmation_token_hash VARCHAR(64) NOT NULL,
+                        token_expires_at TIMESTAMP WITH TIME ZONE,
+                        token_used_at TIMESTAMP WITH TIME ZONE,
                         will_delete_at TIMESTAMP WITH TIME ZONE NOT NULL,
                         erase_started_at TIMESTAMP WITH TIME ZONE,
                         deleted_at TIMESTAMP WITH TIME ZONE
                     )""");
             // Tables made before 2026-11-08 lack the erase claim (2026-11-08, session f3daac6e, from review of PR 17).
             s.execute("ALTER TABLE deletion_requests ADD COLUMN IF NOT EXISTS erase_started_at TIMESTAMP WITH TIME ZONE");
+            // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-13/14): single-use 24 h tokens, and user_id is set NULL
+            // when a deletion completes, so the row cannot re-identify the erased audit entries.
+            s.execute("ALTER TABLE deletion_requests ADD COLUMN IF NOT EXISTS token_expires_at TIMESTAMP WITH TIME ZONE");
+            s.execute("ALTER TABLE deletion_requests ADD COLUMN IF NOT EXISTS token_used_at TIMESTAMP WITH TIME ZONE");
+            s.execute("ALTER TABLE deletion_requests ALTER COLUMN user_id DROP NOT NULL");
         } catch (SQLException e) {
             throw new ComplianceException("storage_error", e);
         }
@@ -343,7 +366,9 @@ public class DataExportCompliance {
     /* ---------- Deletion ---------- */
 
     /**
-     * Records a deletion request and e-mails the confirmation link. Nothing is erased unless the user confirms, so a mail
+     * Records a deletion request and e-mails the confirmation link. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: a
+     * statutory reason (gdpr_request, gdpr_right_to_be_forgotten) gets will_delete_at = now (EXPORT-12), others now +
+     * 30 days (EXPORT-05); the token (32 random bytes, stored as SHA-256) is valid 24 hours (EXPORT-14). Nothing is erased unless the user confirms, so a mail
      * failure leaves a harmless pending row and the user can ask again. POST /compliance/delete.
      *
      * @param userId the signed-in user
@@ -365,19 +390,21 @@ public class DataExportCompliance {
 
         UUID deletionId = UUID.randomUUID();
         Instant now = clock.instant();
-        Instant willDeleteAt = now.plus(GRACE_PERIOD);
+        // EXPORT-05/12 (amended 2026-11-10): 30 days' grace for user_requested / other; none for a statutory reason.
+        Instant willDeleteAt = STATUTORY_REASONS.contains(reason) ? now : now.plus(GRACE_PERIOD);
         String token = newToken();
         update("""
                 INSERT INTO deletion_requests
-                    (id, user_id, requested_at, status, reason, confirmation_token_hash, will_delete_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                deletionId, userId, now, DeletionStatus.PENDING.value(), reason, sha256(token), willDeleteAt);
+                    (id, user_id, requested_at, status, reason, confirmation_token_hash, token_expires_at, will_delete_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                deletionId, userId, now, DeletionStatus.PENDING.value(), reason, sha256(token),
+                now.plus(CONFIRMATION_TOKEN_TTL), willDeleteAt);
         services.audit().record("deletion_requested", userId,
                 Map.of("deletion_id", deletionId.toString(), "reason", reason));
         String link = appBaseUrl + "/compliance/delete/" + deletionId + "/confirm?token=" + token;
         try {
             services.email().send(to, "Confirm account deletion",
-                    "Please confirm your deletion request: " + link + "\nThis link expires in 30 days.");
+                    "Please confirm your deletion request: " + link + "\nThis link expires in 24 hours.");
         } catch (Exception e) {
             throw new ComplianceException("email_failed", e);
         }
@@ -386,57 +413,80 @@ public class DataExportCompliance {
 
     /**
      * Confirms a deletion with the token from the e-mail, which proves the request came from the mailbox's owner. POST
-     * /compliance/delete/:deletion_id/confirm.
+     * /compliance/delete/:deletion_id/confirm. Only the caller's own request: anyone else's (admins included) is
+     * not_found. The token is single-use, valid 24 hours and bound to this deletion id (its hash is stored on the row),
+     * and is compared in constant time; a wrong, reused or expired token is invalid_token. For a statutory reason the
+     * cascade runs before this returns (status completed, deleted_at = the returned time = now).
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-12/14): it took no caller, so anyone holding a link
+     * for someone else's request could confirm it, and the token was valid for the whole grace period.
      *
+     * @param callerId   the signed-in user (from the verified session, never from the request body)
      * @param deletionId the request
      * @param token      the token from the link
-     * @return when the data will be erased
-     * @throws ComplianceException not_found, invalid_token, not_pending, grace_period_expired
+     * @return when the data will be (or, for a statutory reason, was) erased
+     * @throws ComplianceException not_found, invalid_token, not_pending, grace_period_expired, deletion_failed
      */
-    public Instant confirmDeletion(UUID deletionId, String token) {
-        List<String> hashes = query("SELECT confirmation_token_hash FROM deletion_requests WHERE id = ?",
-                row -> row.getString(1), deletionId);
-        if (hashes.isEmpty()) {
+    public Instant confirmDeletion(UUID callerId, UUID deletionId, String token) {
+        List<Object[]> rows = query("SELECT confirmation_token_hash, token_expires_at, token_used_at FROM deletion_requests WHERE id = ?",
+                row -> new Object[] {row.getString(1), instant(row, "token_expires_at"), instant(row, "token_used_at")}, deletionId);
+        DeletionView deletion = rows.isEmpty() ? null : findDeletion(deletionId).orElse(null);
+        if (deletion == null || callerId == null || !callerId.equals(deletion.userId())) {
             throw new ComplianceException("not_found");
         }
-        byte[] expected = hashes.get(0).getBytes(StandardCharsets.UTF_8);
+        byte[] expected = ((String) rows.get(0)[0]).getBytes(StandardCharsets.UTF_8);
         byte[] given = sha256(token == null ? "" : token).getBytes(StandardCharsets.UTF_8);
-        if (!MessageDigest.isEqual(expected, given)) {
+        boolean matches = MessageDigest.isEqual(expected, given);
+        Instant now = clock.instant();
+        Instant tokenExpiresAt = (Instant) rows.get(0)[1];
+        boolean usable = rows.get(0)[2] == null && tokenExpiresAt != null && !now.isAfter(tokenExpiresAt);
+        if (!matches || !usable) {
             throw new ComplianceException("invalid_token");
         }
-        DeletionView deletion = findDeletion(deletionId).orElseThrow(() -> new ComplianceException("not_found"));
         if (deletion.status() != DeletionStatus.PENDING) {
             throw new ComplianceException("not_pending");
         }
-        if (clock.instant().isAfter(deletion.willDeleteAt())) {
+        boolean statutory = STATUTORY_REASONS.contains(deletion.reason());
+        if (!statutory && now.isAfter(deletion.willDeleteAt())) {
             throw new ComplianceException("grace_period_expired");
         }
-        int changed = update("UPDATE deletion_requests SET status = ? WHERE id = ? AND status = ?",
-                DeletionStatus.APPROVED.value(), deletionId, DeletionStatus.PENDING.value());
+        int changed = update("UPDATE deletion_requests SET status = ?, token_used_at = ? WHERE id = ? AND status = ? AND token_used_at IS NULL",
+                DeletionStatus.APPROVED.value(), now, deletionId, DeletionStatus.PENDING.value());
         if (changed == 0) {
-            throw new ComplianceException("not_pending");
+            throw new ComplianceException("invalid_token");
         }
         services.audit().record("deletion_confirmed", deletion.userId(), Map.of("deletion_id", deletionId.toString()));
-        return deletion.willDeleteAt();
+        if (!statutory) {
+            return deletion.willDeleteAt();
+        }
+        Instant claimedAt = clock.instant().truncatedTo(ChronoUnit.MILLIS);
+        if (update("UPDATE deletion_requests SET erase_started_at = ? WHERE id = ? AND status = ? AND erase_started_at IS NULL",
+                claimedAt, deletionId, DeletionStatus.APPROVED.value()) == 0 || !runCascade(deletion, claimedAt)) {
+            throw new ComplianceException("deletion_failed");
+        }
+        return claimedAt;
     }
 
     /**
-     * Cancels a deletion during the grace period. DELETE /compliance/delete/:deletion_id.
+     * Cancels a deletion. DELETE /compliance/delete/:deletion_id. Only the caller's own request: anyone else's
+     * (admins included) is not_found. A pending (unconfirmed) request can always be cancelled; a confirmed one only
+     * until will_delete_at and before its erase has started.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-14: "confirm and cancel act only on the caller's own
+     * request"; admins could cancel anyone's).
      *
      * @param deletionId  the request
-     * @param requesterId the signed-in user, who must be its owner or an admin
+     * @param requesterId the signed-in user, who must be its owner
      * @return the new status
      * @throws ComplianceException not_found, also when the requester may not see it; cannot_cancel; grace_period_expired
      */
     public DeletionStatus cancelDeletion(UUID deletionId, UUID requesterId) {
         DeletionView deletion = findDeletion(deletionId).orElseThrow(() -> new ComplianceException("not_found"));
-        if (!deletion.userId().equals(requesterId) && !services.admins().isAdmin(requesterId)) {
+        if (requesterId == null || !requesterId.equals(deletion.userId())) {
             throw new ComplianceException("not_found");
         }
         if (deletion.status() != DeletionStatus.PENDING && deletion.status() != DeletionStatus.APPROVED) {
             throw new ComplianceException("cannot_cancel");
         }
-        if (clock.instant().isAfter(deletion.willDeleteAt())) {
+        if (deletion.status() == DeletionStatus.APPROVED && clock.instant().isAfter(deletion.willDeleteAt())) {
             throw new ComplianceException("grace_period_expired");
         }
         // Only an erase that has not started can be cancelled, so a cancellation and the eraser never both win.
@@ -449,6 +499,37 @@ public class DataExportCompliance {
         }
         services.audit().record("deletion_cancelled", deletion.userId(), Map.of("deletion_id", deletionId.toString()));
         return DeletionStatus.CANCELLED;
+    }
+
+    /**
+     * The deletion cascade for one claimed request, in the spec's order: (1) erase the user's rows (every table but the
+     * audit tables), (2) log 'user_deleted_cascade' with the user as subject, (3) call the audit eraser's
+     * eraseSubject(user_id) LAST; then the request is completed with user_id set NULL. Nothing logs this user after
+     * step 3 (a failure there is logged without the user). In: the request, its claim time. Out: true when completed
+     * (false if another worker took the claim over, or a step failed and the claim stays for a retry).
+     * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-13). Touches: the application's user data (through
+     * UserData), the audit log and audit store, the database.
+     */
+    private boolean runCascade(DeletionView deletion, Instant claimedAt) {
+        Map<String, String> details = Map.of("deletion_id", deletion.deletionId().toString());
+        try {
+            services.users().eraseAll(deletion.userId());
+        } catch (Exception e) {
+            services.audit().record("deletion_failed", deletion.userId(),
+                    Map.of("deletion_id", deletion.deletionId().toString(), "error", e.getClass().getSimpleName()));
+            return false;
+        }
+        try {
+            services.audit().record("user_deleted_cascade", deletion.userId(), details);
+            services.auditEraser().eraseSubject(deletion.userId());
+        } catch (Exception e) {
+            // Without the user: their audit personal data may already be partly erased.
+            services.audit().record("deletion_failed", null,
+                    Map.of("deletion_id", deletion.deletionId().toString(), "error", e.getClass().getSimpleName()));
+            return false;
+        }
+        return update("UPDATE deletion_requests SET status = ?, deleted_at = ?, user_id = NULL WHERE id = ? AND erase_started_at = ?",
+                DeletionStatus.COMPLETED.value(), clock.instant(), deletion.deletionId(), claimedAt) == 1;
     }
 
     /**
@@ -467,7 +548,6 @@ public class DataExportCompliance {
                 DataExportCompliance::toDeletion, DeletionStatus.APPROVED.value(), now);
         int erased = 0;
         for (DeletionView deletion : due) {
-            Map<String, String> details = Map.of("deletion_id", deletion.deletionId().toString());
             Instant claimedAt = clock.instant().truncatedTo(ChronoUnit.MILLIS);
             int claimed = update("UPDATE deletion_requests SET erase_started_at = ? WHERE id = ? AND status = ?"
                             + " AND (erase_started_at IS NULL OR erase_started_at < ?)",
@@ -475,19 +555,11 @@ public class DataExportCompliance {
             if (claimed == 0) {
                 continue;
             }
-            try {
-                services.users().eraseAll(deletion.userId());
-            } catch (Exception e) {
-                services.audit().record("deletion_failed", deletion.userId(),
-                        Map.of("deletion_id", deletion.deletionId().toString(), "error", e.getClass().getSimpleName()));
-                continue;
+            // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-13): the spec's cascade order, ending with the audit
+            // eraser; no "deletion_completed" entry naming the user is written after it any more.
+            if (runCascade(deletion, claimedAt)) {
+                erased++;
             }
-            if (update("UPDATE deletion_requests SET status = ?, deleted_at = ? WHERE id = ? AND erase_started_at = ?",
-                    DeletionStatus.COMPLETED.value(), clock.instant(), deletion.deletionId(), claimedAt) == 0) {
-                continue;   // another worker took this erase over after the lease; it reports the result
-            }
-            services.audit().record("deletion_completed", deletion.userId(), details);
-            erased++;
         }
         return erased;
     }

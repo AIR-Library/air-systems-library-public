@@ -9,6 +9,7 @@ import java.sql.Statement;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -136,11 +137,19 @@ public class PermissionsRbacSystem {
         public final boolean success;
         public final Map<String, Integer> deletedItems;
         public final String error;
+        /** HTTP status: 200 on success, 404 when the caller may not see the target, 500 when the cascade rolled back. */
+        public final int statusCode;
 
         public CascadeResult(boolean success, Map<String, Integer> deletedItems, String error) {
+            this(success, deletedItems, error, success ? 200 : 500);
+        }
+
+        /** Result with an explicit status (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: RBAC-06's 404). */
+        public CascadeResult(boolean success, Map<String, Integer> deletedItems, String error, int statusCode) {
             this.success = success;
             this.deletedItems = deletedItems;
             this.error = error;
+            this.statusCode = statusCode;
         }
 
         public Map<String, Object> toMap() {
@@ -165,6 +174,12 @@ public class PermissionsRbacSystem {
     private final Map<String, List<String>> orgUsers = new ConcurrentHashMap<>();
     private final Map<String, List<String>> orgApiKeys = new ConcurrentHashMap<>();
     private final Map<String, List<String>> orgSessions = new ConcurrentHashMap<>();
+    /** memberships rows (org_id, user_id, role) as in organizations_teams.md: org -> user -> role, insertion order. */
+    private final Map<String, LinkedHashMap<String, String>> memberships = new ConcurrentHashMap<>();
+    /** invitations per org (ids). */
+    private final Map<String, List<String>> orgInvitations = new ConcurrentHashMap<>();
+    /** Test hook: called before each cascade step with the step's name; an exception it throws aborts the cascade. */
+    private volatile java.util.function.Consumer<String> cascadeStepHook = step -> { };
     private final List<AuditLogEntry> auditLog = new ArrayList<>();
     private final AtomicLong auditIdCounter = new AtomicLong(1);
     private final AtomicLong userIdCounter = new AtomicLong(1);
@@ -364,12 +379,96 @@ public class PermissionsRbacSystem {
     }
 
     // --- Organization Management ---
+
+    /** Adds a 'member' membership row (kept for callers that predate roles). */
     public void addUserToOrg(String orgId, String userId) {
-        orgUsers.computeIfAbsent(orgId, k -> new ArrayList<>()).add(userId);
+        addMembership(orgId, userId, "member");
     }
 
-    public List<String> getOrgUsers(String orgId) {
-        return orgUsers.getOrDefault(orgId, new ArrayList<>());
+    /**
+     * Adds or replaces the membership row (orgId, userId, role), role 'owner' | 'admin' | 'member'.
+     * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (RBAC-06: the delete gate is the caller's membership role in
+     * that org, and a user may belong to several orgs). Touches: memory.
+     */
+    public synchronized void addMembership(String orgId, String userId, String role) {
+        if (!Set.of("owner", "admin", "member").contains(role)) {
+            throw new IllegalArgumentException("invalid role: " + role);
+        }
+        memberships.computeIfAbsent(orgId, k -> new LinkedHashMap<>()).put(userId, role);
+    }
+
+    /** The user's role in the org, or null when not a member. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+    public synchronized String getMembershipRole(String orgId, String userId) {
+        Map<String, String> m = memberships.get(orgId);
+        return m == null ? null : m.get(userId);
+    }
+
+    /** Ids of the org's members (membership rows), in insertion order. */
+    public synchronized List<String> getOrgUsers(String orgId) {
+        Map<String, String> m = memberships.get(orgId);
+        return m == null ? new ArrayList<>() : new ArrayList<>(m.keySet());
+    }
+
+    /** Records an invitation of the org. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (RBAC-06). */
+    public void addInvitation(String orgId, String invitationId) {
+        orgInvitations.computeIfAbsent(orgId, k -> new ArrayList<>()).add(invitationId);
+    }
+
+    public List<String> getOrgInvitations(String orgId) {
+        return orgInvitations.getOrDefault(orgId, new ArrayList<>());
+    }
+
+    /** Installs the cascade step hook (tests use it to fail a cascade midway, RBAC-07). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+    public void setCascadeStepHook(java.util.function.Consumer<String> hook) {
+        this.cascadeStepHook = hook == null ? step -> { } : hook;
+    }
+
+    /**
+     * Runs body as one transaction over the in-memory tables: every table is copied first and restored if body throws,
+     * so a cascade that fails midway leaves nothing deleted (RBAC-04/07); audit entries written inside it are dropped
+     * too, since they describe deletes that were undone. In: body. Out: its result. Added 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP: the cascades had no rollback at all ("Rollback: restore data (simulated)").
+     * Touches: memory.
+     */
+    private synchronized <T> T inTransaction(java.util.function.Supplier<T> body) {
+        Map<String, User> u = new HashMap<>(users);
+        Map<String, List<String>> us = deepCopy(userSessions), uk = deepCopy(userApiKeys), uf = deepCopy(userFiles),
+                dd = deepCopy(deploymentDnsRecords), dt = deepCopy(deploymentThemeConfigs), dl = deepCopy(deploymentLogs),
+                od = deepCopy(orgDeployments), ou = deepCopy(orgUsers), ok = deepCopy(orgApiKeys), os = deepCopy(orgSessions),
+                oi = deepCopy(orgInvitations);
+        Map<String, Map<String, Object>> up = new HashMap<>();
+        userPreferences.forEach((k, v) -> up.put(k, new HashMap<>(v)));
+        Map<String, LinkedHashMap<String, String>> ms = new HashMap<>();
+        memberships.forEach((k, v) -> ms.put(k, new LinkedHashMap<>(v)));
+        int auditSize;
+        synchronized (auditLog) {
+            auditSize = auditLog.size();
+        }
+        try {
+            return body.get();
+        } catch (RuntimeException e) {
+            restore(users, u);
+            restore(userSessions, us); restore(userApiKeys, uk); restore(userFiles, uf);
+            restore(deploymentDnsRecords, dd); restore(deploymentThemeConfigs, dt); restore(deploymentLogs, dl);
+            restore(orgDeployments, od); restore(orgUsers, ou); restore(orgApiKeys, ok); restore(orgSessions, os);
+            restore(orgInvitations, oi); restore(userPreferences, up); restore(memberships, ms);
+            synchronized (auditLog) {
+                // cascade entries written inside the rolled-back transaction describe deletes that did not happen
+                while (auditLog.size() > auditSize) auditLog.remove(auditLog.size() - 1);
+            }
+            throw e;
+        }
+    }
+
+    private static Map<String, List<String>> deepCopy(Map<String, List<String>> m) {
+        Map<String, List<String>> c = new HashMap<>();
+        m.forEach((k, v) -> c.put(k, new ArrayList<>(v)));
+        return c;
+    }
+
+    private static <V> void restore(Map<String, V> live, Map<String, V> saved) {
+        live.clear();
+        live.putAll(saved);
     }
 
     public void addApiKeyToOrg(String orgId, String apiKeyId) {
@@ -494,24 +593,40 @@ public class PermissionsRbacSystem {
     public CascadeResult deleteUserCascade(String userId) {
         Map<String, Integer> deletedItems = new HashMap<>();
         try {
+            return inTransaction(() -> deleteUserCascadeBody(userId));
+        } catch (RuntimeException e) {
+            return new CascadeResult(false, deletedItems, "Cascade delete failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * The user cascade's work (run inside inTransaction). Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: split out
+     * so a failure rolls back (RBAC-04/07); each step calls the cascade step hook. Touches: memory.
+     */
+    private CascadeResult deleteUserCascadeBody(String userId) {
+        Map<String, Integer> deletedItems = new HashMap<>();
+        {
             // Simulate transaction
             int sessionsDeleted = 0;
             int keysDeleted = 0;
             int filesDeleted = 0;
             int prefsCleared = 0;
 
+            cascadeStepHook.accept("user.sessions");
             List<String> sessions = userSessions.get(userId);
             if (sessions != null) {
                 sessionsDeleted = sessions.size();
                 sessions.clear();
             }
 
+            cascadeStepHook.accept("user.api_keys");
             List<String> keys = userApiKeys.get(userId);
             if (keys != null) {
                 keysDeleted = keys.size();
                 keys.clear();
             }
 
+            cascadeStepHook.accept("user.files");
             List<String> files = userFiles.get(userId);
             if (files != null) {
                 filesDeleted = files.size();
@@ -531,14 +646,11 @@ public class PermissionsRbacSystem {
             deletedItems.put("files", filesDeleted);
             deletedItems.put("preferences", prefsCleared);
 
+            cascadeStepHook.accept("user.done");
             // Log cascade delete
             logCascadeDelete("user_deleted_cascade", userId, deletedItems);
 
             return new CascadeResult(true, deletedItems, null);
-
-        } catch (Exception e) {
-            // Rollback: restore data (simulated)
-            return new CascadeResult(false, deletedItems, "Cascade delete failed: " + e.getMessage());
         }
     }
 
@@ -546,8 +658,21 @@ public class PermissionsRbacSystem {
      * Cascade delete deployment: dns_records, theme_configs, deployment_logs, archive to S3
      */
     public CascadeResult deleteDeploymentCascade(String deploymentId) {
-        Map<String, Integer> deletedItems = new HashMap<>();
         try {
+            return inTransaction(() -> deleteDeploymentCascadeBody(deploymentId));
+        } catch (RuntimeException e) {
+            return new CascadeResult(false, new HashMap<>(), "Cascade delete failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * The deployment cascade's work, run inside inTransaction so a failure rolls back. Split out 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP (RBAC-05/07). Touches: memory, the audit log.
+     */
+    private CascadeResult deleteDeploymentCascadeBody(String deploymentId) {
+        Map<String, Integer> deletedItems = new HashMap<>();
+        {
+            cascadeStepHook.accept("deployment.records");
             int dnsDeleted = 0;
             int themesDeleted = 0;
             int logsDeleted = 0;
@@ -582,68 +707,61 @@ public class PermissionsRbacSystem {
             logCascadeDelete("deployment_deleted_cascade", deploymentId, deletedItems);
 
             return new CascadeResult(true, deletedItems, null);
-
-        } catch (Exception e) {
-            return new CascadeResult(false, deletedItems, "Cascade delete failed: " + e.getMessage());
         }
     }
 
     /**
-     * Cascade delete organization: deployments, users, api_keys, sessions
+     * delete_organization (RBAC-06, amended 2026-11-10). Gate: the caller's membership row for orgId has role 'owner';
+     * anyone else (a non-member, an admin, the owner of ANOTHER org, a global OWNER tier) gets 404, so the org's
+     * existence is not revealed. Cascade, in one transaction: the org's deployments (each with the deployment cascade),
+     * API keys whose org_id is this org, all its invitations and its membership rows. Never a user account, a session
+     * or a personal API key: a member's other memberships are untouched.
+     * In: the verified caller, org id. Out: CascadeResult with deleted_items {deployments, api_keys, invitations,
+     * memberships}, or 404 not_found, or a rolled-back failure.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: it had no gate and deleted every member's user account,
+     * sessions and keys. Touches: memory (the in-memory tables), the audit log.
      */
-    public CascadeResult deleteOrganizationCascade(String orgId) {
-        Map<String, Integer> deletedItems = new HashMap<>();
+    public CascadeResult deleteOrganizationCascade(User caller, String orgId) {
+        if (caller == null || orgId == null || !"owner".equals(getMembershipRole(orgId, caller.id))) {
+            return new CascadeResult(false, new HashMap<>(), "not_found", 404);
+        }
         try {
-            int deploymentsDeleted = 0;
-            int usersDeleted = 0;
-            int keysDeleted = 0;
-            int sessionsRevoked = 0;
-
-            List<String> deployments = orgDeployments.get(orgId);
-            if (deployments != null) {
-                deploymentsDeleted = deployments.size();
-                // Delete each deployment cascade
-                for (String depId : deployments) {
-                    deleteDeploymentCascade(depId);
+            return inTransaction(() -> {
+                Map<String, Integer> deletedItems = new LinkedHashMap<>();
+                cascadeStepHook.accept("org.deployments");
+                List<String> deployments = orgDeployments.getOrDefault(orgId, new ArrayList<>());
+                int deploymentsDeleted = deployments.size();
+                for (String depId : new ArrayList<>(deployments)) {
+                    CascadeResult r = deleteDeploymentCascade(depId);
+                    if (!r.success) {
+                        throw new IllegalStateException("deployment cascade failed for " + depId);
+                    }
                 }
-                deployments.clear();
-            }
+                orgDeployments.remove(orgId);
 
-            // FIX: rename local variable to avoid shadowing the field 'orgUsers'
-            List<String> orgUserList = orgUsers.get(orgId);
-            if (orgUserList != null) {
-                usersDeleted = orgUserList.size();
-                // Delete each user cascade
-                for (String userId : orgUserList) {
-                    deleteUserCascade(userId);
-                }
-                orgUserList.clear();
-            }
+                cascadeStepHook.accept("org.api_keys");
+                List<String> keys = orgApiKeys.remove(orgId);
+                int keysDeleted = keys == null ? 0 : keys.size();
 
-            List<String> keys = orgApiKeys.get(orgId);
-            if (keys != null) {
-                keysDeleted = keys.size();
-                keys.clear();
-            }
+                cascadeStepHook.accept("org.invitations");
+                List<String> invitations = orgInvitations.remove(orgId);
+                int invitationsDeleted = invitations == null ? 0 : invitations.size();
 
-            List<String> sessions = orgSessions.get(orgId);
-            if (sessions != null) {
-                sessionsRevoked = sessions.size();
-                sessions.clear();
-            }
+                cascadeStepHook.accept("org.memberships");
+                Map<String, String> members = memberships.remove(orgId);
+                int membershipsDeleted = members == null ? 0 : members.size();
+                orgUsers.remove(orgId);
 
-            deletedItems.put("deployments", deploymentsDeleted);
-            deletedItems.put("users", usersDeleted);
-            deletedItems.put("api_keys", keysDeleted);
-            deletedItems.put("sessions", sessionsRevoked);
-
-            // Log cascade delete
-            logCascadeDelete("org_deleted_cascade", orgId, deletedItems);
-
-            return new CascadeResult(true, deletedItems, null);
-
-        } catch (Exception e) {
-            return new CascadeResult(false, deletedItems, "Cascade delete failed: " + e.getMessage());
+                deletedItems.put("deployments", deploymentsDeleted);
+                deletedItems.put("api_keys", keysDeleted);
+                deletedItems.put("invitations", invitationsDeleted);
+                deletedItems.put("memberships", membershipsDeleted);
+                cascadeStepHook.accept("org.done");
+                logCascadeDelete("org_deleted_cascade", orgId, deletedItems);
+                return new CascadeResult(true, deletedItems, null);
+            });
+        } catch (RuntimeException e) {
+            return new CascadeResult(false, new HashMap<>(), "Cascade delete failed: " + e.getMessage());
         }
     }
 
@@ -774,6 +892,8 @@ public class PermissionsRbacSystem {
         orgUsers.clear();
         orgApiKeys.clear();
         orgSessions.clear();
+        memberships.clear();
+        orgInvitations.clear();
         synchronized (auditLog) {
             auditLog.clear();
         }

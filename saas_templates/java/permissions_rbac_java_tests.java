@@ -27,6 +27,7 @@ public class PermissionsRbacSystemTest {
     }
 
     // --- Test: require_owner on non-owner → 403 ---
+    // RBAC-01
     @Test
     @DisplayName("require_owner: non-owner user receives 403")
     void testRequireOwnerNonOwner() {
@@ -61,6 +62,7 @@ public class PermissionsRbacSystemTest {
     }
 
     // --- Test: require_admin on member → 403 ---
+    // RBAC-02
     @Test
     @DisplayName("require_admin: member user receives 403")
     void testRequireAdminMember() {
@@ -94,6 +96,7 @@ public class PermissionsRbacSystemTest {
     }
 
     // --- Test: require_authenticated on public → 401 ---
+    // RBAC-03
     @Test
     @DisplayName("require_authenticated: public user receives 401")
     void testRequireAuthenticatedPublic() {
@@ -127,6 +130,7 @@ public class PermissionsRbacSystemTest {
     }
 
     // --- Test: cascade_delete user → all related records deleted in transaction ---
+    // RBAC-04
     @Test
     @DisplayName("cascade_delete user: all related records deleted")
     void testCascadeDeleteUser() {
@@ -166,6 +170,7 @@ public class PermissionsRbacSystemTest {
     }
 
     // --- Test: cascade_delete deployment → all related records deleted ---
+    // RBAC-05
     @Test
     @DisplayName("cascade_delete deployment: all related records deleted")
     void testCascadeDeleteDeployment() {
@@ -199,96 +204,132 @@ public class PermissionsRbacSystemTest {
         assertTrue(rbac.getDeploymentLogs(deploymentId).isEmpty());
     }
 
-    // --- Test: cascade_delete org → all nested records deleted ---
+    /**
+     * RBAC-06 (amended 2026-11-10): only an owner of THAT org may delete it (another org's owner, an admin of it and a
+     * non-member get 404 and nothing changes); its deployments (with their records), org API keys, invitations and
+     * memberships are deleted; every member's user account, sessions and personal API keys are kept, and a member who
+     * also belongs to another org keeps that membership. Rewritten 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the old
+     * test asserted that the org's users were deleted, which the amended spec forbids. Touches: memory only.
+     */
+    // RBAC-06
     @Test
-    @DisplayName("cascade_delete org: all nested records deleted")
+    @DisplayName("cascade_delete org: owner of that org only; org data deleted, users kept")
     void testCascadeDeleteOrg() {
         String orgId = "org-1";
+        PermissionsRbacSystem.User owner = rbac.createUser("owner1@test.com", PermissionsRbacSystem.Tier.OWNER, orgId);
+        PermissionsRbacSystem.User member = rbac.createUser("user1@test.com", PermissionsRbacSystem.Tier.MEMBER, orgId);
+        PermissionsRbacSystem.User admin = rbac.createUser("user2@test.com", PermissionsRbacSystem.Tier.ADMIN, orgId);
+        PermissionsRbacSystem.User otherOwner = rbac.createUser("owner2@test.com", PermissionsRbacSystem.Tier.OWNER, "org-2");
+        rbac.addMembership(orgId, owner.id, "owner");
+        rbac.addMembership(orgId, member.id, "member");
+        rbac.addMembership(orgId, admin.id, "admin");
+        rbac.addMembership("org-2", otherOwner.id, "owner");
+        rbac.addMembership("org-2", member.id, "member");   // the member also belongs to org-2
 
-        // Create users in org
-        PermissionsRbacSystem.User user1 = rbac.createUser("user1@test.com", PermissionsRbacSystem.Tier.MEMBER, orgId);
-        PermissionsRbacSystem.User user2 = rbac.createUser("user2@test.com", PermissionsRbacSystem.Tier.ADMIN, orgId);
-        rbac.addUserToOrg(orgId, user1.id);
-        rbac.addUserToOrg(orgId, user2.id);
-
-        // Add user-related records
-        rbac.addSession(user1.id, "session-1");
-        rbac.addApiKey(user1.id, "key-1");
-        rbac.addFile(user1.id, "file-1");
-        rbac.addSession(user2.id, "session-2");
-        rbac.addApiKey(user2.id, "key-2");
-
-        // Create deployments in org
-        String dep1 = "dep-1";
-        String dep2 = "dep-2";
-        rbac.addDeploymentToOrg(orgId, dep1);
-        rbac.addDeploymentToOrg(orgId, dep2);
-
-        // Add deployment-related records
-        rbac.addDnsRecord(dep1, "dns-1");
-        rbac.addThemeConfig(dep1, "theme-1");
-        rbac.addDeploymentLog(dep1, "log-1");
-        rbac.addDnsRecord(dep2, "dns-2");
-        rbac.addThemeConfig(dep2, "theme-2");
-        rbac.addDeploymentLog(dep2, "log-2");
-
-        // Add org-level records
+        rbac.addSession(member.id, "session-1");
+        rbac.addApiKey(member.id, "personal-key-1");          // personal key: no org_id
+        rbac.addFile(member.id, "file-1");
+        rbac.addDeploymentToOrg(orgId, "dep-1");
+        rbac.addDeploymentToOrg(orgId, "dep-2");
+        rbac.addDnsRecord("dep-1", "dns-1");
+        rbac.addThemeConfig("dep-2", "theme-2");
         rbac.addApiKeyToOrg(orgId, "org-key-1");
-        rbac.addSessionToOrg(orgId, "org-session-1");
+        rbac.addInvitation(orgId, "inv-1");
+        rbac.addInvitation(orgId, "inv-2");
+        rbac.addDeploymentToOrg("org-2", "dep-other");
+        rbac.addApiKeyToOrg("org-2", "org2-key");
 
-        // Verify records exist
-        assertEquals(2, rbac.getOrgUsers(orgId).size());
+        // Another org's owner, an admin of this org and a non-member: 404, nothing deleted.
+        for (PermissionsRbacSystem.User caller : java.util.Arrays.asList(otherOwner, admin, null)) {
+            PermissionsRbacSystem.CascadeResult denied = rbac.deleteOrganizationCascade(caller, orgId);
+            assertFalse(denied.success);
+            assertEquals(404, denied.statusCode);
+            assertEquals("not_found", denied.error);
+        }
         assertEquals(2, rbac.getOrgDeployments(orgId).size());
-        assertEquals(1, rbac.getOrgApiKeys(orgId).size());
-        assertEquals(1, rbac.getOrgSessions(orgId).size());
+        assertEquals(3, rbac.getOrgUsers(orgId).size());
 
-        // Execute cascade delete
-        PermissionsRbacSystem.CascadeResult result = rbac.deleteOrganizationCascade(orgId);
-
+        PermissionsRbacSystem.CascadeResult result = rbac.deleteOrganizationCascade(owner, orgId);
         assertTrue(result.success);
+        assertEquals(200, result.statusCode);
         assertEquals(2, result.deletedItems.get("deployments"));
-        assertEquals(2, result.deletedItems.get("users"));
         assertEquals(1, result.deletedItems.get("api_keys"));
-        assertEquals(1, result.deletedItems.get("sessions"));
+        assertEquals(2, result.deletedItems.get("invitations"));
+        assertEquals(3, result.deletedItems.get("memberships"));
 
-        // Verify all records deleted
-        assertTrue(rbac.getOrgUsers(orgId).isEmpty());
         assertTrue(rbac.getOrgDeployments(orgId).isEmpty());
+        assertTrue(rbac.getDeploymentDnsRecords("dep-1").isEmpty());
+        assertTrue(rbac.getDeploymentThemeConfigs("dep-2").isEmpty());
         assertTrue(rbac.getOrgApiKeys(orgId).isEmpty());
-        assertTrue(rbac.getOrgSessions(orgId).isEmpty());
-        assertNull(rbac.getUser(user1.id));
-        assertNull(rbac.getUser(user2.id));
+        assertTrue(rbac.getOrgInvitations(orgId).isEmpty());
+        assertTrue(rbac.getOrgUsers(orgId).isEmpty());
+        assertNull(rbac.getMembershipRole(orgId, member.id));
+
+        // Users, their sessions and personal keys are kept; the other org is untouched.
+        for (PermissionsRbacSystem.User u : java.util.Arrays.asList(owner, member, admin, otherOwner)) {
+            assertNotNull(rbac.getUser(u.id));
+        }
+        assertEquals(List.of("session-1"), rbac.getUserSessions(member.id));
+        assertEquals(List.of("personal-key-1"), rbac.getUserApiKeys(member.id));
+        assertEquals(List.of("file-1"), rbac.getUserFiles(member.id));
+        assertEquals("member", rbac.getMembershipRole("org-2", member.id));
+        assertEquals(List.of("dep-other"), rbac.getOrgDeployments("org-2"));
+        assertEquals(List.of("org2-key"), rbac.getOrgApiKeys("org-2"));
+        assertEquals(1, rbac.getAuditLogByAction("org_deleted_cascade").size());
     }
 
-    // --- Test: cascade on error → rollback (no partial deletes) ---
+    /**
+     * RBAC-07: a cascade that fails midway rolls back, so nothing is deleted. Rewritten 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP: the old test only asserted inside "if (result.success)", so it could never
+     * fail; it now fails each cascade at a late step (after earlier steps have deleted rows) and checks every row is
+     * back and no cascade audit entry remains. Touches: memory only.
+     */
+    // RBAC-07
     @Test
     @DisplayName("cascade on error: rollback prevents partial deletes")
     void testCascadeRollbackOnError() {
-        // This test verifies that if an error occurs during cascade,
-        // no partial deletes are committed. In a real implementation,
-        // this would use database transactions.
-        // For this in-memory implementation, we verify the structure
-        // supports rollback by checking that failed cascades don't
-        // leave inconsistent state.
-
         PermissionsRbacSystem.User user = rbac.createUser("user@test.com", PermissionsRbacSystem.Tier.MEMBER, "org-1");
         rbac.addSession(user.id, "session-1");
         rbac.addApiKey(user.id, "key-1");
+        rbac.addFile(user.id, "file-1");
+        rbac.setCascadeStepHook(step -> {
+            if ("user.files".equals(step)) throw new IllegalStateException("disk error");
+        });
+        PermissionsRbacSystem.CascadeResult failed = rbac.deleteUserCascade(user.id);
+        assertFalse(failed.success);
+        assertNotNull(rbac.getUser(user.id));
+        assertEquals(List.of("session-1"), rbac.getUserSessions(user.id));
+        assertEquals(List.of("key-1"), rbac.getUserApiKeys(user.id));
+        assertEquals(List.of("file-1"), rbac.getUserFiles(user.id));
 
-        // Simulate a scenario where cascade might fail
-        // In production, this would be tested with a mock database
-        // that throws an exception mid-transaction
-        PermissionsRbacSystem.CascadeResult result = rbac.deleteUserCascade(user.id);
+        // Org cascade failing after its deployments were deleted: the deployments come back too.
+        PermissionsRbacSystem.User owner = rbac.createUser("owner@test.com", PermissionsRbacSystem.Tier.OWNER, "org-1");
+        rbac.addMembership("org-1", owner.id, "owner");
+        rbac.addDeploymentToOrg("org-1", "dep-1");
+        rbac.addDnsRecord("dep-1", "dns-1");
+        rbac.addApiKeyToOrg("org-1", "org-key-1");
+        rbac.addInvitation("org-1", "inv-1");
+        rbac.setCascadeStepHook(step -> {
+            if ("org.memberships".equals(step)) throw new IllegalStateException("db down");
+        });
+        PermissionsRbacSystem.CascadeResult orgFailed = rbac.deleteOrganizationCascade(owner, "org-1");
+        assertFalse(orgFailed.success);
+        assertEquals(List.of("dep-1"), rbac.getOrgDeployments("org-1"));
+        assertEquals(List.of("dns-1"), rbac.getDeploymentDnsRecords("dep-1"));
+        assertEquals(List.of("org-key-1"), rbac.getOrgApiKeys("org-1"));
+        assertEquals(List.of("inv-1"), rbac.getOrgInvitations("org-1"));
+        assertEquals("owner", rbac.getMembershipRole("org-1", owner.id));
+        assertTrue(rbac.getAuditLogByAction("deployment_deleted_cascade").isEmpty());
+        assertTrue(rbac.getAuditLogByAction("org_deleted_cascade").isEmpty());
 
-        // If successful, all should be deleted
-        if (result.success) {
-            assertNull(rbac.getUser(user.id));
-            assertTrue(rbac.getUserSessions(user.id).isEmpty());
-            assertTrue(rbac.getUserApiKeys(user.id).isEmpty());
-        }
+        // With the fault gone the same cascade completes.
+        rbac.setCascadeStepHook(null);
+        assertTrue(rbac.deleteOrganizationCascade(owner, "org-1").success);
+        assertTrue(rbac.deleteUserCascade(user.id).success);
     }
 
     // --- Test: permission audit logged → queries show who accessed what ---
+    // RBAC-08
     @Test
     @DisplayName("permission audit logged: queries show access patterns")
     void testPermissionAuditLogged() {
@@ -340,6 +381,7 @@ public class PermissionsRbacSystemTest {
     }
 
     // --- Test: tier hierarchy → member cannot do admin actions, admin cannot do owner actions ---
+    // RBAC-09
     @Test
     @DisplayName("tier hierarchy: member < admin < owner")
     void testTierHierarchy() {
@@ -378,6 +420,7 @@ public class PermissionsRbacSystemTest {
     }
 
     // --- Test: permission check response time < 10ms → no performance impact ---
+    // RBAC-10
     @Test
     @DisplayName("permission check response time < 10ms")
     void testPermissionCheckPerformance() {

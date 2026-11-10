@@ -58,6 +58,10 @@ public class QuotaManager implements AutoCloseable {
                     "timestamp TIMESTAMP, status_code INT, response_time_ms INT)");
             stmt.execute("CREATE TABLE IF NOT EXISTS user_files (" +
                     "id IDENTITY PRIMARY KEY, user_id VARCHAR(255), file_size BIGINT, uploaded_at TIMESTAMP)");
+            // Indexes for the two rate-limit window queries (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: without them
+            // every call scanned all of api_calls, so QUOTA-13's 10,001 enterprise calls were quadratic).
+            stmt.execute("CREATE INDEX IF NOT EXISTS api_calls_user_ts ON api_calls (user_id, timestamp)");
+            stmt.execute("CREATE INDEX IF NOT EXISTS api_calls_ip_ts ON api_calls (ip, timestamp)");
         }
     }
 
@@ -71,6 +75,17 @@ public class QuotaManager implements AutoCloseable {
      * Touches: the database.
      */
     public synchronized Response handleApiCall(User user, String endpoint, String ip, byte[] incomingFile, String feature) throws SQLException {
+        return handleApiCall(user, endpoint, ip, incomingFile == null ? -1L : (long) incomingFile.length, feature);
+    }
+
+    /**
+     * The same gates as {@link #handleApiCall(User, String, String, byte[], String)}, for an upload whose size is known
+     * (e.g. from Content-Length) without its bytes in memory. In: user, endpoint, IP, incoming size in bytes (-1 = not an
+     * upload), feature. Out: Response as above. Why: QUOTA-13 ("enterprise storage upload of any size stored": a size
+     * over every other tier's limit cannot be held in a Java byte array); 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * A limit of -1 is unlimited in every quota. Touches: the database.
+     */
+    public synchronized Response handleApiCall(User user, String endpoint, String ip, long incomingSize, String feature) throws SQLException {
         // Rate limit per IP
         if (rateLimitPerIp(ip)) {
             return errorResponse(429, "ip_rate_limit_exceeded", Map.of("reset_seconds", 1));
@@ -103,14 +118,14 @@ public class QuotaManager implements AutoCloseable {
         }
 
         // Storage quota if file upload
-        if (incomingFile != null) {
-            if (!storageQuotaCheck(user, incomingFile.length)) {
+        if (incomingSize >= 0) {
+            if (!storageQuotaCheck(user, incomingSize)) {
                 return errorResponse(413, "storage_quota_exceeded", Map.of(
                         "usage", getCurrentStorageUsage(user),
                         "limit", getStorageLimit(user)
                 ));
             }
-            storeFile(user, incomingFile.length);
+            storeFile(user, incomingSize);
         }
 
         // Record API call
@@ -175,7 +190,7 @@ public class QuotaManager implements AutoCloseable {
     private boolean apiQuotaCheck(User user) throws SQLException {
         int current = getCurrentApiUsage(user);
         int limit = getApiLimit(user);
-        return limit < 0 || (current + 1) <= limit;
+        return limit == -1 || (current + 1) <= limit;   // -1 = unlimited (QUOTA-13)
     }
 
     /**
@@ -205,7 +220,7 @@ public class QuotaManager implements AutoCloseable {
     private boolean storageQuotaCheck(User user, long incomingSize) throws SQLException {
         long current = getCurrentStorageUsage(user);
         long limit = getStorageLimit(user);
-        return limit < 0 || (current + incomingSize) <= limit;
+        return limit == -1 || (current + incomingSize) <= limit;   // -1 = unlimited (QUOTA-13)
     }
 
     private long getCurrentStorageUsage(User user) throws SQLException {

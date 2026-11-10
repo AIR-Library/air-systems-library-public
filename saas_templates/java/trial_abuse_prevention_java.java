@@ -24,6 +24,8 @@ import javax.sql.DataSource;
 public class TrialAbusePrevention {
     private final DataSource dataSource;
     private final Clock clock;
+    /** Trial length in days for gate 5 (spec: configurable, default 14). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+    private final int trialDays;
 
     /**
      * Creates the gates on the system UTC clock. Input: a DataSource holding the tables. Touches: nothing yet.
@@ -38,8 +40,18 @@ public class TrialAbusePrevention {
      * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing yet.
      */
     public TrialAbusePrevention(DataSource dataSource, Clock clock) {
+        this(dataSource, clock, 14);
+    }
+
+    /**
+     * Gates on the given clock with a configured trial length. In: DataSource, clock, trial days (>= 1). Added
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec: "trial_days is configuration, default 14"). Touches: nothing.
+     */
+    public TrialAbusePrevention(DataSource dataSource, Clock clock, int trialDays) {
+        if (trialDays < 1) throw new IllegalArgumentException("trialDays must be >= 1");
         this.dataSource = Objects.requireNonNull(dataSource, "dataSource");
         this.clock = Objects.requireNonNull(clock, "clock");
+        this.trialDays = trialDays;
     }
 
     /**
@@ -89,21 +101,57 @@ public class TrialAbusePrevention {
         return GateDecision.FAIL;
     }
 
-    /**
-     * Gate 4, DEVICE_FINGERPRINT: how many distinct users already used this device (same deviceHash).
-     * Output: PASS under 2, FAIL for 5 or more (the spec's FAIL rule wins where its ranges overlap at 5),
-     * CHALLENGE for 2 to 4. The "device matches the user's known devices" exception needs a user id; callers
-     * that have one should store the device with insertDeviceFingerprint and compare per user.
-     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: canonical hash via deviceHash, FAIL at 5.
-     * Touches: reads the database.
-     */
+    /** Gate 4 without a user (an anonymous check): counts every user on the device. */
     public GateDecision checkDeviceFingerprint(String userAgent, String screenResolution, String timezone, String browserLanguage) throws SQLException, NoSuchAlgorithmException {
+        return checkDeviceFingerprint(null, userAgent, screenResolution, timezone, browserLanguage);
+    }
+
+    /**
+     * Gate 4, DEVICE_FINGERPRINT (amended 2026-11-10). count = distinct OTHER users on this device (null-safe: with no
+     * user id every user counts). Decision, in this order: FAIL if count >= 5; PASS if count < 2; PASS if this user
+     * already has a row for this device; CHALLENGE otherwise. Reads only; the device row is written by
+     * checkAndRecordDevice after the decision. In: user id (may be null), the four browser attributes. Out: decision.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (TRIAL-09/14): the count included the user itself and
+     * there was no known-device rule. Touches: reads the database.
+     */
+    public GateDecision checkDeviceFingerprint(Long userId, String userAgent, String screenResolution, String timezone, String browserLanguage) throws SQLException, NoSuchAlgorithmException {
         String hash = deviceHash(userAgent, screenResolution, timezone, browserLanguage);
-        String sql = "SELECT COUNT(DISTINCT user_id) FROM device_fingerprints WHERE device_hash = ?";
-        int count = countOne(sql, ps -> ps.setString(1, hash));
-        if (count < 2) return GateDecision.PASS;
+        int count = countOne("SELECT COUNT(DISTINCT user_id) FROM device_fingerprints WHERE device_hash = ? AND (CAST(? AS BIGINT) IS NULL OR user_id <> ?)",
+                ps -> {
+                    ps.setString(1, hash);
+                    if (userId == null) {
+                        ps.setNull(2, Types.BIGINT);
+                        ps.setNull(3, Types.BIGINT);
+                    } else {
+                        ps.setLong(2, userId);
+                        ps.setLong(3, userId);
+                    }
+                });
         if (count >= 5) return GateDecision.FAIL;
+        if (count < 2) return GateDecision.PASS;
+        if (userId != null && countOne("SELECT COUNT(*) FROM device_fingerprints WHERE device_hash = ? AND user_id = ?",
+                ps -> {
+                    ps.setString(1, hash);
+                    ps.setLong(2, userId);
+                }) > 0) {
+            return GateDecision.PASS;
+        }
         return GateDecision.CHALLENGE;
+    }
+
+    /**
+     * The signup / login step for gate 4: runs the gate FIRST, then writes the device row only for PASS or CHALLENGE
+     * (a FAIL records nothing). In: user id, browser attributes. Out: the decision. Why: spec amendment 2026-11-10 —
+     * recording before checking made every later check of a device farm see its own row; TRIAL-14.
+     * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: reads and writes the database.
+     */
+    public GateDecision checkAndRecordDevice(Long userId, String userAgent, String screenResolution, String timezone, String browserLanguage) throws SQLException, NoSuchAlgorithmException {
+        GateDecision decision = checkDeviceFingerprint(userId, userAgent, screenResolution, timezone, browserLanguage);
+        if (decision != GateDecision.FAIL && userId != null) {
+            insertDeviceFingerprint(userId, deviceHash(userAgent, screenResolution, timezone, browserLanguage),
+                    userAgent, screenResolution, timezone);
+        }
+        return decision;
     }
 
     /**
@@ -123,18 +171,19 @@ public class TrialAbusePrevention {
         return sha256Hex(toJson(device));
     }
 
+    /** Gate 5 with the configured trial length (default 14 days; set through the three-argument constructor). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+    public GateDecision checkTrialPaymentTiming(Long userId) throws SQLException {
+        return checkTrialPaymentTiming(userId, trialDays);
+    }
+
     /**
-     * Gate 5, TRIAL_PAYMENT_TIMING. The trial starts at users.created_at; the payment date is the latest
-     * trial_abuse_ledger.payment_added_date for the user.
-     * With a payment added after the trial started: CHALLENGE if more than trialDays + 30 days have passed and the
-     * payment came after the trial ended (late payment entry), otherwise PASS.
-     * With no payment: FAIL once the trial has ended and more than 90 days have passed since it started (trying to
-     * come back after 90+ days without ever paying), otherwise PASS.
-     * Input: user id, trial length in days. Output: the decision; SQLException if the user does not exist.
-     * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: the CHALLENGE test ran first and caught
-     * every old trial, so FAIL was unreachable; "never added payment" now reads payment_added_date, not
-     * subscription status; time comes from the injected clock. Matches the Python template. Touches: reads the
-     * database.
+     * Gate 5, TRIAL_PAYMENT_TIMING (amended 2026-11-10), judged when a payment method is being added, so the payment
+     * date is now. trial_end = users.created_at + trialDays; days_after_trial = floor((now - trial_end) / 1 day),
+     * rounded toward negative infinity (Math.floorDiv); earlier_payment = the ledger already has a payment_added_date
+     * for the user. PASS if days_after_trial < 5; FAIL if days_after_trial >= 90 and no earlier payment; CHALLENGE
+     * otherwise. In: user id, trial length in days. Out: the decision; SQLException if the user does not exist.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (TRIAL-10/11/15): the old rule counted from the trial
+     * START and used different thresholds. Touches: reads the database.
      */
     public GateDecision checkTrialPaymentTiming(Long userId, int trialDays) throws SQLException {
         Instant trialStart;
@@ -148,19 +197,12 @@ public class TrialAbusePrevention {
                 trialStart = rs.getTimestamp("created_at").toInstant();
             }
         }
-        Instant paymentAdded = latestPaymentAddedDate(userId);
-        Instant now = clock.instant();
-        long daysElapsed = ChronoUnit.DAYS.between(trialStart, now);
         Instant trialEnd = trialStart.plus(trialDays, ChronoUnit.DAYS);
-
-        if (paymentAdded != null && paymentAdded.isAfter(trialStart)) {
-            if (daysElapsed < trialDays + 5) return GateDecision.PASS;
-            if (daysElapsed > trialDays + 30 && paymentAdded.isAfter(trialEnd)) return GateDecision.CHALLENGE;
-            return GateDecision.PASS;
-        }
-        boolean trialEnded = now.isAfter(trialEnd);
-        if (trialEnded && daysElapsed > 90) return GateDecision.FAIL;
-        return GateDecision.PASS;
+        long daysAfterTrial = Math.floorDiv(Duration.between(trialEnd, clock.instant()).toMillis(), 86_400_000L);
+        boolean earlierPayment = latestPaymentAddedDate(userId) != null;
+        if (daysAfterTrial < 5) return GateDecision.PASS;
+        if (daysAfterTrial >= 90 && !earlierPayment) return GateDecision.FAIL;
+        return GateDecision.CHALLENGE;
     }
 
     /**

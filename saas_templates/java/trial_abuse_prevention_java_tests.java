@@ -58,12 +58,14 @@ public class TrialAbusePreventionTest {
         }
     }
 
+    // TRIAL-01
     @Test
     public void testEmailTrialHistoryPass() throws Exception {
         GateDecision decision = tap.checkEmailTrialHistory("new@example.com");
         assertEquals(GateDecision.PASS, decision);
     }
 
+    // TRIAL-02
     @Test
     public void testEmailTrialHistoryChallenge() throws Exception {
         // Create a user with one completed trial
@@ -72,6 +74,7 @@ public class TrialAbusePreventionTest {
         assertEquals(GateDecision.CHALLENGE, decision);
     }
 
+    // TRIAL-03
     @Test
     public void testEmailTrialHistoryFail() throws Exception {
         // Create two completed trials
@@ -81,12 +84,14 @@ public class TrialAbusePreventionTest {
         assertEquals(GateDecision.FAIL, decision);
     }
 
+    // TRIAL-04
     @Test
     public void testPaymentMethodHistoryPass() throws Exception {
         GateDecision decision = tap.checkPaymentMethodHistory("pm_new");
         assertEquals(GateDecision.PASS, decision);
     }
 
+    // TRIAL-05
     @Test
     public void testPaymentMethodHistoryFail() throws Exception {
         // Create three completed trials with same payment method
@@ -98,12 +103,14 @@ public class TrialAbusePreventionTest {
         assertEquals(GateDecision.FAIL, decision);
     }
 
+    // TRIAL-06
     @Test
     public void testIpSignupRateLimitPass() throws Exception {
         GateDecision decision = tap.checkIpSignupRateLimit("1.2.3.4");
         assertEquals(GateDecision.PASS, decision);
     }
 
+    // TRIAL-07
     @Test
     public void testIpSignupRateLimitFail() throws Exception {
         // Create 10 signups from same IP in last 24 hours
@@ -114,6 +121,7 @@ public class TrialAbusePreventionTest {
         assertEquals(GateDecision.FAIL, decision);
     }
 
+    // TRIAL-08
     @Test
     public void testDeviceFingerprintPass() throws Exception {
         GateDecision decision = tap.checkDeviceFingerprint("UA", "1920x1080", "UTC", "en");
@@ -121,6 +129,7 @@ public class TrialAbusePreventionTest {
     }
 
     /** Five users on one device: FAIL. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: stores TrialAbusePrevention.deviceHash of that device instead of the literal "hash123". Touches: in-memory H2. */
+    // TRIAL-09
     @Test
     public void testDeviceFingerprintFail() throws Exception {
         // Insert 5 different users with same device fingerprint. Changed 2026-11-10, session
@@ -134,28 +143,128 @@ public class TrialAbusePreventionTest {
         }
         GateDecision decision = tap.checkDeviceFingerprint("UA", "1920x1080", "UTC", "en");
         assertEquals(GateDecision.FAIL, decision);
+        // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (TRIAL-09 amendment): a sixth user's check counts the 5 OTHER
+        // users and fails.
+        Long sixth = createUser("user6@example.com", null);
+        assertEquals(GateDecision.FAIL, tap.checkDeviceFingerprint(sixth, "UA", "1920x1080", "UTC", "en"));
     }
 
+    /** Fixed "now" for the timing tests. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
+    private static final Instant NOW = Instant.parse("2026-06-01T12:00:00Z");
+
+    /**
+     * A user whose 14-day trial ended daysAfterTrial days before NOW (negative: still in the trial), on gates with a
+     * fixed clock. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the test database.
+     */
+    private Long userWhoseTrialEnded(long daysAfterTrial, String email) throws SQLException {
+        Long userId = createUser(email, null);
+        updateUserCreatedAt(userId, NOW.minus(14 + daysAfterTrial, ChronoUnit.DAYS));
+        return userId;
+    }
+
+    private TrialAbusePrevention fixedGates() {
+        return new TrialAbusePrevention(dataSource, Clock.fixed(NOW, ZoneOffset.UTC));
+    }
+
+    /**
+     * TRIAL-10: a first payment during the trial and one 4 days after it ended both PASS. Changed 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP: spec amendment (days counted from the trial END, floor); the test used the
+     * wall clock and only the during-trial case.
+     */
+    // TRIAL-10
     @Test
     public void testTrialPaymentTimingPass() throws Exception {
-        Long userId = createUser("user@example.com", null); // trial just started
-        // Set user created_at to now
-        updateUserCreatedAt(userId, Instant.now());
-        GateDecision decision = tap.checkTrialPaymentTiming(userId, 14); // 14-day trial
-        assertEquals(GateDecision.PASS, decision);
+        TrialAbusePrevention gates = fixedGates();
+        assertEquals(GateDecision.PASS, gates.checkTrialPaymentTiming(userWhoseTrialEnded(-10, "during@example.com")));
+        assertEquals(GateDecision.PASS, gates.checkTrialPaymentTiming(userWhoseTrialEnded(4, "four@example.com"), 14));
+        // 4 days and 23 hours is still day 4 (floor).
+        Long almostFive = createUser("almost5@example.com", null);
+        updateUserCreatedAt(almostFive, NOW.minus(14 + 5, ChronoUnit.DAYS).plus(1, ChronoUnit.HOURS));
+        assertEquals(GateDecision.PASS, gates.checkTrialPaymentTiming(almostFive));
     }
 
+    /**
+     * TRIAL-11: a first payment 90 days after the trial ended, with no earlier payment, FAILs. Changed 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP: spec amendment; fixed clock.
+     */
+    // TRIAL-11
     @Test
     public void testTrialPaymentTimingFail() throws Exception {
-        Long userId = createUser("user@example.com", null);
-        // Set trial started 100 days ago
-        Instant trialStart = Instant.now().minus(100, ChronoUnit.DAYS);
-        updateUserCreatedAt(userId, trialStart);
-        // Ensure no prior successful subscription
-        GateDecision decision = tap.checkTrialPaymentTiming(userId, 14);
-        assertEquals(GateDecision.FAIL, decision);
+        assertEquals(GateDecision.FAIL, fixedGates().checkTrialPaymentTiming(userWhoseTrialEnded(90, "ninety@example.com")));
     }
 
+    /**
+     * TRIAL-15: 5 and 89 days after the trial CHALLENGE; 90 days WITH an earlier payment CHALLENGE; trial_days is
+     * configuration (a 30-day trial moves every boundary). Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     */
+    // TRIAL-15
+    @Test
+    public void testTrialPaymentTimingBoundaries() throws Exception {
+        TrialAbusePrevention gates = fixedGates();
+        assertEquals(GateDecision.CHALLENGE, gates.checkTrialPaymentTiming(userWhoseTrialEnded(5, "five@example.com")));
+        assertEquals(GateDecision.CHALLENGE, gates.checkTrialPaymentTiming(userWhoseTrialEnded(89, "e89@example.com")));
+        Long paidBefore = userWhoseTrialEnded(90, "paidbefore@example.com");
+        Connection conn = dataSource.getConnection();
+        try (PreparedStatement ps = conn.prepareStatement("UPDATE trial_abuse_ledger SET payment_added_date = ? WHERE user_id = ?")) {
+            ps.setTimestamp(1, Timestamp.from(NOW.minus(100, ChronoUnit.DAYS)));
+            ps.setLong(2, paidBefore);
+            ps.executeUpdate();
+        } finally {
+            conn.close();
+        }
+        assertEquals(GateDecision.CHALLENGE, gates.checkTrialPaymentTiming(paidBefore));
+        TrialAbusePrevention thirtyDayTrial = new TrialAbusePrevention(dataSource, Clock.fixed(NOW, ZoneOffset.UTC), 30);
+        // Created 34 days ago: 4 days after a 30-day trial (PASS), 20 days after a 14-day one (CHALLENGE).
+        Long u = createUser("thirty@example.com", null);
+        updateUserCreatedAt(u, NOW.minus(34, ChronoUnit.DAYS));
+        assertEquals(GateDecision.PASS, thirtyDayTrial.checkTrialPaymentTiming(u));
+        assertEquals(GateDecision.CHALLENGE, gates.checkTrialPaymentTiming(u));
+    }
+
+    /**
+     * TRIAL-14: 4 OTHER users on a device -> CHALLENGE for a new user; exactly 5 -> FAIL, even for a user who already
+     * has the device; a FAIL records no device row; a PASS/CHALLENGE through checkAndRecordDevice records one; a user
+     * who already has the device (with 2-4 others) PASSes. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     */
+    // TRIAL-14
+    @Test
+    public void testDeviceFingerprintBoundaries() throws Exception {
+        String ua = "Farm", res = "800x600", tz = "UTC", lang = "en";
+        String hash = TrialAbusePrevention.deviceHash(ua, res, tz, lang);
+        Long[] users = new Long[7];
+        for (int i = 0; i < users.length; i++) users[i] = createUser("farm" + i + "@example.com", null);
+        for (int i = 0; i < 4; i++) {
+            GateDecision d = tap.checkAndRecordDevice(users[i], ua, res, tz, lang);
+            assertNotEquals(GateDecision.FAIL, d);
+        }
+        // users[0] already has the device and 3 others share it: PASS (known device).
+        assertEquals(GateDecision.PASS, tap.checkDeviceFingerprint(users[0], ua, res, tz, lang));
+        // A new user sees 4 others: CHALLENGE, and is recorded.
+        assertEquals(GateDecision.CHALLENGE, tap.checkAndRecordDevice(users[4], ua, res, tz, lang));
+        assertEquals(1, deviceRows(hash, users[4]));
+        // Now 5 users: a new user sees exactly 5 others -> FAIL, and no row is written.
+        assertEquals(GateDecision.FAIL, tap.checkAndRecordDevice(users[5], ua, res, tz, lang));
+        assertEquals(0, deviceRows(hash, users[5]));
+        // A user who already has the device but sees 5 others also FAILs (FAIL is checked first).
+        tap.insertDeviceFingerprint(users[6], hash, ua, res, tz);
+        assertEquals(GateDecision.FAIL, tap.checkDeviceFingerprint(users[6], ua, res, tz, lang));
+    }
+
+    private int deviceRows(String hash, Long userId) throws SQLException {
+        Connection conn = dataSource.getConnection();
+        try (PreparedStatement ps = conn.prepareStatement("SELECT COUNT(*) FROM device_fingerprints WHERE device_hash = ? AND user_id = ?")) {
+            ps.setString(1, hash);
+            ps.setLong(2, userId);
+            try (ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                return rs.getInt(1);
+            }
+        } finally {
+            conn.close();
+        }
+    }
+
+    // TRIAL-12
     @Test
     public void testChargebackHistoryPass() throws Exception {
         Long userId = createUser("user@example.com", null);
@@ -165,6 +274,7 @@ public class TrialAbusePreventionTest {
         assertEquals(GateDecision.PASS, decision);
     }
 
+    // TRIAL-13
     @Test
     public void testChargebackHistoryFail() throws Exception {
         Long userId = createUser("user@example.com", null);

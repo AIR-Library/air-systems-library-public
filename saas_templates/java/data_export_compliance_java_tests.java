@@ -79,6 +79,9 @@ public class DataExportComplianceTest {
     private final List<AuditEntry> audit = new ArrayList<>();
     private final List<Runnable> queued = new ArrayList<>();
     private final List<UUID> erased = new ArrayList<>();
+    /** Every audit write, eraseAll and eraseSubject call in order, as "audit:<action>:<user>", "eraseAll:<user>",
+     *  "eraseSubject:<user>" (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: EXPORT-13 checks the cascade order). */
+    private final List<String> events = new ArrayList<>();
     private final Map<String, Object> userData = new LinkedHashMap<>();
     private boolean storeFails;
     private boolean eraseFails;
@@ -128,12 +131,18 @@ public class DataExportComplianceTest {
                     throw new java.io.IOException("database busy");
                 }
                 erased.add(userId);
+                events.add("eraseAll:" + userId);
             }
         };
+        // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the audit eraser is a required service now (EXPORT-13).
         DataExportCompliance.Services services = new DataExportCompliance.Services(store,
                 (to, subject, body) -> mail.add(new Mail(to, subject, body)),
-                (action, userId, details) -> audit.add(new AuditEntry(action, userId, details)),
-                users, ADMIN::equals, queued::add);
+                (action, userId, details) -> {
+                    audit.add(new AuditEntry(action, userId, details));
+                    events.add("audit:" + action + ":" + userId);
+                },
+                users, ADMIN::equals, queued::add,
+                userId -> events.add("eraseSubject:" + userId));
         compliance = new DataExportCompliance(db, services, clock, "https://app.example.com/");
         compliance.createTables();
     }
@@ -165,7 +174,7 @@ public class DataExportComplianceTest {
 
     private UUID confirmedDeletion() {
         UUID id = compliance.requestAccountDeletion(USER, "user_requested").deletionId();
-        compliance.confirmDeletion(id, tokenFromLastMail());
+        compliance.confirmDeletion(USER, id, tokenFromLastMail());
         return id;
     }
 
@@ -176,6 +185,7 @@ public class DataExportComplianceTest {
 
     /* ---------- export ---------- */
 
+    // EXPORT-11
     @Test
     void exportRequestIsPendingAndRunsInTheBackground() {
         DataExportCompliance.ExportReceipt receipt = compliance.requestDataExport(USER, "json");
@@ -196,6 +206,10 @@ public class DataExportComplianceTest {
         assertTrue(queued.isEmpty());
     }
 
+    // EXPORT-01
+    // EXPORT-02
+    // EXPORT-03
+    // EXPORT-04
     @Test
     void jsonExportHoldsEveryCategoryAndIsEmailedWithASevenDayLink() {
         UUID id = requestAndProcessExport("json");
@@ -219,6 +233,7 @@ public class DataExportComplianceTest {
         assertTrue(sent.body().contains(view.fileUrl()), "the e-mail must carry the download link");
     }
 
+    // EXPORT-01
     @Test
     void csvExportFlattensNestedDataAndIsStoredAsCsv() {
         UUID id = requestAndProcessExport("csv");
@@ -299,16 +314,45 @@ public class DataExportComplianceTest {
 
     /* ---------- deletion ---------- */
 
+    /**
+     * EXPORT-05: a user_requested deletion waits 30 days (will_delete_at = requested_at + 30 days) and e-mails a
+     * confirmation link. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: it used gdpr_right_to_be_forgotten,
+     * which under the amended spec gets no grace period (EXPORT-12, below).
+     */
+    // EXPORT-05
     @Test
     void deletionRequestWaitsThirtyDaysAndEmailsAConfirmationLink() {
-        DataExportCompliance.DeletionReceipt receipt = compliance.requestAccountDeletion(USER, "gdpr_right_to_be_forgotten");
+        DataExportCompliance.DeletionReceipt receipt = compliance.requestAccountDeletion(USER, "user_requested");
 
         assertEquals(DataExportCompliance.DeletionStatus.PENDING, receipt.status());
         assertEquals(START.plus(Duration.ofDays(30)), receipt.willDeleteAt());
         assertEquals("test@example.com", mail.get(0).to());
         assertTrue(mail.get(0).body().contains(
                 "https://app.example.com/compliance/delete/" + receipt.deletionId() + "/confirm?token="));
-        assertEquals("gdpr_right_to_be_forgotten", auditOf("deletion_requested").details().get("reason"));
+        assertEquals("user_requested", auditOf("deletion_requested").details().get("reason"));
+        assertEquals(START.plus(Duration.ofDays(30)), compliance.requestAccountDeletion(USER, "other").willDeleteAt());
+    }
+
+    /**
+     * EXPORT-12: gdpr_request and gdpr_right_to_be_forgotten are not held for 30 days: will_delete_at = requested_at,
+     * and confirm() runs the cascade before it returns (status completed, deleted_at = the returned time = now).
+     * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     */
+    // EXPORT-12
+    @Test
+    void aStatutoryDeletionHasNoGracePeriodAndRunsAtConfirmation() {
+        for (String reason : List.of("gdpr_request", "gdpr_right_to_be_forgotten")) {
+            erased.clear();
+            DataExportCompliance.DeletionReceipt receipt = compliance.requestAccountDeletion(USER, reason);
+            assertEquals(START, receipt.willDeleteAt(), reason);
+            assertTrue(erased.isEmpty(), "nothing is deleted before confirm");
+            Instant scheduled = compliance.confirmDeletion(USER, receipt.deletionId(), tokenFromLastMail());
+            assertEquals(START, scheduled);
+            assertEquals(List.of(USER), erased);
+            DataExportCompliance.DeletionView done = deletion(receipt.deletionId());
+            assertEquals(DataExportCompliance.DeletionStatus.COMPLETED, done.status());
+            assertEquals(START, done.deletedAt());
+        }
     }
 
     @Test
@@ -331,40 +375,65 @@ public class DataExportComplianceTest {
         }
     }
 
+    // EXPORT-09
     @Test
     void confirmingWithTheEmailedTokenApprovesTheDeletion() {
         DataExportCompliance.DeletionReceipt receipt = compliance.requestAccountDeletion(USER, "user_requested");
 
-        Instant scheduled = compliance.confirmDeletion(receipt.deletionId(), tokenFromLastMail());
+        Instant scheduled = compliance.confirmDeletion(USER, receipt.deletionId(), tokenFromLastMail());
 
         assertEquals(receipt.willDeleteAt(), scheduled);
         assertEquals(DataExportCompliance.DeletionStatus.APPROVED, deletion(receipt.deletionId()).status());
         assertEquals(USER, auditOf("deletion_confirmed").userId());
     }
 
+    /** A wrong or missing token changes nothing. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: confirm takes the caller. */
+    // EXPORT-14
     @Test
     void confirmingWithAWrongTokenChangesNothing() {
-        UUID id = compliance.requestAccountDeletion(USER, "user_requested").deletionId();
+        UUID id = compliance.requestAccountDeletion(USER, "gdpr_request").deletionId();
 
-        assertRefused("invalid_token", () -> compliance.confirmDeletion(id, "wrong"));
-        assertRefused("invalid_token", () -> compliance.confirmDeletion(id, null));
-        assertRefused("not_found", () -> compliance.confirmDeletion(UUID.randomUUID(), "wrong"));
+        assertRefused("invalid_token", () -> compliance.confirmDeletion(USER, id, "wrong"));
+        assertRefused("invalid_token", () -> compliance.confirmDeletion(USER, id, null));
+        assertRefused("not_found", () -> compliance.confirmDeletion(USER, UUID.randomUUID(), "wrong"));
         assertEquals(DataExportCompliance.DeletionStatus.PENDING, deletion(id).status());
+        assertTrue(erased.isEmpty(), "nothing is deleted before confirm, even for a statutory reason");
     }
 
+    /**
+     * EXPORT-14: the token is single-use and valid 24 hours, and confirm/cancel act only on the caller's own request
+     * (anyone else, an admin included, gets not_found, even with the right token). Changed 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP: a reused token was "not_pending" and a late one "grace_period_expired"; under
+     * the amended spec both are refused tokens (invalid_token), and expiry is 24 hours, not 30 days.
+     */
+    // EXPORT-14
     @Test
     void aDeletionCanBeConfirmedOnlyOnceAndNotAfterTheGracePeriod() {
         UUID id = compliance.requestAccountDeletion(USER, "user_requested").deletionId();
         String token = tokenFromLastMail();
-        compliance.confirmDeletion(id, token);
-        assertRefused("not_pending", () -> compliance.confirmDeletion(id, token));
+        assertRefused("not_found", () -> compliance.confirmDeletion(STRANGER, id, token));
+        assertRefused("not_found", () -> compliance.confirmDeletion(ADMIN, id, token));
+        assertEquals(DataExportCompliance.DeletionStatus.PENDING, deletion(id).status());
+        compliance.confirmDeletion(USER, id, token);
+        assertRefused("invalid_token", () -> compliance.confirmDeletion(USER, id, token));
 
         UUID late = compliance.requestAccountDeletion(USER, "other").deletionId();
         String lateToken = tokenFromLastMail();
-        clock.advance(Duration.ofDays(31));
-        assertRefused("grace_period_expired", () -> compliance.confirmDeletion(late, lateToken));
+        clock.advance(Duration.ofHours(24).plusSeconds(1));
+        assertRefused("invalid_token", () -> compliance.confirmDeletion(USER, late, lateToken));
+        assertEquals(DataExportCompliance.DeletionStatus.PENDING, deletion(late).status());
+        assertRefused("not_found", () -> compliance.cancelDeletion(late, STRANGER));
+
+        // Exactly 24 hours is still valid.
+        UUID onTime = compliance.requestAccountDeletion(USER, "other").deletionId();
+        String onTimeToken = tokenFromLastMail();
+        clock.advance(Duration.ofHours(24));
+        compliance.confirmDeletion(USER, onTime, onTimeToken);
+        assertEquals(DataExportCompliance.DeletionStatus.APPROVED, deletion(onTime).status());
+        assertTrue(erased.isEmpty());
     }
 
+    // EXPORT-06
     @Test
     void cancellingDuringTheGracePeriodStopsTheDeletion() {
         UUID id = confirmedDeletion();
@@ -395,17 +464,31 @@ public class DataExportComplianceTest {
         UUID finished = confirmedDeletion();
         clock.advance(Duration.ofDays(30));
         compliance.executeScheduledDeletions();
-        assertRefused("cannot_cancel", () -> compliance.cancelDeletion(finished, USER));
+        // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-13): a completed request no longer names its
+        // user (user_id NULL), so it is nobody's own request any more: not_found rather than cannot_cancel.
+        assertRefused("not_found", () -> compliance.cancelDeletion(finished, USER));
     }
 
+    /**
+     * Only the owner can cancel. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-14 amendment: "confirm
+     * and cancel act only on the caller's own request; anyone else's is 404"): an admin could cancel before.
+     */
+    // EXPORT-14
     @Test
     void onlyTheOwnerOrAnAdminCanCancel() {
         UUID id = confirmedDeletion();
 
         assertRefused("not_found", () -> compliance.cancelDeletion(id, STRANGER));
-        assertEquals(DataExportCompliance.DeletionStatus.CANCELLED, compliance.cancelDeletion(id, ADMIN));
+        assertRefused("not_found", () -> compliance.cancelDeletion(id, ADMIN));
+        assertEquals(DataExportCompliance.DeletionStatus.CANCELLED, compliance.cancelDeletion(id, USER));
     }
 
+    /**
+     * EXPORT-07: the cascade erases the user's data once the grace period ends. Changed 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP: no "deletion_completed" entry names the user any more (EXPORT-13), so the
+     * test checks user_deleted_cascade instead, and that deletion_requests.user_id is NULL once completed.
+     */
+    // EXPORT-07
     @Test
     void scheduledDeletionErasesConfirmedUsersOnceTheGracePeriodEnds() {
         UUID id = confirmedDeletion();
@@ -420,8 +503,62 @@ public class DataExportComplianceTest {
         DataExportCompliance.DeletionView done = deletion(id);
         assertEquals(DataExportCompliance.DeletionStatus.COMPLETED, done.status());
         assertNotNull(done.deletedAt());
-        assertEquals(USER, auditOf("deletion_completed").userId());
+        assertEquals(USER, auditOf("user_deleted_cascade").userId());
+        assertNull(done.userId(), "deletion_requests.user_id is NULL once completed");
         assertEquals(0, compliance.executeScheduledDeletions(), "a finished deletion does not run again");
+    }
+
+    /**
+     * EXPORT-13: the cascade order is eraseAll (the user's rows), then 'user_deleted_cascade' logged for the user, then
+     * the audit eraser's eraseSubject(user) LAST, and nothing is logged for the user after it; user_id is NULL on the
+     * completed request. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory H2 and fakes.
+     */
+    // EXPORT-13
+    @Test
+    void theCascadeErasesRowsThenLogsThenErasesTheAuditSubjectLast() {
+        UUID id = confirmedDeletion();
+        clock.advance(Duration.ofDays(30));
+        events.clear();
+        assertEquals(1, compliance.executeScheduledDeletions());
+        assertEquals(List.of("eraseAll:" + USER, "audit:user_deleted_cascade:" + USER, "eraseSubject:" + USER), events);
+        assertNull(deletion(id).userId());
+    }
+
+    /**
+     * EXPORT-08: the audit log is kept: the deletion never deletes audit entries (the entries written before and
+     * during the cascade are all still there); the only audit-store change is the audit system's own eraseSubject.
+     * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     */
+    // EXPORT-08
+    @Test
+    void theAuditLogIsKeptWhenTheUserIsDeleted() {
+        confirmedDeletion();
+        int before = audit.size();
+        clock.advance(Duration.ofDays(30));
+        compliance.executeScheduledDeletions();
+        assertEquals(before + 1, audit.size(), "only user_deleted_cascade was added and nothing was removed");
+        assertEquals(List.of("deletion_requested", "deletion_confirmed", "user_deleted_cascade"),
+                audit.stream().map(AuditEntry::action).toList());
+        assertEquals(1, events.stream().filter(e -> e.startsWith("eraseSubject:")).count());
+    }
+
+    /**
+     * EXPORT-11: every export and deletion request is logged with its context (format, reason, deletion id) so a
+     * why_chain can be built from the log. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     */
+    // EXPORT-11
+    @Test
+    void everyRequestIsAudited() {
+        compliance.requestDataExport(USER, "csv");
+        UUID id = compliance.requestAccountDeletion(USER, "other").deletionId();
+        compliance.confirmDeletion(USER, id, tokenFromLastMail());
+        compliance.cancelDeletion(id, USER);
+        assertEquals(List.of("data_export_requested", "deletion_requested", "deletion_confirmed", "deletion_cancelled"),
+                audit.stream().map(AuditEntry::action).toList());
+        assertEquals("csv", auditOf("data_export_requested").details().get("format"));
+        assertEquals("other", auditOf("deletion_requested").details().get("reason"));
+        assertEquals(id.toString(), auditOf("deletion_cancelled").details().get("deletion_id"));
+        assertTrue(audit.stream().allMatch(a -> USER.equals(a.userId())));
     }
 
     @Test
@@ -507,6 +644,7 @@ public class DataExportComplianceTest {
 
     /* ---------- admin ---------- */
 
+    // EXPORT-10
     @Test
     void adminsCanListExportsByUserAndStatus() {
         UUID done = requestAndProcessExport("json");
@@ -521,6 +659,7 @@ public class DataExportComplianceTest {
         assertEquals(waiting, pending.items().get(0).exportId());
     }
 
+    // EXPORT-10
     @Test
     void adminsCanListDeletionsByStatus() {
         UUID approved = confirmedDeletion();
