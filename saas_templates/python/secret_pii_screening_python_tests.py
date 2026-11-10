@@ -411,6 +411,8 @@ def test_screen_13_hidden_escapes():
 def test_screen_14_input_checks_and_hostile_inputs():
     """invalid_mode, invalid_categories and text_too_large come before any scan; each hostile 200,000-character
     input is screened in strip mode in under 2 seconds; an unpaired surrogate is 400 invalid_text (extra).
+    [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Adds "token=$" * 28571 (spec ruling fed6e7b): it proves detector
+    13 stays linear (it took 18 s before the value-end cache).
     SCREEN-14. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing."""
     s = new_screener()
     assert s.screen_text("x", "mask") == {"ok": False, "error": "invalid_mode", "status": 400}
@@ -426,7 +428,7 @@ def test_screen_14_input_checks_and_hostile_inputs():
     assert s.screen_text(None) == {"ok": False, "error": "invalid_text", "status": 400}
     hb = "-----BEGIN " + "PRIVATE KEY-----"
     hostile = ["a." * 100000, hb * 7400, "1234-" * 40000, "eyJ" * 66666, "xeyJ-" * 40000, "xsk-" * 50000,
-               "password" + " " * 199990, "token=[REDACTED:" * 12500, "a://b:" * 33000, "ab:" * 66000,
+               "password" + " " * 199990, "token=[REDACTED:" * 12500, "token=$" * 28571, "a://b:" * 33000, "ab:" * 66000,
                "1.1." * 50000, "\\n" * 100000, B + "\n" * 199969, B + ("\n" + "A" * 64) * 3000]
     for text in hostile:
         t0 = time.perf_counter()
