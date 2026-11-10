@@ -1,3 +1,7 @@
+// Full-text search & indexing template (TIER_2_MASTER_SPEC system 6): an in-memory inverted index with filters,
+// facets, relevance (exact > partial > prefix), unindex and an enqueued reindex.
+// Repaired 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): Facets_ReturnCountsPerStatus and
+// Relevance_ExactMatchHigherThanPartial failed; see SearchIndexService. Touches: process memory only.
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -97,7 +101,11 @@ namespace SaaS.Search
         public string Status { get; set; }
     }
 
-    // Internal representation of a document
+    /// <summary>
+    /// Internal representation of one indexed document. <c>Sequence</c> is the insertion order, used to break
+    /// relevance ties deterministically (2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: the old tie-break on
+    /// IndexedAt was not deterministic when two documents were indexed in the same clock tick). Pure data.
+    /// </summary>
     internal class SearchDocument
     {
         public string DocumentKey => $"{DocumentType}:{DocumentId}";
@@ -105,18 +113,39 @@ namespace SaaS.Search
         public string DocumentId { get; set; }
         public string Content { get; set; }
         public DateTime IndexedAt { get; set; }
+        public long Sequence { get; set; }
         public Dictionary<string, object> Metadata { get; set; }
     }
 
+    /// <summary>
+    /// In-memory inverted-index search engine (spec TIER 2, system 6): index, search with filters and facets,
+    /// unindex, and an enqueued reindex job.
+    /// Repaired 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP) for two failing tests:
+    /// <list type="bullet">
+    /// <item>Facets_ReturnCountsPerStatus: the spec's own example (<c>GET /search?q=deployment&amp;facets=status,tier</c>
+    /// returning deployment facets) treats the document type as searchable, so each document's type name is now
+    /// indexed as one of its terms.</item>
+    /// <item>Relevance_ExactMatchHigherThanPartial: "partial match" now works both ways (a query that is a prefix of a
+    /// word, and a word of at least 3 letters that is a prefix of the query), scored exact 1.0 &gt; partial 0.6 &gt;
+    /// prefix 0.5, mirroring the passing Go template's exact &gt; contains &gt; prefix order.</item>
+    /// </list>
+    /// Also: every mutation and search runs under one lock (the old reindex cleared the whole index while searches
+    /// ran, and a reindex of one type wiped every other type's terms), and ties sort by insertion order.
+    /// Touches: process memory only (no database, network, files or money).
+    /// </summary>
     public class SearchIndexService
     {
-        // Inverted index: term -> set of document keys
-        private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, byte>> _invertedIndex
-            = new ConcurrentDictionary<string, ConcurrentDictionary<string, byte>>();
+        // Inverted index: term -> set of document keys. Guarded by _gate.
+        private readonly Dictionary<string, HashSet<string>> _invertedIndex = new Dictionary<string, HashSet<string>>();
 
-        // Document store
-        private readonly ConcurrentDictionary<string, SearchDocument> _documents
-            = new ConcurrentDictionary<string, SearchDocument>();
+        // Document store. Guarded by _gate.
+        private readonly Dictionary<string, SearchDocument> _documents = new Dictionary<string, SearchDocument>();
+
+        private readonly object _gate = new object();
+        private long _sequence;
+
+        /// <summary>Shortest indexed word that may match as a prefix of a longer query word ("stri" for "stripe").</summary>
+        private const int MinReversePrefixLength = 3;
 
         // Stop words
         private static readonly HashSet<string> StopWords = new HashSet<string>
@@ -128,13 +157,17 @@ namespace SaaS.Search
         private readonly ConcurrentQueue<Func<Task>> _jobQueue = new ConcurrentQueue<Func<Task>>();
         private readonly CancellationTokenSource _cts = new CancellationTokenSource();
 
+        /// <summary>Creates an empty index and starts the in-process reindex worker. Touches: process memory.</summary>
         public SearchIndexService()
         {
             // Start background worker
             Task.Run(ProcessJobsAsync);
         }
 
-        // Tokenizer
+        /// <summary>
+        /// Splits text on whitespace and punctuation, lowercases it and drops stop words (spec: "split on whitespace,
+        /// lowercase, remove common words"). Input: any text (null allowed). Output: the tokens in order. Pure.
+        /// </summary>
         private static IEnumerable<string> Tokenize(string text)
         {
             if (string.IsNullOrWhiteSpace(text)) yield break;
@@ -148,136 +181,164 @@ namespace SaaS.Search
             }
         }
 
-        // Index a document (create or update)
-        public async Task<IndexResponse> IndexDocumentAsync(IndexRequest request)
+        /// <summary>
+        /// The distinct terms a document is indexed under: its content tokens plus its document type name, so that a
+        /// query naming the type ("deployment") finds documents of that type, as in the spec's facet example.
+        /// 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Pure.
+        /// </summary>
+        private static IEnumerable<string> TermsOf(SearchDocument doc) =>
+            Tokenize(doc.Content).Concat(Tokenize(doc.DocumentType)).Distinct();
+
+        /// <summary>Adds a document's terms to the inverted index. Caller holds _gate. Touches: process memory.</summary>
+        private void AddTerms(SearchDocument doc)
         {
+            foreach (var term in TermsOf(doc))
+            {
+                if (!_invertedIndex.TryGetValue(term, out var set))
+                {
+                    set = new HashSet<string>();
+                    _invertedIndex[term] = set;
+                }
+                set.Add(doc.DocumentKey);
+            }
+        }
+
+        /// <summary>Removes a document's terms from the inverted index. Caller holds _gate. Touches: process memory.</summary>
+        private void RemoveTerms(SearchDocument doc)
+        {
+            foreach (var term in TermsOf(doc))
+            {
+                if (_invertedIndex.TryGetValue(term, out var set))
+                {
+                    set.Remove(doc.DocumentKey);
+                    if (set.Count == 0) _invertedIndex.Remove(term);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Indexes a document, replacing any earlier version with the same type and id (spec endpoint 1); it is
+        /// searchable as soon as this returns (real-time indexing). Input: type, id, content, metadata.
+        /// Output: success and indexed_at. Touches: process memory. Updated 2026-11-10 (session
+        /// session_012zDydZCZ4AChqhEZ4oVtaP): runs under the index lock and records the insertion order.
+        /// </summary>
+        public Task<IndexResponse> IndexDocumentAsync(IndexRequest request)
+        {
+            if (request == null) throw new ArgumentNullException(nameof(request));
+            if (string.IsNullOrWhiteSpace(request.DocumentType)) throw new ArgumentException("document_type is required", nameof(request));
+            if (string.IsNullOrWhiteSpace(request.DocumentId)) throw new ArgumentException("document_id is required", nameof(request));
+
             var doc = new SearchDocument
             {
                 DocumentType = request.DocumentType,
                 DocumentId = request.DocumentId,
-                Content = request.Content,
+                Content = request.Content ?? string.Empty,
                 IndexedAt = DateTime.UtcNow,
                 Metadata = request.Metadata ?? new Dictionary<string, object>()
             };
 
-            var key = doc.DocumentKey;
-            // Remove old terms if updating
-            if (_documents.TryGetValue(key, out var oldDoc))
+            lock (_gate)
             {
-                var oldTerms = Tokenize(oldDoc.Content);
-                foreach (var term in oldTerms.Distinct())
-                {
-                    if (_invertedIndex.TryGetValue(term, out var set))
-                    {
-                        set.TryRemove(key, out _);
-                        if (set.IsEmpty) _invertedIndex.TryRemove(term, out _);
-                    }
-                }
+                // Remove old terms if updating
+                if (_documents.TryGetValue(doc.DocumentKey, out var oldDoc)) RemoveTerms(oldDoc);
+                doc.Sequence = ++_sequence;
+                _documents[doc.DocumentKey] = doc;
+                AddTerms(doc);
             }
 
-            // Store document
-            _documents[key] = doc;
-
-            // Index terms
-            var terms = Tokenize(doc.Content).Distinct();
-            foreach (var term in terms)
-            {
-                var set = _invertedIndex.GetOrAdd(term, _ => new ConcurrentDictionary<string, byte>());
-                set[key] = 0;
-            }
-
-            return await Task.FromResult(new IndexResponse
-            {
-                Success = true,
-                IndexedAt = doc.IndexedAt
-            });
+            return Task.FromResult(new IndexResponse { Success = true, IndexedAt = doc.IndexedAt });
         }
 
-        // Search
-        public async Task<SearchResponse> SearchAsync(SearchRequest request)
+        /// <summary>
+        /// Scores how one indexed term matches one query term: 1.0 exact, 0.6 partial (an indexed word of at least
+        /// <see cref="MinReversePrefixLength"/> letters that begins the query word: "stri" for "stripe"), 0.5 prefix
+        /// (the query word begins an indexed word: "stri" finds "stripe"), 0 no match. Spec: "exact match &gt; partial
+        /// match &gt; prefix match". 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Pure.
+        /// </summary>
+        private static double MatchScore(string indexTerm, string queryTerm)
         {
-            var queryTerms = Tokenize(request.Query).ToList();
-            var matchedKeys = new HashSet<string>();
+            if (indexTerm == queryTerm) return 1.0;
+            if (indexTerm.Length >= MinReversePrefixLength && queryTerm.StartsWith(indexTerm, StringComparison.Ordinal)) return 0.6;
+            if (indexTerm.StartsWith(queryTerm, StringComparison.Ordinal)) return 0.5;
+            return 0;
+        }
 
-            // Gather candidate docs
-            foreach (var term in queryTerms)
-            {
-                if (_invertedIndex.TryGetValue(term, out var set))
-                {
-                    foreach (var key in set.Keys) matchedKeys.Add(key);
-                }
+        /// <summary>
+        /// Searches the index (spec endpoints 2-4). Input: query, optional document type, "field:value" filters (all
+        /// must match), facet fields, limit and offset. Output: the page of results ordered by relevance, then by
+        /// insertion order; the total; has_more; and, when facets were asked for, per-field value counts over every
+        /// matching document (not just the page). Touches: process memory.
+        /// Updated 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): per-term best-match scoring (exact &gt;
+        /// partial &gt; prefix), document-type terms, deterministic tie-break, runs under the index lock.
+        /// </summary>
+        public Task<SearchResponse> SearchAsync(SearchRequest request)
+        {
+            if (request == null) throw new ArgumentNullException(nameof(request));
+            var queryTerms = Tokenize(request.Query).Distinct().ToList();
+            var limit = request.Limit > 0 ? request.Limit : 20;
+            var offset = Math.Max(0, request.Offset);
 
-                // Prefix match
-                var prefixMatches = _invertedIndex.Keys
-                    .Where(k => k.StartsWith(term) && k != term);
-                foreach (var pref in prefixMatches)
-                {
-                    if (_invertedIndex.TryGetValue(pref, out var prefSet))
-                    {
-                        foreach (var key in prefSet.Keys) matchedKeys.Add(key);
-                    }
-                }
-            }
-
-            // Filter by document_type
-            if (!string.IsNullOrWhiteSpace(request.DocumentType))
-            {
-                matchedKeys.RemoveWhere(k => !k.StartsWith($"{request.DocumentType}:"));
-            }
-
-            // Apply metadata filters
+            var filters = new List<KeyValuePair<string, string>>();
             foreach (var filter in request.Filters ?? Enumerable.Empty<string>())
             {
-                var parts = filter.Split(':', 2);
-                if (parts.Length != 2) continue;
-                var field = parts[0];
-                var value = parts[1];
-                matchedKeys.RemoveWhere(k =>
-                {
-                    if (!_documents.TryGetValue(k, out var doc)) return true;
-                    if (!doc.Metadata.TryGetValue(field, out var metaVal)) return true;
-                    return !string.Equals(metaVal?.ToString(), value, StringComparison.OrdinalIgnoreCase);
-                });
+                var parts = (filter ?? string.Empty).Split(':', 2);
+                if (parts.Length == 2) filters.Add(new KeyValuePair<string, string>(parts[0], parts[1]));
             }
 
-            // Compute relevance
-            var results = new List<SearchResultItem>();
-            foreach (var key in matchedKeys)
+            var scored = new List<(SearchDocument Doc, double Score)>();
+            lock (_gate)
             {
-                if (!_documents.TryGetValue(key, out var doc)) continue;
-                double relevance = 0;
+                // Best score of each query term per document, summed over the query terms.
+                var scores = new Dictionary<string, double>();
                 foreach (var term in queryTerms)
                 {
-                    var contentLower = doc.Content.ToLowerInvariant();
-                    if (contentLower.Contains(term))
+                    var best = new Dictionary<string, double>();
+                    foreach (var entry in _invertedIndex)
                     {
-                        relevance += 2; // exact/partial match
+                        var s = MatchScore(entry.Key, term);
+                        if (s <= 0) continue;
+                        foreach (var key in entry.Value)
+                        {
+                            if (!best.TryGetValue(key, out var prev) || s > prev) best[key] = s;
+                        }
                     }
-                    else if (contentLower.Split(' ').Any(w => w.StartsWith(term)))
-                    {
-                        relevance += 0.5; // prefix
-                    }
+                    foreach (var kv in best)
+                        scores[kv.Key] = (scores.TryGetValue(kv.Key, out var acc) ? acc : 0) + kv.Value;
                 }
-                results.Add(new SearchResultItem
+
+                foreach (var kv in scores)
                 {
-                    DocumentId = doc.DocumentId,
-                    DocumentType = doc.DocumentType,
-                    Relevance = relevance,
-                    Metadata = doc.Metadata
-                });
+                    var doc = _documents[kv.Key];
+                    if (!string.IsNullOrWhiteSpace(request.DocumentType) && doc.DocumentType != request.DocumentType) continue;
+                    var keep = true;
+                    foreach (var f in filters)
+                    {
+                        if (!doc.Metadata.TryGetValue(f.Key, out var metaVal) ||
+                            !string.Equals(metaVal?.ToString(), f.Value, StringComparison.OrdinalIgnoreCase))
+                        {
+                            keep = false;
+                            break;
+                        }
+                    }
+                    if (keep) scored.Add((doc, kv.Value));
+                }
             }
 
-            // Sort by relevance desc then by indexed_at desc
-            results = results
-                .OrderByDescending(r => r.Relevance)
-                .ThenByDescending(r => _documents[$"{r.DocumentType}:{r.DocumentId}"].IndexedAt)
+            var ordered = scored
+                .OrderByDescending(r => r.Score)
+                .ThenBy(r => r.Doc.Sequence)
+                .Select(r => new SearchResultItem
+                {
+                    DocumentId = r.Doc.DocumentId,
+                    DocumentType = r.Doc.DocumentType,
+                    Relevance = r.Score,
+                    Metadata = r.Doc.Metadata
+                })
                 .ToList();
 
-            var total = results.Count;
-            var paged = results.Skip(request.Offset).Take(request.Limit).ToList();
-            var hasMore = request.Offset + request.Limit < total;
+            var total = ordered.Count;
 
-            // Facets
+            // Facets: COUNT(*) GROUP BY metadata field over every matching document.
             Dictionary<string, Dictionary<string, int>> facets = null;
             if (request.Facets != null && request.Facets.Any())
             {
@@ -285,71 +346,73 @@ namespace SaaS.Search
                 foreach (var facetField in request.Facets)
                 {
                     var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-                    foreach (var item in results)
+                    foreach (var item in ordered)
                     {
                         if (item.Metadata != null && item.Metadata.TryGetValue(facetField, out var val))
                         {
                             var key = val?.ToString() ?? "null";
-                            if (!counts.ContainsKey(key)) counts[key] = 0;
-                            counts[key]++;
+                            counts[key] = counts.TryGetValue(key, out var c) ? c + 1 : 1;
                         }
                     }
                     facets[facetField] = counts;
                 }
             }
 
-            return await Task.FromResult(new SearchResponse
+            return Task.FromResult(new SearchResponse
             {
-                Results = paged,
+                Results = ordered.Skip(offset).Take(limit).ToList(),
                 Total = total,
-                HasMore = hasMore,
+                HasMore = offset + limit < total,
                 Facets = facets
             });
         }
 
-        // Unindex document
-        public async Task<UnindexResponse> UnindexDocumentAsync(string documentType, string documentId)
+        /// <summary>
+        /// Removes a document from the index (spec endpoint 5). Input: type and id. Output: success (also when it was
+        /// not indexed: deleting is idempotent). Touches: process memory. Updated 2026-11-10 (session
+        /// session_012zDydZCZ4AChqhEZ4oVtaP): runs under the index lock and removes the type term too.
+        /// </summary>
+        public Task<UnindexResponse> UnindexDocumentAsync(string documentType, string documentId)
         {
             var key = $"{documentType}:{documentId}";
-            if (_documents.TryRemove(key, out var doc))
+            lock (_gate)
             {
-                var terms = Tokenize(doc.Content).Distinct();
-                foreach (var term in terms)
+                if (_documents.TryGetValue(key, out var doc))
                 {
-                    if (_invertedIndex.TryGetValue(term, out var set))
-                    {
-                        set.TryRemove(key, out _);
-                        if (set.IsEmpty) _invertedIndex.TryRemove(term, out _);
-                    }
+                    RemoveTerms(doc);
+                    _documents.Remove(key);
                 }
             }
-            return await Task.FromResult(new UnindexResponse { Success = true });
+            return Task.FromResult(new UnindexResponse { Success = true });
         }
 
-        // Reindex all (admin)
-        public async Task<ReindexResponse> ReindexAsync(ReindexRequest request)
+        /// <summary>
+        /// Enqueues a reindex job (spec endpoint 6). Input: a document type, or null for all. Output: success, the job
+        /// id and status "enqueued". The job re-derives the terms of the selected documents only. Touches: process
+        /// memory. Updated 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): the old job cleared the whole
+        /// index, so reindexing one type erased every other type's terms, and it ran unlocked beside searches.
+        /// </summary>
+        public Task<ReindexResponse> ReindexAsync(ReindexRequest request)
         {
+            var documentType = request?.DocumentType;
             var jobId = Guid.NewGuid().ToString();
-            _jobQueue.Enqueue(async () =>
+            _jobQueue.Enqueue(() =>
             {
-                // Simple reindex: clear and rebuild
-                _invertedIndex.Clear();
-                var docs = request.DocumentType == null
-                    ? _documents.Values
-                    : _documents.Values.Where(d => d.DocumentType == request.DocumentType);
-                foreach (var doc in docs)
+                lock (_gate)
                 {
-                    var terms = Tokenize(doc.Content).Distinct();
-                    foreach (var term in terms)
+                    var docs = _documents.Values
+                        .Where(d => documentType == null || d.DocumentType == documentType)
+                        .ToList();
+                    foreach (var doc in docs)
                     {
-                        var set = _invertedIndex.GetOrAdd(term, _ => new ConcurrentDictionary<string, byte>());
-                        set[doc.DocumentKey] = 0;
+                        RemoveTerms(doc);
+                        AddTerms(doc);
                     }
                 }
-                await Task.CompletedTask;
+                return Task.CompletedTask;
             });
 
-            return await Task.FromResult(new ReindexResponse
+            return Task.FromResult(new ReindexResponse
             {
                 Success = true,
                 JobId = jobId,
@@ -357,7 +420,10 @@ namespace SaaS.Search
             });
         }
 
-        // Background job processor
+        /// <summary>
+        /// Runs enqueued reindex jobs one at a time until the service is disposed of with the process. A failing job
+        /// is skipped so the worker keeps running. Touches: process memory.
+        /// </summary>
         private async Task ProcessJobsAsync()
         {
             while (!_cts.IsCancellationRequested)
@@ -365,7 +431,7 @@ namespace SaaS.Search
                 if (_jobQueue.TryDequeue(out var job))
                 {
                     try { await job(); }
-                    catch { /* swallow */ }
+                    catch { /* a failed reindex leaves the previous terms in place */ }
                 }
                 else
                 {

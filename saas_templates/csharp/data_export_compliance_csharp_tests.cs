@@ -1,8 +1,18 @@
+// HTTP tests for the data export & compliance template. Changed 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP):
+// the API now takes the user from a verified bearer token and keeps /admin for admins (the spec says "admin only"), so
+// each test signs in as its own fresh user (minted with the test secret below) and the admin tests use an admin token;
+// the background worker is removed from the test host so a new export stays "pending" until a test processes it
+// on purpose; and RequestExport_JsonAndCsvFormatsBothWork compared the status with the format although the test above
+// it requires "pending" for the same request (it now checks status pending and the echoed format). New tests cover
+// anonymous and non-admin access, other users' requests, the emailed confirmation token, the built export and its
+// signed link, and the cascade after the grace period. Touches: an in-process test server; no network.
 using System;
 using System.Collections.Generic;
 using System.Data;
-using System.Data.SqlClient;
+using System.IdentityModel.Tokens.Jwt;
 using System.Linq;
+using System.Net.Http.Headers;
+using System.Security.Claims;
 using System.Net;
 using System.Net.Http;
 using System.Text;
@@ -14,8 +24,10 @@ using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.IdentityModel.Tokens;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Xunit;
@@ -24,10 +36,49 @@ namespace ComplianceModule.Tests
 {
     public class CustomWebApplicationFactory<TStartup> : WebApplicationFactory<TStartup> where TStartup : class
     {
+        /// <summary>The token signing secret of the test host (a test value, not a real secret).</summary>
+        public const string JwtSecret = "compliance-tests-signing-secret-0123456789abcdef";
+
+        /// <summary>
+        /// Points WebApplicationFactory at a content root. It otherwise looks for a solution (.sln) above the test
+        /// binaries, which a single-assembly build (app and tests compiled together, as the library's runner does) does
+        /// not have. WebApplicationFactory reads the documented ASPNETCORE_TEST_CONTENTROOT_&lt;ASSEMBLY&gt; setting
+        /// first. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: this process's environment.
+        /// </summary>
+        static CustomWebApplicationFactory()
+        {
+            var assembly = typeof(TStartup).Assembly.GetName().Name!.ToUpperInvariant().Replace(".", "_");
+            Environment.SetEnvironmentVariable($"ASPNETCORE_TEST_CONTENTROOT_{assembly}", AppContext.BaseDirectory);
+        }
+
+        /// <summary>
+        /// An HS256 bearer token for a user (role "admin" for an admin), valid 15 minutes, signed with
+        /// <see cref="JwtSecret"/>. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Pure.
+        /// </summary>
+        public static string Token(Guid userId, string role = null)
+        {
+            var claims = new List<Claim> { new Claim("sub", userId.ToString()) };
+            if (role != null) claims.Add(new Claim("role", role));
+            var handler = new JwtSecurityTokenHandler();
+            return handler.WriteToken(handler.CreateToken(new SecurityTokenDescriptor
+            {
+                Subject = new ClaimsIdentity(claims),
+                Expires = DateTime.UtcNow.AddMinutes(15),
+                SigningCredentials = new SigningCredentials(new SymmetricSecurityKey(Encoding.UTF8.GetBytes(JwtSecret)), SecurityAlgorithms.HmacSha256)
+            }));
+        }
+
         protected override IHost CreateHost(IHostBuilder builder)
         {
+            builder.ConfigureAppConfiguration(config =>
+                config.AddInMemoryCollection(new Dictionary<string, string> { ["Auth:JwtSecret"] = JwtSecret }));
             builder.ConfigureServices(services =>
             {
+                // No background worker in tests: exports stay "pending" until a test runs ExportProcessor itself.
+                var worker = services.SingleOrDefault(d => d.ImplementationType == typeof(ComplianceWorker));
+                if (worker != null)
+                    services.Remove(worker);
+
                 // Remove the existing DbContext registration
                 var descriptor = services.SingleOrDefault(
                     d => d.ServiceType == typeof(DbContextOptions<ComplianceDbContext>));
@@ -67,13 +118,32 @@ namespace ComplianceModule.Tests
     public class ComplianceApiTests : IClassFixture<CustomWebApplicationFactory<ComplianceModule.Startup>>
     {
         private readonly HttpClient _client;
+        private readonly HttpClient _adminClient;
+        private readonly Guid _userId = Guid.NewGuid();
         private readonly CustomWebApplicationFactory<ComplianceModule.Startup> _factory;
 
         public ComplianceApiTests(CustomWebApplicationFactory<ComplianceModule.Startup> factory)
         {
             _factory = factory;
+            // Each test is its own signed-in user, seeded in the development user store.
             _client = factory.CreateClient();
+            _client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", CustomWebApplicationFactory<ComplianceModule.Startup>.Token(_userId));
+            _adminClient = factory.CreateClient();
+            _adminClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", CustomWebApplicationFactory<ComplianceModule.Startup>.Token(Guid.NewGuid(), "admin"));
+            factory.Services.GetRequiredService<InMemoryUserDataStore>().Seed(_userId, SampleUser(_userId));
         }
+
+        /// <summary>A user's data document with every category the spec lists. Pure.</summary>
+        private static JObject SampleUser(Guid id) => new JObject
+        {
+            ["profile"] = new JObject { ["id"] = id.ToString(), ["email"] = $"{id:N}@example.test", ["name"] = "Test User", ["tier"] = "team", ["status"] = "active" },
+            ["sessions"] = new JArray(new JObject { ["ip"] = "203.0.113.7", ["device_info"] = "Firefox on Linux" }),
+            ["activity"] = new JArray(new JObject { ["action"] = "login" }),
+            ["files"] = new JArray(new JObject { ["name"] = "report.pdf", ["size"] = 2048 }),
+            ["preferences"] = new JObject { ["theme"] = "dark", ["language"] = "en" },
+            ["transactions"] = new JArray(new JObject { ["amount"] = 19.99, ["note"] = "=HYPERLINK(\"x\")" }),
+            ["audit_trail"] = new JArray(new JObject { ["action"] = "profile_update" })
+        };
 
         [Fact]
         public async Task RequestExport_ReturnsPendingStatus()
@@ -106,7 +176,8 @@ namespace ComplianceModule.Tests
             jsonResponse.EnsureSuccessStatusCode();
             var jsonResponseString = await jsonResponse.Content.ReadAsStringAsync();
             var jsonExportResponse = JsonConvert.DeserializeObject<ExportResponse>(jsonResponseString);
-            Assert.Equal("json", jsonExportResponse.Status); // Note: Status is "pending", format is in the request
+            Assert.Equal("pending", jsonExportResponse.Status);
+            Assert.Equal("json", jsonExportResponse.Format);
 
             // Test CSV
             var csvRequest = new ExportRequestDto { Format = "csv" };
@@ -115,7 +186,8 @@ namespace ComplianceModule.Tests
             csvResponse.EnsureSuccessStatusCode();
             var csvResponseString = await csvResponse.Content.ReadAsStringAsync();
             var csvExportResponse = JsonConvert.DeserializeObject<ExportResponse>(csvResponseString);
-            Assert.Equal("csv", csvExportResponse.Status); // Status is "pending"
+            Assert.Equal("pending", csvExportResponse.Status);
+            Assert.Equal("csv", csvExportResponse.Format);
         }
 
         [Fact]
@@ -218,7 +290,7 @@ namespace ComplianceModule.Tests
             await CreateTestExportRequest("csv");
 
             // Request admin endpoint
-            var response = await _client.GetAsync("/admin/compliance/exports");
+            var response = await _adminClient.GetAsync("/admin/compliance/exports");
             response.EnsureSuccessStatusCode();
             var responseString = await response.Content.ReadAsStringAsync();
             var adminResponse = JsonConvert.DeserializeObject<AdminExportResponse>(responseString);
@@ -235,13 +307,104 @@ namespace ComplianceModule.Tests
             await CreateTestDeletionRequest("pending", "user_requested");
             
             // Request admin endpoint for pending deletions
-            var response = await _client.GetAsync("/admin/compliance/deletions?status=pending");
+            var response = await _adminClient.GetAsync("/admin/compliance/deletions?status=pending");
             response.EnsureSuccessStatusCode();
             var responseString = await response.Content.ReadAsStringAsync();
             var adminResponse = JsonConvert.DeserializeObject<AdminDeletionResponse>(responseString);
             
             Assert.True(adminResponse.Total >= 1);
             Assert.All(adminResponse.Deletions, d => Assert.Equal("pending", d.Status));
+        }
+
+        /// <summary>No token: 401. A user's token on an admin endpoint: 403. Added 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP).</summary>
+        [Fact]
+        public async Task AnonymousAndNonAdminCallersAreRefused()
+        {
+            var anonymous = _factory.CreateClient();
+            var content = new StringContent(JsonConvert.SerializeObject(new ExportRequestDto { Format = "json" }), Encoding.UTF8, "application/json");
+            Assert.Equal(HttpStatusCode.Unauthorized, (await anonymous.PostAsync("/compliance/export", content)).StatusCode);
+            Assert.Equal(HttpStatusCode.Unauthorized, (await anonymous.GetAsync("/admin/compliance/exports")).StatusCode);
+            Assert.Equal(HttpStatusCode.Forbidden, (await _client.GetAsync("/admin/compliance/exports")).StatusCode);
+            Assert.Equal(HttpStatusCode.Forbidden, (await _client.GetAsync("/admin/compliance/deletions")).StatusCode);
+        }
+
+        /// <summary>Another user can neither read an export nor cancel a deletion by id (404, as if absent). Added 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP).</summary>
+        [Fact]
+        public async Task OtherUsersCannotReadOrCancelMyRequests()
+        {
+            var export = await PostAs<ExportResponse>(_client, "/compliance/export", new ExportRequestDto { Format = "csv" });
+            var deletion = await PostAs<DeletionResponse>(_client, "/compliance/delete", new DeletionRequestDto { Reason = "other" });
+
+            var stranger = _factory.CreateClient();
+            stranger.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", CustomWebApplicationFactory<ComplianceModule.Startup>.Token(Guid.NewGuid()));
+            Assert.Equal(HttpStatusCode.NotFound, (await stranger.GetAsync($"/compliance/exports/{export.ExportId}")).StatusCode);
+            Assert.Equal(HttpStatusCode.NotFound, (await stranger.DeleteAsync($"/compliance/delete/{deletion.DeletionId}")).StatusCode);
+        }
+
+        /// <summary>
+        /// The emailed token confirms the deletion (once); after the 30-day grace period the cascade removes the user's
+        /// data and the audit log survives. Added 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP).
+        /// </summary>
+        [Fact]
+        public async Task ConfirmedDeletionCascadesAfterGracePeriodAndKeepsAudit()
+        {
+            var deletion = await PostAs<DeletionResponse>(_client, "/compliance/delete", new DeletionRequestDto { Reason = "gdpr_request" });
+            var mailer = _factory.Services.GetRequiredService<DevelopmentComplianceMailer>();
+            var token = mailer.Sent.Last(m => m.DeletionId == Guid.Parse(deletion.DeletionId)).Secret;
+
+            var confirm = await PostAs<DeletionConfirmationResponse>(_client, $"/compliance/delete/{deletion.DeletionId}/confirm", new ConfirmDeletionDto { ConfirmationToken = token });
+            Assert.True(confirm.Success);
+            var again = await _client.PostAsync($"/compliance/delete/{deletion.DeletionId}/confirm",
+                new StringContent(JsonConvert.SerializeObject(new ConfirmDeletionDto { ConfirmationToken = token }), Encoding.UTF8, "application/json"));
+            Assert.Equal(HttpStatusCode.Conflict, again.StatusCode);
+
+            var store = _factory.Services.GetRequiredService<InMemoryUserDataStore>();
+            using var scope = _factory.Services.CreateScope();
+            var processor = scope.ServiceProvider.GetRequiredService<ExportProcessor>();
+            Assert.Equal(0, await processor.ProcessDueDeletionsAsync(DateTime.UtcNow.AddDays(29), CancellationToken.None));
+            Assert.True(store.Exists(_userId));
+            await processor.ProcessDueDeletionsAsync(DateTime.UtcNow.AddDays(31), CancellationToken.None);
+            Assert.False(store.Exists(_userId));
+
+            var db = scope.ServiceProvider.GetRequiredService<ComplianceDbContext>();
+            var actions = await db.AuditLogs.Where(a => a.UserId == _userId).Select(a => a.Action).ToListAsync();
+            Assert.Contains("deletion_requested", actions);
+            Assert.Contains("deletion_completed", actions);
+        }
+
+        /// <summary>
+        /// A processed export is completed with a 7-day signed link that downloads a file holding every data category,
+        /// CSV-formula-safe; a tampered or expired link is refused. Added 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP).
+        /// </summary>
+        [Fact]
+        public async Task ProcessedExportHasWorkingSignedLink()
+        {
+            var export = await PostAs<ExportResponse>(_client, "/compliance/export", new ExportRequestDto { Format = "csv" });
+            using (var scope = _factory.Services.CreateScope())
+                await scope.ServiceProvider.GetRequiredService<ExportProcessor>().ProcessPendingExportsAsync(CancellationToken.None);
+
+            var status = JsonConvert.DeserializeObject<ExportStatusResponse>(await (await _client.GetAsync($"/compliance/exports/{export.ExportId}")).Content.ReadAsStringAsync());
+            Assert.Equal("completed", status.Status);
+            Assert.InRange(DateTime.Parse(status.ExpiresAt, null, System.Globalization.DateTimeStyles.RoundtripKind).Subtract(DateTime.UtcNow).TotalDays, 6.9, 7.1);
+
+            var anonymous = _factory.CreateClient();
+            var file = await anonymous.GetStringAsync(status.FileUrl);
+            foreach (var section in new[] { "profile", "sessions", "activity", "files", "preferences", "transactions", "audit_trail" })
+                Assert.Contains($"\"{section}\"", file);
+            Assert.Contains("\"'=HYPERLINK", file);
+
+            var tampered = status.FileUrl.Replace("signature=", "signature=x");
+            Assert.Equal(HttpStatusCode.Forbidden, (await anonymous.GetAsync(tampered)).StatusCode);
+            var expired = System.Text.RegularExpressions.Regex.Replace(status.FileUrl, "expires=\\d+", "expires=1");
+            Assert.Equal(HttpStatusCode.Forbidden, (await anonymous.GetAsync(expired)).StatusCode);
+        }
+
+        /// <summary>POSTs a JSON body, requires success and reads the answer. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.</summary>
+        private static async Task<T> PostAs<T>(HttpClient client, string url, object body)
+        {
+            var response = await client.PostAsync(url, new StringContent(JsonConvert.SerializeObject(body), Encoding.UTF8, "application/json"));
+            response.EnsureSuccessStatusCode();
+            return JsonConvert.DeserializeObject<T>(await response.Content.ReadAsStringAsync());
         }
 
         private async Task CreateTestExportRequest(string format)

@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Threading.Tasks;
 using BackgroundJobs;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Xunit;
@@ -14,8 +15,33 @@ public class BackgroundJobsTests : IClassFixture<WebApplicationFactory<Backgroun
 {
     private readonly WebApplicationFactory<BackgroundJobs.Program> _factory;
 
+    // Keeps this test's shared in-memory database alive for the life of the test.
+    private readonly SqliteConnection _keepAlive;
+
+    /// <summary>
+    /// Points WebApplicationFactory at a content root. It otherwise looks for a solution (.sln) above the test binaries,
+    /// which a single-assembly build (app and tests compiled together, as the library's runner does) does not have, and
+    /// every test failed with "Solution root could not be located". WebApplicationFactory reads the documented
+    /// ASPNETCORE_TEST_CONTENTROOT_&lt;ASSEMBLY&gt; setting first. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// Touches: this process's environment.
+    /// </summary>
+    static BackgroundJobsTests()
+    {
+        var assembly = typeof(BackgroundJobs.Program).Assembly.GetName().Name!.ToUpperInvariant().Replace(".", "_");
+        Environment.SetEnvironmentVariable($"ASPNETCORE_TEST_CONTENTROOT_{assembly}", AppContext.BaseDirectory);
+    }
+
     public BackgroundJobsTests(WebApplicationFactory<BackgroundJobs.Program> factory)
     {
+        // One named, shared-cache in-memory database per test. The original opened a new ":memory:" connection inside
+        // the options callback, which runs once per scope, so every request and the worker each saw a different,
+        // empty database ("no such table"). Separate connections to one shared-cache database are also safe to use
+        // from the request threads and the worker at once, which a single shared connection is not.
+        // 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.
+        var connectionString = $"DataSource=file:jobs_{Guid.NewGuid():N}?mode=memory&cache=shared";
+        _keepAlive = new SqliteConnection(connectionString);
+        _keepAlive.Open();
+
         _factory = factory.WithWebHostBuilder(builder =>
         {
             builder.ConfigureServices(services =>
@@ -25,9 +51,7 @@ public class BackgroundJobsTests : IClassFixture<WebApplicationFactory<Backgroun
                 if (descriptor != null) services.Remove(descriptor);
                 services.AddDbContext<JobsDbContext>(options =>
                 {
-                    var connection = new SqliteConnection("DataSource=:memory:");
-                    connection.Open();
-                    options.UseSqlite(connection);
+                    options.UseSqlite(connectionString);
                 });
                 // Ensure DB is created
                 var sp = services.BuildServiceProvider();
@@ -187,7 +211,11 @@ public class BackgroundJobsTests : IClassFixture<WebApplicationFactory<Backgroun
         var json = await resp.Content.ReadFromJsonAsync<JsonElement>();
         var newJobId = json.GetProperty("new_job_id").GetGuid();
 
-        var newStatus = await GetJobStatusAsync(newJobId);
+        // The new job's status as created, from the retry response. Reading it with a second request raced the worker,
+        // which may claim the new job in between (2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP).
+        var newStatus = Enum.Parse<JobStatus>(json.GetProperty("status").GetString()!, true);
         Assert.Equal(JobStatus.Enqueued, newStatus);
+        Assert.NotEqual(jobId, newJobId);
+        await GetJobStatusAsync(newJobId); // the new job exists and is readable
     }
 }
