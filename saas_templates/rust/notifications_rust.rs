@@ -4,7 +4,10 @@
 //! What: `NotificationService` renders the spec's templates (`{variable}` substitution, one pass),
 //! honours do-not-disturb, quiet hours, per-channel preferences and email unsubscribe, sends through an
 //! injected `Sender` with up to 3 attempts and exponential backoff, and logs every message (sent,
-//! queued, skipped or failed) so it can be tracked, opened and clicked.
+//! queued, skipped or failed) so it can be tracked, opened and clicked. A message scheduled for later is
+//! logged `queued`; the host must call `deliver_due` on a schedule (for example every minute from its
+//! job runner or cron) to send the queued messages whose time has come (added for the CodeRabbit
+//! review on PR 19, 2026-11-10: queued rows were never delivered).
 //! Why: the old file did not compile (two `update_user_preferences`, `?` in a `bool` function, the
 //! removed `NO_PARAMS`), used the local wall clock for quiet hours, faked failures from a template
 //! variable inside production code, sent every email to a hard-coded address, and "unsubscribed" users
@@ -504,31 +507,55 @@ impl NotificationService {
             }
         }
 
+        let message = self.build_message(&template, &message_id, user_id, &chosen, vars);
+        match self.send_with_retries(&message) {
+            Ok(attempt) => {
+                self.log(&message_id, user_id, template_key, &chosen, vars, "sent", attempt, scheduled_at, Some((self.clock)()), None)?;
+                Ok(SendResponse { success: true, message_id, status: "sent".into() })
+            }
+            Err(last_error) => {
+                self.log(&message_id, user_id, template_key, &chosen, vars, "failed", MAX_ATTEMPTS, scheduled_at, None, Some(&last_error))?;
+                Ok(SendResponse { success: false, message_id, status: "failed".into() })
+            }
+        }
+    }
+
+    /// What: render a template into a provider message; email gets the unsubscribe link (text and
+    /// HTML). In: template, message id, user, chosen channel, vars. Out: `OutgoingMessage`.
+    /// Why: shared by `send_single_notification` and `deliver_due` so a queued message is rendered
+    /// exactly like an immediate one (CodeRabbit review on PR 19). 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing (calls the unsubscribe-link builder).
+    fn build_message(&self, template: &NotificationTemplate, message_id: &str, user_id: i64, channel: &str, vars: &HashMap<String, String>) -> OutgoingMessage {
         let mut body_text = render(&template.body_text, vars, false);
         let mut body_html = render(&template.body_html, vars, true);
-        if chosen == "email" {
+        if channel == "email" {
             let link = (self.unsubscribe_link)(user_id);
             body_text.push_str(&format!("\n\nUnsubscribe: {}", link));
             if !body_html.is_empty() {
                 body_html.push_str(&format!("<p><a href=\"{}\">Unsubscribe</a></p>", escape_html(&link)));
             }
         }
-        let message = OutgoingMessage {
-            message_id: message_id.clone(),
+        OutgoingMessage {
+            message_id: message_id.to_string(),
             user_id,
-            channel: chosen.clone(),
+            channel: channel.to_string(),
             subject: render(&template.subject, vars, false),
             body_text,
             body_html,
             vars: vars.clone(),
-        };
+        }
+    }
+
+    /// What: hand a message to the sender up to `MAX_ATTEMPTS` times with exponential backoff
+    /// (`backoff_base`, x2 per attempt) between tries. In: the message. Out: `Ok(attempt that
+    /// succeeded)` or `Err(last provider error)`. Why: the one retry loop for immediate and queued
+    /// messages (moved out of `send_single_notification` for the CodeRabbit review on PR 19).
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the sender (network in production), the sleeper.
+    fn send_with_retries(&self, message: &OutgoingMessage) -> Result<u32, String> {
         let mut last_error = String::new();
         for attempt in 1..=MAX_ATTEMPTS {
-            match self.sender.send(&message) {
-                Ok(()) => {
-                    self.log(&message_id, user_id, template_key, &chosen, vars, "sent", attempt, scheduled_at, Some((self.clock)()), None)?;
-                    return Ok(SendResponse { success: true, message_id, status: "sent".into() });
-                }
+            match self.sender.send(message) {
+                Ok(()) => return Ok(attempt),
                 Err(e) => {
                     last_error = e;
                     if attempt < MAX_ATTEMPTS {
@@ -537,8 +564,81 @@ impl NotificationService {
                 }
             }
         }
-        self.log(&message_id, user_id, template_key, &chosen, vars, "failed", MAX_ATTEMPTS, scheduled_at, None, Some(&last_error))?;
-        Ok(SendResponse { success: false, message_id, status: "failed".into() })
+        Err(last_error)
+    }
+
+    /// What: deliver every `queued` message whose `scheduled_at` has come (`<= now` by the injected
+    /// clock), oldest first. Each row is claimed (`queued` -> `sending`, so two runners never send it
+    /// twice), the user's preferences are checked again (do-not-disturb, a disabled channel or an
+    /// email unsubscribe since scheduling -> `skipped`; quiet hours -> back to `queued` for a later
+    /// run), then it is rendered and sent with the same retry loop as an immediate send and updated to
+    /// `sent` or `failed`. The host must call this on a schedule (for example every minute); nothing
+    /// else sends queued messages. In: nothing. Out: how many messages were sent.
+    /// Why: CodeRabbit review on PR 19: a future `scheduled_at` was logged `queued` and reported as a
+    /// success, but nothing ever delivered it. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// Touches: database (read and update `notification_logs`), the sender (network in production),
+    /// the clock, the sleeper.
+    pub fn deliver_due(&self) -> SqlResult<usize> {
+        let now = (self.clock)();
+        let due: Vec<(String, i64, String, String, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, user_id, template_key, channel, vars_used FROM notification_logs
+                 WHERE status = 'queued' AND scheduled_at IS NOT NULL AND julianday(scheduled_at) <= julianday(?1)
+                 ORDER BY julianday(scheduled_at), rowid",
+            )?;
+            let rows = stmt
+                .query_map(params![now.to_rfc3339()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+                .collect::<SqlResult<Vec<_>>>()?;
+            rows
+        };
+        let mut sent = 0;
+        for (id, user_id, template_key, channel, vars_json) in due {
+            let claimed = self.conn.execute("UPDATE notification_logs SET status = 'sending' WHERE id = ?1 AND status = 'queued'", params![id])?;
+            if claimed == 0 {
+                continue;
+            }
+            let finish = |status: &str, attempts: u32, sent_at: Option<DateTime<Utc>>, error: Option<&str>| -> SqlResult<()> {
+                self.conn.execute(
+                    "UPDATE notification_logs SET status = ?2, attempts = ?3, sent_at = ?4, error = ?5 WHERE id = ?1",
+                    params![id, status, attempts, sent_at.map(|t| t.to_rfc3339()), error],
+                )?;
+                Ok(())
+            };
+            let prefs = self.get_user_preferences(user_id)?;
+            if prefs.do_not_disturb {
+                finish("skipped", 0, None, Some("do_not_disturb"))?;
+                continue;
+            }
+            if !*prefs.channels_enabled.get(&channel).unwrap_or(&true) {
+                finish("skipped", 0, None, Some("channel_disabled"))?;
+                continue;
+            }
+            if channel == "email" && prefs.unsubscribed {
+                finish("skipped", 0, None, Some("unsubscribed"))?;
+                continue;
+            }
+            if in_quiet_hours(&prefs, now) {
+                finish("queued", 0, None, None)?;
+                continue;
+            }
+            let template = match self.load_template(&template_key) {
+                Ok(t) => t,
+                Err(e) => {
+                    finish("failed", 0, None, Some(&format!("template: {}", e)))?;
+                    continue;
+                }
+            };
+            let vars: HashMap<String, String> = serde_json::from_str(&vars_json).unwrap_or_default();
+            let message = self.build_message(&template, &id, user_id, &channel, &vars);
+            match self.send_with_retries(&message) {
+                Ok(attempt) => {
+                    finish("sent", attempt, Some((self.clock)()), None)?;
+                    sent += 1;
+                }
+                Err(last_error) => finish("failed", MAX_ATTEMPTS, None, Some(&last_error))?,
+            }
+        }
+        Ok(sent)
     }
 
     /// What: send many notifications; sent counts sent and queued, failed counts everything else.

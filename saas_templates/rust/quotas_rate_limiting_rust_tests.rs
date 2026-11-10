@@ -216,3 +216,46 @@ async fn tier_upgrade() {
     let count: i64 = row.get("call_count");
     assert!(count > 1_000);
 }
+/// Added 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP), CodeRabbit review on PR 19: a hit left by an IP
+/// seen once is deleted by the next limiter call of ANY bucket once it is older than the longest
+/// window, a hit still inside the longest window is kept, and the per-bucket limit still counts
+/// exactly (100 per minute for the user). Touches: in-memory SQLite.
+#[tokio::test]
+async fn stale_rows_of_other_buckets_are_pruned() {
+    let pool = SqlitePoolOptions::new().max_connections(1).connect(":memory:").await.unwrap();
+    init_db(&pool).await.unwrap();
+    let count = |bucket: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query("SELECT COUNT(*) AS n FROM rate_limit_hits WHERE bucket = ?1")
+                .bind(bucket)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .get::<i64, _>("n")
+        }
+    };
+    // A one-time IP at t0.
+    check_rate_limit_per_ip_at(&pool, "203.0.113.7", t0()).await.unwrap();
+    assert_eq!(count("ip:203.0.113.7").await, 1);
+
+    // 100 s later a different IP is checked: the first IP's 100 s old row is past the longest (60 s)
+    // window and is removed by this other bucket's call.
+    check_rate_limit_per_ip_at(&pool, "203.0.113.8", t0() + chrono::Duration::seconds(100)).await.unwrap();
+    assert_eq!(count("ip:203.0.113.7").await, 0, "a stale row of another bucket must be removed");
+    assert_eq!(count("ip:203.0.113.8").await, 1);
+
+    // 120 s after t0 a user is checked: the second IP's row is 20 s old, past its own 1 s window but
+    // still inside the longest window, so it stays.
+    let user = User { id: 42, tier: Tier::Solo };
+    let later = t0() + chrono::Duration::seconds(120);
+    check_rate_limit_per_user_at(&pool, &user, later).await.unwrap();
+    assert_eq!(count("ip:203.0.113.8").await, 1);
+
+    // The user's own window still counts exactly: 99 more pass, the 101st is refused.
+    for _ in 0..99 {
+        check_rate_limit_per_user_at(&pool, &user, later).await.unwrap();
+    }
+    assert!(matches!(check_rate_limit_per_user_at(&pool, &user, later).await.unwrap_err(), QuotaError::RateLimitExceeded { .. }));
+    assert_eq!(count("user:42").await, 100);
+}

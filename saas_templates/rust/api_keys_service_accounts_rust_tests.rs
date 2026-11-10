@@ -246,3 +246,40 @@ async fn test_rotated_key_stops_after_grace_period() {
     // another user cannot revoke or read the key
     assert_eq!(db.revoke_api_key(api_key_id, Uuid::new_v4()).await.unwrap_err(), ApiKeyError::NotFound);
 }
+
+/// Added 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP), CodeRabbit review on PR 19: a key already in its
+/// rotation grace period cannot be rotated again (409 `rotation_in_progress`), so the old key still
+/// stops 24 hours after the FIRST rotation even if someone keeps asking to rotate it. The new key can
+/// itself be rotated. Touches: memory only.
+#[tokio::test]
+async fn test_rotate_refuses_key_already_in_grace_period() {
+    let now = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(1_767_225_600));
+    let clock = now.clone();
+    let db = Database::new_in_memory()
+        .await
+        .unwrap()
+        .with_clock(Box::new(move || chrono::DateTime::from_timestamp(clock.load(std::sync::atomic::Ordering::SeqCst), 0).unwrap()));
+    let user_id = Uuid::new_v4();
+    let create_req = CreateApiKeyRequest { name: "Rotating".to_string(), scopes: vec!["read:deployments".to_string()], expires_at: None, rate_limit: 1000 };
+    let created = db.create_api_key(user_id, create_req).await.unwrap();
+    let api_key_id = Uuid::parse_str(&created.api_key_id).unwrap();
+    let first = db.rotate_api_key(api_key_id, user_id).await.unwrap();
+
+    // 12 hours later the old key is still in its grace period: a second rotation is refused.
+    now.fetch_add(12 * 3600, std::sync::atomic::Ordering::SeqCst);
+    let err = db.rotate_api_key(api_key_id, user_id).await.unwrap_err();
+    assert_eq!(err, ApiKeyError::RotationInProgress);
+    assert_eq!(err.status(), 409);
+    assert!(err.to_string().contains("rotation_in_progress"));
+    let keys = db.list_api_keys(user_id).await.unwrap().keys;
+    assert_eq!(keys.len(), 2, "the refused rotation made no new key");
+
+    // The grace period still ends 24 hours after the first rotation.
+    now.fetch_add(12 * 3600, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(db.use_api_key(&created.key, "/api/deployments", "GET").await.unwrap_err(), ApiKeyError::NotActive);
+    assert!(db.use_api_key(&first.new_key, "/api/deployments", "GET").await.is_ok());
+
+    // The new key can be rotated in its turn.
+    let new_id = Uuid::parse_str(&first.new_api_key_id).unwrap();
+    assert!(db.rotate_api_key(new_id, user_id).await.is_ok());
+}

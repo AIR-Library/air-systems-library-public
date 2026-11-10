@@ -23,6 +23,10 @@ pub const USER_RATE_WINDOW_SECS: u64 = 60;
 pub const IP_RATE_LIMIT: i64 = 10;
 /// Per-IP window in seconds.
 pub const IP_RATE_WINDOW_SECS: u64 = 1;
+/// The longest rate-limit window: any hit older than this can no longer count against any bucket, so
+/// every limiter call deletes such hits, whatever their bucket (CodeRabbit review on PR 19,
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: one-time IPs used to leave their rows forever).
+pub const LONGEST_RATE_WINDOW_SECS: u64 = if USER_RATE_WINDOW_SECS > IP_RATE_WINDOW_SECS { USER_RATE_WINDOW_SECS } else { IP_RATE_WINDOW_SECS };
 
 /// What: a subscription tier. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -129,7 +133,8 @@ fn db(e: sqlx::Error) -> QuotaError {
 }
 
 /// What: create the tables. In: pool. Out: `()` or an error. Why: executable schema (spec tables plus
-/// `rate_limit_hits` for the sliding windows). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+/// `rate_limit_hits` for the sliding windows; the `at_ms` index serves the all-bucket prune added for
+/// the CodeRabbit review on PR 19). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
 /// Touches: database (DDL).
 pub async fn init_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     for ddl in [
@@ -142,6 +147,7 @@ pub async fn init_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         "CREATE TABLE IF NOT EXISTS rate_limit_hits (id INTEGER PRIMARY KEY AUTOINCREMENT, bucket TEXT NOT NULL,
             at_ms INTEGER NOT NULL)",
         "CREATE INDEX IF NOT EXISTS rate_limit_hits_bucket ON rate_limit_hits (bucket, at_ms)",
+        "CREATE INDEX IF NOT EXISTS rate_limit_hits_at ON rate_limit_hits (at_ms)",
     ] {
         sqlx::query(ddl).execute(pool).await?;
     }
@@ -272,12 +278,22 @@ pub async fn release_storage(pool: &SqlitePool, user: &User, bytes: u64, now: Da
 }
 
 /// What: a sliding-window limiter: record a hit for `bucket` only if fewer than `limit` hits fall in
-/// the last `window_secs`, in one statement; older hits of the bucket are pruned. In: pool, bucket,
-/// limit, window, time. Out: whether the hit was admitted. Why: spec checks 3 and 4.
+/// the last `window_secs`, in one statement. Before that it prunes: the bucket's own hits older than
+/// its window, and every bucket's hits older than the longest window (`LONGEST_RATE_WINDOW_SECS`, or
+/// this call's window if longer), so a hit is never deleted while it can still count and the per-bucket
+/// count stays exact. In: pool, bucket, limit, window, time. Out: whether the hit was admitted.
+/// Why: spec checks 3 and 4; the all-bucket prune was added for the CodeRabbit review on PR 19 (rows
+/// of IPs seen once were never removed, so the table grew without bound).
 /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (rate_limit_hits).
 async fn admit(pool: &SqlitePool, bucket: &str, limit: i64, window_secs: u64, now: DateTime<Utc>) -> Result<bool, QuotaError> {
     let now_ms = now.timestamp_millis();
     let since = now_ms - (window_secs as i64) * 1000;
+    let stale = now_ms - (window_secs.max(LONGEST_RATE_WINDOW_SECS) as i64) * 1000;
+    sqlx::query("DELETE FROM rate_limit_hits WHERE at_ms <= ?1")
+        .bind(stale)
+        .execute(pool)
+        .await
+        .map_err(db)?;
     sqlx::query("DELETE FROM rate_limit_hits WHERE bucket = ?1 AND at_ms <= ?2")
         .bind(bucket)
         .bind(since)

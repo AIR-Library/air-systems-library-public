@@ -288,6 +288,25 @@ impl BillingService {
         self.price_ids.get(tier).cloned().ok_or_else(|| BillingError::InvalidTier(tier.to_string()))
     }
 
+    /// What: the tier a provider price stands for: its `lookup_key` when that names a known tier, else
+    /// the tier whose configured price id equals the price's `id`, else `None` (the caller keeps the
+    /// stored tier). In: the `price` object of a subscription item. Out: a known tier or `None`.
+    /// Why: CodeRabbit review on PR 19: a price without a lookup key (or with an unknown one) made
+    /// `customer.subscription.updated` fail and roll back, so past_due/canceled/trialing were never
+    /// saved. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+    fn tier_for_price(&self, price: &Value) -> Option<String> {
+        if let Some(key) = price["lookup_key"].as_str() {
+            if tier_price_cents(key).is_some() {
+                return Some(key.to_string());
+            }
+        }
+        let id = price["id"].as_str()?;
+        self.price_ids
+            .iter()
+            .find(|(tier, pid)| pid.as_str() == id && tier_price_cents(tier).is_some())
+            .map(|(tier, _)| tier.clone())
+    }
+
     /// What: append an audit row. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
     fn audit(conn: &Connection, action: &str, customer_id: Option<&str>, details: Value, now: DateTime<Utc>) -> Result<(), BillingError> {
         conn.execute(
@@ -424,8 +443,11 @@ impl BillingService {
     /// is applied once (a duplicate returns `{received: true}` and changes nothing) and a failure
     /// leaves it unprocessed for the provider's retry. Handles invoice.payment_succeeded,
     /// invoice.payment_failed, customer.subscription.updated and customer.subscription.deleted; other
-    /// types are acknowledged. Out: `{received: true}` or `InvalidSignature` (403) / `InvalidEvent`.
-    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database, clock.
+    /// types are acknowledged. For customer.subscription.updated the tier comes from `tier_for_price`
+    /// (lookup key, else configured price id, else the stored tier) and the status is always saved; an
+    /// unknown subscription with an unknown price is acknowledged and audited but not recorded (changed
+    /// for the CodeRabbit review on PR 19, 2026-11-10). Out: `{received: true}` or `InvalidSignature`
+    /// (403) / `InvalidEvent`. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database, clock.
     pub async fn handle_stripe_webhook(&self, request: WebhookRequest) -> Result<Value, BillingError> {
         self.verify_signature(&request.payload, &request.signature)?;
         let event: Value = serde_json::from_str(&request.payload).map_err(|_| BillingError::InvalidEvent("body is not JSON".into()))?;
@@ -464,10 +486,21 @@ impl BillingService {
             }
             "customer.subscription.updated" => {
                 let sub_id = obj["id"].as_str().ok_or_else(|| BillingError::InvalidEvent("subscription id".into()))?;
-                let tier = obj["items"]["data"][0]["price"]["lookup_key"].as_str().ok_or_else(|| BillingError::InvalidEvent("lookup_key".into()))?;
-                tier_price_cents(tier).ok_or_else(|| BillingError::InvalidTier(tier.to_string()))?;
                 let status = obj["status"].as_str().unwrap_or("active");
                 let old_tier: Option<String> = tx.query_row("SELECT tier FROM subscriptions WHERE stripe_subscription_id = ?1", params![sub_id], |r| r.get(0)).optional()?;
+                let tier = match (self.tier_for_price(&obj["items"]["data"][0]["price"]), &old_tier) {
+                    (Some(t), _) => t,
+                    (None, Some(stored)) => stored.clone(),
+                    (None, None) => {
+                        // Unknown subscription on an unknown price: nothing to attach it to. Acknowledge
+                        // (the event id is kept so it is not reprocessed) and leave an audit trail.
+                        Self::audit(&tx, "subscription_update_ignored", customer,
+                            json!({ "subscription_id": sub_id, "status": status, "reason": "unknown subscription and price" }), now)?;
+                        tx.commit()?;
+                        return Ok(json!({ "received": true }));
+                    }
+                };
+                let tier = tier.as_str();
                 if old_tier.is_none() {
                     tx.execute(
                         "INSERT INTO subscriptions (stripe_subscription_id, customer_id, tier, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",

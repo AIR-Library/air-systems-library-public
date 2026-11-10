@@ -5,8 +5,10 @@
 //! activity, files, preferences, transactions, audit trail) as JSON or CSV, stores it through a
 //! `FileStorage`, and emails a download link signed with HMAC-SHA256 that expires after 7 days. Account
 //! deletion needs the emailed confirmation token (stored only as a SHA-256 hash), waits a 30-day grace
-//! period during which the user can cancel, and then cascades over every user table except the audit
-//! log. Every request and action is written to the audit log.
+//! period during which the user can cancel, and then removes the user's export files from storage and
+//! cascades over every user table (export requests included) except the audit log, so an old signed
+//! link stops working (CodeRabbit review on PR 19, 2026-11-10). Every request and action is written to
+//! the audit log.
 //! Why: the old file could not compile anywhere without a live Postgres server at build time
 //! (compile-time-checked SQL macros), real S3 and SMTP clients, and it stored the deletion token in
 //! clear text. Rewritten on SQLite with storage and email behind traits, 2026-11-10,
@@ -211,6 +213,12 @@ pub trait FileStorage: Send {
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), String>;
     /// What: `get` (see the implementations). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
     fn get(&self, key: &str) -> Option<Vec<u8>>;
+    /// What: remove the file at `key`; removing a key that is already gone is `Ok` (idempotent, so a
+    /// failed account deletion can simply be retried). In: key. Out: `()` or a message.
+    /// Why: CodeRabbit review on PR 19: account deletion left the user's export files in storage, so a
+    /// recent download link still served their data after the account was gone. 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the storage service (deletes a file).
+    fn delete(&self, key: &str) -> Result<(), String>;
 }
 
 /// What: in-memory storage; clones share files. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
@@ -230,6 +238,13 @@ impl FileStorage for InMemoryFileStorage {
     /// What: `get` of `FileStorage for InMemoryFileStorage`; behaviour as the trait or type documents it. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: as described for its type.
     fn get(&self, key: &str) -> Option<Vec<u8>> {
         self.files.lock().ok()?.get(key).cloned()
+    }
+    /// What: `delete` of `FileStorage for InMemoryFileStorage`: drops the key from the map (a missing key
+    /// is `Ok`). In: key. Out: `()` or "lock poisoned". Why: CodeRabbit review on PR 19 (export files must
+    /// go with the account). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
+    fn delete(&self, key: &str) -> Result<(), String> {
+        self.files.lock().map_err(|_| "lock poisoned".to_string())?.remove(key);
+        Ok(())
     }
 }
 
@@ -469,10 +484,13 @@ impl ComplianceService {
         Ok(())
     }
 
-    /// What: serve a download link: checks the HMAC in constant time and the 7-day expiry.
+    /// What: serve a download link: checks the HMAC in constant time and the 7-day expiry, then that the
+    /// export request row still exists and is `completed` and that its file is still in storage.
     /// In: the URL path after `/compliance/download/` (`<expires>/<sig>/<id>.<ext>`). Out: file bytes,
-    /// `InvalidLink` or `LinkExpired`. Why: spec "Signed URLs: 7-day expiry, download-only".
-    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (read), file storage.
+    /// `InvalidLink`, `LinkExpired`, or `ExportNotFound` when the row or file is gone (for example after
+    /// the account was deleted). Why: spec "Signed URLs: 7-day expiry, download-only"; the row/status
+    /// check was added for the CodeRabbit review on PR 19 (a valid signature alone must not outlive the
+    /// account). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (read), file storage.
     pub fn download(&self, path: &str) -> Result<Vec<u8>, ComplianceError> {
         let parts: Vec<&str> = path.split('/').collect();
         let [exp, sig, file] = parts[..] else { return Err(ComplianceError::InvalidLink) };
@@ -484,7 +502,11 @@ impl ComplianceService {
         if (self.clock)().timestamp() >= expires {
             return Err(ComplianceError::LinkExpired);
         }
-        let key: Option<String> = self.db().query_row("SELECT file_key FROM export_requests WHERE id = ?1", params![export_id], |r| r.get(0)).optional()?.flatten();
+        let key: Option<String> = self
+            .db()
+            .query_row("SELECT file_key FROM export_requests WHERE id = ?1 AND status = 'completed'", params![export_id], |r| r.get(0))
+            .optional()?
+            .flatten();
         key.and_then(|k| self.storage.get(&k)).ok_or(ComplianceError::ExportNotFound)
     }
 
@@ -612,8 +634,12 @@ impl ComplianceService {
     }
 
     /// What: run every confirmed deletion whose grace period has ended (call from a scheduled job).
-    /// Out: how many users were deleted. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
-    /// Touches: database.
+    /// A user whose export files could not be removed from storage is skipped: the request stays
+    /// `approved` (so the next run retries it), an audit row `deletion_cleanup_failed` is written, and
+    /// the other due users are still processed. Out: how many users were deleted; database errors are
+    /// returned. Why: the retry behaviour was added for the CodeRabbit review on PR 19 (export files
+    /// must go with the account, and a storage outage must not lose the deletion). 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database, file storage (deletes export files).
     pub async fn process_due_deletions(&self) -> Result<usize, ComplianceError> {
         let now = ts((self.clock)());
         let due: Vec<(String, i64)> = {
@@ -622,20 +648,46 @@ impl ComplianceService {
             let rows = stmt.query_map(params![now], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
             rows
         };
+        let mut deleted = 0;
         for (id, user_id) in &due {
-            self.cascade_delete_user(*user_id).await?;
+            match self.cascade_delete_user(*user_id).await {
+                Ok(()) => {}
+                Err(ComplianceError::Storage(e)) => {
+                    let conn = self.db();
+                    self.audit(&conn, *user_id, "deletion_cleanup_failed", json!({ "deletion_id": id, "error": e }))?;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
             self.db().execute("UPDATE deletion_requests SET status = 'completed', deleted_at = ?2 WHERE id = ?1", params![id, now])?;
+            deleted += 1;
         }
-        Ok(due.len())
+        Ok(deleted)
     }
 
-    /// What: delete the user's rows from every user table and the user, in one transaction, keeping
-    /// the audit log (spec "except audit_log (keep for compliance)"); writes an audit row with counts.
-    /// In: user id. Out: `()`. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
+    /// What: delete the user's export files from storage, then (in one transaction) the user's export
+    /// requests, rows in every user table and the user, keeping the audit log (spec "except audit_log
+    /// (keep for compliance)"); writes an audit row with counts. If any export file cannot be removed
+    /// it returns `Storage` before the transaction starts, so nothing is deleted and the call can be
+    /// retried (removing a file twice is fine). In: user id. Out: `()`.
+    /// Why: export cleanup added for the CodeRabbit review on PR 19: the files and `export_requests`
+    /// rows used to survive the deletion, so a recent signed link still downloaded the user's data.
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database, file storage (deletes files).
     pub async fn cascade_delete_user(&self, user_id: i64) -> Result<(), ComplianceError> {
         let mut conn = self.db();
+        let keys: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT file_key FROM export_requests WHERE user_id = ?1 AND file_key IS NOT NULL ORDER BY rowid")?;
+            let rows = stmt.query_map(params![user_id], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+            rows
+        };
+        for key in &keys {
+            self.storage.delete(key).map_err(ComplianceError::Storage)?;
+        }
         let tx = conn.transaction()?;
         let mut counts = serde_json::Map::new();
+        let n = tx.execute("DELETE FROM export_requests WHERE user_id = ?1", params![user_id])?;
+        counts.insert("export_requests".to_string(), json!(n));
+        counts.insert("export_files".to_string(), json!(keys.len()));
         for table in CASCADE_TABLES {
             let n = tx.execute(&format!("DELETE FROM {} WHERE user_id = ?1", table), params![user_id])?;
             counts.insert(table.to_string(), json!(n));

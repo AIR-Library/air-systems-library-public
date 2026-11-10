@@ -42,6 +42,10 @@ pub enum ApiKeyError {
     RateLimited,
     /// 404: no such key for this user.
     NotFound,
+    /// 409 `rotation_in_progress`: the key was already rotated and is in its grace period; use the new
+    /// key. Why: CodeRabbit review on PR 19 (re-rotating pushed the grace period forward, so the old
+    /// key never expired); matches the Go template. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    RotationInProgress,
     /// 400: bad input.
     Invalid(String),
     /// 500.
@@ -57,6 +61,7 @@ impl ApiKeyError {
             ApiKeyError::Forbidden(_) => 403,
             ApiKeyError::RateLimited => 429,
             ApiKeyError::NotFound => 404,
+            ApiKeyError::RotationInProgress => 409,
             ApiKeyError::Invalid(_) => 400,
             ApiKeyError::Db(_) => 500,
         }
@@ -73,6 +78,7 @@ impl fmt::Display for ApiKeyError {
             ApiKeyError::Forbidden(scope) => write!(f, "API key does not have permission: requires {}", scope),
             ApiKeyError::RateLimited => write!(f, "Rate limit exceeded"),
             ApiKeyError::NotFound => write!(f, "API key not found"),
+            ApiKeyError::RotationInProgress => write!(f, "rotation_in_progress: this API key was already rotated; use the new key"),
             ApiKeyError::Invalid(m) => write!(f, "Invalid request: {}", m),
             ApiKeyError::Db(_) => write!(f, "Internal error"),
         }
@@ -340,8 +346,14 @@ impl Database {
     }
 
     /// What: rotate one of the user's live keys (spec endpoint 4): a new key with the same name, scopes
-    /// and limit; the old key keeps working for 24 hours, then stops. Out: the new key (shown once).
-    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
+    /// and limit; the old key keeps working for 24 hours, then stops. A key can be rotated only once:
+    /// the old row is claimed with a conditional update (`revoked_at IS NULL AND grace_ends_at IS
+    /// NULL`) before the new key is made, so a second or concurrent rotation gets `RotationInProgress`
+    /// (409) and the grace period is never pushed forward; if making the new key fails, the claim is
+    /// undone. In: key id, the authenticated user. Out: the new key (shown once), `NotFound`,
+    /// `NotActive` or `RotationInProgress`. Why: rotate-once rule added for the CodeRabbit review on
+    /// PR 19 (rotating daily kept the old key valid forever). 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database, bcrypt, OS randomness.
     pub async fn rotate_api_key(&self, api_key_id: Uuid, user_id: Uuid) -> Result<RotateApiKeyResponse, ApiKeyError> {
         let old = {
             let conn = self.conn();
@@ -353,12 +365,22 @@ impl Database {
             return Err(ApiKeyError::NotActive);
         }
         let expires = old.expires_at.as_deref().and_then(parse_time);
-        let (new_id, new_key, now) = self.insert_key(user_id, &old.name, &old.scopes, old.rate_limit, expires)?;
+        let now = (self.clock)();
         let grace = now + Duration::hours(ROTATION_GRACE_HOURS);
-        self.conn().execute(
-            "UPDATE api_keys SET revoked_at = ?2, grace_ends_at = ?3 WHERE id = ?1",
+        let claimed = self.conn().execute(
+            "UPDATE api_keys SET revoked_at = ?2, grace_ends_at = ?3 WHERE id = ?1 AND revoked_at IS NULL AND grace_ends_at IS NULL",
             params![api_key_id.to_string(), ts(now), ts(grace)],
         )?;
+        if claimed == 0 {
+            return Err(ApiKeyError::RotationInProgress);
+        }
+        let (new_id, new_key, _) = match self.insert_key(user_id, &old.name, &old.scopes, old.rate_limit, expires) {
+            Ok(made) => made,
+            Err(e) => {
+                self.conn().execute("UPDATE api_keys SET revoked_at = NULL, grace_ends_at = NULL WHERE id = ?1", params![api_key_id.to_string()])?;
+                return Err(e);
+            }
+        };
         Ok(RotateApiKeyResponse { new_api_key_id: new_id.to_string(), new_key, old_key_revoked_at: ts(now), grace_period_ends_at: ts(grace) })
     }
 

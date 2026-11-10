@@ -187,3 +187,107 @@ async fn test_deletion_runs_only_after_grace_period() {
     let audit: i64 = svc.db().query_row("SELECT COUNT(*) FROM audit_log WHERE user_id = 1", [], |r| r.get(0)).unwrap();
     assert!(audit >= 3);
 }
+
+/// Added 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP), CodeRabbit review on PR 19: an export made
+/// late in the grace period has a link that is still inside its 7 days when the deletion runs. After
+/// the deletion that link is refused, the file is gone from storage and the export row is gone.
+/// Touches: memory only.
+#[tokio::test]
+async fn test_deletion_removes_exports_and_refuses_old_link() {
+    let storage = InMemoryFileStorage::default();
+    let mailer = InMemoryMailer::default();
+    let now = Arc::new(AtomicI64::new(Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap().timestamp()));
+    let clock = now.clone();
+    let svc = ComplianceService::new(Connection::open_in_memory().unwrap(), Box::new(storage.clone()), Box::new(mailer.clone()), &[7u8; 32], "https://example.com")
+        .unwrap()
+        .with_clock(Box::new(move || Utc.timestamp_opt(clock.load(Ordering::SeqCst), 0).unwrap()));
+    svc.db()
+        .execute("INSERT INTO users (id, email, name, created_at, tier, status) VALUES (1, 'alice@example.com', 'Alice', '2025-01-01T00:00:00Z', 'pro', 'active')", [])
+        .unwrap();
+    let d = svc.request_account_deletion(1, DeletionReason::GdprRightToBeForgotten).await.unwrap();
+    let token = mailer.sent.lock().unwrap().last().unwrap().body.split("token=").nth(1).unwrap().to_string();
+    svc.confirm_deletion(d.deletion_id.clone(), &token).await.unwrap();
+
+    // Day 25: export, so the 7-day link is still valid on day 30.
+    now.fetch_add(25 * 86_400, Ordering::SeqCst);
+    let e = svc.request_data_export(1, ExportFormat::Json).await.unwrap();
+    svc.generate_export_file(e.export_id.clone(), 1, ExportFormat::Json).await.unwrap();
+    let url = svc.check_export_status(1, e.export_id.clone()).await.unwrap().file_url.unwrap();
+    let path = url.split("/compliance/download/").nth(1).unwrap().to_string();
+    assert!(svc.download(&path).is_ok());
+    assert_eq!(storage.files.lock().unwrap().len(), 1);
+
+    // Day 30: the grace period is over and the deletion runs.
+    now.fetch_add(5 * 86_400, Ordering::SeqCst);
+    assert_eq!(svc.process_due_deletions().await.unwrap(), 1);
+    assert_eq!(svc.download(&path), Err(ComplianceError::ExportNotFound));
+    assert!(storage.files.lock().unwrap().is_empty(), "export file must be removed from storage");
+    let rows: i64 = svc.db().query_row("SELECT COUNT(*) FROM export_requests WHERE user_id = 1", [], |r| r.get(0)).unwrap();
+    assert_eq!(rows, 0);
+    let audit: i64 = svc.db().query_row("SELECT COUNT(*) FROM audit_log WHERE user_id = 1 AND action = 'user_deleted_cascade'", [], |r| r.get(0)).unwrap();
+    assert_eq!(audit, 1);
+}
+
+/// What: a store whose `delete` fails until `fail` is cleared (storage outage during a deletion).
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, CodeRabbit review on PR 19. Touches: memory.
+#[derive(Clone, Default)]
+struct FlakyDeleteStorage {
+    inner: InMemoryFileStorage,
+    fail: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// What: `FileStorage` for the test store: put/get pass through, `delete` errors while `fail` is set.
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
+impl FileStorage for FlakyDeleteStorage {
+    /// What: store the file in memory. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), String> {
+        self.inner.put(key, bytes)
+    }
+    /// What: read the file from memory. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
+    fn get(&self, key: &str) -> Option<Vec<u8>> {
+        self.inner.get(key)
+    }
+    /// What: fail while `fail` is set, else remove. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
+    fn delete(&self, key: &str) -> Result<(), String> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err("storage unavailable".into());
+        }
+        self.inner.delete(key)
+    }
+}
+
+/// Added 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP), CodeRabbit review on PR 19: if the export files
+/// cannot be removed, nothing is deleted and the request stays approved; the next run completes it.
+/// Touches: memory only.
+#[tokio::test]
+async fn test_deletion_is_retried_when_export_cleanup_fails() {
+    let storage = FlakyDeleteStorage::default();
+    let mailer = InMemoryMailer::default();
+    let now = Arc::new(AtomicI64::new(Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap().timestamp()));
+    let clock = now.clone();
+    let svc = ComplianceService::new(Connection::open_in_memory().unwrap(), Box::new(storage.clone()), Box::new(mailer.clone()), &[7u8; 32], "https://example.com")
+        .unwrap()
+        .with_clock(Box::new(move || Utc.timestamp_opt(clock.load(Ordering::SeqCst), 0).unwrap()));
+    svc.db()
+        .execute("INSERT INTO users (id, email, name, created_at, tier, status) VALUES (1, 'alice@example.com', 'Alice', '2025-01-01T00:00:00Z', 'pro', 'active')", [])
+        .unwrap();
+    let e = svc.request_data_export(1, ExportFormat::Csv).await.unwrap();
+    svc.generate_export_file(e.export_id, 1, ExportFormat::Csv).await.unwrap();
+    let d = svc.request_account_deletion(1, DeletionReason::UserRequested).await.unwrap();
+    let token = mailer.sent.lock().unwrap().last().unwrap().body.split("token=").nth(1).unwrap().to_string();
+    svc.confirm_deletion(d.deletion_id.clone(), &token).await.unwrap();
+    now.fetch_add(30 * 86_400, Ordering::SeqCst);
+
+    storage.fail.store(true, Ordering::SeqCst);
+    assert_eq!(svc.process_due_deletions().await.unwrap(), 0);
+    let users: i64 = svc.db().query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0)).unwrap();
+    assert_eq!(users, 1, "nothing is deleted while the export files remain");
+    let pending = svc.list_deletions(Some(DeletionStatus::Approved)).await.unwrap();
+    assert_eq!(pending.total, 1);
+
+    storage.fail.store(false, Ordering::SeqCst);
+    assert_eq!(svc.process_due_deletions().await.unwrap(), 1);
+    assert!(storage.inner.files.lock().unwrap().is_empty());
+    let users: i64 = svc.db().query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0)).unwrap();
+    assert_eq!(users, 0);
+}

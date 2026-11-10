@@ -206,3 +206,60 @@ fn test_user_preferences_channels_enabled() {
     let log = service.track_message_status(&resp.message_id).unwrap();
     assert_eq!(log.channel, "sms");
 }
+/// What: a provider that records every accepted message in a shared list the test keeps.
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, CodeRabbit review on PR 19. Touches: memory.
+struct RecordingSender(std::rc::Rc<std::cell::RefCell<Vec<OutgoingMessage>>>);
+
+/// What: `Sender` for the test provider: accept and record. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+/// Touches: memory.
+impl Sender for RecordingSender {
+    /// What: record the message and accept it. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
+    fn send(&self, message: &OutgoingMessage) -> Result<(), String> {
+        self.0.borrow_mut().push(message.clone());
+        Ok(())
+    }
+}
+
+/// Added 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP), CodeRabbit review on PR 19: a message scheduled
+/// for later is queued, `deliver_due` does not send it early, and sends it (rendered, status `sent`)
+/// once the clock reaches its time; a second run sends nothing again. Touches: memory only.
+#[test]
+fn test_scheduled_message_is_delivered_when_due() {
+    let delivered = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let now = std::rc::Rc::new(std::cell::Cell::new(fixed_time(2026, 1, 15, 12, 0)));
+    let clock = now.clone();
+    let service = NotificationService::new(Connection::open_in_memory().unwrap(), Box::new(RecordingSender(delivered.clone())))
+        .unwrap()
+        .with_sleeper(Box::new(|_| {}))
+        .with_clock(Box::new(move || clock.get()));
+    let mut vars = HashMap::new();
+    vars.insert("app_name".to_string(), "TestApp".to_string());
+    let at: DateTime<Utc> = fixed_time(2026, 1, 15, 14, 0);
+    let resp = service.send_single_notification(1, "welcome_email", Some("email"), &vars, Some(at)).unwrap();
+    assert_eq!(resp.status, "queued");
+    assert!(delivered.borrow().is_empty());
+
+    // Before its time: nothing is sent and it stays queued.
+    assert_eq!(service.deliver_due().unwrap(), 0);
+    assert!(delivered.borrow().is_empty());
+    assert_eq!(service.track_message_status(&resp.message_id).unwrap().status, "queued");
+
+    // At its time: sent once, rendered with its vars, under the same message id.
+    now.set(fixed_time(2026, 1, 15, 14, 0));
+    assert_eq!(service.deliver_due().unwrap(), 1);
+    {
+        let sent = delivered.borrow();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].message_id, resp.message_id);
+        assert!(sent[0].body_text.contains("TestApp"));
+        assert!(sent[0].body_text.contains("Unsubscribe"));
+    }
+    let tracked = service.track_message_status(&resp.message_id).unwrap();
+    assert_eq!(tracked.status, "sent");
+    assert!(tracked.sent_at.is_some());
+
+    // Nothing is delivered twice.
+    now.set(fixed_time(2026, 1, 15, 15, 0));
+    assert_eq!(service.deliver_due().unwrap(), 0);
+    assert_eq!(delivered.borrow().len(), 1);
+}

@@ -221,3 +221,42 @@ async fn test_webhook_signature_invalid() {
     tampered.payload = tampered.payload.replace("10000", "1");
     assert!(matches!(service.handle_stripe_webhook(tampered).await.unwrap_err(), BillingError::InvalidSignature));
 }
+
+/// Added 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP), CodeRabbit review on PR 19: a
+/// customer.subscription.updated whose price has no lookup key still saves the status. The tier comes
+/// from the configured price id; with an unknown price id the stored tier is kept; an unknown
+/// subscription on an unknown price is acknowledged without a row. Touches: memory only.
+#[tokio::test]
+async fn test_webhook_subscription_updated_without_lookup_key() {
+    let service = service(FakePaymentProvider::with_subscription_id("sub_123"));
+    service.create_subscription(CreateSubscriptionRequest { customer_id: "cust_123".into(), tier: "solo".into() }).await.unwrap();
+    let event = |id: &str, sub: &str, price: Value, status: &str| {
+        serde_json::json!({
+            "id": id,
+            "type": "customer.subscription.updated",
+            "data": { "object": { "id": sub, "customer": "cust_123", "items": { "data": [{ "price": price }] }, "status": status } }
+        })
+    };
+
+    // No lookup key, but a configured price id: tier follows the price, status is saved.
+    let r = service.handle_stripe_webhook(signed(&event("evt_a", "sub_123", serde_json::json!({ "id": "price_team" }), "past_due"), SECRET)).await;
+    assert_eq!(r.unwrap()["received"], true);
+    assert_eq!(count(&service, "subscriptions", "stripe_subscription_id = 'sub_123' AND tier = 'team' AND status = 'past_due'"), 1);
+
+    // No lookup key and an unknown price id: the stored tier is kept, the status is still saved.
+    let r = service.handle_stripe_webhook(signed(&event("evt_b", "sub_123", serde_json::json!({ "id": "price_legacy_x" }), "canceled"), SECRET)).await;
+    assert_eq!(r.unwrap()["received"], true);
+    assert_eq!(count(&service, "subscriptions", "stripe_subscription_id = 'sub_123' AND tier = 'team' AND status = 'canceled'"), 1);
+
+    // An unknown lookup key falls back the same way.
+    let r = service.handle_stripe_webhook(signed(&event("evt_c", "sub_123", serde_json::json!({ "id": "price_legacy_x", "lookup_key": "gold" }), "trialing"), SECRET)).await;
+    assert_eq!(r.unwrap()["received"], true);
+    assert_eq!(count(&service, "subscriptions", "stripe_subscription_id = 'sub_123' AND tier = 'team' AND status = 'trialing'"), 1);
+
+    // Unknown subscription and unknown price: acknowledged, nothing recorded, the event is not reprocessed.
+    let r = service.handle_stripe_webhook(signed(&event("evt_d", "sub_unknown", serde_json::json!({ "id": "price_legacy_x" }), "active"), SECRET)).await;
+    assert_eq!(r.unwrap()["received"], true);
+    assert_eq!(count(&service, "subscriptions", "stripe_subscription_id = 'sub_unknown'"), 0);
+    assert_eq!(count(&service, "audit_log", "action = 'subscription_update_ignored'"), 1);
+    assert_eq!(count(&service, "events", "stripe_event_id = 'evt_d'"), 1);
+}
