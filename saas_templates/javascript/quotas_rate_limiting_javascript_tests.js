@@ -196,6 +196,10 @@ test('feature_gate FAIL → feature unavailable, 403 with upgrade hint', () => {
   assert.strictEqual(err.body.tier, 'solo');
   assert.strictEqual(err.body.minimum_tier, 'team');
   assert.ok(err.body.upgrade_url.includes('upgrade'), 'upgrade_url should contain upgrade path');
+  // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): the spec gives the refusal one shape in every language,
+  // 403 {error: "feature_not_available_in_tier", tier, minimum_tier, upgrade_url}; nothing else is in the body.
+  assert.deepStrictEqual(Object.keys(err.body).sort(), ['error', 'minimum_tier', 'tier', 'upgrade_url']);
+  assert.strictEqual(err.statusCode, 403);
 });
 
 // 11. month rollover

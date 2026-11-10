@@ -5,6 +5,10 @@
 // Changed 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP): a fixed clock, an unsubscribe secret and a no-op retry
 //   sleep are injected; tests follow the amended NOTIF-02/05/11/12 and NOTIF-07/09 now prove their rows (see the
 //   comments on each changed test).
+// Changed again 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP, Phase B.2): NOTIF-08 counts retries after the first
+//   attempt (4 attempts, 1 s / 2 s / 4 s; the test expected 3 attempts); deliverDue reports `deferred`, so the
+//   NOTIF-12 result arrays carry deferred => 0; NOTIF-05 and NOTIF-07 gained the quiet-hours re-queue in
+//   deliverDue and the open endpoint.
 // Touches: an in-memory SQLite database; no mail() or SMS API (test mode).
 declare(strict_types=1);
 
@@ -197,6 +201,36 @@ final class NotificationServiceTest extends TestCase
         $this->assertSame('sent', $this->service->endpointSend($payload)['status']);
     }
 
+    /**
+     * NOTIF-05, deliver_due step 3 (Phase B.2): a scheduled message that falls due inside the user's quiet hours
+     * (22:00-07:00 UTC, across midnight) is not sent; deliverDue puts it back to 'queued' with scheduled_at =
+     * quiet_hours_end and sends it then. Quiet hours must be "HH:MM" (else 400 invalid_quiet_hours, nothing changed).
+     * Input: the fixed clock. Output: assertions only. Why: the amended spec. 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory SQLite database; e-mail is captured (test mode).
+     */
+    // NOTIF-05
+    public function testDeliverDueRequeuesInsideQuietHours(): void
+    {
+        $utc = new DateTimeZone('UTC');
+        $msg = $this->service->endpointSend(['user_id' => 300, 'template_key' => 'welcome_email', 'channel' => 'email', 'vars' => ['app_name' => 'Night'], 'scheduled_at' => '2026-11-10T23:30:00Z']);
+        $this->assertSame('queued', $msg['status']);
+        $this->assertTrue($this->service->updateUserPreferences(300, ['quiet_hours_start' => '22:00', 'quiet_hours_end' => '07:00'])['success']);
+
+        $this->assertSame(['requeued' => 0, 'sent' => 0, 'skipped' => 0, 'failed' => 0, 'deferred' => 1], $this->service->deliverDue(new DateTimeImmutable('2026-11-10 23:30:00', $utc)));
+        $row = $this->logRow($msg['message_id']);
+        $this->assertSame(['queued', '2026-11-11 07:00:00', null, null], [$row['status'], $row['scheduled_at'], $row['claimed_at'], $row['sent_at']]);
+        $this->assertSame([], $this->service->getLastEmailData(), 'nothing sent inside quiet hours');
+        $this->assertSame(0, $this->service->deliverDue(new DateTimeImmutable('2026-11-11 06:59:59', $utc))['sent']);
+        $this->assertSame(['requeued' => 0, 'sent' => 1, 'skipped' => 0, 'failed' => 0, 'deferred' => 0], $this->service->deliverDue(new DateTimeImmutable('2026-11-11 07:00:00', $utc)));
+        $this->assertSame('sent', $this->logRow($msg['message_id'])['status']);
+
+        foreach (['7:00', '24:00', '07:60', '07:00:00', 'soon', ''] as $bad) {
+            $this->assertSame(['success' => false, 'error' => 'invalid_quiet_hours', 'status' => 400], $this->service->updateUserPreferences(300, ['quiet_hours_end' => $bad]), $bad);
+        }
+        $this->assertSame('07:00', $this->service->getUserPreferences(300)['quiet_hours_end'], 'unchanged');
+        $this->assertTrue($this->service->updateUserPreferences(300, ['quiet_hours_start' => null, 'quiet_hours_end' => null])['success'], 'null clears');
+    }
+
     // NOTIF-06
     public function testDoNotDisturbSkips(): void
     {
@@ -250,9 +284,37 @@ final class NotificationServiceTest extends TestCase
     }
 
     /**
-     * NOTIF-08: a failing email is retried with backoff and succeeds on the third attempt. Changed 2026-11-10
+     * NOTIF-07 as amended (Phase B.2): GET /notifications/open/:message_id sets opened_at and status 'opened' the
+     * first time only and answers 204 either way; a second call, an unknown id and a message not yet sent change
+     * nothing. Input: the fixed clock. Output: assertions only. Why: the amended spec. 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory SQLite database.
+     */
+    // NOTIF-07
+    public function testOpenEndpointRecordsTheFirstOpenOnly(): void
+    {
+        $sent = $this->service->endpointSend(['user_id' => 7, 'template_key' => 'welcome_email', 'channel' => 'email', 'vars' => ['app_name' => 'Open'], 'scheduled_at' => null]);
+        $this->assertSame('sent', $sent['status']);
+        $this->now = $this->now->modify('+5 minutes');
+        $this->assertSame(['status' => 204], $this->service->endpointOpen((string)$sent['message_id']));
+        $first = $this->logRow($sent['message_id']);
+        $this->assertSame(['opened', '2026-11-10 12:05:00'], [$first['status'], $first['opened_at']]);
+        $this->now = $this->now->modify('+1 hour');
+        $this->assertSame(['status' => 204], $this->service->endpointOpen((string)$sent['message_id']));
+        $this->assertSame($first, $this->logRow($sent['message_id']), 'a second open changes nothing');
+        $this->assertSame(['status' => 204], $this->service->endpointOpen('999999'), 'unknown id: 204 as well');
+
+        $queued = $this->service->endpointSend(['user_id' => 7, 'template_key' => 'welcome_email', 'channel' => 'email', 'vars' => [], 'scheduled_at' => '2026-12-01T00:00:00Z']);
+        $this->assertSame(['status' => 204], $this->service->endpointOpen((string)$queued['message_id']));
+        $this->assertSame(['queued', null], [$this->logRow($queued['message_id'])['status'], $this->logRow($queued['message_id'])['opened_at']], 'an unsent message is not opened');
+    }
+
+    /**
+     * NOTIF-08: a failing email is retried with backoff and succeeds when the sender recovers. Changed 2026-11-10
      * (session_012zDydZCZ4AChqhEZ4oVtaP): the service is built with the injected secret and sleep (the
-     * backoff really slept 1.5 s), and the backoff steps are asserted.
+     * backoff really slept 1.5 s), and the backoff steps are asserted. Changed again the same day (Phase B.2,
+     * amended NOTIF-08: up to 3 retries AFTER the first attempt): the sender fails three times and the fourth
+     * attempt succeeds, after waits of 1 s, 2 s and 4 s (the test expected success on the third attempt after
+     * 1 s and 2 s, which was the old 3-attempts-in-total count). testRetryGivesUpAfterFourAttempts proves the end.
      */
     // NOTIF-08
     public function testRetryOnFailure(): void
@@ -263,10 +325,10 @@ final class NotificationServiceTest extends TestCase
             protected function sendEmail(int $userId, string $subject, string $textBody, string $htmlBody): void
             {
                 $this->attempt++;
-                if ($this->attempt < 3) {
+                if ($this->attempt < 4) {
                     throw new Exception('SMTP error');
                 }
-                // Third attempt succeeds - store data but don't throw
+                // Fourth attempt (the third retry) succeeds - store data but don't throw
                 $this->lastEmailData = [
                     'to' => "user{$userId}@example.com",
                     'subject' => $subject,
@@ -288,8 +350,35 @@ final class NotificationServiceTest extends TestCase
         $result = $service->endpointSend($payload);
         $this->assertTrue($result['success']);
         $this->assertEquals('sent', $result['status']);
-        $this->assertSame(3, $service->attempt);
-        $this->assertSame([1000000, 2000000], $this->sleeps, 'exponential backoff 1 s, 2 s');
+        $this->assertSame(4, $service->attempt);
+        $this->assertSame([1000000, 2000000, 4000000], $this->sleeps, 'exponential backoff 1 s, 2 s, 4 s');
+    }
+
+    /**
+     * NOTIF-08, the end of the retries (Phase B.2): a sender that never recovers is tried 4 times (the first attempt
+     * and 3 retries, waiting 1 s, 2 s, 4 s) and the message is marked 'failed'. Input: a sender that always
+     * throws. Output: assertions only. Why: the amended spec ("a 4th failure marks it failed"). 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory SQLite database.
+     */
+    // NOTIF-08
+    public function testRetryGivesUpAfterFourAttempts(): void
+    {
+        $sleeps = &$this->sleeps;
+        $service = new class($this->pdo, [], [], self::SECRET, fn(): DateTimeImmutable => $this->now, 'https://example.com', function (int $us) use (&$sleeps): void { $sleeps[] = $us; }) extends NotificationService {
+            public int $attempt = 0;
+            protected function sendEmail(int $userId, string $subject, string $textBody, string $htmlBody): void
+            {
+                $this->attempt++;
+                throw new Exception('SMTP down');
+            }
+        };
+        $service->enableTestMode();
+        $result = $service->endpointSend(['user_id' => 8, 'template_key' => 'welcome_email', 'channel' => 'email', 'vars' => ['app_name' => 'Down'], 'scheduled_at' => null]);
+        $this->assertSame([false, 'failed', 'SMTP down'], [$result['success'], $result['status'], $result['error']]);
+        $this->assertSame(4, $service->attempt, 'the first attempt and 3 retries');
+        $this->assertSame([1000000, 2000000, 4000000], $this->sleeps);
+        $this->assertSame('failed', $this->logRow($result['message_id'])['status']);
+        $this->assertSame(3, NotificationService::MAX_RETRIES);
     }
 
     /**
@@ -408,6 +497,8 @@ final class NotificationServiceTest extends TestCase
      * 300 s is left alone). Why: amended spec. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite.
      */
     // NOTIF-12
+    // deliverDue's result carries `deferred` (quiet hours, NOTIF-05) since 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP
+    // (Phase B.2); each expected array below gained deferred => 0 and nothing else changed.
     public function testScheduledSendDeliveredOnceByDeliverDue(): void
     {
         $utc = new DateTimeZone('UTC');
@@ -416,23 +507,23 @@ final class NotificationServiceTest extends TestCase
         $b = $this->service->endpointSend(['user_id' => 51, 'template_key' => 'welcome_email', 'channel' => 'email', 'vars' => ['app_name' => 'Later'], 'scheduled_at' => $due]);
         $this->assertSame(['queued', 'queued'], [$a['status'], $b['status']]);
         $this->assertSame([], $this->service->getLastEmailData(), 'not sent now');
-        $this->assertSame(['requeued' => 0, 'sent' => 0, 'skipped' => 0, 'failed' => 0], $this->service->deliverDue());
+        $this->assertSame(['requeued' => 0, 'sent' => 0, 'skipped' => 0, 'failed' => 0, 'deferred' => 0], $this->service->deliverDue());
 
         // User 51 unsubscribes meanwhile.
         $this->service->handleUnsubscribe('POST', '51', 'email', $this->service->unsubscribeToken(51, 'email'));
 
         $at = new DateTimeImmutable('2026-12-10 12:00:00', $utc);
-        $this->assertSame(['requeued' => 0, 'sent' => 1, 'skipped' => 1, 'failed' => 0], $this->service->deliverDue($at));
+        $this->assertSame(['requeued' => 0, 'sent' => 1, 'skipped' => 1, 'failed' => 0, 'deferred' => 0], $this->service->deliverDue($at));
         $this->assertSame('sent', $this->logRow($a['message_id'])['status']);
         $this->assertSame(['skipped', 'channel_disabled'], [$this->logRow($b['message_id'])['status'], $this->logRow($b['message_id'])['error']]);
-        $this->assertSame(['requeued' => 0, 'sent' => 0, 'skipped' => 0, 'failed' => 0], $this->service->deliverDue($at->modify('+1 hour')), 'exactly once');
+        $this->assertSame(['requeued' => 0, 'sent' => 0, 'skipped' => 0, 'failed' => 0, 'deferred' => 0], $this->service->deliverDue($at->modify('+1 hour')), 'exactly once');
 
         // A crashed worker's claim: re-queued after 300 s, not before.
         $c = $this->service->endpointSend(['user_id' => 52, 'template_key' => 'welcome_email', 'channel' => 'in_app', 'vars' => [], 'scheduled_at' => $due]);
         $this->pdo->prepare("UPDATE notification_logs SET status = 'sending', claimed_at = :t WHERE id = :id")->execute([':t' => '2026-12-10 12:00:00', ':id' => $c['message_id']]);
-        $this->assertSame(['requeued' => 0, 'sent' => 0, 'skipped' => 0, 'failed' => 0], $this->service->deliverDue(new DateTimeImmutable('2026-12-10 12:05:00', $utc)));
+        $this->assertSame(['requeued' => 0, 'sent' => 0, 'skipped' => 0, 'failed' => 0, 'deferred' => 0], $this->service->deliverDue(new DateTimeImmutable('2026-12-10 12:05:00', $utc)));
         $this->assertSame('sending', $this->logRow($c['message_id'])['status']);
-        $this->assertSame(['requeued' => 1, 'sent' => 1, 'skipped' => 0, 'failed' => 0], $this->service->deliverDue(new DateTimeImmutable('2026-12-10 12:05:01', $utc)));
+        $this->assertSame(['requeued' => 1, 'sent' => 1, 'skipped' => 0, 'failed' => 0, 'deferred' => 0], $this->service->deliverDue(new DateTimeImmutable('2026-12-10 12:05:01', $utc)));
         $this->assertSame('sent', $this->logRow($c['message_id'])['status']);
     }
 }

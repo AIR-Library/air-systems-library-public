@@ -463,6 +463,44 @@ class AuditLoggingServiceTest {
         }
     }
 
+    /**
+     * AUDIT-10 (Phase B.2 amendment): log() refuses an actor_type other than user/service/api_key (400
+     * invalid_actor_type), a 'user' actor without actor_id (400 actor_required) and a 'service' actor without
+     * actor_service (400 actor_service_required, even when an actor_id is given: no fallback), writing nothing; erase_subject and apply_retention return erased_rows =
+     * the audit_personal rows they deleted (0 when there is nothing); replay's "erased" is false while the entry's
+     * subject row exists and true once it is gone. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: H2.
+     */
+    // AUDIT-10
+    @Test
+    @Order(22)
+    void testActorRefusalsErasedRowsAndReplayErasedFlag() throws Exception {
+        AuditLoggingService.LogRequest robot = AuditLoggingService.LogRequest.byUser("1", "user_created", "user", "u_1");
+        robot.actorType = "robot";
+        AuditLoggingService.AuditException e = refused(() -> service.log(robot));
+        assertEquals(400, e.status());
+        assertEquals("invalid_actor_type", e.code());
+        e = refused(() -> service.log(AuditLoggingService.LogRequest.byUser(null, "user_created", "user", "u_1")));
+        assertEquals(400, e.status());
+        assertEquals("actor_required", e.code());
+        e = refused(() -> service.log(AuditLoggingService.LogRequest.byService(null, "billing_changed", "subscription", "s_1").subject("none")));
+        assertEquals(400, e.status());
+        assertEquals("actor_service_required", e.code());
+        // No fallback to actor_id as the service name (lead's spec clarification, 2026-11-10).
+        AuditLoggingService.LogRequest withId = AuditLoggingService.LogRequest.byService(null, "billing_changed", "subscription", "s_1").subject("none");
+        withId.actorId = "billing";
+        assertEquals("actor_service_required", refused(() -> service.log(withId)).code());
+        assertEquals(0, rows("SELECT * FROM audit_log").size());
+
+        String live = (String) userEvent("7", "user_updated", "u_7", Map.of("n", 1), Map.of("n", 2)).get("log_id");
+        Map<String, Object> before = service.replay(ADMIN, live);
+        assertEquals(false, before.get("erased"));
+        assertNotNull(before.get("resource_state_at_time"));
+        // u_7 is both actor ("7" is another user) and subject: one subject row under u_7.
+        assertEquals(1, service.eraseSubject("u_7").get("erased_rows"));
+        assertEquals(0, service.eraseSubject("u_7").get("erased_rows"), "nothing left to erase");
+        assertEquals(true, service.replay(ADMIN, live).get("erased"));
+    }
+
     // ------------------------------------------------------------------
     // Additional: Search endpoint
     // ------------------------------------------------------------------

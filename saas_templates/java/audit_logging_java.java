@@ -582,8 +582,10 @@ public class AuditLoggingService implements AutoCloseable {
     /**
      * The resource state at the time of the entry (its old_value) and whether a later entry for the same resource holds
      * a different value. An entry whose subject row was erased answers {log_id, timestamp, erased: true,
-     * resource_state_at_time: null, has_diverged: null}. Admins only (403). Unknown id: NoSuchElementException.
-     * Rewritten 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: reads the database.
+     * resource_state_at_time: null, has_diverged: null}; any other entry answers erased: false with its state.
+     * Admins only (403). Unknown id: NoSuchElementException.
+     * Rewritten 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Changed the same day (Phase B.2): erased: false is
+     * returned for a live entry too. Touches: reads the database.
      */
     public Map<String, Object> replay(Caller caller, String logId) throws SQLException {
         requireAdmin(caller);
@@ -614,6 +616,9 @@ public class AuditLoggingService implements AutoCloseable {
             response.put("has_diverged", null);
             return response;
         }
+        // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2: replay's "erased" reflects the entry's subject row):
+        // a live entry says erased: false, so callers read one field in every case.
+        response.put("erased", false);
         response.put("resource_state_at_time", entry.get("old_value"));
         response.put("has_diverged", checkDivergence(id, (String) entry.get("resource_type"),
                 (String) entry.get("resource_id"), (JsonNode) entry.get("new_value"), subjectRef));

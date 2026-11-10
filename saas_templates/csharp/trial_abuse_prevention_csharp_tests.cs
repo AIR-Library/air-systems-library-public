@@ -384,6 +384,33 @@ namespace TrialAbusePreventionTests
             Assert.Equal(GateDecision.Fail, result.Decision);
             Assert.Contains("days_after_trial=90", result.Reason);
             Assert.Contains("earlier_payment=false", result.Reason);
+            Assert.Equal("trial_ended_no_payment_cannot_retry", result.Error);
+        }
+
+        /// <summary>
+        /// TRIAL-11 (Phase B.2 amendment): a user with no users row is FAIL {error: "user_not_found"} (fail closed); a
+        /// user with a users row and no ledger row is judged from users.created_at with no earlier payment (PASS 3 days
+        /// after the trial, FAIL 100 days after). In: nothing. Out: asserts. Added 2026-11-10,
+        /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory EF.
+        /// </summary>
+        // TRIAL-11
+        [Fact]
+        public async Task TrialPaymentTiming_UnknownUserFails_NoLedgerRowJudgedFromCreatedAt()
+        {
+            var unknown = await _service.CheckTrialPaymentTiming("nobody_here");
+            Assert.Equal(GateDecision.Fail, unknown.Decision);
+            Assert.Equal("user_not_found", unknown.Error);
+
+            var recent = await UserWithTrialEndedDaysAgo("no_ledger_recent", 3);
+            Assert.False(await _context.TrialAbuseLedgers.AnyAsync(l => l.UserId == recent));
+            var pass = await _service.CheckTrialPaymentTiming(recent);
+            Assert.Equal(GateDecision.Pass, pass.Decision);
+            Assert.Null(pass.Error);
+
+            var old = await UserWithTrialEndedDaysAgo("no_ledger_old", 100);
+            var fail = await _service.CheckTrialPaymentTiming(old);
+            Assert.Equal(GateDecision.Fail, fail.Decision);
+            Assert.Contains("earlier_payment=false", fail.Reason);
         }
 
         /// <summary>

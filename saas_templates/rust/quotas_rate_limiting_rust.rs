@@ -99,7 +99,9 @@ impl QuotaError {
 
 /// What: `fmt::Display` for `QuotaError`. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing beyond what each method says.
 impl fmt::Display for QuotaError {
-    /// What: the spec's JSON error body. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// What: the spec's JSON error body. Changed 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP, Phase B.2):
+    /// the feature-gate refusal's code is feature_not_available_in_tier (was feature_not_available), the one
+    /// name the quotas spec now gives in every language. Touches: nothing.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             QuotaError::QuotaExceeded { current, limit, reset_date } => write!(
@@ -118,7 +120,7 @@ impl fmt::Display for QuotaError {
             }
             QuotaError::FeatureNotAvailable { tier, minimum_tier, upgrade_url } => write!(
                 f,
-                "{{\"error\":\"feature_not_available\",\"tier\":\"{}\",\"minimum_tier\":\"{}\",\"upgrade_url\":\"{}\"}}",
+                "{{\"error\":\"feature_not_available_in_tier\",\"tier\":\"{}\",\"minimum_tier\":\"{}\",\"upgrade_url\":\"{}\"}}",
                 tier.as_str(),
                 minimum_tier.as_str(),
                 upgrade_url

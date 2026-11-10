@@ -393,7 +393,9 @@ async function rejection(fn: () => Promise<unknown>): Promise<ComplianceError> {
       await service.confirmDeletion('user_123', res.deletion_id, token);
       assert(false, 'Second confirmation should fail');
     } catch (e) {
-      assert((e as Error).message.includes('already approved'), 'Should reject duplicate confirmation');
+      // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 / EXPORT-15): the reply was "already approved"; a
+      // reused token now gets the same 400 invalid_confirmation_token as a wrong one, so the reply never says which.
+      assert(e instanceof ComplianceError && e.code === 'invalid_confirmation_token' && e.status === 400, 'Should reject duplicate confirmation');
     }
     
     // Try with invalid token
@@ -580,16 +582,88 @@ async function rejection(fn: () => Promise<unknown>): Promise<ComplianceError> {
     assertEquals(db.deletionRequests.find(r => r.id === res.deletion_id)!.status, 'pending', 'still pending');
 
     await service.confirmDeletion('user_123', res.deletion_id, token);
-    assertEquals((await rejection(() => service.confirmDeletion('user_123', res.deletion_id, token))).code, 'not_pending', 'a reused token is refused');
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 / EXPORT-15): a reused token was 409 not_pending; the
+    // spec now gives a wrong, reused or expired token the one answer 400 invalid_confirmation_token.
+    assertEquals((await rejection(() => service.confirmDeletion('user_123', res.deletion_id, token))).code, 'invalid_confirmation_token', 'a reused token is refused');
 
     seedUser();
     const late = await service.requestDeletion('user_123', 'user_requested');
     const lateToken = tokenFromEmail(email, 'alice@example.com');
     clock.advanceHours(24);
     clock.advanceHours(0.001);
-    assertEquals((await rejection(() => service.confirmDeletion('user_123', late.deletion_id, lateToken))).code, 'confirmation_token_expired', 'a token over 24 h old is refused');
+    // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 / EXPORT-15): was 403 confirmation_token_expired, which
+    // told the caller which case it was; now the same 400 invalid_confirmation_token as a wrong token.
+    assertEquals((await rejection(() => service.confirmDeletion('user_123', late.deletion_id, lateToken))).code, 'invalid_confirmation_token', 'a token over 24 h old is refused');
 
     const exp = await service.requestExport('user_123', 'json');
     assertEquals((await rejection(() => service.getExportStatus('admin_999', exp.export_id))).status, 404, "another user's export status is 404");
+  });
+
+  /**
+   * EXPORT-15: a wrong, a reused and an expired (over 24 h) token all get the same 400
+   * {error: "invalid_confirmation_token"} and change nothing; confirm and cancel of a cancelled request are 409
+   * {error: "deletion_not_pending"}; of a completed one (a statutory reason completes on confirm; its user_id is NULL,
+   * EXPORT-13) 404 {error: "not_found"}, even for the user who asked; another user's request is 404 too
+   * (spec clarification 3abb340, 2026-11-10).
+   * In: the shared service. Out: throws on failure. Why: EXPORT-15 (Phase B.2, spec amended 2026-11-10).
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory only.
+   */
+  // EXPORT-15
+  test('Deletion confirmation: one 400 for wrong, reused or expired tokens; 409 once cancelled, 404 once completed', async () => {
+    seedUser();
+    const res = await service.requestDeletion('user_123', 'user_requested');
+    const token = tokenFromEmail(email, 'alice@example.com');
+
+    const other = await rejection(() => service.confirmDeletion('admin_999', res.deletion_id, token));
+    assertEquals(other.status, 404, "another user's confirm is 404");
+    assertEquals(other.code, 'not_found', "another user's confirm is not_found");
+    const otherCancel = await rejection(() => service.cancelDeletion('admin_999', res.deletion_id));
+    assertEquals(otherCancel.status, 404, "another user's cancel is 404");
+    assertEquals(otherCancel.code, 'not_found', "another user's cancel is not_found");
+
+    const wrong = await rejection(() => service.confirmDeletion('user_123', res.deletion_id, token.slice(0, -1) + (token.endsWith('A') ? 'B' : 'A')));
+    assertEquals(wrong.status, 400, 'a wrong token is 400');
+    assertEquals(wrong.code, 'invalid_confirmation_token', 'a wrong token is invalid_confirmation_token');
+    assertEquals(db.deletionRequests.find(r => r.id === res.deletion_id)!.status, 'pending', 'a wrong token changes nothing');
+
+    await service.confirmDeletion('user_123', res.deletion_id, token);
+    const reused = await rejection(() => service.confirmDeletion('user_123', res.deletion_id, token));
+    assertEquals(reused.status, 400, 'a reused token is 400');
+    assertEquals(reused.code, 'invalid_confirmation_token', 'a reused token gets the same answer');
+    assertEquals(db.deletionRequests.find(r => r.id === res.deletion_id)!.status, 'approved', 'a reused token changes nothing');
+
+    seedUser();
+    const late = await service.requestDeletion('user_123', 'user_requested');
+    const lateToken = tokenFromEmail(email, 'alice@example.com');
+    clock.advanceHours(24.001);
+    const expired = await rejection(() => service.confirmDeletion('user_123', late.deletion_id, lateToken));
+    assertEquals(expired.status, 400, 'an expired token is 400');
+    assertEquals(expired.code, 'invalid_confirmation_token', 'an expired token gets the same answer');
+    assertEquals(wrong.message, expired.message, 'the message does not say which case it was');
+    assertEquals(db.deletionRequests.find(r => r.id === late.deletion_id)!.status, 'pending', 'an expired token changes nothing');
+
+    // cancelled: confirm and cancel are both 409 deletion_not_pending
+    await service.cancelDeletion('user_123', late.deletion_id);
+    const confirmCancelled = await rejection(() => service.confirmDeletion('user_123', late.deletion_id, lateToken));
+    assertEquals(confirmCancelled.status, 409, 'confirm of a cancelled request is 409');
+    assertEquals(confirmCancelled.code, 'deletion_not_pending', 'confirm of a cancelled request is deletion_not_pending');
+    const cancelCancelled = await rejection(() => service.cancelDeletion('user_123', late.deletion_id));
+    assertEquals(cancelCancelled.status, 409, 'cancel of a cancelled request is 409');
+    assertEquals(cancelCancelled.code, 'deletion_not_pending', 'cancel of a cancelled request is deletion_not_pending');
+
+    // completed: a statutory reason runs the cascade at confirm; the request has no owner any more, so it is 404
+    seedUser();
+    const gdpr = await service.requestDeletion('user_123', 'gdpr_request');
+    const gdprToken = tokenFromEmail(email, 'alice@example.com');
+    await service.confirmDeletion('user_123', gdpr.deletion_id, gdprToken);
+    assertEquals(db.deletionRequests.find(r => r.id === gdpr.deletion_id)!.status, 'completed', 'the statutory request completed');
+    assertEquals(db.deletionRequests.find(r => r.id === gdpr.deletion_id)!.user_id, null, 'the completed request has no owner');
+    const confirmCompleted = await rejection(() => service.confirmDeletion('user_123', gdpr.deletion_id, gdprToken));
+    assertEquals(confirmCompleted.status, 404, 'confirm of a completed request is 404');
+    assertEquals(confirmCompleted.code, 'not_found', 'confirm of a completed request is not_found');
+    const cancelCompleted = await rejection(() => service.cancelDeletion('user_123', gdpr.deletion_id));
+    assertEquals(cancelCompleted.status, 404, 'cancel of a completed request is 404');
+    assertEquals(cancelCompleted.code, 'not_found', 'cancel of a completed request is not_found');
+    assertEquals((await rejection(() => service.cancelDeletion('admin_999', gdpr.deletion_id))).status, 404, 'and 404 to anyone else');
   });
 }

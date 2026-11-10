@@ -335,6 +335,65 @@ public class AuditLoggingTests : IDisposable
     }
 
     /// <summary>
+    /// AUDIT-10 (Phase B.2 amendment, "Refusals by log()"): a missing actor_type or one outside user / service /
+    /// api_key is 400 invalid_actor_type; a 'user' actor without actor_id is 400 actor_required; a 'service' actor
+    /// without actor_service is 400 actor_service_required; nothing is written. In: nothing. Out: asserts. Added
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the test's in-memory SQLite database.
+    /// </summary>
+    // AUDIT-10
+    [Fact]
+    public async Task Log_RefusesBadActorTypeMissingActorAndMissingServiceName()
+    {
+        async Task Refused(AuditLogEntry e, string code)
+        {
+            var ex = await Assert.ThrowsAsync<AuditException>(() => _repo.LogMutationAsync(e));
+            Assert.Equal(400, ex.Status);
+            Assert.Equal(code, ex.Code);
+        }
+        await Refused(new AuditLogEntry { ActorType = null, ActorId = "1", Action = "user_created", ResourceType = "user", ResourceId = "2" }, "invalid_actor_type");
+        await Refused(new AuditLogEntry { ActorType = (ActorType)99, ActorId = "1", Action = "user_created", ResourceType = "user", ResourceId = "2" }, "invalid_actor_type");
+        await Refused(new AuditLogEntry { ActorType = ActorType.User, Action = "user_created", ResourceType = "user", ResourceId = "2" }, "actor_required");
+        await Refused(new AuditLogEntry { ActorType = ActorType.User, ActorId = " ", Action = "user_created", ResourceType = "user", ResourceId = "2" }, "actor_required");
+        await Refused(new AuditLogEntry { ActorType = ActorType.Service, ActorId = "billing", Action = "invoice_created", ResourceType = "invoice", ResourceId = "i1", SubjectUserId = "none" }, "actor_service_required");
+        Assert.Empty(await AllRowsText());
+
+        await _repo.LogMutationAsync(new AuditLogEntry { ActorType = ActorType.Service, ActorService = "billing", Action = "invoice_created", ResourceType = "invoice", ResourceId = "i1", SubjectUserId = "none" });
+        Assert.Equal("billing", Assert.Single((await _repo.QueryLogsAsync(Admin)).Logs).ActorService);
+    }
+
+    /// <summary>
+    /// AUDIT-08 (Phase B.2 amendment): replay's erased reflects the entry's own subject row. An admin's entry about a
+    /// user replays with erased false after only the admin is erased (its subject row stays) and erased true once the
+    /// user is erased; an entry with subject 'none' replays with erased false after its actor is erased. erased_rows
+    /// counts the audit_personal rows deleted. In: nothing. Out: asserts. Added 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the test's in-memory SQLite database.
+    /// </summary>
+    // AUDIT-08
+    [Fact]
+    public async Task Replay_ErasedFollowsTheEntrysSubjectRow()
+    {
+        var aboutUser = await LogSampleAsync(actorId: "1", action: "user_suspended", resourceType: "user", resourceId: "77");
+        var noSubject = await LogSampleAsync(actorId: "1", action: "deployment_created", resourceType: "deployment", resourceId: "dep-9", subject: "none");
+
+        Assert.Equal(2, await _repo.EraseSubjectAsync("1")); // the admin's two actor rows
+        var afterAdmin = await _repo.ReplayAsync(Admin, aboutUser);
+        Assert.False(afterAdmin.Erased);
+        // The subject's snapshot is still there (only the admin's actor rows were erased). Asserted before use:
+        // code-quality review on PR 21, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        Assert.NotNull(afterAdmin.ResourceStateAtTime);
+        Assert.Equal("team", afterAdmin.ResourceStateAtTime.Value.GetProperty("tier").GetString());
+        var noSubjectReplay = await _repo.ReplayAsync(Admin, noSubject);
+        Assert.False(noSubjectReplay.Erased);
+        Assert.NotNull(noSubjectReplay.ResourceStateAtTime);
+
+        Assert.Equal(1, await _repo.EraseSubjectAsync("77")); // the user's one subject row
+        var afterUser = await _repo.ReplayAsync(Admin, aboutUser);
+        Assert.True(afterUser.Erased);
+        Assert.Null(afterUser.ResourceStateAtTime);
+        Assert.Null(afterUser.HasDiverged);
+    }
+
+    /// <summary>
     /// AUDIT-05: with 1,000,000 entries (seeded directly in one transaction; 1% by user actors with personal rows) an
     /// unfiltered page, a filtered page (actor + action wildcard + resource type) and a time-window page each return in
     /// under 100 ms, with their totals. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (the suite had no AUDIT-05

@@ -171,9 +171,31 @@ public class TrialAbusePrevention {
         return sha256Hex(toJson(device));
     }
 
+    /**
+     * Gate 5's answer: the decision and, for FAIL, the error the caller returns (403). error is "user_not_found" when the
+     * user has no users row, "trial_ended_no_payment_cannot_retry" for the late-payment FAIL, null for PASS/CHALLENGE.
+     * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (trial spec gate 5, Phase B.2: a missing user is FAIL
+     * {error: "user_not_found"}, fail closed; it threw an SQLException before). Touches: nothing.
+     */
+    public record TimingDecision(GateDecision decision, String error) { }
+
     /** Gate 5 with the configured trial length (default 14 days; set through the three-argument constructor). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. */
     public GateDecision checkTrialPaymentTiming(Long userId) throws SQLException {
         return checkTrialPaymentTiming(userId, trialDays);
+    }
+
+    /**
+     * Gate 5 decision only (see {@link #judgeTrialPaymentTiming(Long, int)}). In: user id, trial length in days.
+     * Out: PASS, CHALLENGE or FAIL (FAIL also for a user with no users row). Changed 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a missing user is FAIL, not an SQLException. Touches: reads the DB.
+     */
+    public GateDecision checkTrialPaymentTiming(Long userId, int trialDays) throws SQLException {
+        return judgeTrialPaymentTiming(userId, trialDays).decision();
+    }
+
+    /** Gate 5 with its error, on the configured trial length. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: reads the DB. */
+    public TimingDecision judgeTrialPaymentTiming(Long userId) throws SQLException {
+        return judgeTrialPaymentTiming(userId, trialDays);
     }
 
     /**
@@ -181,28 +203,34 @@ public class TrialAbusePrevention {
      * date is now. trial_end = users.created_at + trialDays; days_after_trial = floor((now - trial_end) / 1 day),
      * rounded toward negative infinity (Math.floorDiv); earlier_payment = the ledger already has a payment_added_date
      * for the user. PASS if days_after_trial < 5; FAIL if days_after_trial >= 90 and no earlier payment; CHALLENGE
-     * otherwise. In: user id, trial length in days. Out: the decision; SQLException if the user does not exist.
+     * otherwise. A user with no users row (or a null user id) is FAIL user_not_found (fail closed); a user with no
+     * ledger row is judged from users.created_at with no earlier payment.
+     * In: user id, trial length in days. Out: the TimingDecision.
      * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (TRIAL-10/11/15): the old rule counted from the trial
-     * START and used different thresholds. Touches: reads the database.
+     * START and used different thresholds. Changed again the same day (Phase B.2): user_not_found instead of an
+     * SQLException, and the FAIL carries its error code. Touches: reads the database.
      */
-    public GateDecision checkTrialPaymentTiming(Long userId, int trialDays) throws SQLException {
+    public TimingDecision judgeTrialPaymentTiming(Long userId, int trialDays) throws SQLException {
+        if (userId == null) return new TimingDecision(GateDecision.FAIL, "user_not_found");
         Instant trialStart;
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement("SELECT created_at FROM users WHERE id = ?")) {
             ps.setLong(1, userId);
             try (ResultSet rs = ps.executeQuery()) {
                 if (!rs.next() || rs.getTimestamp("created_at") == null) {
-                    throw new SQLException("User not found: " + userId);
+                    return new TimingDecision(GateDecision.FAIL, "user_not_found");
                 }
                 trialStart = rs.getTimestamp("created_at").toInstant();
             }
         }
         Instant trialEnd = trialStart.plus(trialDays, ChronoUnit.DAYS);
         long daysAfterTrial = Math.floorDiv(Duration.between(trialEnd, clock.instant()).toMillis(), 86_400_000L);
-        boolean earlierPayment = latestPaymentAddedDate(userId) != null;
-        if (daysAfterTrial < 5) return GateDecision.PASS;
-        if (daysAfterTrial >= 90 && !earlierPayment) return GateDecision.FAIL;
-        return GateDecision.CHALLENGE;
+        boolean earlierPayment = latestPaymentAddedDate(userId) != null;   // no ledger row -> no earlier payment
+        if (daysAfterTrial < 5) return new TimingDecision(GateDecision.PASS, null);
+        if (daysAfterTrial >= 90 && !earlierPayment) {
+            return new TimingDecision(GateDecision.FAIL, "trial_ended_no_payment_cannot_retry");
+        }
+        return new TimingDecision(GateDecision.CHALLENGE, null);
     }
 
     /**

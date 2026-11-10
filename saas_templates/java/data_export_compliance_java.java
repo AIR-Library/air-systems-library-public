@@ -104,10 +104,30 @@ public class DataExportCompliance {
         }
     }
 
-    /** A refused or failed request. {@code code()} is one of: invalid_format, invalid_reason, not_found, invalid_token,
-     *  not_pending, cannot_cancel, grace_period_expired, forbidden, email_failed, storage_error. */
+    /** A refused or failed request. {@code code()} is one of: invalid_format, invalid_reason, not_found,
+     *  invalid_confirmation_token, deletion_not_pending, cannot_cancel, grace_period_expired, forbidden, email_failed,
+     *  deletion_failed, storage_error; {@code httpStatus()} is the status the endpoint answers with.
+     *  Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-15, Phase B.2): invalid_token became
+     *  invalid_confirmation_token (400) and not_pending became deletion_not_pending (409), and each code carries its
+     *  HTTP status. */
     public static class ComplianceException extends RuntimeException {
         private final String code;
+
+        /**
+         * The HTTP status for this refusal. In: none. Out: 400 (invalid_format, invalid_reason,
+         * invalid_confirmation_token), 403 forbidden, 404 not_found, 409 (deletion_not_pending, cannot_cancel,
+         * grace_period_expired), else 500 (email_failed, deletion_failed, storage_error). Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP
+         * (EXPORT-15: the spec names a status with each answer). Touches: nothing.
+         */
+        public int httpStatus() {
+            return switch (code) {
+                case "invalid_format", "invalid_reason", "invalid_confirmation_token" -> 400;
+                case "forbidden" -> 403;
+                case "not_found" -> 404;
+                case "deletion_not_pending", "cannot_cancel", "grace_period_expired" -> 409;
+                default -> 500;
+            };
+        }
 
         public ComplianceException(String code) {
             super(code);
@@ -415,8 +435,14 @@ public class DataExportCompliance {
      * Confirms a deletion with the token from the e-mail, which proves the request came from the mailbox's owner. POST
      * /compliance/delete/:deletion_id/confirm. Only the caller's own request: anyone else's (admins included) is
      * not_found. The token is single-use, valid 24 hours and bound to this deletion id (its hash is stored on the row),
-     * and is compared in constant time; a wrong, reused or expired token is invalid_token. For a statutory reason the
-     * cascade runs before this returns (status completed, deleted_at = the returned time = now).
+     * and is compared in constant time; a wrong, reused or expired token is invalid_confirmation_token (400). For a
+     * statutory reason the cascade runs before this returns (status completed, deleted_at = the returned time = now).
+     * Checks run in this order: owner (404 not_found; a completed request has user_id NULL, so it is 404 to every
+     * caller), cancelled (409 deletion_not_pending), token (400 invalid_confirmation_token), still pending (409
+     * deletion_not_pending).
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-15, Phase B.2): codes renamed from invalid_token /
+     * not_pending, and a closed request is refused before the token is looked at, so a still-valid token on a
+     * cancelled request answers 409, not 400.
      * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-12/14): it took no caller, so anyone holding a link
      * for someone else's request could confirm it, and the token was valid for the whole grace period.
      *
@@ -424,7 +450,8 @@ public class DataExportCompliance {
      * @param deletionId the request
      * @param token      the token from the link
      * @return when the data will be (or, for a statutory reason, was) erased
-     * @throws ComplianceException not_found, invalid_token, not_pending, grace_period_expired, deletion_failed
+     * @throws ComplianceException not_found, deletion_not_pending, invalid_confirmation_token, grace_period_expired,
+     *                             deletion_failed
      */
     public Instant confirmDeletion(UUID callerId, UUID deletionId, String token) {
         List<Object[]> rows = query("SELECT confirmation_token_hash, token_expires_at, token_used_at FROM deletion_requests WHERE id = ?",
@@ -433,6 +460,7 @@ public class DataExportCompliance {
         if (deletion == null || callerId == null || !callerId.equals(deletion.userId())) {
             throw new ComplianceException("not_found");
         }
+        refuseIfClosed(deletion);
         byte[] expected = ((String) rows.get(0)[0]).getBytes(StandardCharsets.UTF_8);
         byte[] given = sha256(token == null ? "" : token).getBytes(StandardCharsets.UTF_8);
         boolean matches = MessageDigest.isEqual(expected, given);
@@ -440,10 +468,10 @@ public class DataExportCompliance {
         Instant tokenExpiresAt = (Instant) rows.get(0)[1];
         boolean usable = rows.get(0)[2] == null && tokenExpiresAt != null && !now.isAfter(tokenExpiresAt);
         if (!matches || !usable) {
-            throw new ComplianceException("invalid_token");
+            throw new ComplianceException("invalid_confirmation_token");
         }
         if (deletion.status() != DeletionStatus.PENDING) {
-            throw new ComplianceException("not_pending");
+            throw new ComplianceException("deletion_not_pending");
         }
         boolean statutory = STATUTORY_REASONS.contains(deletion.reason());
         if (!statutory && now.isAfter(deletion.willDeleteAt())) {
@@ -452,7 +480,8 @@ public class DataExportCompliance {
         int changed = update("UPDATE deletion_requests SET status = ?, token_used_at = ? WHERE id = ? AND status = ? AND token_used_at IS NULL",
                 DeletionStatus.APPROVED.value(), now, deletionId, DeletionStatus.PENDING.value());
         if (changed == 0) {
-            throw new ComplianceException("invalid_token");
+            // Another confirm with the same token won the race: for this caller the token is now a reused one.
+            throw new ComplianceException("invalid_confirmation_token");
         }
         services.audit().record("deletion_confirmed", deletion.userId(), Map.of("deletion_id", deletionId.toString()));
         if (!statutory) {
@@ -476,16 +505,19 @@ public class DataExportCompliance {
      * @param deletionId  the request
      * @param requesterId the signed-in user, who must be its owner
      * @return the new status
-     * @throws ComplianceException not_found, also when the requester may not see it; cannot_cancel; grace_period_expired
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-15, Phase B.2): a cancelled or completed request is
+     * 409 deletion_not_pending (it was cannot_cancel); a completed one has user_id NULL and is 404 not_found (spec
+     * clarification 3abb340); cannot_cancel (409) is left only for an erase already started.
+     *
+     * @throws ComplianceException not_found, also when the requester may not see it; deletion_not_pending;
+     *                             grace_period_expired; cannot_cancel
      */
     public DeletionStatus cancelDeletion(UUID deletionId, UUID requesterId) {
         DeletionView deletion = findDeletion(deletionId).orElseThrow(() -> new ComplianceException("not_found"));
         if (requesterId == null || !requesterId.equals(deletion.userId())) {
             throw new ComplianceException("not_found");
         }
-        if (deletion.status() != DeletionStatus.PENDING && deletion.status() != DeletionStatus.APPROVED) {
-            throw new ComplianceException("cannot_cancel");
-        }
+        refuseIfClosed(deletion);
         if (deletion.status() == DeletionStatus.APPROVED && clock.instant().isAfter(deletion.willDeleteAt())) {
             throw new ComplianceException("grace_period_expired");
         }
@@ -499,6 +531,18 @@ public class DataExportCompliance {
         }
         services.audit().record("deletion_cancelled", deletion.userId(), Map.of("deletion_id", deletionId.toString()));
         return DeletionStatus.CANCELLED;
+    }
+
+    /**
+     * Refuses a cancelled request: 409 deletion_not_pending, checked before the token. A completed request never gets
+     * here: its user_id is NULL (EXPORT-13), so the owner check has already answered 404 not_found. In: the caller's own
+     * request. Out: nothing, or the exception. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-15, Phase B.2,
+     * as clarified in spec commit 3abb340). Touches: nothing.
+     */
+    private static void refuseIfClosed(DeletionView deletion) {
+        if (deletion.status() == DeletionStatus.CANCELLED) {
+            throw new ComplianceException("deletion_not_pending");
+        }
     }
 
     /**

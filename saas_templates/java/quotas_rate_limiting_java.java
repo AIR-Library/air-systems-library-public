@@ -69,7 +69,9 @@ public class QuotaManager implements AutoCloseable {
      * Runs every gate for one API call and, if all pass, stores the upload (if any), records the call and
      * increments the month's usage. Input: user, endpoint, client IP, optional uploaded bytes, feature name.
      * Output: Response 200, or 429 (ip_rate_limit_exceeded / rate_limit_exceeded / quota_exceeded),
-     * 403 (feature_not_available) or 413 (storage_quota_exceeded) with a JSON body.
+     * 403 (feature_not_available_in_tier, with tier, minimum_tier and upgrade_url) or 413 (storage_quota_exceeded) with
+     * a JSON body. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (quotas spec, Phase B.2: the feature-gate refusal
+     * is named feature_not_available_in_tier in every language; it was feature_not_available).
      * Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: synchronized, so two concurrent calls cannot
      * both pass the same last unit of quota; the 403 names the real minimum tier and an upgrade hint.
      * Touches: the database.
@@ -98,14 +100,15 @@ public class QuotaManager implements AutoCloseable {
 
         // Feature gate
         if (!featureGate(user, feature)) {
+            // Spec shape (Phase B.2, 2026-11-10): 403 {error, tier, minimum_tier, upgrade_url}, every field present; a
+            // feature no tier has gets minimum_tier null and the plain upgrade page.
             Map<String, Object> details = new LinkedHashMap<>();
             details.put("tier", user.getTier().name().toLowerCase(Locale.ROOT));
             Tier minimum = minimumTier(feature);
-            if (minimum != null) {
-                details.put("minimum_tier", minimum.name().toLowerCase(Locale.ROOT));
-                details.put("upgrade_url", "/billing/upgrade?tier=" + minimum.name().toLowerCase(Locale.ROOT));
-            }
-            return errorResponse(403, "feature_not_available", details);
+            details.put("minimum_tier", minimum == null ? null : minimum.name().toLowerCase(Locale.ROOT));
+            details.put("upgrade_url", minimum == null ? "/billing/upgrade"
+                    : "/billing/upgrade?tier=" + minimum.name().toLowerCase(Locale.ROOT));
+            return errorResponse(403, "feature_not_available_in_tier", details);
         }
 
         // API quota

@@ -163,7 +163,9 @@ func TestAuditLogger_Filtering(t *testing.T) {
 		{ActorID: strPtr("1"), ActorType: "user", Action: "user_created", ResourceType: "user", ResourceID: "u1", NewValue: json.RawMessage(`{}`)},
 		{ActorID: strPtr("1"), ActorType: "user", Action: "user_suspended", ResourceType: "user", ResourceID: "u2", NewValue: json.RawMessage(`{}`)},
 		{ActorID: strPtr("2"), ActorType: "user", Action: "user_created", ResourceType: "user", ResourceID: "u3", NewValue: json.RawMessage(`{}`)},
-		{ActorID: strPtr("1"), ActorType: "service", SubjectUserID: strPtr("none"), Action: "deployment_created", ResourceType: "deployment", ResourceID: "d1", NewValue: json.RawMessage(`{}`)},
+		// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 follow-up): a service entry names its service in
+		// ActorService; ActorID is no longer taken as the service name (it was ActorID "1").
+		{ActorService: strPtr("1"), ActorType: "service", SubjectUserID: strPtr("none"), Action: "deployment_created", ResourceType: "deployment", ResourceID: "d1", NewValue: json.RawMessage(`{}`)},
 	}
 
 	for _, l := range logs {
@@ -461,7 +463,9 @@ func TestAuditLogger_Search(t *testing.T) {
 	logs := []LogMutationRequest{
 		{ActorID: strPtr("1"), ActorType: "user", Action: "user_created", ResourceType: "user", ResourceID: "u1", NewValue: json.RawMessage(`{"email": "alice@example.com"}`)},
 		{ActorID: strPtr("1"), ActorType: "user", Action: "user_updated", ResourceType: "user", ResourceID: "u2", NewValue: json.RawMessage(`{"email": "bob@example.com"}`)},
-		{ActorID: strPtr("2"), ActorType: "service", SubjectUserID: strPtr("none"), Action: "deployment_created", ResourceType: "deployment", ResourceID: "d1", NewValue: json.RawMessage(`{"name": "prod"}`)},
+		// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 follow-up): the service is named in ActorService
+		// (it was ActorID "2", which no longer stands in for it).
+		{ActorService: strPtr("2"), ActorType: "service", SubjectUserID: strPtr("none"), Action: "deployment_created", ResourceType: "deployment", ResourceID: "d1", NewValue: json.RawMessage(`{"name": "prod"}`)},
 	}
 	for _, l := range logs {
 		_, err := logger.LogMutation(ctx, l)
@@ -890,7 +894,11 @@ func TestAuditLogger_ApplyRetention(t *testing.T) {
 // subject_required), a metadata key other than feature_flag / erased_rows (400 metadata_key_not_allowed), an
 // api_key entry without actor_user_id (400 actor_user_required) and a 'user' entry with a different subject
 // (400 subject_mismatch), writing nothing; and every read by a non-admin caller gets 403 admin_only.
-// Written 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite.
+// Written 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Extended the same day (Phase B.2, audit spec
+// "Refusals by log()"): an unknown actor_type is 400 invalid_actor_type, a 'user' actor without actor_id is 400
+// actor_required, and a 'service' actor with no service name is 400 actor_service_required. Extended again the
+// same day (Phase B.2 follow-up): a 'service' actor with an actor_id but no actor_service is also 400
+// actor_service_required (actor_id is no longer used as the service name). Touches: in-memory SQLite.
 // AUDIT-10
 func TestAuditLogger_Refusals(t *testing.T) {
 	logger, err := NewAuditLogger(":memory:")
@@ -913,6 +921,22 @@ func TestAuditLogger_Refusals(t *testing.T) {
 		}},
 		{"actor_user_required", func(r *LogMutationRequest) { r.SubjectUserID, r.ActorType = strPtr("none"), "api_key" }},
 		{"subject_mismatch", func(r *LogMutationRequest) { r.ResourceType, r.SubjectUserID = "user", strPtr("2") }},
+		// Phase B.2, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the three actor refusals.
+		{"invalid_actor_type", func(r *LogMutationRequest) { r.SubjectUserID, r.ActorType = strPtr("none"), "robot" }},
+		{"actor_required", func(r *LogMutationRequest) { r.SubjectUserID, r.ActorID = strPtr("none"), nil }},
+		{"actor_required", func(r *LogMutationRequest) { r.SubjectUserID, r.ActorID = strPtr("none"), strPtr("") }},
+		{"actor_service_required", func(r *LogMutationRequest) {
+			r.SubjectUserID, r.ActorType, r.ActorID = strPtr("none"), "service", nil
+		}},
+		{"actor_service_required", func(r *LogMutationRequest) {
+			r.SubjectUserID, r.ActorType, r.ActorID, r.ActorService = strPtr("none"), "service", nil, strPtr("")
+		}},
+		// Phase B.2 follow-up, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: an actor_id does not stand in for
+		// actor_service (the base request carries ActorID "1"; the fallback used it as the service name).
+		{"actor_service_required", func(r *LogMutationRequest) { r.SubjectUserID, r.ActorType = strPtr("none"), "service" }},
+		{"actor_service_required", func(r *LogMutationRequest) {
+			r.SubjectUserID, r.ActorType, r.ActorID = strPtr("none"), "service", strPtr("billing-worker")
+		}},
 	}
 	for _, c := range cases {
 		r := base()
@@ -949,5 +973,62 @@ func TestAuditLogger_Refusals(t *testing.T) {
 				t.Errorf("read %d by %+v: expected 403 admin_only, got %v", i, caller, e)
 			}
 		}
+	}
+}
+
+// TestAuditLogger_ReplayErasedReflectsSubjectRow proves the Phase B.2 audit amendment for replay: "erased"
+// reflects the entry's OWN 'subject' row. Before any erasure every replay answers "erased": false (present in
+// the JSON); erasing the admin who acted leaves the entry's subject row, so it stays false with its state;
+// erasing the subject makes it true with state and has_diverged null; an entry with subject 'none' stays false.
+// Input: none; output: test failures. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite.
+// AUDIT-08
+func TestAuditLogger_ReplayErasedReflectsSubjectRow(t *testing.T) {
+	logger, err := NewAuditLogger(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logger.Close()
+	ctx := context.Background()
+	byAdmin, err := logger.LogMutation(ctx, LogMutationRequest{ActorID: strPtr("adm"), ActorType: "user", SubjectUserID: strPtr("cust"),
+		Action: "subscription_changed", ResourceType: "subscription", ResourceID: "sub_9",
+		OldValue: json.RawMessage(`{"tier":"solo"}`), NewValue: json.RawMessage(`{"tier":"team"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	noSubject, err := logger.LogMutation(ctx, LogMutationRequest{ActorID: strPtr("adm"), ActorType: "user", SubjectUserID: strPtr("none"),
+		Action: "deployment_created", ResourceType: "deployment", ResourceID: "dep_9", NewValue: json.RawMessage(`{"name":"x"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay := func(id string) (ReplayResponse, map[string]json.RawMessage) {
+		t.Helper()
+		rp, err := logger.Replay(ctx, admin, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := json.Marshal(rp)
+		m := map[string]json.RawMessage{}
+		_ = json.Unmarshal(raw, &m)
+		return rp, m
+	}
+	rp, m := replay(byAdmin)
+	if rp.Erased || string(m["erased"]) != "false" || string(rp.ResourceStateAtTime) != `{"tier":"solo"}` {
+		t.Fatalf("before erasure: want erased false in the JSON and the state, got %s %+v", m["erased"], rp)
+	}
+	if _, err := logger.EraseSubject(ctx, "adm"); err != nil {
+		t.Fatal(err)
+	}
+	if rp, _ := replay(byAdmin); rp.Erased || rp.HasDiverged == nil || string(rp.ResourceStateAtTime) != `{"tier":"solo"}` {
+		t.Fatalf("erasing the actor must not erase the entry's subject row: %+v", rp)
+	}
+	if _, err := logger.EraseSubject(ctx, "cust"); err != nil {
+		t.Fatal(err)
+	}
+	rp, m = replay(byAdmin)
+	if !rp.Erased || string(m["erased"]) != "true" || rp.HasDiverged != nil || string(rp.ResourceStateAtTime) != "null" {
+		t.Fatalf("after erasing the subject: want erased true, state and has_diverged null, got %+v", rp)
+	}
+	if rp, m := replay(noSubject); rp.Erased || string(m["erased"]) != "false" {
+		t.Fatalf("an entry with no subject is never erased: %+v", rp)
 	}
 }

@@ -250,6 +250,32 @@ class TestTrialAbusePrevention(unittest.TestCase):
         self.now[0] = T0 + datetime.timedelta(days=7 + 5)
         self.assertEqual(short.check_trial_payment_timing(1)["decision"], "CHALLENGE")
 
+    # TRIAL-11
+    # TRIAL-15
+    def test_trial_payment_timing_missing_user_or_ledger_row(self):
+        """No users row -> FAIL user_not_found (and subscription_created refuses 403 user_not_found, recording
+        nothing); a users row with no ledger row is judged from users.created_at with no earlier payment
+        (4 days after the trial PASS, 89 CHALLENGE, 90 FAIL), and a payment then gets its ledger row.
+        In: the clocked engine. Out: assertions. Why: the Phase B.2 amendment to gate 5 (2026-11-10).
+        2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the test database."""
+        res = self.tap.check_trial_payment_timing(999)
+        self.assertEqual((res["decision"], res["reason"]), ("FAIL", "user_not_found"))
+        self.assertEqual(self.tap.subscription_created(999, "pm_ghost"), {"error": "user_not_found", "code": 403})
+        self.assertIsNone(self.tap.get_user(999))
+
+        legacy = self.tap.add_user("legacy@example.com", created_at=T0 - datetime.timedelta(days=30))
+        self.assertIsNone(self.tap.get_user(legacy))  # no ledger row
+        for days, decision in ((4, "PASS"), (89, "CHALLENGE"), (90, "FAIL")):
+            self.now[0] = T0 - datetime.timedelta(days=30) + datetime.timedelta(days=14 + days)
+            res = self.tap.check_trial_payment_timing(legacy)
+            self.assertEqual((res["decision"], res["days_after_trial"], res["earlier_payment"]),
+                             (decision, days, False))
+        self.now[0] = T0 - datetime.timedelta(days=30) + datetime.timedelta(days=14 + 4)
+        self.assertTrue(self.tap.subscription_created(legacy, "pm_legacy")["success"])
+        self.assertIsNotNone(self.tap.get_user(legacy)["payment_added_date"])
+        self.now[0] = T0 - datetime.timedelta(days=30) + datetime.timedelta(days=14 + 90)
+        self.assertEqual(self.tap.check_trial_payment_timing(legacy)["earlier_payment"], True)
+
     # TRIAL-12
     def test_chargeback_history_pass(self):
         """No chargebacks: the gate passes and the subscription is created.

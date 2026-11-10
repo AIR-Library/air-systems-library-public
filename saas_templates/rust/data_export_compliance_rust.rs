@@ -18,6 +18,10 @@
 //! single-use; confirm and cancel act only on the caller's own request; the cascade logs
 //! 'user_deleted_cascade', then calls an injected `AuditEraser` last, and nulls deletion_requests.user_id;
 //! the admin lists check the verified caller's role.
+//! Amended 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP, Phase B.2, EXPORT-15): a wrong, reused or expired
+//! token is one 400 invalid_confirmation_token; a cancelled request is 409 deletion_not_pending; a
+//! completed one (it has no owner) and another user's are 404 not_found (`ComplianceError::code`/`status`). The cascade
+//! now also clears user_id on this module's own audit_log rows, so nothing personal remains.
 //! Touches: the SQLite database it owns; files through `FileStorage` (S3 in production, memory in
 //! tests); email through `Mailer` (network in production); the clock; OS randomness. No money.
 
@@ -43,7 +47,11 @@ pub const CONFIRM_TOKEN_HOURS: i64 = 24;
 /// User-data tables the cascade deletes from (the audit log is kept on purpose).
 pub const CASCADE_TABLES: [&str; 6] = ["sessions", "activity", "files", "preferences", "transactions", "api_keys"];
 
-/// What: compliance errors. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+/// What: compliance errors; `code()` and `status()` give the spec's error code and HTTP status.
+/// Changed 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP, Phase B.2, EXPORT-15): `TokenMismatch` and
+/// `TokenExpired` became one `InvalidConfirmationToken` (a wrong, reused or expired token gets one answer,
+/// 400 invalid_confirmation_token, so the reply never says which); `DeletionNotPending` (409) is a request
+/// that is cancelled or completed; `GracePeriodOver` (409) is a cancel after will_delete_at. Touches: nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComplianceError {
     Db(String),
@@ -51,13 +59,53 @@ pub enum ComplianceError {
     Email(String),
     UserNotFound,
     ExportNotFound,
+    /// Another user's deletion request, or none: 404 not_found (EXPORT-14/15).
     DeletionNotFound,
-    TokenMismatch,
-    TokenExpired,
+    /// A wrong, reused or expired confirmation token: 400 invalid_confirmation_token (EXPORT-15).
+    InvalidConfirmationToken,
+    /// Confirm or cancel of a request no longer pending: 409 deletion_not_pending (EXPORT-15).
+    DeletionNotPending,
+    /// Cancel after the grace period ended: 409 grace_period_over.
+    GracePeriodOver,
     AuditErase(String),
     NotAllowed(String),
     InvalidLink,
     LinkExpired,
+}
+
+/// What: the spec's error code and HTTP status for each `ComplianceError`. In: the error.
+/// Out: (`code()`: the `{error: ...}` string, `status()`: the HTTP status). Why: EXPORT-15 (Phase B.2: one
+/// answer in every language: 404 not_found, 400 invalid_confirmation_token, 409 deletion_not_pending).
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+impl ComplianceError {
+    /// What: the error code a server puts in `{error: ...}`. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// Touches: nothing.
+    pub fn code(&self) -> &'static str {
+        match self {
+            ComplianceError::Db(_) | ComplianceError::Storage(_) | ComplianceError::Email(_) | ComplianceError::AuditErase(_) => "internal_error",
+            ComplianceError::UserNotFound => "user_not_found",
+            ComplianceError::ExportNotFound | ComplianceError::DeletionNotFound => "not_found",
+            ComplianceError::InvalidConfirmationToken => "invalid_confirmation_token",
+            ComplianceError::DeletionNotPending => "deletion_not_pending",
+            ComplianceError::GracePeriodOver => "grace_period_over",
+            ComplianceError::NotAllowed(_) => "forbidden",
+            ComplianceError::InvalidLink => "invalid_link",
+            ComplianceError::LinkExpired => "link_expired",
+        }
+    }
+
+    /// What: the HTTP status for the error. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+    pub fn status(&self) -> u16 {
+        match self {
+            ComplianceError::Db(_) | ComplianceError::Storage(_) | ComplianceError::Email(_) | ComplianceError::AuditErase(_) => 500,
+            ComplianceError::UserNotFound | ComplianceError::ExportNotFound | ComplianceError::DeletionNotFound => 404,
+            ComplianceError::InvalidConfirmationToken => 400,
+            ComplianceError::DeletionNotPending | ComplianceError::GracePeriodOver => 409,
+            ComplianceError::NotAllowed(_) => 403,
+            ComplianceError::InvalidLink => 403,
+            ComplianceError::LinkExpired => 410,
+        }
+    }
 }
 
 /// What: `fmt::Display` for `ComplianceError`. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing beyond what each method says.
@@ -652,37 +700,61 @@ impl ComplianceService {
         })
     }
 
+    /// What: the caller's own deletion request with its token hash and token expiry, or `DeletionNotFound`
+    /// (404 not_found) for none and for anyone else's, so the two cannot be told apart. A completed request
+    /// has no owner any more (user_id NULL, EXPORT-13), so it is 404 to every caller; the status filter
+    /// keeps that true even for a completed row that still names a user. In: connection, the verified caller, deletion id.
+    /// Out: (request, token hash, token expiry). Why: EXPORT-14/15. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// Touches: database (read).
+    fn own_deletion(conn: &Connection, user_id: i64, deletion_id: &str) -> Result<(DeletionRequest, String, Option<String>), ComplianceError> {
+        conn.query_row(
+            "SELECT id, user_id, requested_at, status, reason, scheduled_for, deleted_at, token_hash, token_expires_at
+             FROM deletion_requests WHERE id = ?1 AND user_id = ?2 AND status != 'completed'",
+            params![deletion_id, user_id],
+            |r| Ok((Self::deletion_row(r)?, r.get(7)?, r.get(8)?)),
+        )
+        .optional()?
+        .ok_or(ComplianceError::DeletionNotFound)
+    }
+
+    /// What: refuse a cancelled request with `DeletionNotPending` (409 deletion_not_pending). Checked before
+    /// the token, so a cancelled request's token, spent or not, never reads as a wrong token. (A completed
+    /// request never gets here: `own_deletion` answers 404 for it.) In: the request. Out: `()` or the error.
+    /// Why: EXPORT-15 (Phase B.2, as amended in commit 3abb340: completed is 404, cancelled is 409).
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+    fn refuse_if_closed(d: &DeletionRequest) -> Result<(), ComplianceError> {
+        if matches!(d.status, DeletionStatus::Cancelled) {
+            return Err(ComplianceError::DeletionNotPending);
+        }
+        Ok(())
+    }
+
     /// What: confirm the caller's own deletion with the emailed token (spec endpoint 4). Order: the
-    /// request must be the caller's (else `DeletionNotFound`, 404, for anyone else's); the token's SHA-256
-    /// must match in constant time (`TokenMismatch`; a used token's hash is cleared, so a reused token is
-    /// refused the same way); the token must be under 24 hours old (`TokenExpired`); the request must be
-    /// pending. Then pending -> approved and the token is spent. For a statutory reason the cascade runs
-    /// before this returns: status 'completed', deleted_at = deletion_scheduled_for = now (if the cascade
-    /// fails, the request stays approved and due now, and the error is returned).
+    /// request must be the caller's and not completed (else `DeletionNotFound`, 404 not_found, for anyone
+    /// else's and for a completed one); it must not be cancelled (else `DeletionNotPending`, 409); the token's SHA-256 must match in
+    /// constant time and the token must be under 24 hours old, else `InvalidConfirmationToken` (400) for a
+    /// wrong, reused (a used token's hash is cleared) or expired token alike; the request must be pending
+    /// (an approved one already spent its token, so it is refused as a reused token above). Then pending
+    /// -> approved and the token is spent. For a statutory reason the cascade runs before this returns:
+    /// status 'completed', deleted_at = deletion_scheduled_for = now (if the cascade fails, the request
+    /// stays approved and due now, and the error is returned).
     /// In: the authenticated user (from the server's session), deletion id, token. Out: when it runs.
-    /// Why: 2026-11-10 amendment (EXPORT-12/14). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// Why: 2026-11-10 amendment (EXPORT-12/14); changed 2026-11-10 for EXPORT-15 (Phase B.2: one 400 for a
+    /// wrong, reused or expired token; 409 for a closed request). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
     /// Touches: database; for a statutory reason also file storage and the audit eraser.
     pub async fn confirm_deletion(&self, user_id: i64, deletion_id: String, token: &str) -> Result<ConfirmDeletionResponse, ComplianceError> {
         let (d, now) = {
             let conn = self.db();
-            let row: Option<(DeletionRequest, String, Option<String>)> = conn
-                .query_row(
-                    "SELECT id, user_id, requested_at, status, reason, scheduled_for, deleted_at, token_hash, token_expires_at
-                     FROM deletion_requests WHERE id = ?1 AND user_id = ?2",
-                    params![deletion_id, user_id],
-                    |r| Ok((Self::deletion_row(r)?, r.get(7)?, r.get(8)?)),
-                )
-                .optional()?;
-            let (d, hash, expires) = row.ok_or(ComplianceError::DeletionNotFound)?;
-            if !ct_eq(hex(&Sha256::digest(token.as_bytes())).as_bytes(), hash.as_bytes()) {
-                return Err(ComplianceError::TokenMismatch);
-            }
+            let (d, hash, expires) = Self::own_deletion(&conn, user_id, &deletion_id)?;
+            Self::refuse_if_closed(&d)?;
             let now = (self.clock)();
-            if parse_ts(expires).map_or(true, |e| now >= e) {
-                return Err(ComplianceError::TokenExpired);
+            let matches = !hash.is_empty() && ct_eq(hex(&Sha256::digest(token.as_bytes())).as_bytes(), hash.as_bytes());
+            let expired = parse_ts(expires).map_or(true, |e| now >= e);
+            if !matches || expired {
+                return Err(ComplianceError::InvalidConfirmationToken);
             }
             if d.status != DeletionStatus::Pending {
-                return Err(ComplianceError::NotAllowed(format!("deletion is {}", d.status.as_str())));
+                return Err(ComplianceError::DeletionNotPending);
             }
             let scheduled = if d.reason.is_statutory() { now } else { d.scheduled_for };
             let n = conn.execute(
@@ -691,7 +763,7 @@ impl ComplianceService {
                 params![d.id, user_id, ts(scheduled), hash],
             )?;
             if n != 1 {
-                return Err(ComplianceError::TokenMismatch);
+                return Err(ComplianceError::InvalidConfirmationToken);
             }
             self.audit(&conn, user_id, "deletion_confirmed", json!({ "deletion_id": d.id }))?;
             (DeletionRequest { scheduled_for: scheduled, ..d }, now)
@@ -703,21 +775,18 @@ impl ComplianceService {
         Ok(ConfirmDeletionResponse { success: true, deletion_scheduled_for: d.scheduled_for })
     }
 
-    /// What: cancel the caller's own deletion within the grace period (spec endpoint 5); anyone else's
-    /// request is `DeletionNotFound` (404). In: the authenticated user, deletion id. Out: cancelled.
-    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
+    /// What: cancel the caller's own deletion within the grace period (spec endpoint 5). Anyone else's
+    /// request, and a completed one, is `DeletionNotFound` (404 not_found); a cancelled one is
+    /// `DeletionNotPending` (409 deletion_not_pending); after will_delete_at it is `GracePeriodOver` (409). The token is spent.
+    /// In: the authenticated user, deletion id. Out: cancelled. Changed 2026-11-10 for EXPORT-15 (Phase B.2:
+    /// a closed request was a generic `NotAllowed`). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// Touches: database.
     pub async fn cancel_deletion(&self, user_id: i64, deletion_id: String) -> Result<CancelDeletionResponse, ComplianceError> {
         let conn = self.db();
-        let d = conn
-            .query_row(
-                "SELECT id, user_id, requested_at, status, reason, scheduled_for, deleted_at FROM deletion_requests WHERE id = ?1 AND user_id = ?2",
-                params![deletion_id, user_id],
-                Self::deletion_row,
-            )
-            .optional()?
-            .ok_or(ComplianceError::DeletionNotFound)?;
-        if !matches!(d.status, DeletionStatus::Pending | DeletionStatus::Approved) || (self.clock)() >= d.scheduled_for {
-            return Err(ComplianceError::NotAllowed("the grace period is over or the request is closed".into()));
+        let (d, _, _) = Self::own_deletion(&conn, user_id, &deletion_id)?;
+        Self::refuse_if_closed(&d)?;
+        if (self.clock)() >= d.scheduled_for {
+            return Err(ComplianceError::GracePeriodOver);
         }
         conn.execute("UPDATE deletion_requests SET status = 'cancelled', token_hash = '' WHERE id = ?1", params![d.id])?;
         self.audit(&conn, user_id, "deletion_cancelled", json!({ "deletion_id": d.id }))?;
@@ -766,13 +835,17 @@ impl ComplianceService {
     /// (1) delete the user's rows (export requests, every user table, the user), never the audit tables;
     /// (2) log 'user_deleted_cascade' with the user as subject (counts only); complete the deletion
     /// request and set deletion_requests.user_id NULL for every request of this user (so the rows cannot
-    /// re-identify erased audit entries); (3) call the audit eraser's erase_subject(user_id) LAST, then
-    /// commit. Nothing logs this user afterwards. If an export file cannot be removed it returns
+    /// re-identify erased audit entries); (3) erase: this module's own audit_log rows keep their action,
+    /// time and details but their user_id is set NULL, then the audit eraser's erase_subject(user_id) is
+    /// called LAST, then commit. Nothing logs this user afterwards, and nothing personal is left in this
+    /// module's tables. If an export file cannot be removed it returns
     /// `Storage` before the transaction starts; if the eraser fails the transaction rolls back
     /// (`AuditErase`); either way nothing is deleted and the call can be retried.
     /// In: user id, the deletion request being completed (if any). Out: `()`.
     /// Why: export cleanup for the CodeRabbit review on PR 19; order, eraser and NULL user_id for the
-    /// 2026-11-10 amendment (EXPORT-13). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// 2026-11-10 amendment (EXPORT-13); the local audit_log user_id is cleared since 2026-11-10 (Phase B.2
+    /// bug: it kept the deleted user's id, so the audit rows still named them after the cascade).
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
     /// Touches: database, file storage (deletes files), the audit eraser.
     async fn cascade(&self, user_id: i64, deletion_id: Option<&str>) -> Result<(), ComplianceError> {
         let mut conn = self.db();
@@ -807,6 +880,8 @@ impl ComplianceService {
                 token_hash = '', user_id = NULL WHERE user_id = ?1",
             params![user_id],
         )?;
+        // Phase B.2 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): the rows stay (EXPORT-08), the link to the person goes.
+        tx.execute("UPDATE audit_log SET user_id = NULL WHERE user_id = ?1", params![user_id])?;
         self.audit_eraser.erase_subject(user_id).map_err(ComplianceError::AuditErase)?;
         tx.commit()?;
         Ok(())
@@ -847,7 +922,8 @@ impl ComplianceService {
 }
 
 /// The schema: the spec's two tables (plus file key, schedule, token hash and token expiry; deletion
-/// user_id is nullable since 2026-11-10, EXPORT-13), the audit log, and
+/// user_id is nullable since 2026-11-10, EXPORT-13), the audit log (user_id NULL once the user is erased,
+/// 2026-11-10 Phase B.2), and
 /// the application's user tables that exports read and the cascade deletes.
 pub const MIGRATIONS: &str = "
 CREATE TABLE IF NOT EXISTS export_requests (id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, requested_at TEXT NOT NULL,
@@ -856,7 +932,7 @@ CREATE TABLE IF NOT EXISTS export_requests (id TEXT PRIMARY KEY, user_id INTEGER
 CREATE TABLE IF NOT EXISTS deletion_requests (id TEXT PRIMARY KEY, user_id INTEGER NULL, requested_at TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('pending','approved','completed','cancelled')), reason TEXT NOT NULL,
     scheduled_for TEXT NOT NULL, deleted_at TEXT NULL, token_hash TEXT NOT NULL, token_expires_at TEXT NULL);
-CREATE TABLE IF NOT EXISTS audit_log (id TEXT PRIMARY KEY, user_id INTEGER, action TEXT NOT NULL, created_at TEXT NOT NULL, details TEXT);
+CREATE TABLE IF NOT EXISTS audit_log (id TEXT PRIMARY KEY, user_id INTEGER NULL, action TEXT NOT NULL, created_at TEXT NOT NULL, details TEXT);
 CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, email TEXT NOT NULL, name TEXT NOT NULL, created_at TEXT NOT NULL,
     tier TEXT NOT NULL, status TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, ip TEXT, device TEXT, created_at TEXT);

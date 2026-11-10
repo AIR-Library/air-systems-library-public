@@ -31,7 +31,8 @@ export interface Database {
 
 /**
  * An error with an HTTP status and a stable code: 400 subject_required / subject_mismatch / metadata_key_not_allowed
- * / actor_user_required / actor_required / invalid_actor_type, 403 forbidden, 404 not_found.
+ * / actor_user_required / actor_required / actor_service_required / invalid_actor_type, 403 forbidden, 404 not_found.
+ * (actor_service_required added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, Phase B.2.)
  * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
  */
 export class AuditError extends Error {
@@ -256,7 +257,11 @@ export class AuditLogger {
 
   /**
    * Validates one entry against the spec's rules. In: the input. Out: the resolved subject user id ('none' or an
-   * id). Throws AuditError 400 (codes in the AUDIT-10 row and the schema notes). Touches nothing.
+   * id). Throws AuditError 400 (codes in the AUDIT-10 row and the schema notes): invalid_actor_type (actor_type not
+   * user / service / api_key), actor_required (a 'user' actor without actor_id), actor_service_required (a 'service'
+   * actor without actor_service), actor_user_required, subject_required, subject_mismatch, metadata_key_not_allowed.
+   * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 audit amendment): a 'service' actor without
+   * actor_service was accepted (actor_id stood in for it, or it was stored NULL). Touches nothing.
    */
   private validate(input: LogInput): string {
     if (!ACTOR_TYPES.has(input.actor_type)) {
@@ -294,6 +299,9 @@ export class AuditLogger {
     if (input.actor_type === 'user' && (input.actor_id === null || input.actor_id === undefined)) {
       throw new AuditError('actor_required', 'a user actor needs actor_id', 400);
     }
+    if (input.actor_type === 'service' && (typeof input.actor_service !== 'string' || input.actor_service.trim() === '')) {
+      throw new AuditError('actor_service_required', 'a service actor needs actor_service (the service name)', 400);
+    }
     if (input.actor_type === 'api_key' && (input.actor_user_id === null || input.actor_user_id === undefined)) {
       throw new AuditError('actor_user_required', 'an api_key actor needs actor_user_id (the key owner)', 400);
     }
@@ -323,7 +331,9 @@ export class AuditLogger {
 
   /**
    * Inserts one validated entry and its personal rows; the caller holds the transaction. In: input and subject.
-   * Out: { success, log_id }. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the three audit tables.
+   * Out: { success, log_id }. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP; Phase B.2 the same day: actor_service is
+   * taken only from actor_service (validate() now requires it for a service actor; actor_id no longer stands in).
+   * Touches: the three audit tables.
    */
   private async insertEntry(input: LogInput, subject: string): Promise<{ success: true; log_id: string }> {
     const logId = randomUUID();
@@ -331,9 +341,7 @@ export class AuditLogger {
     const actorUser = input.actor_type === 'user' ? input.actor_id : input.actor_type === 'api_key' ? input.actor_user_id : null;
     const hasActor = actorUser !== null && actorUser !== undefined;
     const roles = [hasActor ? 'actor' : '', hasSubject ? 'subject' : ''].filter(Boolean).join(',');
-    const actorService = input.actor_type === 'service'
-      ? (input.actor_service ?? (input.actor_id !== null && input.actor_id !== undefined ? String(input.actor_id) : null))
-      : null;
+    const actorService = input.actor_type === 'service' ? (input.actor_service ?? null) : null;
     const val = (v: any) => (v === undefined ? null : JSON.stringify(v));
 
     await this.db.query(

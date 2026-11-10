@@ -3,7 +3,7 @@
 //!
 //! What: `NotificationService` renders the spec's templates (`{variable}` substitution, one pass),
 //! honours do-not-disturb, quiet hours, per-channel preferences and email unsubscribe, sends through an
-//! injected `Sender` with up to 3 attempts and exponential backoff, and logs every message (sent,
+//! injected `Sender` with up to 4 attempts (3 retries) and exponential backoff, and logs every message (sent,
 //! queued, skipped or failed) so it can be tracked, opened and clicked. A message scheduled for later is
 //! logged `queued`; the host must call `deliver_due` on a schedule (for example every minute from its
 //! job runner or cron) to send the queued messages whose time has come (added for the CodeRabbit
@@ -18,6 +18,11 @@
 //! POST unsubscribes (channels_enabled[channel] = false); quiet hours queue the message until
 //! quiet_hours_end; `deliver_due(now)` re-queues rows stuck at 'sending' for over 300 s, claims due rows
 //! with a conditional update, re-checks preferences and finishes with a write conditional on its claim.
+//! Amended 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, NOTIF-05/07/08): a failed send is
+//! retried up to 3 times after the first attempt (4 attempts, waiting 1 s, 2 s and 4 s); `deliver_due`
+//! re-checks quiet hours (HH:MM, UTC, may cross midnight) and puts a due message that falls inside them
+//! back to 'queued' with scheduled_at = quiet_hours_end; `open_message` (GET /notifications/open/:id)
+//! sets opened_at and status 'opened' the first time only and answers 204 either way.
 //! Touches: the SQLite database it is given (in memory for tests); the network only through the
 //! injected sender; no money.
 
@@ -34,8 +39,13 @@ use std::time::Duration;
 
 /// The channels the service knows.
 pub const CHANNELS: [&str; 3] = ["email", "sms", "in_app"];
-/// Attempts per message before it is logged as failed (spec: "retry 3x").
-pub const MAX_ATTEMPTS: u32 = 3;
+/// Attempts per message before it is logged as failed: the first plus up to 3 retries (spec, amended
+/// 2026-11-10 Phase B.2: "retry up to 3 times after the first attempt (at most 4 attempts)"; it was 3
+/// attempts in all). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+pub const MAX_ATTEMPTS: u32 = 4;
+/// The wait before the first retry; it doubles before each later one: 1 s, 2 s, 4 s (spec, Phase B.2;
+/// it was 500 ms). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+pub const RETRY_BACKOFF_BASE: Duration = Duration::from_secs(1);
 /// A row claimed ('sending') longer ago than this is taken to belong to a crashed worker (spec: 300 s).
 pub const STALE_CLAIM_SECS: i64 = 300;
 /// Shortest accepted unsubscribe secret, in bytes (spec: the service refuses to start below 32).
@@ -126,13 +136,15 @@ pub struct UserNotificationPreferences {
 }
 
 /// What: the outcome counts of one `deliver_due` run. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP
-/// (NOTIF-12). Touches: nothing.
+/// (NOTIF-12). `deferred` (added 2026-11-10, Phase B.2, NOTIF-05) counts due messages put back to
+/// 'queued' until quiet_hours_end because the user is in quiet hours now. Touches: nothing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeliverCounts {
     pub requeued: usize,
     pub sent: usize,
     pub skipped: usize,
     pub failed: usize,
+    pub deferred: usize,
 }
 
 /// What: a partial preferences update; `None` keeps the stored value. 2026-11-10,
@@ -371,7 +383,7 @@ impl NotificationService {
             sender,
             clock: Box::new(Utc::now),
             sleeper: Box::new(std::thread::sleep),
-            backoff_base: Duration::from_millis(500),
+            backoff_base: RETRY_BACKOFF_BASE,
             unsubscribe_secret: unsubscribe_secret.to_vec(),
             base_url: "https://app.example.com".to_string(),
         })
@@ -591,7 +603,7 @@ impl NotificationService {
     /// What: send one templated notification. Order: unknown template or channel -> error;
     /// do-not-disturb -> skipped; a future `scheduled_at`, or now inside the user's quiet hours ->
     /// stored 'queued' with scheduled_at (the requested time, or the next quiet_hours_end) for
-    /// `deliver_due`; a disabled or unavailable channel -> skipped; otherwise up to 3 attempts with
+    /// `deliver_due`; a disabled or unavailable channel -> skipped; otherwise up to 4 attempts (3 retries; changed 2026-11-10, Phase B.2) with
     /// exponential backoff -> sent or failed. Every outcome is logged under the returned message id.
     /// In: user, template key, channel or `None` (auto), vars, schedule. Out: `SendResponse`.
     /// Why: spec endpoint 1; quiet hours queue instead of dropping since the 2026-11-10 amendment
@@ -673,10 +685,12 @@ impl NotificationService {
         }
     }
 
-    /// What: hand a message to the sender up to `MAX_ATTEMPTS` times with exponential backoff
-    /// (`backoff_base`, x2 per attempt) between tries. In: the message. Out: `Ok(attempt that
-    /// succeeded)` or `Err(last provider error)`. Why: the one retry loop for immediate and queued
-    /// messages (moved out of `send_single_notification` for the CodeRabbit review on PR 19).
+    /// What: hand a message to the sender up to `MAX_ATTEMPTS` (4) times: the first attempt and up to 3
+    /// retries, waiting `backoff_base` (1 s), then 2 s, then 4 s before them; no wait after the last.
+    /// In: the message. Out: `Ok(attempt that succeeded)` or `Err(last provider error)`. Why: the one retry
+    /// loop for immediate and queued messages (moved out of `send_single_notification` for the CodeRabbit
+    /// review on PR 19); counting changed 2026-11-10 (Phase B.2, NOTIF-08: 3 retries after the first
+    /// attempt, as background jobs count; it made 3 attempts in all with 0.5 s / 1 s).
     /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the sender (network in production), the sleeper.
     fn send_with_retries(&self, message: &OutgoingMessage) -> Result<u32, String> {
         let mut last_error = String::new();
@@ -701,11 +715,13 @@ impl NotificationService {
     ///    by one: UPDATE ... SET status = 'sending', claimed_at = now WHERE id = ? AND status = 'queued'
     ///    (a row another worker claimed first is skipped);
     /// 3. preferences are checked NOW: channel off (an unsubscribe), no enabled channel, or
-    ///    do-not-disturb -> 'skipped';
+    ///    do-not-disturb -> 'skipped'; inside the user's quiet hours at `now` -> back to 'queued' with
+    ///    scheduled_at = the next quiet_hours_end and claimed_at cleared (counted as `deferred`);
     /// 4. the final write is UPDATE ... WHERE id = ? AND status = 'sending' AND claimed_at = <this claim>.
-    /// In: now. Out: counts {requeued, sent, skipped, failed}.
+    /// In: now. Out: counts {requeued, sent, skipped, failed, deferred}.
     /// Why: CodeRabbit review on PR 19 (queued rows were never delivered); steps 1-4 from the 2026-11-10
-    /// amendment (NOTIF-12). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// amendment (NOTIF-12); the quiet-hours re-check from Phase B.2 (2026-11-10, NOTIF-05: a scheduled
+    /// message that fell due inside quiet hours was sent anyway). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
     /// Touches: database (notification_logs), the sender (network in production), the sleeper.
     pub fn deliver_due(&self, now: DateTime<Utc>) -> SqlResult<DeliverCounts> {
         let mut counts = DeliverCounts::default();
@@ -771,6 +787,17 @@ impl NotificationService {
                     continue;
                 }
             };
+            // 3b. quiet hours as they are now (Phase B.2, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+            if in_quiet_hours(&prefs, now) {
+                if let Some(end) = prefs.quiet_hours_end.as_deref().and_then(|end| quiet_hours_end_after(now, end)) {
+                    counts.deferred += self.conn.execute(
+                        "UPDATE notification_logs SET status = 'queued', scheduled_at = ?2, claimed_at = NULL
+                         WHERE id = ?1 AND status = 'sending' AND claimed_at = ?3",
+                        params![id, ts(end), claim],
+                    )?;
+                    continue;
+                }
+            }
             let vars: HashMap<String, String> = serde_json::from_str(&vars_json).unwrap_or_default();
             let message = self.build_message(&template, &id, user_id, &channel, &vars);
             match self.send_with_retries(&message) {
@@ -833,40 +860,76 @@ impl NotificationService {
         )
     }
 
-    /// What: set a column to now, once, on a sent message. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// What: set a column to now, once, on a delivered (sent or opened) message. In: message id, column.
+    /// Out: `()`, or `QueryReturnedNoRows` for an unknown or undelivered message. Changed 2026-11-10 (Phase
+    /// B.2): an opened message (status 'opened') still takes a click. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
     /// Touches: database (write).
     fn stamp(&self, message_id: &str, column: &str) -> SqlResult<()> {
-        let sql = format!("UPDATE notification_logs SET {c} = COALESCE({c}, ?1) WHERE id = ?2 AND status = 'sent'", c = column);
+        let sql = format!("UPDATE notification_logs SET {c} = COALESCE({c}, ?1) WHERE id = ?2 AND status IN ('sent', 'opened')", c = column);
         let n = self.conn.execute(&sql, params![ts((self.clock)()), message_id])?;
         if n == 0 { Err(rusqlite::Error::QueryReturnedNoRows) } else { Ok(()) }
     }
 
-    /// What: mark a sent message opened (the tracking link was followed). Why: spec tracking.
-    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (write).
-    pub fn mark_opened(&self, message_id: &str) -> SqlResult<()> {
-        self.stamp(message_id, "opened_at")
+    /// What: record the first opening of a sent message: opened_at = now and status 'opened', only while
+    /// it is 'sent' and not yet opened, so a second opening changes nothing. In: message id. Out: how many
+    /// rows changed (1 the first time, else 0). Why: NOTIF-07 (Phase B.2). 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (write).
+    fn record_open(&self, message_id: &str) -> SqlResult<usize> {
+        self.conn.execute(
+            "UPDATE notification_logs SET opened_at = ?1, status = 'opened' WHERE id = ?2 AND status = 'sent' AND opened_at IS NULL",
+            params![ts((self.clock)()), message_id],
+        )
     }
 
-    /// What: mark a sent message clicked; a click implies it was opened. Why: spec tracking.
+    /// What: GET /notifications/open/:message_id, the tracking pixel or link (this template has no router,
+    /// so the host routes that path here). The first call on a sent message sets opened_at and status
+    /// 'opened'; any later call, or an unknown or unsent id, changes nothing. In: message id. Out: the HTTP
+    /// status, always 204 (so the answer never says whether an id exists or was opened before), or a
+    /// database error. Why: NOTIF-07 (Phase B.2, 2026-11-10: the spec now names this endpoint).
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (write).
+    pub fn open_message(&self, message_id: &str) -> SqlResult<u16> {
+        self.record_open(message_id)?;
+        Ok(204)
+    }
+
+    /// What: mark a delivered message opened (the tracking link was followed): as `open_message`, but an
+    /// unknown or undelivered message is `QueryReturnedNoRows`; a second call is `Ok` and changes nothing.
+    /// Why: spec tracking; since 2026-11-10 (Phase B.2, NOTIF-07) it also sets status 'opened', once.
+    /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (write).
+    pub fn mark_opened(&self, message_id: &str) -> SqlResult<()> {
+        if self.record_open(message_id)? == 0 {
+            let opened: Option<String> = self
+                .conn
+                .query_row("SELECT status FROM notification_logs WHERE id = ?1 AND status = 'opened'", params![message_id], |r| r.get(0))
+                .optional()?;
+            opened.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        }
+        Ok(())
+    }
+
+    /// What: mark a delivered message clicked; a click implies it was opened. Why: spec tracking.
+    /// Changed 2026-11-10 (Phase B.2): goes through `mark_opened`, so the status becomes 'opened'.
     /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (write).
     pub fn mark_clicked(&self, message_id: &str) -> SqlResult<()> {
         self.stamp(message_id, "clicked_at")?;
-        self.stamp(message_id, "opened_at")
+        self.mark_opened(message_id)
     }
 
-    /// What: record a provider bounce for a sent message. Why: spec tracking ("bounced").
+    /// What: record a provider bounce for a delivered (sent or opened) message. Why: spec tracking
+    /// ("bounced"). Changed 2026-11-10 (Phase B.2): an opened message can still bounce later.
     /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (write).
     pub fn mark_bounced(&self, message_id: &str) -> SqlResult<()> {
-        let n = self.conn.execute("UPDATE notification_logs SET bounced = 1 WHERE id = ?1 AND status = 'sent'", params![message_id])?;
+        let n = self.conn.execute("UPDATE notification_logs SET bounced = 1 WHERE id = ?1 AND status IN ('sent', 'opened')", params![message_id])?;
         if n == 0 { Err(rusqlite::Error::QueryReturnedNoRows) } else { Ok(()) }
     }
 
     /// What: in-app messages for a user, newest last, ids only. Why: spec "In-app: store in
-    /// notification_logs, fetch via /notifications endpoint". 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    /// notification_logs, fetch via /notifications endpoint". Changed 2026-11-10 (Phase B.2): an opened
+    /// message (status 'opened') is still listed. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
     /// Touches: database (read).
     pub fn list_in_app(&self, user_id: i64) -> SqlResult<Vec<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id FROM notification_logs WHERE user_id = ?1 AND channel = 'in_app' AND status = 'sent' ORDER BY rowid",
+            "SELECT id FROM notification_logs WHERE user_id = ?1 AND channel = 'in_app' AND status IN ('sent', 'opened') ORDER BY rowid",
         )?;
         let ids = stmt.query_map(params![user_id], |r| r.get(0))?.collect::<SqlResult<Vec<String>>>()?;
         Ok(ids)

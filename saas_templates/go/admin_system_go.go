@@ -17,6 +17,12 @@
 // approved); create and reset_password really send the invite / reset email through the injectable
 // Mail, with a single-use token stored as its SHA-256; every mutation writes its audit row in the same
 // transaction as the change.
+//
+// Phase B.2, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (admin spec "EVERY ACTION" and "TIERS", ADMIN-19):
+// a suspended caller is refused with 403 account_suspended before any gate; the staff role (users.role, the
+// spec's users.tier: owner/admin/user) and the plan (customers.tier and deployments.tier: solo/team/enterprise)
+// are validated separately and never mixed (400 invalid_tier); deployments carry domain_verified (default
+// false) and publish needs it (400 domain_not_verified).
 package admin
 
 import (
@@ -45,7 +51,12 @@ import (
 
 // ---------- Constants & Globals ----------
 var (
+	// allowedRoles are the staff roles (users.role, the spec's users.tier). allowedPlans are the plans a
+	// customer or deployment is on (customers.tier, deployments.tier). The two never mix: a value from one
+	// list where the other is expected is 400 invalid_tier. allowedPlans added 2026-11-10,
+	// session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, admin spec "TIERS"; plans reused the role names).
 	allowedRoles = []string{"owner", "admin", "user"}
+	allowedPlans = []string{"solo", "team", "enterprise"}
 	csrfHeader   = "X-CSRF-Token"
 	// csrfToken is the expected CSRF token. It is random per process (never a hard-coded secret);
 	// a host app should bind a token to each session and set it here or replace verifyCSRF.
@@ -108,12 +119,13 @@ type StripePlanChanger struct {
 }
 
 // NewStripePlanChangerFromEnv builds a StripePlanChanger from STRIPE_SECRET_KEY and
-// STRIPE_PRICE_OWNER / STRIPE_PRICE_ADMIN / STRIPE_PRICE_USER. Output: the adapter (calls fail with a
-// clear error when the key or a price is missing). Added 2026-11-10, session
-// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: environment variables only.
+// STRIPE_PRICE_SOLO / STRIPE_PRICE_TEAM / STRIPE_PRICE_ENTERPRISE (one price per plan). Output: the adapter
+// (calls fail with a clear error when the key or a price is missing). Added 2026-11-10, session
+// session_012zDydZCZ4AChqhEZ4oVtaP; the same day (Phase B.2, admin spec "TIERS") prices are keyed by plan,
+// not by staff role (it read STRIPE_PRICE_OWNER / _ADMIN / _USER). Touches: environment variables only.
 func NewStripePlanChangerFromEnv() *StripePlanChanger {
 	prices := map[string]string{}
-	for _, tier := range allowedRoles {
+	for _, tier := range allowedPlans {
 		if v := os.Getenv("STRIPE_PRICE_" + strings.ToUpper(tier)); v != "" {
 			prices[tier] = v
 		}
@@ -154,7 +166,8 @@ func (s *StripePlanChanger) stripeDo(ctx context.Context, method, path string, f
 	return json.Unmarshal(raw, out)
 }
 
-// PriceID returns the configured Stripe price for a tier. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+// PriceID returns the configured Stripe price for a plan (solo, team, enterprise). Added 2026-11-10, session
+// session_012zDydZCZ4AChqhEZ4oVtaP; keyed by plan since Phase B.2 the same day.
 // Touches: nothing.
 func (s *StripePlanChanger) PriceID(tier string) (string, error) {
 	price, ok := s.PriceIDs[tier]
@@ -297,6 +310,9 @@ func migrate() error {
 			tier TEXT NOT NULL,
 			theme_id INTEGER NOT NULL,
 			status TEXT NOT NULL DEFAULT 'draft',
+			-- domain_verified: set true once the customer's domain is verified (SetDomainVerified); publish
+			-- needs it. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, admin spec "TIERS").
+			domain_verified BOOLEAN NOT NULL DEFAULT 0,
 			published_at DATETIME,
 			suspend_reason TEXT,
 			archived_at DATETIME,
@@ -430,6 +446,9 @@ func validateName(name string) bool {
 	return len(strings.TrimSpace(name)) >= 2
 }
 
+// validateRole reports whether role is a staff role (owner, admin, user). A plan name is not a role.
+// In: the value. Out: true for a staff role. Doc block added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP
+// (Phase B.2). Touches nothing.
 func validateRole(role string) bool {
 	for _, r := range allowedRoles {
 		if r == role {
@@ -437,6 +456,44 @@ func validateRole(role string) bool {
 		}
 	}
 	return false
+}
+
+// validatePlan reports whether plan is a customer/deployment plan (solo, team, enterprise). A staff role is
+// not a plan. In: the value. Out: true for a plan. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase
+// B.2, admin spec "TIERS": change_plan and create_deployment accepted the staff roles). Touches nothing.
+func validatePlan(plan string) bool {
+	for _, p := range allowedPlans {
+		if p == plan {
+			return true
+		}
+	}
+	return false
+}
+
+// invalidTier answers 400 {error: "invalid_tier"} for a value from the wrong tier list (a plan where a staff
+// role is expected, or the reverse) or an unknown value. In: the response writer and what was expected
+// ("role" or "plan"). Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2). Touches: the response.
+func invalidTier(w http.ResponseWriter, expected string) {
+	msg := "tier must be a staff role: owner, admin or user"
+	if expected == "plan" {
+		msg = "tier must be a plan: solo, team or enterprise"
+	}
+	writeJSON(w, http.StatusBadRequest, jsonResponse{"error": "invalid_tier", "message": msg})
+}
+
+// SetDomainVerified records whether a deployment's domain is verified (the host's DNS or HTTP check calls
+// it); publish refuses an unverified domain. In: the deployment id and the result. Out: sql.ErrNoRows for
+// an unknown deployment, or the update's error. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase
+// B.2: publish assumed every domain was verified). Touches: SQLite deployments.
+func SetDomainVerified(deploymentID int64, verified bool) error {
+	res, err := db.Exec(`UPDATE deployments SET domain_verified=? WHERE id=?`, verified, deploymentID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // ---------- Safety Checks ----------
@@ -500,8 +557,14 @@ func handleUserAction(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusServiceUnavailable, jsonResponse{"error": "mail_unavailable", "message": "No mailer is configured"})
 			return
 		}
-		if !validateEmail(email) || !validateName(name) || !validateRole(tier) {
+		if !validateEmail(email) || !validateName(name) {
 			writeJSON(w, http.StatusBadRequest, jsonResponse{"error": "validation_failed", "message": "Invalid input"})
+			return
+		}
+		// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, "TIERS"): a user's tier is a staff role;
+		// anything else, a plan name included, is 400 invalid_tier (it was validation_failed).
+		if !validateRole(tier) {
+			invalidTier(w, "role")
 			return
 		}
 		// email uniqueness
@@ -619,8 +682,9 @@ func handleUserAction(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, jsonResponse{"error": "cannot_change_own_role", "message": "Cannot change own role"})
 			return
 		}
+		// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, "TIERS"): 400 invalid_tier (was invalid_role).
 		if !validateRole(newTier) {
-			writeJSON(w, http.StatusBadRequest, jsonResponse{"error": "invalid_role", "message": "Invalid role"})
+			invalidTier(w, "role")
 			return
 		}
 		var oldTier string
@@ -783,7 +847,8 @@ func inTx(fn func(tx *sql.Tx) error) error {
 
 // handleCustomerAction is POST /admin/customers/{customer_id}/action (owner, CSRF).
 //
-// change_plan (ADMIN-12, amended 2026-11-10): unknown tier -> 400 invalid_tier; unknown customer -> 404;
+// change_plan (ADMIN-12, amended 2026-11-10): a new_tier that is not a plan (solo/team/enterprise; a staff
+// role included, Phase B.2) -> 400 invalid_tier; unknown customer -> 404;
 // no subscription -> 400 no_subscription; the subscription's items are retrieved and anything but exactly
 // one item -> 409 subscription_item_ambiguous, both before any update; then the provider updates
 // {id: current_item_id, price} with create_prorations, and the tier and its audit row are written in one
@@ -813,8 +878,10 @@ func handleCustomerAction(w http.ResponseWriter, r *http.Request) {
 	switch form.Get("action") {
 	case "change_plan":
 		newTier := form.Get("new_tier")
-		if !validateRole(newTier) {
-			writeJSON(w, http.StatusBadRequest, jsonResponse{"error": "invalid_tier", "message": "Invalid tier"})
+		// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, "TIERS"): the new tier is a plan; a staff
+		// role (it accepted owner/admin/user) is 400 invalid_tier.
+		if !validatePlan(newTier) {
+			invalidTier(w, "plan")
 			return
 		}
 		var stripeSubID sql.NullString
@@ -961,9 +1028,12 @@ func handleDeploymentsList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, list)
 }
 
-// handleDeploymentAction is POST /admin/deployments/action (owner, CSRF): create, publish (double gate:
-// owner + server-side SafetyFlags.CanPublish; only from 'draft'), suspend, retire. Each change and its audit
-// row are one transaction. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite.
+// handleDeploymentAction is POST /admin/deployments/action (owner, CSRF): create (tier must be a plan, else
+// 400 invalid_tier; the new deployment's domain is unverified), publish (double gate: owner + server-side
+// SafetyFlags.CanPublish; only from 'draft', else 400 invalid_state; only with domain_verified, else 400
+// domain_not_verified), suspend, retire. Each change and its audit row are one transaction.
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP; the plan check and domain_verified were added the same
+// day (Phase B.2, admin spec "TIERS"). Touches: SQLite.
 func handleDeploymentAction(w http.ResponseWriter, r *http.Request) {
 	actorID := r.Context().Value(ctxUserIDKey).(int64)
 	form, err := readParams(r)
@@ -980,6 +1050,12 @@ func handleDeploymentAction(w http.ResponseWriter, r *http.Request) {
 		themeIDStr := form.Get("theme_id")
 		custID, _ := strconv.ParseInt(custIDStr, 10, 64)
 		themeID, _ := strconv.ParseInt(themeIDStr, 10, 64)
+		// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, "TIERS"): a deployment's tier is a plan; a
+		// staff role or anything else is 400 invalid_tier (it was stored unchecked).
+		if !validatePlan(tier) {
+			invalidTier(w, "plan")
+			return
+		}
 		// checks
 		var exists int
 		db.QueryRow(`SELECT COUNT(*) FROM customers WHERE id=?`, custID).Scan(&exists)
@@ -1028,22 +1104,28 @@ func handleDeploymentAction(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusForbidden, jsonResponse{"error": "cannot_publish", "message": "Publishing is disabled by safety flag"})
 			return
 		}
+		// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): domain_verified is read from the row (it was
+		// assumed true); an unverified domain is 400 domain_not_verified.
 		var status, domain string
-		var verified bool = true // assume domain verified
-		err := db.QueryRow(`SELECT status, domain FROM deployments WHERE id=?`, depID).Scan(&status, &domain)
+		var verified bool
+		err := db.QueryRow(`SELECT status, domain, domain_verified FROM deployments WHERE id=?`, depID).Scan(&status, &domain, &verified)
 		if err != nil {
 			writeJSON(w, http.StatusNotFound, jsonResponse{"error": "not_found", "message": "Deployment not found"})
 			return
 		}
-		if status != "draft" || !verified {
+		if status != "draft" {
 			writeJSON(w, http.StatusBadRequest, jsonResponse{"error": "invalid_state", "message": "Cannot publish"})
+			return
+		}
+		if !verified {
+			writeJSON(w, http.StatusBadRequest, jsonResponse{"error": "domain_not_verified", "message": "The deployment's domain is not verified"})
 			return
 		}
 		// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: conditional on status='draft', with its audit row, in one
 		// transaction, so two concurrent publishes cannot both succeed.
 		published := false
 		if err := inTx(func(tx *sql.Tx) error {
-			res, err := tx.Exec(`UPDATE deployments SET status='live', published_at=? WHERE id=? AND status='draft'`, time.Now().UTC(), depID)
+			res, err := tx.Exec(`UPDATE deployments SET status='live', published_at=? WHERE id=? AND status='draft' AND domain_verified=1`, time.Now().UTC(), depID)
 			if err != nil {
 				return err
 			}
@@ -1303,7 +1385,9 @@ func decideAction(actorID, actionID int64, decide, reason string) (int, jsonResp
 // suspended). Any other type, a missing target or bad params answers with an error status and body (the
 // caller rolls back, so the action stays pending). Out: (result JSON, 0, nil) or (_, status, body).
 // Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-16: "execute the original action"; approval
-// used to only mark it approved). Touches: SQLite users and audit_log (inside tx).
+// used to only mark it approved). Changed the same day (Phase B.2, admin spec "TIERS"): a change_role whose
+// new_tier is not a staff role is 400 invalid_tier (it was 422 invalid_action_params).
+// Touches: SQLite users and audit_log (inside tx).
 func executeAction(tx *sql.Tx, actorID, actionID int64) (string, int, jsonResponse) {
 	var actionType string
 	var target sql.NullInt64
@@ -1336,8 +1420,11 @@ func executeAction(tx *sql.Tx, actorID, actionID int64) (string, int, jsonRespon
 	switch actionType {
 	case "change_role":
 		newTier := p["new_tier"]
+		// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, "TIERS"): a new_tier that is not a staff
+		// role (a plan name included) is 400 invalid_tier, as for the direct change_role (it was 422
+		// invalid_action_params).
 		if !validateRole(newTier) {
-			return "", http.StatusUnprocessableEntity, jsonResponse{"error": "invalid_action_params", "message": "change_role needs a valid new_tier"}
+			return "", http.StatusBadRequest, jsonResponse{"error": "invalid_tier", "message": "tier must be a staff role: owner, admin or user"}
 		}
 		if lastOwner && newTier != "owner" {
 			return "", http.StatusBadRequest, jsonResponse{"error": "cannot_demote_last_owner", "message": "Cannot demote last active owner"}
@@ -1504,12 +1591,15 @@ func TrustedHeaderResolver(header string) IdentityResolver {
 
 // AuthMiddleware puts the caller's user id and role into the request context. Input: the request.
 // Output: the wrapped handler sees ctxUserIDKey and ctxRoleKey; when no resolver is configured
-// (ResolveUserID is nil), the resolver finds no identity, or the user is unknown or not active, the
-// request is answered 401 {"error": "unauthenticated"} and never reaches the handler. The role and
-// status are read from the users table; the client-sent X-User-Role header is ignored.
+// (ResolveUserID is nil), the resolver finds no identity, or the user is unknown or neither active nor
+// suspended, the request is answered 401 {"error": "unauthenticated"} and never reaches the handler. A
+// suspended caller is answered 403 {"error": "account_suspended"} before any gate (CSRF, owner, admin) and
+// any handler, so nothing changes (ADMIN-19). The role and status are read from the users table; the
+// client-sent X-User-Role header is ignored.
 // Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: it used to copy the role from the
 // client's X-User-Role header, so anyone could claim "owner"; later the same day (CodeRabbit review on
-// PR 19, security) it fails closed instead of trusting X-User-ID by default.
+// PR 19, security) it fails closed instead of trusting X-User-ID by default; and again the same day (Phase
+// B.2, ADMIN-19) a suspended caller gets 403 account_suspended instead of 401 unauthenticated.
 // Touches: SQLite database (one read of users).
 func AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1527,8 +1617,16 @@ func AuthMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		ctx := r.Context()
-		var role string
-		if err := db.QueryRowContext(ctx, `SELECT role FROM users WHERE id=? AND status='active'`, uid).Scan(&role); err != nil {
+		var role, status string
+		if err := db.QueryRowContext(ctx, `SELECT role, status FROM users WHERE id=?`, uid).Scan(&role, &status); err != nil {
+			unauthenticated("Authentication required")
+			return
+		}
+		if status == "suspended" {
+			writeJSON(w, http.StatusForbidden, jsonResponse{"error": "account_suspended", "message": "This account is suspended"})
+			return
+		}
+		if status != "active" {
 			unauthenticated("Authentication required")
 			return
 		}

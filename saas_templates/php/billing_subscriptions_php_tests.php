@@ -404,4 +404,41 @@ class BillingSystemTest extends TestCase
         $this->assertTrue($result['received']);
         $this->assertLessThan(3, $duration);
     }
+
+    /**
+     * Every billing error carries its HTTP status beside the code: 400 invalid_tier (create and change_plan),
+     * invalid_amount, invoice_not_succeeded, refund_exceeds_invoice, missing_signature; 403 invalid_signature;
+     * 404 subscription_not_found, invoice_not_found; 503 stripe_not_configured. No Stripe call is made.
+     * Input: the fresh in-memory database and the gateway mock. Output: assertions only.
+     * Why: Phase B.2 bug "billing errors are {error} arrays without an HTTP status except the newest ones"
+     * (BILL-02, BILL-05 and BILL-09 name 400, 400 and 403). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches: the in-memory SQLite database only.
+     */
+    // BILL-02
+    // BILL-05
+    // BILL-09
+    public function testEveryErrorCarriesItsHttpStatus()
+    {
+        $this->stripeMock->expects($this->never())->method('createSubscription');
+        $this->stripeMock->expects($this->never())->method('updateSubscription');
+        $now = (new DateTime('now', new DateTimeZone('UTC')))->format(DateTime::ATOM);
+        self::$pdo->prepare('INSERT INTO invoices (stripe_invoice_id, customer_id, amount, status, paid_at) VALUES (?, ?, ?, ?, ?)')
+            ->execute(['inv_paid', 'cus_test', 1000, 'succeeded', $now]);
+        self::$pdo->prepare('INSERT INTO invoices (stripe_invoice_id, customer_id, amount, status, paid_at) VALUES (?, ?, ?, ?, ?)')
+            ->execute(['inv_open', 'cus_test', 1000, 'open', $now]);
+        $pair = static fn(array $r): array => [$r['error'] ?? null, $r['status'] ?? null];
+
+        $this->assertSame(['invalid_tier', 400], $pair(BillingSystem::createSubscription('cus_test', 'admin')));
+        $this->assertSame(['invalid_tier', 400], $pair(BillingSystem::changePlan('sub_x', 'platinum')));
+        $this->assertSame(['subscription_not_found', 404], $pair(BillingSystem::changePlan('sub_missing', 'team')));
+        $this->assertSame(['invalid_amount', 400], $pair(BillingSystem::queueRefund('inv_paid', 0, 'x', 'admin')));
+        $this->assertSame(['invoice_not_found', 404], $pair(BillingSystem::queueRefund('inv_none', 10, 'x', 'admin')));
+        $this->assertSame(['invoice_not_succeeded', 400], $pair(BillingSystem::queueRefund('inv_open', 10, 'x', 'admin')));
+        $this->assertSame(['refund_exceeds_invoice', 400], $pair(BillingSystem::queueRefund('inv_paid', 1001, 'x', 'admin')));
+        $payload = json_encode(['id' => 'evt_status']);
+        $this->assertSame(['missing_signature', 400], $pair(BillingSystem::handleStripeWebhook($payload, [])));
+        $this->assertSame(['invalid_signature', 403], $pair(BillingSystem::handleStripeWebhook($payload, ['Stripe-Signature' => $this->sign($payload, 'wrong_secret')])));
+        BillingSystem::$stripe = null;
+        $this->assertSame(['stripe_not_configured', 503], $pair(BillingSystem::createSubscription('cus_test', 'solo')));
+    }
 }

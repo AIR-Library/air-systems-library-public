@@ -241,6 +241,16 @@ class QuotaRateLimiter
         return true;
     }
 
+    /**
+     * Gate 5, feature_gate_by_tier: PASS when $tier is one of the feature's allowed tiers.
+     *
+     * Inputs: the user id (for the why-chain), the plan tier, the feature name and the upgrade link. Output: true,
+     * or the refusal body {error: "feature_not_available_in_tier", tier, minimum_tier, upgrade_url} that
+     * checkRequest() answers with 403; minimum_tier is the cheapest allowed tier in solo < team < enterprise
+     * order (null for a feature no tier has).
+     * Why: the amended spec gives one refusal shape in every language (Phase B.2; it lacked tier and
+     * minimum_tier). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the why-chain log only.
+     */
     private function checkFeatureGate(int $user_id, string $tier, string $feature, ?string $upgrade_url): bool|array
     {
         $features = [
@@ -260,8 +270,17 @@ class QuotaRateLimiter
         ]);
 
         if (!$passed) {
+            $minimum = null;
+            foreach (['solo', 'team', 'enterprise'] as $candidate) {
+                if (in_array($candidate, $allowedTiers, true)) {
+                    $minimum = $candidate;
+                    break;
+                }
+            }
             return [
                 'error' => 'feature_not_available_in_tier',
+                'tier' => $tier,
+                'minimum_tier' => $minimum,
                 'upgrade_url' => $upgrade_url ?? ''
             ];
         }

@@ -6,6 +6,9 @@
 //   injected (1 s per call, so order is fixed); metadata no longer carries an ip; replay divergence is read from
 //   later log entries (the 'resources' side table is gone); AUDIT-05 (1M rows), AUDIT-08, AUDIT-09 and AUDIT-10
 //   are new. Each changed test says what changed.
+// Changed again 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP, Phase B.2): AUDIT-10 also proves actor_required and
+//   actor_service_required; AUDIT-08 proves that replay's `erased` follows the entry's subject row and that
+//   AuditLogger is a Compliance\AuditEraser.
 // Touches: an in-memory SQLite database only.
 declare(strict_types=1);
 
@@ -392,6 +395,37 @@ final class AuditLoggerTest extends TestCase
     }
 
     /**
+     * AUDIT-08, Phase B.2: replay's `erased` reflects the entry's own subject row. An admin's entry about a user
+     * whose ADMIN is erased keeps its subject row: erased false and the snapshot still replays; once the user
+     * (the subject) is erased it is erased true. An entry with subject 'none' is never erased. The logger is the
+     * Compliance\AuditEraser that data_export_compliance's cascade calls, and returns {erased_rows}.
+     * Input: the fresh logger. Output: assertions only.
+     * Why: the amended spec ("erased_rows = audit_personal rows deleted; replay erased reflects the entry's subject
+     * row") and the bug "AuditLogger::eraseSubject returns an array while the AuditEraser interface returns void".
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory SQLite database.
+     */
+    // AUDIT-08
+    public function testReplayErasedFollowsTheSubjectRow(): void
+    {
+        $this->assertInstanceOf(\Compliance\AuditEraser::class, $this->logger);
+        $entry = $this->logger->logMutation(['actor_id' => 5, 'actor_type' => 'user', 'subject_user_id' => 77, 'action' => 'subscription_changed',
+            'resource_type' => 'subscription', 'resource_id' => 'sub_77', 'old_value' => ['tier' => 'solo'], 'new_value' => ['tier' => 'team']]);
+        $none = $this->logger->logMutation(['actor_id' => 5, 'actor_type' => 'user', 'subject_user_id' => 'none', 'action' => 'theme_changed',
+            'resource_type' => 'theme', 'resource_id' => 'th_1', 'old_value' => ['c' => 1], 'new_value' => ['c' => 2]]);
+        $this->assertFalse($this->logger->replay($entry['log_id'], self::ADMIN)['erased']);
+
+        $this->assertSame(['erased_rows' => 2], $this->logger->eraseSubject(5), "the admin's two actor rows");
+        $replay = $this->logger->replay($entry['log_id'], self::ADMIN);
+        $this->assertSame([false, ['tier' => 'solo']], [$replay['erased'], $replay['resource_state_at_time']], 'subject row kept: not erased');
+        $this->assertFalse($this->logger->replay($none['log_id'], self::ADMIN)['erased']);
+
+        $this->assertSame(['erased_rows' => 1], $this->logger->eraseSubject(77), "the subject's row");
+        $replay = $this->logger->replay($entry['log_id'], self::ADMIN);
+        $this->assertSame([true, null, null], [$replay['erased'], $replay['resource_state_at_time'], $replay['has_diverged']]);
+        $this->assertSame([false, ['c' => 1]], [$this->logger->replay($none['log_id'], self::ADMIN)['erased'], $this->logger->replay($none['log_id'], self::ADMIN)['resource_state_at_time']]);
+    }
+
+    /**
      * AUDIT-09: apply_retention (30 days here) erases the personal data of older entries and drops subjects
      * left without personal rows; newer entries keep theirs; no audit_log row is removed.
      * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
@@ -424,6 +458,8 @@ final class AuditLoggerTest extends TestCase
      * key other than feature_flag / erased_rows (400 metadata_key_not_allowed), an api_key entry without
      * actor_user_id (400 actor_user_required) and a 'user' entry with another subject (400 subject_mismatch);
      * nothing is written; reads by a non-admin caller get 403. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Extended the same day (Phase B.2): an unknown actor_type is invalid_actor_type, a 'user' actor without
+     * actor_id is actor_required and a 'service' actor without actor_service is actor_service_required.
      */
     // AUDIT-10
     public function testRefusals(): void
@@ -435,8 +471,15 @@ final class AuditLoggerTest extends TestCase
         $this->assertRefused(fn() => $this->logger->logMutation(['actor_id' => 'key_9', 'actor_type' => 'api_key'] + $base + ['subject_user_id' => 'none']), 400, 'actor_user_required');
         $this->assertRefused(fn() => $this->logger->logMutation(['actor_id' => 1, 'actor_type' => 'user', 'action' => 'user_updated', 'resource_type' => 'user', 'resource_id' => 7, 'subject_user_id' => 8]), 400, 'subject_mismatch');
         $this->assertRefused(fn() => $this->logger->logMutation(['actor_type' => 'robot'] + $base + ['subject_user_id' => 'none']), 400, 'invalid_actor_type');
+        $this->assertRefused(fn() => $this->logger->logMutation(['actor_type' => null] + $base + ['subject_user_id' => 'none']), 400, 'invalid_actor_type');
+        $this->assertRefused(fn() => $this->logger->logMutation(['actor_id' => null] + $base + ['subject_user_id' => 'none']), 400, 'actor_required');
+        $this->assertRefused(fn() => $this->logger->logMutation(['actor_id' => ''] + $base + ['subject_user_id' => 'none']), 400, 'actor_required');
+        $this->assertRefused(fn() => $this->logger->logMutation(['actor_id' => 'billing', 'actor_type' => 'service'] + $base + ['subject_user_id' => 'none']), 400, 'actor_service_required');
+        $this->assertRefused(fn() => $this->logger->logMutation(['actor_type' => 'service', 'actor_service' => ''] + $base + ['subject_user_id' => 'none']), 400, 'actor_service_required');
         $this->assertSame(0, (int)$this->pdo->query('SELECT COUNT(*) FROM audit_log')->fetchColumn(), 'nothing written');
         $this->assertTrue($this->logger->logMutation($base + ['subject_user_id' => 'none', 'metadata' => ['feature_flag' => 'new_ui']])['success']);
+        $this->assertTrue($this->logger->logMutation(['actor_type' => 'service', 'actor_service' => 'billing'] + $base + ['subject_user_id' => 'none'])['success'], 'a named service is accepted');
+        $this->assertSame('billing', $this->pdo->query("SELECT actor_service FROM audit_log WHERE actor_type = 'service'")->fetchColumn());
 
         $logId = (string)$this->pdo->query('SELECT id FROM audit_log')->fetchColumn();
         foreach ([null, [], ['user_id' => 1, 'is_admin' => false], ['user_id' => 1, 'is_admin' => 'true']] as $caller) {

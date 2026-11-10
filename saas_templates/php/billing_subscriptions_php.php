@@ -248,7 +248,8 @@ SQL;
      * @param string $customerId Stripe customer id.
      * @param string $tier       solo | team | enterprise.
      * @return array {success, subscription_id, tier, status: 'active', next_billing_date} or
-     *               {error: invalid_tier | stripe_not_configured | stripe_error, message}
+     *               {error: invalid_tier | stripe_not_configured | stripe_error, status, message}
+     *               (every error carries its HTTP status since 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP; see fail())
      *
      * Why: validates the tier before any Stripe call; Stripe sits behind StripeGateway.
      * 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches Stripe (creates a paid
@@ -257,10 +258,10 @@ SQL;
     public static function createSubscription(string $customerId, string $tier): array
     {
         if (!isset(self::PRICE_IDS[$tier])) {
-            return ['error' => 'invalid_tier', 'message' => 'Unknown tier'];
+            return self::fail('invalid_tier', 400, 'Unknown tier');
         }
         if (self::$stripe === null) {
-            return ['error' => 'stripe_not_configured', 'message' => 'Stripe is not configured'];
+            return self::fail('stripe_not_configured', 503, 'Stripe is not configured');
         }
         try {
             $subscription = self::$stripe->createSubscription([
@@ -268,7 +269,7 @@ SQL;
                 'items' => [['price' => self::PRICE_IDS[$tier]]],
             ]);
         } catch (Throwable) {
-            return ['error' => 'stripe_error', 'message' => 'The payment provider rejected the request'];
+            return self::fail('stripe_error', 502, 'The payment provider rejected the request');
         }
 
         $now = self::now();
@@ -304,8 +305,9 @@ SQL;
      * @param string $subscriptionId Stripe subscription id (must be in our records).
      * @param string $newTier        solo | team | enterprise.
      * @return array {success, subscription_id, old_tier, new_tier, effective_date, proration_credit}
-     *               or {error: invalid_tier (400) | subscription_not_found | stripe_not_configured |
-     *               subscription_item_ambiguous (409) | stripe_error, message}
+     *               or {error: invalid_tier (400) | subscription_not_found (404) | stripe_not_configured (503) |
+     *               subscription_item_ambiguous (409) | stripe_error (502), status, message}
+     *               (the status on every error is 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
      *
      * Order (BILL-03 as amended): unknown tier -> invalid_tier; retrieve the subscription; not exactly one
      * item -> subscription_item_ambiguous; both before any update. Then
@@ -319,24 +321,23 @@ SQL;
     public static function changePlan(string $subscriptionId, string $newTier): array
     {
         if (!isset(self::PRICE_IDS[$newTier])) {
-            return ['error' => 'invalid_tier', 'message' => 'Unknown tier'];
+            return self::fail('invalid_tier', 400, 'Unknown tier');
         }
         $current = self::findSubscription($subscriptionId);
         if ($current === null) {
-            return ['error' => 'subscription_not_found', 'message' => 'Subscription does not exist'];
+            return self::fail('subscription_not_found', 404, 'Subscription does not exist');
         }
         if (self::$stripe === null) {
-            return ['error' => 'stripe_not_configured', 'message' => 'Stripe is not configured'];
+            return self::fail('stripe_not_configured', 503, 'Stripe is not configured');
         }
         try {
             $remote = self::$stripe->retrieveSubscription($subscriptionId);
         } catch (Throwable) {
-            return ['error' => 'stripe_error', 'message' => 'The payment provider rejected the request'];
+            return self::fail('stripe_error', 502, 'The payment provider rejected the request');
         }
         $items = self::listItems($remote);
         if (count($items) !== 1 || !is_string($items[0]) || $items[0] === '') {
-            return ['error' => 'subscription_item_ambiguous', 'status' => 409,
-                'message' => 'The subscription does not have exactly one item'];
+            return self::fail('subscription_item_ambiguous', 409, 'The subscription does not have exactly one item');
         }
         try {
             $subscription = self::$stripe->updateSubscription($subscriptionId, [
@@ -344,7 +345,7 @@ SQL;
                 'proration_behavior' => 'create_prorations',
             ]);
         } catch (Throwable) {
-            return ['error' => 'stripe_error', 'message' => 'The payment provider rejected the request'];
+            return self::fail('stripe_error', 502, 'The payment provider rejected the request');
         }
 
         self::pdo()->prepare(
@@ -384,7 +385,8 @@ SQL;
      * @param string $reason    Why the refund is given.
      * @param string $createdBy Who queued it (taken from your authenticated admin, not the client).
      * @return array {success, refund_id, status: 'queued', amount, reason} or
-     *               {error: invalid_amount | invoice_not_found | invoice_not_succeeded | refund_exceeds_invoice, message}
+     *               {error: invalid_amount (400) | invoice_not_found (404) | invoice_not_succeeded (400) |
+     *               refund_exceeds_invoice (400), status, message} (status added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
      *
      * Why: earlier refunds now count toward the limit, inside one transaction.
      * 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches the database and the audit
@@ -393,7 +395,7 @@ SQL;
     public static function queueRefund(string $invoiceId, int $amount, string $reason, string $createdBy): array
     {
         if ($amount <= 0) {
-            return ['error' => 'invalid_amount', 'message' => 'Refund amount must be positive'];
+            return self::fail('invalid_amount', 400, 'Refund amount must be positive');
         }
         $pdo = self::pdo();
         $pdo->beginTransaction();
@@ -403,17 +405,17 @@ SQL;
             $invoice = $stmt->fetch();
             if ($invoice === false) {
                 $pdo->rollBack();
-                return ['error' => 'invoice_not_found', 'message' => 'Invoice does not exist'];
+                return self::fail('invoice_not_found', 404, 'Invoice does not exist');
             }
             if ($invoice['status'] !== 'succeeded') {
                 $pdo->rollBack();
-                return ['error' => 'invoice_not_succeeded', 'message' => 'Invoice has not been paid'];
+                return self::fail('invoice_not_succeeded', 400, 'Invoice has not been paid');
             }
             $sum = $pdo->prepare("SELECT COALESCE(SUM(amount), 0) FROM refunds WHERE invoice_id = :id AND status IN ('queued', 'executed')");
             $sum->execute([':id' => $invoiceId]);
             if ($amount + (int) $sum->fetchColumn() > (int) $invoice['amount']) {
                 $pdo->rollBack();
-                return ['error' => 'refund_exceeds_invoice', 'message' => 'Refund amount exceeds invoice'];
+                return self::fail('refund_exceeds_invoice', 400, 'Refund amount exceeds invoice');
             }
 
             $pdo->prepare(
@@ -449,8 +451,9 @@ SQL;
      * @param string $rawBody The request body exactly as received.
      * @param array  $headers Request headers (any letter case).
      * @return array {received: true, duplicate?: true} or
-     *               {error: missing_webhook_secret | missing_signature | invalid_signature | invalid_event | processing_failed, message}
-     *               (answer invalid_signature with HTTP 403, processing_failed with 500)
+     *               {error: missing_webhook_secret (500) | missing_signature (400) | invalid_signature (403) |
+     *               invalid_event (400) | processing_failed (500), status, message} (status added 2026-11-10,
+     *               session_012zDydZCZ4AChqhEZ4oVtaP)
      *
      * Why: see the file header (event recorded before processing; duplicate invoice rows).
      * 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches the database and the audit
@@ -459,7 +462,7 @@ SQL;
     public static function handleStripeWebhook(string $rawBody, array $headers): array
     {
         if (self::$webhookSecret === null) {
-            return ['error' => 'missing_webhook_secret', 'message' => 'Webhook secret not configured'];
+            return self::fail('missing_webhook_secret', 500, 'Webhook secret not configured');
         }
         $sigHeader = null;
         foreach ($headers as $name => $value) {
@@ -468,18 +471,18 @@ SQL;
             }
         }
         if (!is_string($sigHeader) || $sigHeader === '') {
-            return ['error' => 'missing_signature', 'message' => 'Missing Stripe signature header'];
+            return self::fail('missing_signature', 400, 'Missing Stripe signature header');
         }
 
         try {
             $event = Webhook::constructEvent($rawBody, $sigHeader, self::$webhookSecret);
         } catch (SignatureVerificationException) {
-            return ['error' => 'invalid_signature', 'message' => 'Signature verification failed'];
+            return self::fail('invalid_signature', 403, 'Signature verification failed');
         } catch (Throwable) {
-            return ['error' => 'invalid_event', 'message' => 'Malformed event'];
+            return self::fail('invalid_event', 400, 'Malformed event');
         }
         if (!is_string($event->id ?? null) || !is_string($event->type ?? null)) {
-            return ['error' => 'invalid_event', 'message' => 'Malformed event'];
+            return self::fail('invalid_event', 400, 'Malformed event');
         }
 
         $pdo = self::pdo();
@@ -500,7 +503,7 @@ SQL;
             if ($pdo->inTransaction()) {
                 $pdo->rollBack();
             }
-            return ['error' => 'processing_failed', 'message' => 'Event could not be processed'];
+            return self::fail('processing_failed', 500, 'Event could not be processed');
         }
 
         return ['received' => true];
@@ -604,6 +607,22 @@ SQL;
             $ids[] = is_array($item) ? ($item['id'] ?? null) : ($item->id ?? null);
         }
         return $ids;
+    }
+
+    /**
+     * An error response with the HTTP status the spec gives it: {error, status, message}.
+     *
+     * Inputs: the error code, the HTTP status and a message (no secrets). Output: the array a caller turns
+     * into the HTTP answer. Statuses: 400 invalid_tier, invalid_amount, invoice_not_succeeded,
+     * refund_exceeds_invoice, missing_signature, invalid_event; 403 invalid_signature; 404
+     * subscription_not_found, invoice_not_found; 409 subscription_item_ambiguous; 500 missing_webhook_secret,
+     * processing_failed; 502 stripe_error; 503 stripe_not_configured.
+     * Why: Phase B.2 bug "billing errors are {error} arrays without an HTTP status except the newest ones".
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+     */
+    private static function fail(string $code, int $status, string $message): array
+    {
+        return ['error' => $code, 'status' => $status, 'message' => $message];
     }
 
     /**

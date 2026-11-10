@@ -182,9 +182,12 @@ fn device_fingerprint_fail() {
 }
 
 /// What: a database whose clock is `now`, with user 1 created (trial started) at `created`.
+/// Changed 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP, Phase B.2): gate 5 now reads created_at from the
+/// users row, so the helper also records user 1 there (the ledger row stays, with the same date).
 /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite.
 fn timing_db(created: chrono::DateTime<Utc>, now: chrono::DateTime<Utc>) -> Database {
     let db = Database::new_in_memory().unwrap().with_clock(Box::new(move || now));
+    db.insert_user(1, Some("u1@example.com"), created).unwrap();
     db.insert_trial_abuse_ledger(Some(1), None, None, None, None, Some(&created.to_rfc3339()), Some(&created.to_rfc3339()), None, None).unwrap();
     db
 }
@@ -220,6 +223,40 @@ fn trial_payment_timing_fail() {
     assert_eq!(result.decision, Decision::Fail);
     let err = fail_response(&result).unwrap();
     assert_eq!((err.error.as_str(), err.code), ("trial_ended_no_payment_cannot_retry", 403));
+}
+
+/// What: TRIAL-11 (Phase B.2 amendment): a user with no users row is FAIL 403 user_not_found (fail closed),
+/// even when a ledger row exists for that id and the ledger dates would PASS, and the decision is logged; a
+/// user with a users row and no ledger row is judged from users.created_at with no earlier payment (4 days
+/// after the trial PASS, 90 days FAIL with trial_ended_no_payment_cannot_retry). In: none. Out: panics on a
+/// wrong decision. Why: Phase B.2 bug: an unknown user returned PASS. 2026-11-10,
+/// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite.
+// TRIAL-11
+#[test]
+fn trial_payment_timing_unknown_user_fails_closed_and_no_ledger_uses_created_at() {
+    let created = Utc::now() - Duration::days(200);
+    let now = created + Duration::days(14 + 1);
+    let db = Database::new_in_memory().unwrap().with_clock(Box::new(move || now));
+    db.insert_trial_abuse_ledger(Some(9), None, None, None, None, Some(&created.to_rfc3339()), Some(&created.to_rfc3339()), None, None).unwrap();
+    for user in [9, 404] {
+        let before = db.gate_decision_count().unwrap();
+        let result = db.check_trial_payment_timing(user).unwrap();
+        assert_eq!(result.decision, Decision::Fail, "user {}", user);
+        let err = fail_response(&result).unwrap();
+        assert_eq!((err.error.as_str(), err.code), ("user_not_found", 403));
+        assert_eq!(db.gate_decision_count().unwrap(), before + 1, "the FAIL is logged");
+    }
+    for (days, decision) in [(4, Decision::Pass), (90, Decision::Fail)] {
+        let now = created + Duration::days(14 + days);
+        let db = Database::new_in_memory().unwrap().with_clock(Box::new(move || now));
+        db.insert_user(2, None, created).unwrap();
+        let result = db.check_trial_payment_timing(2).unwrap();
+        assert_eq!(result.decision, decision, "{} days, no ledger row", days);
+        assert_eq!(result.rule_inputs["earlier_payment"], false);
+        if decision == Decision::Fail {
+            assert_eq!(fail_response(&result).unwrap().error, "trial_ended_no_payment_cannot_retry");
+        }
+    }
 }
 
 /// What: TRIAL-15: 5 and 89 days after the trial CHALLENGE; 90 days with an earlier payment CHALLENGE;

@@ -422,11 +422,14 @@ class TestComplianceManager(unittest.TestCase):
                      lambda: self.compliance.cancel_deletion(intruder, deletion_id)):
             with self.assertRaises(ComplianceError) as cm:
                 call()
-            self.assertEqual((cm.exception.status, cm.exception.code), (404, 'deletion_not_found'))
+            # [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2 (EXPORT-15): the spec now names the 404
+            # code not_found (was deletion_not_found) and gives an expired token the same 400 as a wrong one
+            # (was 410 confirmation_token_expired). The refusals themselves are unchanged.
+            self.assertEqual((cm.exception.status, cm.exception.code), (404, 'not_found'))
         self.now[0] = T0 + timedelta(hours=24)
         with self.assertRaises(ComplianceError) as cm:
             self.compliance.confirm_deletion(self.test_user_id, deletion_id, token)
-        self.assertEqual((cm.exception.status, cm.exception.code), (410, 'confirmation_token_expired'))
+        self.assertEqual((cm.exception.status, cm.exception.code), (400, 'invalid_confirmation_token'))
         self.cascade_delete_func.assert_not_called()
 
         other = self._make_deletion(token='once', reason='user_requested')
@@ -485,14 +488,70 @@ class TestComplianceManager(unittest.TestCase):
         self.assertEqual(cm.exception.code, 'grace_period_over')
     
     def test_cancel_deletion_wrong_status(self):
-        """Cancelling a completed request is 409 cannot_cancel.
+        """Cancelling a completed request is 404 not_found.
         In: the test fixtures. Out: assertions. Why: EXPORT-06. Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: caller user_id, error code.
+        Corrected 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, EXPORT-15 as clarified in 3abb340): a
+        completed request has no owner, so it is 404 not_found; it asserted 409 cannot_cancel.
         Touches: in-memory SQLite only."""
         deletion_id = self._make_deletion(token='token', status=DeletionRequestStatus.COMPLETED)
         
         with self.assertRaises(ComplianceError) as cm:
             self.compliance.cancel_deletion(self.test_user_id, deletion_id)
-        self.assertEqual(cm.exception.code, 'cannot_cancel')
+        self.assertEqual((cm.exception.status, cm.exception.code), (404, 'not_found'))
+
+    # EXPORT-15
+    def test_wrong_reused_expired_token_one_answer_and_closed_request_409(self):
+        """A wrong, a reused and an expired token all get the same 400 invalid_confirmation_token (same status,
+        code and message), and nothing changes; confirm and cancel of a cancelled request get 409
+        deletion_not_pending, even with the request's still-valid token; of a completed request (a statutory one
+        the cascade finished, user_id NULL) 404 not_found, as does a completed row that still names its user.
+        In: the test fixtures. Out: assertions. Why: EXPORT-15 (Phase B.2, 2026-11-10; clarified in 3abb340).
+        2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite and mocks only."""
+        answers = []
+        wrong = self._make_deletion(token='right')
+        with self.assertRaises(ComplianceError) as cm:
+            self.compliance.confirm_deletion(self.test_user_id, wrong, 'wrong')
+        answers.append(cm.exception)
+        reused = self._make_deletion(token='once')
+        self.compliance.confirm_deletion(self.test_user_id, reused, 'once')
+        with self.assertRaises(ComplianceError) as cm:
+            self.compliance.confirm_deletion(self.test_user_id, reused, 'once')
+        answers.append(cm.exception)
+        expired = self._make_deletion(token='late', token_expires_at=T0 + timedelta(hours=24))
+        self.now[0] = T0 + timedelta(hours=24, seconds=1)
+        with self.assertRaises(ComplianceError) as cm:
+            self.compliance.confirm_deletion(self.test_user_id, expired, 'late')
+        answers.append(cm.exception)
+        self.assertEqual({(e.status, e.code, str(e)) for e in answers},
+                         {(400, 'invalid_confirmation_token', str(answers[0]))})
+        for deletion_id in (wrong, expired):
+            self.assertEqual(self.db_session.query(DeletionRequest).filter_by(id=deletion_id).first().status,
+                             DeletionRequestStatus.PENDING)
+
+        self.now[0] = T0
+        for status, answer in ((DeletionRequestStatus.CANCELLED, (409, 'deletion_not_pending')),
+                               (DeletionRequestStatus.COMPLETED, (404, 'not_found'))):
+            closed = self._make_deletion(token='still-valid', status=status)
+            for call in (lambda: self.compliance.confirm_deletion(self.test_user_id, closed, 'still-valid'),
+                         lambda: self.compliance.cancel_deletion(self.test_user_id, closed)):
+                with self.assertRaises(ComplianceError) as cm:
+                    call()
+                self.assertEqual((cm.exception.status, cm.exception.code), answer)
+            self.assertEqual(self.db_session.query(DeletionRequest).filter_by(id=closed).first().status, status)
+        self.cascade_delete_func.assert_not_called()
+
+        # A real completed request: the statutory cascade ran and user_id is NULL, so it is 404 to its old owner.
+        result = self.compliance.request_account_deletion(self.test_user_id, 'gdpr_request')
+        done = uuid.UUID(result['deletion_id'])
+        token = self._emailed_token()
+        self.compliance.confirm_deletion(self.test_user_id, done, token)
+        row = self.db_session.query(DeletionRequest).filter_by(id=done).first()
+        self.assertEqual((row.status, row.user_id), (DeletionRequestStatus.COMPLETED, None))
+        for call in (lambda: self.compliance.confirm_deletion(self.test_user_id, done, token),
+                     lambda: self.compliance.cancel_deletion(self.test_user_id, done)):
+            with self.assertRaises(ComplianceError) as cm:
+                call()
+            self.assertEqual((cm.exception.status, cm.exception.code), (404, 'not_found'))
 
     def _real_tables(self):
         """Create user tables and an audit_log in the test database and wire a real cascade function and audit

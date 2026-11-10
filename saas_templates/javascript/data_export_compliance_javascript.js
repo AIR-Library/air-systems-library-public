@@ -589,33 +589,51 @@ function createComplianceService(options = {}) {
   }));
 
   /**
+   * Finds the deletion request the caller may act on, for confirm and cancel (EXPORT-14/15).
+   * In: deletion id, caller's user id. Out: { row } for the caller's own request that is not completed; null for a
+   * missing request, anyone else's, or a completed one (all 404 not_found). A completed request has no owner any more:
+   * its user_id is NULL after the cascade (EXPORT-13), so it is 404 to every caller, even a row that still names a
+   * user (spec clarification, commit 3abb340).
+   * Why: Phase B.2 (EXPORT-15) gives one answer per case in every language. 2026-11-10,
+   * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (read).
+   */
+  async function findOwnDeletion(deletionId, userId) {
+    const d = await get('SELECT * FROM deletion_requests WHERE id = ? AND user_id = ?', [deletionId, userId]);
+    return d && d.status !== 'completed' ? { row: d } : null;
+  }
+
+  /**
    * POST /compliance/delete/:id/confirm { confirmation_token }: approves the caller's own pending request (anyone
-   * else's is 404). The token must hash (SHA-256, constant-time compare) to this request's stored hash and be within
-   * its 24 h; it is single-use (the hash is cleared on use, and a request that is no longer pending answers 409).
-   * A statutory request runs the cascade before returning: status 'completed', deleted_at = deletion_scheduled_for =
-   * now. Out: { success, deletion_scheduled_for, status }; 400 wrong token, 409 not pending, 410 token expired.
-   * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-09/12/13/14). Touches: database; for a statutory
+   * else's, and a completed one, is 404 {error: "not_found"}). A cancelled request is 409
+   * {error: "deletion_not_pending"}, checked before the token. The token must hash (SHA-256, constant-time compare) to this request's stored
+   * hash and be within its 24 h; it is single-use (the hash is cleared on use). A wrong, reused (the request is
+   * already approved) or expired token gets the one answer 400 {error: "invalid_confirmation_token"}, so the reply
+   * never says which. A statutory request runs the cascade before returning: status 'completed', deleted_at =
+   * deletion_scheduled_for = now. Out: { success, deletion_scheduled_for, status }.
+   * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-09/12/13/14; Phase B.2 EXPORT-15: 404 code is
+   * not_found, a reused token is 400 not 409, an expired token is 400 not 410). Touches: database; for a statutory
    * reason also storage and the audit eraser.
    */
   app.post('/compliance/delete/:deletion_id/confirm', route(async (req, res) => {
     const token = (req.body && req.body.confirmation_token) || '';
-    const d = await get('SELECT * FROM deletion_requests WHERE id = ? AND user_id = ?', [req.params.deletion_id, req.user.id]);
-    if (!d) return res.status(404).json({ error: 'deletion_not_found' });
-    if (d.status !== 'pending' || !d.confirmation_token_hash) return res.status(409).json({ error: 'deletion_not_pending' });
-    if (typeof token !== 'string' || !safeEqual(sha256(token), d.confirmation_token_hash)) {
+    const found = await findOwnDeletion(req.params.deletion_id, req.user.id);
+    if (!found) return res.status(404).json({ error: 'not_found' });
+    const d = found.row;
+    if (d.status === 'cancelled') return res.status(409).json({ error: 'deletion_not_pending' });
+    const matches = d.status === 'pending' && !!d.confirmation_token_hash && typeof token === 'string'
+      && safeEqual(sha256(token), d.confirmation_token_hash);
+    if (!matches || !d.token_expires_at || Date.parse(d.token_expires_at) <= now()) {
       return res.status(400).json({ error: 'invalid_confirmation_token' });
-    }
-    if (!d.token_expires_at || Date.parse(d.token_expires_at) <= now()) {
-      return res.status(410).json({ error: 'confirmation_token_expired' });
     }
     const confirmedAt = iso(now());
     const statutory = STATUTORY_REASONS.includes(d.reason);
-    // One conditional write consumes the token: of two concurrent confirms, only one proceeds.
+    // One conditional write consumes the token: of two concurrent confirms, only one proceeds; the loser presented a
+    // token that is now used, so it gets the same answer as any reused token.
     const changed = await runChanges(`UPDATE deletion_requests SET status = 'approved', confirmed_at = ?,
       confirmation_token_hash = NULL, will_delete_at = ? WHERE id = ? AND status = 'pending'
       AND confirmation_token_hash = ?`,
     [confirmedAt, statutory ? confirmedAt : d.will_delete_at, d.id, d.confirmation_token_hash]);
-    if (changed !== 1) return res.status(409).json({ error: 'deletion_not_pending' });
+    if (changed !== 1) return res.status(400).json({ error: 'invalid_confirmation_token' });
     await audit(req.user.id, 'deletion_confirmed', { deletion_id: d.id });
     if (statutory) {
       await cascadeDelete({ ...d, status: 'approved', will_delete_at: confirmedAt });
@@ -626,13 +644,16 @@ function createComplianceService(options = {}) {
 
   /**
    * DELETE /compliance/delete/:id: cancels the caller's own pending or approved request before its date (anyone
-   * else's is 404). Out: { success, status: 'cancelled' }; 409 otherwise.
-   * Why: spec endpoint; rebuilt 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP behind the token gate (see module header). Touches: database.
+   * else's, and a completed one, is 404 {error: "not_found"}). Out: { success, status: 'cancelled' }; a cancelled
+   * request is 409 {error: "deletion_not_pending"}; an approved request whose date has passed is 409 grace_period_over.
+   * Why: spec endpoint; rebuilt 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP behind the token gate (see module header);
+   * Phase B.2 (EXPORT-15) the same day: the codes were deletion_not_found and cannot_cancel. Touches: database.
    */
   app.delete('/compliance/delete/:deletion_id', route(async (req, res) => {
-    const d = await get('SELECT * FROM deletion_requests WHERE id = ? AND user_id = ?', [req.params.deletion_id, req.user.id]);
-    if (!d) return res.status(404).json({ error: 'deletion_not_found' });
-    if (d.status !== 'pending' && d.status !== 'approved') return res.status(409).json({ error: 'cannot_cancel' });
+    const found = await findOwnDeletion(req.params.deletion_id, req.user.id);
+    if (!found) return res.status(404).json({ error: 'not_found' });
+    const d = found.row;
+    if (d.status !== 'pending' && d.status !== 'approved') return res.status(409).json({ error: 'deletion_not_pending' });
     if (d.status === 'approved' && Date.parse(d.will_delete_at) <= now()) return res.status(409).json({ error: 'grace_period_over' });
     await run(`UPDATE deletion_requests SET status = 'cancelled', cancelled_at = ?, confirmation_token_hash = NULL
       WHERE id = ?`, [iso(now()), d.id]);

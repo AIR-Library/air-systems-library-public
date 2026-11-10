@@ -16,7 +16,9 @@ const { app, knex, runMigrations, csrfTokenFor } = createAdminSystem({
   csrfSecret: crypto.randomBytes(32).toString('hex'),
   stripe,
   mailer,
-  priceIds: { owner: 'price_owner', admin: 'price_admin', user: 'price_user' },
+  // Prices are keyed by PLAN (solo, team, enterprise), not by staff role (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP,
+  // Phase B.2 admin spec TIERS: the two are never mixed).
+  priceIds: { solo: 'price_solo', team: 'price_team', enterprise: 'price_enterprise' },
   // The seeded deployment and the create test use theme1, so it is configured (2026-11-10, session
   // session_012zDydZCZ4AChqhEZ4oVtaP: themes are now a configured list, CodeRabbit review on PR 19).
   themes: ['default', 'theme1'],
@@ -36,7 +38,7 @@ describe('Admin System Tests', () => {
         id: 1,
         email: 'cust@example.com',
         name: 'Customer',
-        tier: 'user',
+        tier: 'solo', // a customer's tier is the PLAN (was 'user', a staff role; Phase B.2, 2026-11-10)
         signup_date: '2023-01-01',
         invoice_count: 5,
         status: 'active',
@@ -53,9 +55,10 @@ describe('Admin System Tests', () => {
         id: 1,
         customer_id: 1,
         domain: 'example.com',
-        tier: 'user',
+        tier: 'solo', // the PLAN (was 'user'; Phase B.2, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
         status: 'draft',
         theme: 'theme1',
+        domain_verified: true, // publish now needs a verified domain (Phase B.2); ADMIN-15 publishes this one
       },
     ]);
     await knex('governance_actions').insert([
@@ -227,23 +230,26 @@ describe('Admin System Tests', () => {
 
   // ADMIN-12
   // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the update now names the existing item (spec amended); a bare
-  // {price} adds a second item and bills both plans, so the expected call changed.
+  // {price} adds a second item and bills both plans, so the expected call changed. Phase B.2, same day: the new tier
+  // is a PLAN ('team'; it was 'admin', a staff role, which is now 400 invalid_tier).
   test('change_plan → stripe.subscriptions.update called with the existing item id, audit logged', async () => {
-    stripe.subscriptions.retrieve.mockResolvedValue({ id: 'sub_123', items: { data: [{ id: 'si_current', price: { id: 'price_user' } }] } });
+    stripe.subscriptions.retrieve.mockResolvedValue({ id: 'sub_123', items: { data: [{ id: 'si_current', price: { id: 'price_solo' } }] } });
     stripe.subscriptions.update.mockResolvedValue({ id: 'sub_123' });
     const res = await agent
       .post('/admin/customers/1/action')
       .set(authHeaders(1, 'owner'))
-      .send({ action: 'change_plan', new_tier: 'admin' });
+      .send({ action: 'change_plan', new_tier: 'team' });
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
+    expect(res.body.old_tier).toBe('solo');
+    expect(res.body.new_tier).toBe('team');
     const customer = await knex('customers').where({ id: 1 }).first();
-    expect(customer.tier).toBe('admin');
+    expect(customer.tier).toBe('team');
     expect(stripe.subscriptions.update).toHaveBeenCalled();
     expect(stripe.subscriptions.retrieve).toHaveBeenCalledWith('sub_123');
     expect(stripe.subscriptions.update).toHaveBeenCalledTimes(1);
     expect(stripe.subscriptions.update).toHaveBeenCalledWith('sub_123', {
-      items: [{ id: 'si_current', price: 'price_admin' }],
+      items: [{ id: 'si_current', price: 'price_team' }],
       proration_behavior: 'create_prorations',
     });
     const audit = await knex('audit_logs').where({ action: 'plan_changed', resource_id: 1 }).first();
@@ -262,7 +268,7 @@ describe('Admin System Tests', () => {
     const res = await agent
       .post('/admin/customers/1/action')
       .set(authHeaders(1, 'owner'))
-      .send({ action: 'change_plan', new_tier: 'owner' });
+      .send({ action: 'change_plan', new_tier: 'enterprise' }); // a PLAN (was 'owner'; Phase B.2, 2026-11-10)
     expect(res.status).toBe(409);
     expect(res.body.error).toBe('subscription_item_ambiguous');
     expect(stripe.subscriptions.update).not.toHaveBeenCalled();
@@ -288,12 +294,15 @@ describe('Admin System Tests', () => {
     const res = await agent
       .post('/admin/deployments/action')
       .set(authHeaders(1, 'owner'))
-      .send({ action: 'create', customer_id: 1, domain: 'newdomain.com', tier: 'user', theme_id: 'theme1' });
+      // tier is the PLAN (was 'user', a staff role; Phase B.2, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+      .send({ action: 'create', customer_id: 1, domain: 'newdomain.com', tier: 'team', theme_id: 'theme1' });
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
     const deployment = await knex('deployments').where({ id: res.body.deployment_id }).first();
     expect(deployment).toBeDefined();
     expect(deployment.domain).toBe('newdomain.com');
+    expect(deployment.tier).toBe('team');
+    expect(Boolean(deployment.domain_verified)).toBe(false); // a new deployment's domain is not verified yet
   });
 
   // ADMIN-15
@@ -373,7 +382,7 @@ describe('Admin System Tests', () => {
       await fresh.runMigrations();
       await fresh.knex('users').insert([{ id: 1, email: 'owner@example.com', name: 'Owner', tier: 'owner', status: 'active' }]);
       await fresh.knex('customers').insert([{
-        id: 1, email: 'cust@example.com', name: 'Customer', tier: 'user', signup_date: '2023-01-01', status: 'active',
+        id: 1, email: 'cust@example.com', name: 'Customer', tier: 'solo', signup_date: '2023-01-01', status: 'active',
         payment_method: 'pm_123', address: '123 Main St', stripe_subscription_id: 'sub_123',
       }]);
       expect(await fresh.knex('deployments').first()).toBeUndefined();
@@ -385,7 +394,8 @@ describe('Admin System Tests', () => {
       const unknown = await request(fresh.app)
         .post('/admin/deployments/action')
         .set(headers)
-        .send({ action: 'create', customer_id: 1, domain: 'nope.example.com', tier: 'user', theme_id: 'no-such-theme' });
+        // tier is the PLAN (was 'user'; Phase B.2, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+        .send({ action: 'create', customer_id: 1, domain: 'nope.example.com', tier: 'solo', theme_id: 'no-such-theme' });
       expect(unknown.status).toBe(404);
       expect(unknown.body.error).toBe('theme_not_found');
       expect(await fresh.knex('deployments').first()).toBeUndefined();
@@ -393,7 +403,7 @@ describe('Admin System Tests', () => {
       const first = await request(fresh.app)
         .post('/admin/deployments/action')
         .set(headers)
-        .send({ action: 'create', customer_id: 1, domain: 'first.example.com', tier: 'user', theme_id: 'default' });
+        .send({ action: 'create', customer_id: 1, domain: 'first.example.com', tier: 'solo', theme_id: 'default' });
       expect(first.status).toBe(200);
       expect(first.body.success).toBe(true);
       const deployment = await fresh.knex('deployments').where({ id: first.body.deployment_id }).first();
@@ -428,5 +438,88 @@ describe('Admin System Tests', () => {
       .send({ action: 'create', email: 'csrf@example.com', name: 'Csrf User', tier: 'user' });
     expect(badCsrf.status).toBe(403);
     expect(badCsrf.body.error).toBe('csrf_token_invalid');
+  });
+
+  /**
+   * ADMIN-15 (Phase B.2): publish needs domain_verified. A draft deployment whose domain is not verified is 400
+   * domain_not_verified and stays a draft; once verified it publishes. In: the shared test system. Out: assertions.
+   * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches the test database.
+   */
+  // ADMIN-15
+  test('publish_deployment with an unverified domain → 400 domain_not_verified, still draft', async () => {
+    const [id] = await knex('deployments').insert({ customer_id: 1, domain: 'unverified.example.com', tier: 'team',
+      status: 'draft', theme: 'theme1' });
+    const refused = await agent.post('/admin/deployments/action').set(authHeaders(1, 'owner'))
+      .send({ action: 'publish', deployment_id: id });
+    expect(refused.status).toBe(400);
+    expect(refused.body.error).toBe('domain_not_verified');
+    expect((await knex('deployments').where({ id }).first()).status).toBe('draft');
+    await knex('deployments').where({ id }).update({ domain_verified: true });
+    const ok = await agent.post('/admin/deployments/action').set(authHeaders(1, 'owner'))
+      .send({ action: 'publish', deployment_id: id });
+    expect(ok.status).toBe(200);
+    expect(ok.body.status).toBe('live');
+  });
+
+  /**
+   * TIERS (Phase B.2): users.tier is the staff role and a customer's or deployment's tier is the plan; a value from
+   * the wrong list is 400 invalid_tier and changes nothing (user create and change_role refuse a plan; change_plan and
+   * deployment create refuse a role). In: the shared test system. Out: assertions.
+   * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches the test database and the Stripe fake.
+   */
+  // ADMIN-06 ADMIN-12 ADMIN-14
+  test('a plan where a role is expected, or a role where a plan is expected → 400 invalid_tier', async () => {
+    stripe.subscriptions.update.mockClear();
+    const post = (path, body) => agent.post(path).set(authHeaders(1, 'owner')).send(body);
+    const cases = [
+      ['/admin/users/action', { action: 'create', email: 'plan@example.com', name: 'Plan User', tier: 'team' }],
+      ['/admin/users/action', { action: 'change_role', user_id: 2, new_tier: 'enterprise' }],
+      ['/admin/customers/1/action', { action: 'change_plan', new_tier: 'admin' }],
+      ['/admin/deployments/action', { action: 'create', customer_id: 1, domain: 'role.example.com', tier: 'owner', theme_id: 'theme1' }],
+    ];
+    const customerBefore = await knex('customers').where({ id: 1 }).first();
+    for (const [path, body] of cases) {
+      const res = await post(path, body);
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe('invalid_tier');
+    }
+    expect(await knex('users').where({ email: 'plan@example.com' }).first()).toBeUndefined();
+    expect((await knex('users').where({ id: 2 }).first()).tier).toBe('admin');
+    expect((await knex('customers').where({ id: 1 }).first()).tier).toBe(customerBefore.tier);
+    expect(await knex('deployments').where({ domain: 'role.example.com' }).first()).toBeUndefined();
+    expect(stripe.subscriptions.update).not.toHaveBeenCalled();
+  });
+
+  /**
+   * ADMIN-19: a suspended owner is refused before any gate (authentication runs first, then CSRF, then the role
+   * gates) with 403 account_suspended on reads and mutations, even with a wrong CSRF token, and nothing changes.
+   * In: the shared test system with a suspended owner (id 9). Out: assertions.
+   * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches the test database.
+   */
+  // ADMIN-19
+  test('a suspended owner calling any admin action → 403 account_suspended, nothing changed', async () => {
+    await knex('users').insert({ id: 9, email: 'suspended-owner@example.com', name: 'Suspended Owner', tier: 'owner',
+      status: 'suspended' });
+    const auditBefore = (await knex('audit_logs').count('id as n').first()).n;
+    const usersBefore = (await knex('users').count('id as n').first()).n;
+    const calls = [
+      agent.get('/admin/customers').set(authHeaders(9, 'owner')),
+      agent.get('/admin/governance/audit-log').set(authHeaders(9, 'owner')),
+      agent.post('/admin/users/action').set(authHeaders(9, 'owner'))
+        .send({ action: 'create', email: 'by-suspended@example.com', name: 'By Suspended', tier: 'user' }),
+      agent.post('/admin/users/action').set({ ...authHeaders(9, 'owner'), 'X-CSRF-Token': 'wrong' })
+        .send({ action: 'suspend', user_id: 2, reason: 'x' }),
+      agent.post('/admin/customers/1/action').set(authHeaders(9, 'owner')).send({ action: 'change_plan', new_tier: 'team' }),
+      agent.post('/admin/deployments/action').set(authHeaders(9, 'owner')).send({ action: 'retire', deployment_id: 1 }),
+    ];
+    for (const res of await Promise.all(calls)) {
+      expect(res.status).toBe(403);
+      expect(res.body.error).toBe('account_suspended');
+    }
+    expect(await knex('users').where({ email: 'by-suspended@example.com' }).first()).toBeUndefined();
+    expect((await knex('users').where({ id: 2 }).first()).status).toBe('active');
+    expect((await knex('deployments').where({ id: 1 }).first()).status).not.toBe('archived');
+    expect((await knex('users').count('id as n').first()).n).toBe(usersBefore);
+    expect((await knex('audit_logs').count('id as n').first()).n).toBe(auditBefore);
   });
 });

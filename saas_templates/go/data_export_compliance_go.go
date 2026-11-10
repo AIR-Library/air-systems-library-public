@@ -33,8 +33,10 @@ import (
 	"time"
 )
 
-// Errors returned to the HTTP layer: ErrNotFound -> 404, ErrInvalidToken -> 400/403, the rest -> 400/409.
-// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+// Errors returned to the HTTP layer; HTTPStatus gives each one's status. ErrNotFound -> 404 not_found,
+// ErrInvalidToken -> 400 invalid_confirmation_token (a wrong, reused or expired token alike), ErrNotPending ->
+// 409 deletion_not_pending (a cancelled or completed request). Added 2026-11-10,
+// session_012zDydZCZ4AChqhEZ4oVtaP; the statuses were settled the same day (Phase B.2, EXPORT-15).
 var (
 	ErrNotFound          = errors.New("not_found")
 	ErrInvalidToken      = errors.New("invalid_confirmation_token")
@@ -407,6 +409,30 @@ func (s *ComplianceService) RequestDeletion(userID int, reason string) (*Deletio
 	return req, nil
 }
 
+// HTTPStatus maps an error from this service to its HTTP status: 404 not_found; 400
+// invalid_confirmation_token, invalid_reason, unsupported_format, invalid_link; 409 deletion_not_pending,
+// grace_period_elapsed; 410 link_expired; 503 not_configured; 500 anything else; 200 for nil.
+// In: the error. Out: the status code. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2,
+// EXPORT-15: one answer per case in every language; the comment above said "400/403"). Touches nothing.
+func HTTPStatus(err error) int {
+	switch {
+	case err == nil:
+		return 200
+	case errors.Is(err, ErrNotFound):
+		return 404
+	case errors.Is(err, ErrInvalidToken), errors.Is(err, ErrInvalidReason), errors.Is(err, ErrUnsupportedFormat),
+		errors.Is(err, ErrInvalidLink):
+		return 400
+	case errors.Is(err, ErrNotPending), errors.Is(err, ErrGraceElapsed):
+		return 409
+	case errors.Is(err, ErrLinkExpired):
+		return 410
+	case errors.Is(err, ErrNotConfigured):
+		return 503
+	}
+	return 500
+}
+
 // ownDeletion returns the caller's own request or ErrNotFound; the caller holds s.mu.
 func (s *ComplianceService) ownDeletion(callerUserID int, deletionID string) (*DeletionRequest, error) {
 	req, ok := s.deletions[deletionID]
@@ -420,10 +446,14 @@ func (s *ComplianceService) ownDeletion(callerUserID int, deletionID string) (*D
 //
 // In: the verified caller's user id, the deletion id and the token. Out: the request with WillDeleteAt
 // as deletion_scheduled_for; for a statutory reason the cascade has already run (status 'completed',
-// DeletedAt = now). Errors: ErrNotFound (no such request, or another user's), ErrNotPending,
-// ErrInvalidToken (wrong, reused or older than 24 h; compared in constant time).
+// DeletedAt = now). Checks, in order: ErrNotFound (404: no such request, or another user's); ErrNotPending
+// (409: the request is cancelled or completed); ErrInvalidToken (400: wrong, reused or older than 24 h, one
+// answer for all three; compared in constant time); ErrNotPending (409) for any other non-pending status.
 // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-09, 12, 14): any non-empty token used to be
-// accepted for any request, and the token was written to the audit log. Touches: memory, the eraser.
+// accepted for any request, and the token was written to the audit log. Changed again the same day (Phase
+// B.2, EXPORT-15): a reused token on a confirmed (approved) request was 409 deletion_not_pending, which told
+// the caller the token had been spent; it is now 400 invalid_confirmation_token, and only a cancelled or
+// completed request is 409. Touches: memory, the eraser.
 func (s *ComplianceService) ConfirmDeletion(callerUserID int, deletionID, token string) (*DeletionRequest, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -431,12 +461,15 @@ func (s *ComplianceService) ConfirmDeletion(callerUserID int, deletionID, token 
 	if err != nil {
 		return nil, err
 	}
-	if req.Status != "pending" {
+	if req.Status == "cancelled" || req.Status == "completed" {
 		return nil, ErrNotPending
 	}
 	if req.tokenUsed || !s.now().Before(req.tokenExpires) ||
 		subtle.ConstantTimeCompare([]byte(sha256Hex(token)), []byte(req.tokenHash)) != 1 {
 		return nil, ErrInvalidToken
+	}
+	if req.Status != "pending" {
+		return nil, ErrNotPending
 	}
 	req.tokenUsed = true
 	req.Status = "approved"
@@ -450,8 +483,10 @@ func (s *ComplianceService) ConfirmDeletion(callerUserID int, deletionID, token 
 }
 
 // CancelDeletion cancels the caller's own pending or approved request before WillDeleteAt.
-// Out: the request, or ErrNotFound (another user's too), ErrNotPending or ErrGraceElapsed.
+// In: the verified caller's user id and the deletion id. Out: the request, or ErrNotFound (404, another
+// user's too), ErrNotPending (409, already cancelled or completed) or ErrGraceElapsed (409).
 // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-06, 14): anyone could cancel any request.
+// Reviewed the same day for Phase B.2 (EXPORT-15): unchanged, it already answered 409 deletion_not_pending.
 // Touches: memory.
 func (s *ComplianceService) CancelDeletion(callerUserID int, deletionID string) (*DeletionRequest, error) {
 	s.mu.Lock()

@@ -4,6 +4,13 @@
 // that nothing had issued, which a correct callback must refuse (spec gate state_valid), and now obtain one from
 // CreateOAuthStateAsync; VerifyEmail_HappyPath re-read the user through the context that still tracked the old
 // instance and now reads through a fresh one. Three tests were added for verify_access_token and the login lock.
+// Phase B.2 (2026-11-10, same session): verification codes, MFA challenge ids and OAuth states are seeded as their
+// SHA-256 (CodeHash; the Code column is gone), the OAuth mocks answer the single ExchangeCodeAsync call that replaced
+// GetEmailFromCodeAsync + IsEmailVerifiedAsync, and AUTH-16 tests were added.
+// spec d270fa3 (2026-11-10, same session: keyed HMAC for stored secrets): the service takes a fixed test HMAC key,
+// rows are seeded as HMAC-SHA256(TestSecretKey, value) through Hash() (they used AuthService's static plain SHA-256),
+// AUTH-16 asserts the stored value is not the plain SHA-256, and a test proves the service refuses to start without
+// a 32-byte key.
 // Touches: EF InMemory databases and an in-memory cache only.
 using System;
 using System.Collections.Generic;
@@ -25,6 +32,26 @@ namespace AuthSystemTests
         private readonly Mock<IOAuthProvider> _oauthProviderMock;
         private readonly IMemoryCache _cache;
         private readonly string _jwtSecret = "this_is_a_very_secret_key_for_jwt_signing_that_is_long_enough";
+        /// <summary>Fixed 32+ byte HMAC key for stored secrets (spec d270fa3: tests pass a fixed test key). 2026-11-10,
+        /// session_012zDydZCZ4AChqhEZ4oVtaP.</summary>
+        private const string TestSecretKey = "test-secret-key-0123456789abcdef-auth";
+
+        /// <summary>
+        /// The value the service stores for a secret: lower-case hex HMAC-SHA256(TestSecretKey, value). In: the secret.
+        /// Out: 64 hex characters. Why: spec d270fa3: keyed HMAC for stored secrets; the tests called the service's
+        /// static plain SHA-256 (AuthService.HashSecret) until 2026-11-10. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        /// Touches: nothing.
+        /// </summary>
+        private static string Hash(string value) => Convert.ToHexString(System.Security.Cryptography.HMACSHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(TestSecretKey), System.Text.Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
+
+        /// <summary>
+        /// Plain, unkeyed SHA-256 hex of a secret, which the service must no longer store. In: the secret. Out: 64 hex
+        /// characters. Why: spec d270fa3: keyed HMAC for stored secrets (AUTH-16 asserts the stored value is not this).
+        /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+        /// </summary>
+        private static string PlainSha256(string value) => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
 
         public AuthServiceTests()
         {
@@ -37,7 +64,9 @@ namespace AuthSystemTests
         }
 
         private AuthDbContext CreateDb() => new AuthDbContext(_dbOptions);
-        private AuthService CreateService() => new AuthService(CreateDb(), _emailSenderMock.Object, _oauthProviderMock.Object, _cache, _jwtSecret);
+        /// <summary>A service on a fresh context with the test JWT secret and, since spec d270fa3 (2026-11-10,
+        /// session_012zDydZCZ4AChqhEZ4oVtaP), the fixed TestSecretKey. Touches: the in-memory database and cache.</summary>
+        private AuthService CreateService() => new AuthService(CreateDb(), _emailSenderMock.Object, _oauthProviderMock.Object, _cache, _jwtSecret, TestSecretKey);
 
         // AUTH-01
         [Fact]
@@ -116,7 +145,7 @@ namespace AuthSystemTests
             db.VerificationCodes.Add(new VerificationCode
             {
                 UserId = user.Id,
-                Code = code,
+                CodeHash = Hash(code), // stored only as its hash (AUTH-16, 2026-11-10)
                 Type = "email",
                 CreatedAt = DateTime.UtcNow,
                 ExpiresAt = DateTime.UtcNow.AddMinutes(15)
@@ -148,7 +177,7 @@ namespace AuthSystemTests
             db.VerificationCodes.Add(new VerificationCode
             {
                 UserId = user.Id,
-                Code = code,
+                CodeHash = Hash(code), // stored only as its hash (AUTH-16, 2026-11-10)
                 Type = "email",
                 CreatedAt = DateTime.UtcNow.AddMinutes(-20),
                 ExpiresAt = DateTime.UtcNow.AddMinutes(-5)
@@ -216,8 +245,9 @@ namespace AuthSystemTests
         [Fact]
         public async Task OAuthCallback_NewUser_CreatesUserAndLinksProvider()
         {
-            _oauthProviderMock.Setup(o => o.GetEmailFromCodeAsync("google", "code")).ReturnsAsync("newuser@example.com");
-            _oauthProviderMock.Setup(o => o.IsEmailVerifiedAsync("google", "code")).ReturnsAsync(true);
+            // one exchange of the code through the injected client (Phase B.2, 2026-11-10; was two calls with the same code)
+            _oauthProviderMock.Setup(o => o.ExchangeCodeAsync("google", "code"))
+                .ReturnsAsync(new OAuthIdentity { ProviderUserId = "g-1", Email = "newuser@example.com", EmailVerified = true });
 
             var service = CreateService();
             var state = await service.CreateOAuthStateAsync();
@@ -241,8 +271,9 @@ namespace AuthSystemTests
             db.Users.Add(user);
             await db.SaveChangesAsync();
 
-            _oauthProviderMock.Setup(o => o.GetEmailFromCodeAsync("google", "code")).ReturnsAsync("existing@example.com");
-            _oauthProviderMock.Setup(o => o.IsEmailVerifiedAsync("google", "code")).ReturnsAsync(true);
+            // one exchange of the code through the injected client (Phase B.2, 2026-11-10; was two calls with the same code)
+            _oauthProviderMock.Setup(o => o.ExchangeCodeAsync("google", "code"))
+                .ReturnsAsync(new OAuthIdentity { ProviderUserId = "g-2", Email = "existing@example.com", EmailVerified = true });
 
             var service = CreateService();
             var state = await service.CreateOAuthStateAsync();
@@ -274,7 +305,7 @@ namespace AuthSystemTests
             db.VerificationCodes.Add(new VerificationCode
             {
                 UserId = user.Id,
-                Code = challengeId,
+                CodeHash = Hash(challengeId), // stored only as its hash (Phase B.2, 2026-11-10)
                 Type = "mfa",
                 CreatedAt = DateTime.UtcNow,
                 ExpiresAt = DateTime.UtcNow.AddMinutes(5)
@@ -307,7 +338,7 @@ namespace AuthSystemTests
             db.VerificationCodes.Add(new VerificationCode
             {
                 UserId = user.Id,
-                Code = challengeId,
+                CodeHash = Hash(challengeId), // stored only as its hash (Phase B.2, 2026-11-10)
                 Type = "mfa",
                 CreatedAt = DateTime.UtcNow,
                 ExpiresAt = DateTime.UtcNow.AddMinutes(5)
@@ -332,7 +363,7 @@ namespace AuthSystemTests
             db.Sessions.Add(new Session
             {
                 UserId = user.Id,
-                RefreshTokenHash = AuthService.HashRefreshToken(refreshToken), // only the hash is stored (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+                RefreshTokenHash = Hash(refreshToken), // only the hash is stored (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
                 CreatedAt = DateTime.UtcNow,
                 ExpiresAt = DateTime.UtcNow.AddDays(7),
                 Ip = "127.0.0.1",
@@ -359,7 +390,7 @@ namespace AuthSystemTests
             db.Sessions.Add(new Session
             {
                 UserId = user.Id,
-                RefreshTokenHash = AuthService.HashRefreshToken(refreshToken), // only the hash is stored (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+                RefreshTokenHash = Hash(refreshToken), // only the hash is stored (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
                 CreatedAt = DateTime.UtcNow,
                 ExpiresAt = DateTime.UtcNow.AddDays(7),
                 Ip = "127.0.0.1",
@@ -408,7 +439,7 @@ namespace AuthSystemTests
             var payload = B64($"{{\"user_id\":\"{user.Id}\",\"tier\":\"free\",\"exp\":{exp}}}");
             var unsigned = B64("{\"alg\":\"none\",\"typ\":\"JWT\"}") + "." + payload + ".";
 
-            var otherKeyService = new AuthService(CreateDb(), _emailSenderMock.Object, _oauthProviderMock.Object, _cache, "a_completely_different_secret_key_that_is_also_long_enough");
+            var otherKeyService = new AuthService(CreateDb(), _emailSenderMock.Object, _oauthProviderMock.Object, _cache, "a_completely_different_secret_key_that_is_also_long_enough", TestSecretKey);
             var login = await otherKeyService.LoginAsync("test@example.com", "ThisIsAVeryLongPassword123!", "device1", "127.0.0.1");
             var forged = (string)((dynamic)login).token;
 
@@ -434,6 +465,160 @@ namespace AuthSystemTests
                 Assert.Equal("invalid_credentials", ((dynamic)await service.LoginAsync("test@example.com", "WrongPassword", "device1", "10.0.0.1")).error);
             var locked = await service.LoginAsync("test@example.com", "ThisIsAVeryLongPassword123!", "device1", "10.0.0.1");
             Assert.Equal("too_many_attempts", ((dynamic)locked).error);
+        }
+
+        /// <summary>
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec d270fa3: keyed HMAC for stored secrets): each
+        /// stored value must equal HMAC-SHA256(TestSecretKey, value) and must not equal its plain SHA-256.
+        /// AUTH-16: login returns a refresh_token that token_refresh accepts; the sessions table holds only its SHA-256
+        /// (no stored column equals the token); and the signup verification code is stored only as its SHA-256 (the
+        /// code emailed to the user is not in the table, and it still verifies). In: nothing. Out: asserts. Added
+        /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2). Touches: the in-memory database and cache.
+        /// </summary>
+        // AUTH-16
+        [Fact]
+        public async Task Login_RefreshTokenAccepted_OnlyHashesAtRest()
+        {
+            string emailedCode = null;
+            _emailSenderMock.Setup(e => e.SendVerificationEmailAsync("hash@example.com", It.IsAny<string>()))
+                .Callback<string, string>((_, c) => emailedCode = c).Returns(Task.CompletedTask);
+            var service = CreateService();
+            Assert.Equal("pending_verification", ((dynamic)await service.SignupAsync("hash@example.com", "a long passphrase nobody guesses", "Hash")).status);
+            Assert.NotNull(emailedCode);
+            using (var db = CreateDb())
+            {
+                var stored = await db.VerificationCodes.SingleAsync(v => v.Type == "email");
+                Assert.Equal(Hash(emailedCode), stored.CodeHash);
+                Assert.NotEqual(PlainSha256(emailedCode), stored.CodeHash); // spec d270fa3 (2026-11-10): keyed, not plain
+                Assert.NotEqual(emailedCode, stored.CodeHash);
+                Assert.Equal(64, stored.CodeHash.Length);
+            }
+            Assert.Equal("verified", ((dynamic)await CreateService().VerifyEmailAsync("hash@example.com", emailedCode)).status);
+
+            var login = await CreateService().LoginAsync("hash@example.com", "a long passphrase nobody guesses", "device1", "127.0.0.1");
+            Assert.Equal("authenticated", ((dynamic)login).status);
+            string refreshToken = ((dynamic)login).refresh_token;
+            Assert.False(string.IsNullOrEmpty(refreshToken));
+
+            using (var db = CreateDb())
+            {
+                var session = await db.Sessions.AsNoTracking().SingleAsync();
+                Assert.Equal(Hash(refreshToken), session.RefreshTokenHash);
+                Assert.NotEqual(PlainSha256(refreshToken), session.RefreshTokenHash); // spec d270fa3 (2026-11-10)
+                Assert.Null(session.RefreshToken); // not mapped: a database read never hands out the token
+                Assert.DoesNotContain(refreshToken, new[] { session.RefreshTokenHash, session.Ip, session.DeviceId });
+            }
+
+            var refreshed = await CreateService().TokenRefreshAsync(refreshToken);
+            Assert.Equal("ok", ((dynamic)refreshed).status);
+            Assert.Equal("ok", ((dynamic)await CreateService().VerifyAccessTokenAsync((string)((dynamic)refreshed).token)).status);
+            // the stored hash itself is not a usable refresh token
+            using (var db = CreateDb())
+                Assert.Equal("invalid_token", ((dynamic)await CreateService().TokenRefreshAsync((await db.Sessions.SingleAsync()).RefreshTokenHash)).error);
+        }
+
+        /// <summary>
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec d270fa3): the challenge id and state hashes must
+        /// equal HMAC-SHA256(TestSecretKey, value), not the plain SHA-256.
+        /// AUTH-16 (with "Secrets at rest"): MFA verify and the OAuth callback also return a refresh_token that
+        /// token_refresh accepts; the MFA challenge id and the OAuth state are stored only as their SHA-256; the OAuth
+        /// state is single use and expires after 10 minutes; the callback exchanges the provider's code exactly once
+        /// through the injected client and takes the identity from that exchange, never from the code (a code the
+        /// provider refuses signs nobody in). In: nothing. Out: asserts. Added 2026-11-10,
+        /// session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2). Touches: the in-memory database and cache.
+        /// </summary>
+        // AUTH-16
+        [Fact]
+        public async Task MfaAndOAuth_ReturnRefreshToken_StateAndChallengeHashed_StateSingleUseAndExpiring()
+        {
+            using (var db = CreateDb())
+            {
+                db.Users.Add(new User { Email = "mfa@example.com", PasswordHash = BCrypt.Net.BCrypt.HashPassword("a long passphrase nobody guesses"), Status = "verified", MfaEnabled = true, MfaSecret = "JBSWY3DPEHPK3PXP" });
+                await db.SaveChangesAsync();
+            }
+            var mfaLogin = await CreateService().LoginAsync("mfa@example.com", "a long passphrase nobody guesses", "device1", "127.0.0.1");
+            string challengeId = ((dynamic)mfaLogin).challenge_id;
+            using (var db = CreateDb())
+            {
+                var row = await db.VerificationCodes.SingleAsync(v => v.Type == "mfa");
+                Assert.Equal(Hash(challengeId), row.CodeHash);
+                Assert.NotEqual(PlainSha256(challengeId), row.CodeHash); // spec d270fa3 (2026-11-10)
+                Assert.Equal("invalid_challenge", ((dynamic)await CreateService().MfaChallengeAsync(row.CodeHash, "000000")).error);
+            }
+            var mfa = await CreateService().MfaChallengeAsync(challengeId, new Totp(Base32Encoding.ToBytes("JBSWY3DPEHPK3PXP")).ComputeTotp());
+            Assert.Equal("authenticated", ((dynamic)mfa).status);
+            Assert.Equal("ok", ((dynamic)await CreateService().TokenRefreshAsync((string)((dynamic)mfa).refresh_token)).status);
+
+            _oauthProviderMock.Setup(o => o.ExchangeCodeAsync("google", "good-code"))
+                .ReturnsAsync(new OAuthIdentity { ProviderUserId = "g-9", Email = "oauth@example.com", EmailVerified = true });
+            _oauthProviderMock.Setup(o => o.ExchangeCodeAsync("google", "refused-code")).ReturnsAsync((OAuthIdentity)null);
+
+            var service = CreateService();
+            var state = await service.CreateOAuthStateAsync();
+            using (var db = CreateDb())
+            {
+                var row = await db.VerificationCodes.SingleAsync(v => v.Type == "oauth_state");
+                Assert.Equal(Hash(state), row.CodeHash);
+                Assert.NotEqual(PlainSha256(state), row.CodeHash); // spec d270fa3 (2026-11-10)
+                Assert.NotEqual(state, row.CodeHash);
+                Assert.InRange(row.ExpiresAt - row.CreatedAt, TimeSpan.FromMinutes(10) - TimeSpan.FromSeconds(1), TimeSpan.FromMinutes(10) + TimeSpan.FromSeconds(1));
+            }
+            var oauth = await service.OAuthCallbackAsync("google", "good-code", state);
+            Assert.Equal("authenticated", ((dynamic)oauth).status);
+            Assert.Equal("oauth@example.com", ((dynamic)oauth).user.email);
+            Assert.Equal("ok", ((dynamic)await CreateService().TokenRefreshAsync((string)((dynamic)oauth).refresh_token)).status);
+            _oauthProviderMock.Verify(o => o.ExchangeCodeAsync("google", "good-code"), Times.Once);
+
+            // single use: the same state again is refused before the provider is asked
+            Assert.Equal("invalid_state", ((dynamic)await CreateService().OAuthCallbackAsync("google", "good-code", state)).error);
+            _oauthProviderMock.Verify(o => o.ExchangeCodeAsync("google", "good-code"), Times.Once);
+
+            // a code the provider refuses signs nobody in (the code is never an identity)
+            var state2 = await CreateService().CreateOAuthStateAsync();
+            Assert.Equal("oauth_exchange_failed", ((dynamic)await CreateService().OAuthCallbackAsync("google", "refused-code", state2)).error);
+
+            // expired: a state older than 10 minutes is refused
+            var state3 = await CreateService().CreateOAuthStateAsync();
+            using (var db = CreateDb())
+            {
+                var row = await db.VerificationCodes.SingleAsync(v => v.Type == "oauth_state" && v.CodeHash == Hash(state3));
+                row.ExpiresAt = DateTime.UtcNow.AddSeconds(-1);
+                await db.SaveChangesAsync();
+            }
+            Assert.Equal("invalid_state", ((dynamic)await CreateService().OAuthCallbackAsync("google", "good-code", state3)).error);
+            _oauthProviderMock.Verify(o => o.ExchangeCodeAsync("google", "good-code"), Times.Once);
+        }
+
+        /// <summary>
+        /// AUTH-16: the service refuses to start without a 32-byte HMAC key: the constructor throws ArgumentException
+        /// for an empty or 31-byte secretKey, and for a null one when AUTH_SECRET_KEY is unset or 31 bytes; a 32-byte
+        /// AUTH_SECRET_KEY starts it and keys the stored hash. In: nothing. Out: asserts. Why: spec d270fa3: keyed HMAC
+        /// for stored secrets ("the service refuses to start without it"). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        /// Touches: the AUTH_SECRET_KEY environment variable (restored afterwards), the in-memory database and cache.
+        /// </summary>
+        // AUTH-16
+        [Fact]
+        public void Constructor_WithoutA32ByteSecretKey_RefusesToStart()
+        {
+            AuthService Make(string key) => new AuthService(CreateDb(), _emailSenderMock.Object, _oauthProviderMock.Object, _cache, _jwtSecret, key);
+            var saved = Environment.GetEnvironmentVariable("AUTH_SECRET_KEY");
+            try
+            {
+                Environment.SetEnvironmentVariable("AUTH_SECRET_KEY", null);
+                Assert.Contains("AUTH_SECRET_KEY", Assert.Throws<ArgumentException>(() => Make(null)).Message);
+                Assert.Throws<ArgumentException>(() => Make(""));
+                Assert.Throws<ArgumentException>(() => Make(new string('k', 31)));
+                Environment.SetEnvironmentVariable("AUTH_SECRET_KEY", new string('k', 31));
+                Assert.Throws<ArgumentException>(() => Make(null));
+                Environment.SetEnvironmentVariable("AUTH_SECRET_KEY", TestSecretKey);
+                var fromEnv = Make(null);
+                Assert.Equal(Hash("123456"), fromEnv.HashSecret("123456"));
+                Assert.NotEqual(PlainSha256("123456"), fromEnv.HashSecret("123456"));
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("AUTH_SECRET_KEY", saved);
+            }
         }
 }
 }

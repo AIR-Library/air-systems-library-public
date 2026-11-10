@@ -229,8 +229,8 @@ public class NotificationService {
     /**
      * Sends one notification. Order: do-not-disturb -> 'skipped'; no enabled channel -> 'skipped'; scheduled_at in the
      * future -> 'queued' with that scheduled_at; inside quiet hours -> 'queued' with scheduled_at = the end of the quiet
-     * window; otherwise sent now, retrying a failing send up to 3 attempts with exponential backoff (1 s, 2 s) through
-     * the injected sleeper; a bounce is not retried. Queued rows are sent by deliverDue, never by a timer.
+     * window; otherwise sent now, retrying a failing send up to 3 times after the first attempt (4 attempts, waits 1 s,
+     * 2 s, 4 s) through the injected sleeper; a bounce is not retried. Queued rows are sent by deliverDue, never by a timer.
      * In: NotificationRequest. Out: SendResponse(success, messageId, status sent|queued|skipped|failed).
      * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-02/05/12): defaults (SMS off, no quiet hours), queued
      * rows carry scheduled_at, injected clock and sleeper, emails carry a signed unsubscribe link.
@@ -290,11 +290,16 @@ public class NotificationService {
         }
     }
 
+    /** Most attempts for one email/SMS send: the first plus 3 retries (NOTIF-08, amended 2026-11-10 Phase B.2). */
+    public static final int MAX_ATTEMPTS = 4;
+
     /**
-     * Renders the template and sends it on the channel, retrying up to 3 attempts with 1 s then 2 s waits; an email's
-     * body ends with the user's signed unsubscribe link. In: user id, channel, template, vars. Out: the outcome.
+     * Renders the template and sends it on the channel, retrying a failure up to 3 times after the first attempt (at
+     * most 4 attempts) with 1 s, 2 s and 4 s waits; an email's body ends with the user's signed unsubscribe link.
+     * In: user id, channel, template, vars. Out: the outcome (failed after the 4th failure).
      * Split out of sendSingle 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, so deliverDue sends the same way.
-     * Touches: the senders (network).
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-08, Phase B.2: "retry up to 3 times after the first
+     * attempt", the same counting as background jobs): it made 3 attempts in all. Touches: the senders (network).
      */
     private DeliveryOutcome deliver(long userId, String channel, NotificationTemplate template, Map<String, Object> vars) {
         String body = renderTemplate(template.bodyText, vars);
@@ -303,7 +308,7 @@ public class NotificationService {
             body = body + "\n\nUnsubscribe: " + unsubscribeLink(userId, "email");
         }
         String error = null;
-        for (int attempt = 1; attempt <= 3; attempt++) {
+        for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
             try {
                 if (channel.equals("email")) {
                     emailSender.send(userId + "@example.com", subject, body);
@@ -317,8 +322,8 @@ public class NotificationService {
                 return new DeliveryOutcome(false, true, be.getMessage());
             } catch (Exception e) {
                 error = e.getMessage();
-                if (attempt < 3) {
-                    sleeper.accept((long) Math.pow(2, attempt - 1) * 1000);
+                if (attempt < MAX_ATTEMPTS) {
+                    sleeper.accept(1000L << (attempt - 1));   // 1 s, 2 s, 4 s
                 }
             }
         }
@@ -349,7 +354,10 @@ public class NotificationService {
      * (1) 'sending' rows claimed more than 300 s ago go back to 'queued' (a crashed worker); (2) 'queued' rows with
      * scheduled_at <= now, by scheduled_at then insertion order, are claimed one by one with a conditional UPDATE
      * (a row another worker claimed first is skipped); (3) preferences are read NOW: do-not-disturb, an unsubscribed
-     * or disabled channel -> 'skipped'; (4) the final write is conditional on the same claim.
+     * or disabled channel -> 'skipped'; inside the user's quiet hours (UTC, may cross midnight) -> back to 'queued'
+     * with scheduled_at = quiet_hours_end, unsent; (4) the final write is conditional on the same claim.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-05, Phase B.2: step 3 re-queues a due message that
+     * falls inside quiet hours; it was sent).
      * In: now (the caller's clock). Out: how many messages were sent. Each message is sent exactly once when no
      * worker crashes, at least once after a crash. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-12).
      * Touches: the database; the senders (network).
@@ -409,6 +417,18 @@ public class NotificationService {
             NotificationTemplate template = getTemplate(templateKey);
             if (prefs.doNotDisturb || channel == null || !isChannelEnabled(prefs, channel)) {
                 finalStatus = "skipped";
+            } else if (isInQuietHours(prefs, now.toLocalTime())) {
+                // Step 3: still inside the user's quiet hours -> back to 'queued' until the window ends.
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "UPDATE notification_logs SET status = 'queued', claimed_at = NULL, scheduled_at = ? WHERE id = ? AND status = 'sending' AND claimed_at = ?")) {
+                    ps.setTimestamp(1, Timestamp.valueOf(quietHoursEnd(prefs, now)));
+                    ps.setString(2, id);
+                    ps.setTimestamp(3, claim);
+                    ps.executeUpdate();
+                } catch (SQLException e) {
+                    throw new IllegalStateException("deliver_due: re-queue for quiet hours failed", e);
+                }
+                continue;
             } else if (template == null) {
                 finalStatus = "failed";
                 error = "Template not found";
@@ -595,15 +615,36 @@ public class NotificationService {
         }
     }
 
+    /**
+     * Records that a message was opened (tracking pixel or link): sets opened_at and status 'opened' the first time
+     * only; a second call, or an unknown id, changes nothing. In: message id. Out: none.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-07, Phase B.2): it overwrote opened_at on every call
+     * and never set the status. Touches: the database.
+     */
     public void openMessage(String messageId) {
+        if (messageId == null) return;
         try (PreparedStatement ps = conn.prepareStatement(
-                "UPDATE notification_logs SET opened_at = ? WHERE id = ?")) {
+                "UPDATE notification_logs SET opened_at = ?, status = 'opened' WHERE id = ? AND opened_at IS NULL")) {
             ps.setTimestamp(1, Timestamp.valueOf(now()));
             ps.setString(2, messageId);
             ps.executeUpdate();
         } catch (SQLException e) {
             logger.severe("Open error: " + e.getMessage());
         }
+    }
+
+    /**
+     * GET /notifications/open/:message_id (this template has no router, so the route is this method): records the
+     * open once through openMessage and answers 204 with no body either way, so the reply never says whether the id
+     * exists. In: HTTP method, message id. Out: HandlerResponse 204 (405 for a method other than GET).
+     * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (NOTIF-07, Phase B.2). Touches: the database.
+     */
+    public HandlerResponse handleOpen(String method, String messageId) {
+        if (!"GET".equals(method)) {
+            return new HandlerResponse(405, Map.of("error", "method_not_allowed"));
+        }
+        openMessage(messageId);
+        return new HandlerResponse(204, Map.of());
     }
 
     public void clickMessage(String messageId) {

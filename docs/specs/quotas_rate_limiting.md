@@ -73,7 +73,8 @@ IMPLEMENTATION REQUIREMENTS:
   - api_calls table: (id, user_id, ip, endpoint, timestamp, status_code, response_time_ms)
   - Rate limiting: use in-memory counter (Redis if distributed) or DB query
   - Return on quota exceeded: {error: "quota_exceeded", current: X, limit: Y, reset_date: "..."}
-  - Return on feature unavailable: {error: "feature_not_available", tier: "solo", minimum_tier: "team"}
+  - Return on feature unavailable: 403 {error: "feature_not_available_in_tier", tier: "solo", minimum_tier:
+    "team", upgrade_url} (one name in every language). Amended 2026-11-10 (Phase B.2: one answer in every language).
 
 TESTS REQUIRED:
   - **QUOTA-01** api_quota PASS → call succeeds, usage incremented

@@ -50,11 +50,16 @@ class AdminSystemTests {
     private static final String CSRF_HEADER = "X-CSRF-Token";
     private static final String CSRF_TOKEN = "secure-token";
 
+    /**
+     * The three staff users. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (admin spec TIERS, Phase B.2): staff
+     * roles are lowercase 'owner' / 'admin' / 'user' (they were upper case), and customers and deployments in the tests
+     * below carry a plan ('solo' / 'team'), never a staff role or a made-up plan name.
+     */
     @BeforeAll
     void setupUsers() {
-        owner = new User(); owner.setEmail("owner@example.com"); owner.setName("Owner"); owner.setTier("OWNER");
-        admin = new User(); admin.setEmail("admin@example.com"); admin.setName("Admin"); admin.setTier("ADMIN");
-        regular = new User(); regular.setEmail("user@example.com"); regular.setName("User"); regular.setTier("USER");
+        owner = new User(); owner.setEmail("owner@example.com"); owner.setName("Owner"); owner.setTier("owner");
+        admin = new User(); admin.setEmail("admin@example.com"); admin.setName("Admin"); admin.setTier("admin");
+        regular = new User(); regular.setEmail("user@example.com"); regular.setName("User"); regular.setTier("user");
         userRepo.saveAll(List.of(owner, admin, regular));
     }
 
@@ -87,7 +92,7 @@ class AdminSystemTests {
         Map<String, Object> payload = Map.of(
                 "email", "newuser@example.com",
                 "name", "New User",
-                "tier", "USER",
+                "tier", "user",
                 "notify", true
         );
         mockMvc.perform(post("/admin/users/action")
@@ -108,7 +113,7 @@ class AdminSystemTests {
         Map<String, Object> payload = Map.of(
                 "email", owner.getEmail(),
                 "name", "Dup",
-                "tier", "USER",
+                "tier", "user",
                 "notify", false
         );
         mockMvc.perform(post("/admin/users/action")
@@ -126,7 +131,7 @@ class AdminSystemTests {
         Map<String, Object> payload = Map.of(
                 "email", "another@example.com",
                 "name", "Another",
-                "tier", "USER",
+                "tier", "user",
                 "notify", false
         );
         mockMvc.perform(post("/admin/users/action")
@@ -171,9 +176,9 @@ class AdminSystemTests {
     void testChangeRoleHappyPath() throws Exception {
         // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: a user of its own, and the row's "role changed + audit
         // logged" checked (the stored tier and a role_changed audit row).
-        User target = new User(); target.setEmail("role-target@example.com"); target.setName("Role"); target.setTier("USER");
+        User target = new User(); target.setEmail("role-target@example.com"); target.setName("Role"); target.setTier("user");
         userRepo.save(target);
-        Map<String, Object> payload = Map.of("user_id", target.getId(), "new_tier", "ADMIN");
+        Map<String, Object> payload = Map.of("user_id", target.getId(), "new_tier", "admin");
         mockMvc.perform(post("/admin/users/action")
                 .header("X-Action", "change_role")
                 .contentType(MediaType.APPLICATION_JSON)
@@ -181,7 +186,7 @@ class AdminSystemTests {
                 .with(auth(owner)))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true));
-        Assertions.assertEquals("ADMIN", userRepo.findById(target.getId()).orElseThrow().getTier());
+        Assertions.assertEquals("admin", userRepo.findById(target.getId()).orElseThrow().getTier());
         Assertions.assertEquals(1, auditRows("role_changed", target.getId()).size());
     }
 
@@ -190,11 +195,11 @@ class AdminSystemTests {
     void testChangeRoleLastOwner() throws Exception {
         // Ensure only one owner exists
         userRepo.findAll().stream()
-                .filter(u -> !"OWNER".equals(u.getTier()))
-                .forEach(u -> u.setTier("USER"));
+                .filter(u -> !"owner".equals(u.getTier()))
+                .forEach(u -> u.setTier("user"));
         userRepo.saveAll(userRepo.findAll());
 
-        Map<String, Object> payload = Map.of("user_id", owner.getId(), "new_tier", "ADMIN");
+        Map<String, Object> payload = Map.of("user_id", owner.getId(), "new_tier", "admin");
         try {
             mockMvc.perform(post("/admin/users/action")
                     .header("X-Action", "change_role")
@@ -207,7 +212,7 @@ class AdminSystemTests {
             // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: put the admin back, so tests that act as the admin do
             // not depend on running before this one (the setup above demotes every non-owner).
             User a = userRepo.findById(admin.getId()).orElseThrow();
-            a.setTier("ADMIN");
+            a.setTier("admin");
             userRepo.save(a);
         }
     }
@@ -251,7 +256,7 @@ class AdminSystemTests {
             Customer c = new Customer();
             c.setEmail("c"+i+"@example.com");
             c.setName("Customer "+i);
-            c.setTier("USER");
+            c.setTier("solo");
             c.setSignupDate(java.time.LocalDate.now());
             custRepo.save(c);
         }
@@ -284,7 +289,7 @@ class AdminSystemTests {
         Customer c = new Customer();
         c.setEmail("detail@example.com");
         c.setName("Detail");
-        c.setTier("USER");
+        c.setTier("solo");
         c.setSignupDate(java.time.LocalDate.now());
         custRepo.save(c);
         mockMvc.perform(get("/admin/customers/"+c.getId())
@@ -294,7 +299,7 @@ class AdminSystemTests {
                 .andExpect(jsonPath("$.name").value("Detail"))
                 // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: every field the spec lists is in the answer.
                 .andExpect(jsonPath("$.customer_id").value(c.getId()))
-                .andExpect(jsonPath("$.tier").value("USER"))
+                .andExpect(jsonPath("$.tier").value("solo"))
                 .andExpect(jsonPath("$.subscription_status").exists())
                 .andExpect(jsonPath("$.payment_method").hasJsonPath())
                 .andExpect(jsonPath("$.address").hasJsonPath())
@@ -373,7 +378,7 @@ class AdminSystemTests {
         Customer c = new Customer();
         c.setEmail("refund@example.com");
         c.setName("Refund");
-        c.setTier("BASIC");
+        c.setTier("solo");
         c.setSignupDate(java.time.LocalDate.now());
         custRepo.save(c);
         Invoice inv = new Invoice();
@@ -402,13 +407,13 @@ class AdminSystemTests {
         Customer c = new Customer();
         c.setEmail("dep@example.com");
         c.setName("DepCust");
-        c.setTier("BASIC");
+        c.setTier("solo");
         c.setSignupDate(java.time.LocalDate.now());
         custRepo.save(c);
         Map<String, Object> payload = Map.of(
                 "customer_id", c.getId(),
                 "domain", "example.com",
-                "tier", "BASIC",
+                "tier", "solo",
                 "theme_id", 1
         );
         mockMvc.perform(post("/admin/deployments/action")
@@ -434,7 +439,7 @@ class AdminSystemTests {
         Deployment d = new Deployment();
         d.setCustomerId(1L);
         d.setDomain("publish.com");
-        d.setTier("BASIC");
+        d.setTier("solo");
         d.setStatus("draft");
         // Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: the spec's publish check requires a
         // verified domain and a theme; the draft now has both.
@@ -454,7 +459,7 @@ class AdminSystemTests {
         Deployment unverified = new Deployment();
         unverified.setCustomerId(1L);
         unverified.setDomain("unverified-publish.com");
-        unverified.setTier("BASIC");
+        unverified.setTier("solo");
         unverified.setStatus("draft");
         unverified.setThemeId(1L);
         unverified.setDomainVerified(false);
@@ -476,7 +481,7 @@ class AdminSystemTests {
         // Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: the action was never saved and the request
         // assumed id 1 existed; it is now saved and its real id used. It targets a user of its own, because
         // approving executes the action and must not remove a user other tests rely on.
-        User target = new User(); target.setEmail("approve-target@example.com"); target.setName("Target"); target.setTier("USER");
+        User target = new User(); target.setEmail("approve-target@example.com"); target.setName("Target"); target.setTier("user");
         userRepo.save(target);
         GovernanceAction ga = new GovernanceAction();
         ga.setActionType("delete_user");
@@ -499,7 +504,7 @@ class AdminSystemTests {
     void testGovernanceReject() throws Exception {
         // create a pending governance action
         // Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: saved, and its real id used (it assumed id 2).
-        User target = new User(); target.setEmail("reject-target@example.com"); target.setName("Target"); target.setTier("USER");
+        User target = new User(); target.setEmail("reject-target@example.com"); target.setName("Target"); target.setTier("user");
         userRepo.save(target);
         GovernanceAction ga = new GovernanceAction();
         ga.setActionType("delete_user");
@@ -535,7 +540,7 @@ class AdminSystemTests {
                     .header("X-Action", "create")
                     .contentType(MediaType.APPLICATION_JSON)
                     .content(mapper.writeValueAsString(Map.of("email", "audit" + i + "@example.com", "name", "Audit " + i,
-                            "tier", "USER", "notify", false)))
+                            "tier", "user", "notify", false)))
                     .with(auth(owner)))
                     .andExpect(status().isOk());
         }
@@ -553,5 +558,114 @@ class AdminSystemTests {
                         .param("limit", "2").param("offset", "2").with(auth(owner)))
                 .andReturn().getResponse().getContentAsString();
         Assertions.assertEquals(Math.min(2, rows.size() - 2), mapper.readValue(page2, List.class).size());
+    }
+    /**
+     * Posts a JSON body as the given user and returns the response. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP
+     * for the Phase B.2 tests below. Touches: the test application (MockMvc).
+     */
+    private ResultActions postAs(User u, String url, String actionHeader, String action, Map<String, Object> body) throws Exception {
+        return mockMvc.perform(post(url)
+                .header(actionHeader, action)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(mapper.writeValueAsString(body))
+                .with(auth(u)));
+    }
+
+    /**
+     * ADMIN-19: a suspended owner is refused before any gate with 403 {error: "account_suspended"} on every admin
+     * action (users, customers, deployments, governance; reads and writes), and nothing changes. Added 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2: a suspended caller got 401 unauthenticated). Touches: test database.
+     */
+    // ADMIN-19
+    @Test
+    void testSuspendedOwnerIsRefusedEverywhere() throws Exception {
+        User suspended = new User(); suspended.setEmail("suspended-owner@example.com"); suspended.setName("Suspended");
+        suspended.setTier("owner"); suspended.setStatus("suspended");
+        userRepo.save(suspended);
+        Deployment d = new Deployment();
+        d.setCustomerId(1L); d.setDomain("suspended-owner.com"); d.setTier("solo"); d.setStatus("draft");
+        d.setThemeId(1L); d.setDomainVerified(true);
+        depRepo.save(d);
+        User victim = new User(); victim.setEmail("suspended-victim@example.com"); victim.setName("Victim"); victim.setTier("user");
+        userRepo.save(victim);
+
+        postAs(suspended, "/admin/users/action", "X-Action", "create",
+                Map.of("email", "by-suspended@example.com", "name", "X", "tier", "user", "notify", false))
+                .andExpect(status().isForbidden()).andExpect(jsonPath("$.error").value("account_suspended"));
+        postAs(suspended, "/admin/users/action", "X-Action", "change_role", Map.of("user_id", victim.getId(), "new_tier", "admin"))
+                .andExpect(status().isForbidden()).andExpect(jsonPath("$.error").value("account_suspended"));
+        postAs(suspended, "/admin/deployments/action", "X-Action", "publish", Map.of("deployment_id", d.getId()))
+                .andExpect(status().isForbidden()).andExpect(jsonPath("$.error").value("account_suspended"));
+        mockMvc.perform(get("/admin/customers").with(auth(suspended)))
+                .andExpect(status().isForbidden()).andExpect(jsonPath("$.error").value("account_suspended"));
+        mockMvc.perform(get("/admin/governance/audit-log").with(auth(suspended)))
+                .andExpect(status().isForbidden()).andExpect(jsonPath("$.error").value("account_suspended"));
+
+        Assertions.assertFalse(userRepo.existsByEmail("by-suspended@example.com"));
+        Assertions.assertEquals("user", userRepo.findById(victim.getId()).orElseThrow().getTier());
+        Assertions.assertEquals("draft", depRepo.findById(d.getId()).orElseThrow().getStatus());
+    }
+
+    /**
+     * Admin spec TIERS (Phase B.2): users.tier is the staff role and a customer's or deployment's tier is the plan; a
+     * plan where a role is expected (create user, change_role) or a role where a plan is expected (change_plan,
+     * create_deployment) is 400 invalid_tier and changes nothing. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches: the test database, the in-memory Stripe gateway.
+     */
+    // ADMIN-06
+    @Test
+    void testRolesAndPlansAreNeverMixed() throws Exception {
+        postAs(owner, "/admin/users/action", "X-Action", "create",
+                Map.of("email", "plan-as-role@example.com", "name", "P", "tier", "team", "notify", false))
+                .andExpect(status().isBadRequest()).andExpect(jsonPath("$.error").value("invalid_tier"));
+        Assertions.assertFalse(userRepo.existsByEmail("plan-as-role@example.com"));
+        User target = new User(); target.setEmail("mix-target@example.com"); target.setName("Mix"); target.setTier("user");
+        userRepo.save(target);
+        postAs(owner, "/admin/users/action", "X-Action", "change_role", Map.of("user_id", target.getId(), "new_tier", "enterprise"))
+                .andExpect(status().isBadRequest()).andExpect(jsonPath("$.error").value("invalid_tier"));
+        Assertions.assertEquals("user", userRepo.findById(target.getId()).orElseThrow().getTier());
+
+        InMemoryAdminStripeGateway fake = (InMemoryAdminStripeGateway) stripeGateway;
+        Customer c = new Customer();
+        c.setEmail("mix-cust@example.com"); c.setName("MixCust"); c.setTier("solo");
+        c.setSignupDate(java.time.LocalDate.now()); c.setStripeSubscriptionId("sub_mix");
+        custRepo.save(c);
+        int before = fake.calls().size();
+        postAs(owner, "/admin/customers/" + c.getId() + "/action", "X-Action", "change_plan", Map.of("new_tier", "owner"))
+                .andExpect(status().isBadRequest()).andExpect(jsonPath("$.error").value("invalid_tier"));
+        Assertions.assertEquals(before, fake.calls().size(), "no Stripe call for a role given as a plan");
+        Assertions.assertEquals("solo", custRepo.findById(c.getId()).orElseThrow().getTier());
+
+        postAs(owner, "/admin/deployments/action", "X-Action", "create",
+                Map.of("customer_id", c.getId(), "domain", "role-as-plan.com", "tier", "admin", "theme_id", 1))
+                .andExpect(status().isBadRequest()).andExpect(jsonPath("$.error").value("invalid_tier"));
+        Assertions.assertTrue(depRepo.findPage(0, 10_000).stream().noneMatch(x -> "role-as-plan.com".equals(x.getDomain())));
+    }
+
+    /**
+     * Admin spec TIERS (Phase B.2): a new deployment has domain_verified false, and publish refuses it with 400
+     * domain_not_verified until the domain is verified. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches: the test database.
+     */
+    // ADMIN-15
+    @Test
+    void testPublishNeedsVerifiedDomain() throws Exception {
+        Customer c = new Customer();
+        c.setEmail("verify-cust@example.com"); c.setName("Verify"); c.setTier("team");
+        c.setSignupDate(java.time.LocalDate.now());
+        custRepo.save(c);
+        postAs(owner, "/admin/deployments/action", "X-Action", "create",
+                Map.of("customer_id", c.getId(), "domain", "needs-verify.com", "tier", "team", "theme_id", 1))
+                .andExpect(status().isOk());
+        Deployment created = depRepo.findPage(0, 10_000).stream()
+                .filter(x -> "needs-verify.com".equals(x.getDomain())).findFirst().orElseThrow();
+        Assertions.assertFalse(created.isDomainVerified());
+        postAs(owner, "/admin/deployments/action", "X-Action", "publish", Map.of("deployment_id", created.getId()))
+                .andExpect(status().isBadRequest()).andExpect(jsonPath("$.error").value("domain_not_verified"));
+        Assertions.assertEquals("draft", depRepo.findById(created.getId()).orElseThrow().getStatus());
+        created.setDomainVerified(true);
+        depRepo.save(created);
+        postAs(owner, "/admin/deployments/action", "X-Action", "publish", Map.of("deployment_id", created.getId()))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.status").value("live"));
     }
 }

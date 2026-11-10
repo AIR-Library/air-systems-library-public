@@ -6,7 +6,7 @@ type Decision = 'PASS' | 'CHALLENGE' | 'FAIL';
 
 /**
  * What a gate returns: its decision and the numbers it decided on. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: paymentDelay may be null
- * and the chargeback gate reports its total in count. Touches: nothing.
+ * and the chargeback gate reports its total in count; error names a fail-closed reason (Phase B.2). Touches: nothing.
  */
 interface GateResult {
   decision: Decision;
@@ -16,6 +16,8 @@ interface GateResult {
   deviceHash?: string;
   trialDuration?: number;
   paymentDelay?: number | null;
+  /** Why a gate failed closed: 'user_not_found' from the timing gate (Phase B.2, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). */
+  error?: string;
 }
 
 interface User {
@@ -47,7 +49,17 @@ interface AbuseLedgerEntry {
 export const db = new Database(':memory:');
 
 // Migration (DDL)
+// users: the account a trial belongs to; created_at starts the trial (TRIAL_PAYMENT_TIMING). Added 2026-11-10,
+// session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 trial spec amendment: payment timing is judged from users.created_at,
+// and a user with no users row fails closed with user_not_found). Touches: in-memory SQLite.
 db.exec(`
+CREATE TABLE users (
+  id INTEGER PRIMARY KEY,
+  email TEXT NOT NULL,
+  created_at DATETIME NOT NULL,
+  abuse_flags TEXT NOT NULL DEFAULT '[]' -- JSON
+);
+
 CREATE TABLE trial_abuse_ledger (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL,
@@ -282,31 +294,33 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  * Gate 5, TRIAL_PAYMENT_TIMING, judged when a payment method is being added (so the payment date is now).
  *
  * In: the user id and trial_days (configuration, default 14). Out: { decision, trialDuration (trial_days),
- * paymentDelay (days_after_trial, or null when no trial is on record) }.
- * trial_end = the user's trial start (the ledger's first trial_started_at) + trial_days;
- * days_after_trial = floor((now - trial_end) / 1 day), rounded toward negative infinity (Math.floor), negative while
- * the trial runs; earlier_payment = the ledger already has a payment_added_date for the user.
+ * paymentDelay (days_after_trial, or null for an unknown user), error? ('user_not_found') }.
+ * trial_end = users.created_at + trial_days; days_after_trial = floor((now - trial_end) / 1 day), rounded toward
+ * negative infinity (Math.floor), negative while the trial runs; earlier_payment = the ledger already has a
+ * payment_added_date for the user (none when the user has no ledger row).
  * PASS if days_after_trial < 5; FAIL if days_after_trial >= 90 and no earlier payment (the API answers 403
- * trial_ended_no_payment_cannot_retry); CHALLENGE otherwise (flag late_payment_entry).
+ * trial_ended_no_payment_cannot_retry); CHALLENGE otherwise (flag late_payment_entry). A user with no users row is
+ * FAIL with error 'user_not_found' (fail closed).
  * Why: TRIAL-10/11/15 amendment 2026-11-10 (review on PR 19); the old rule measured from the trial START, so a
- * payment 100 days after signup was FAIL, and its CHALLENGE window overlapped PASS. 2026-11-10,
- * session_012zDydZCZ4AChqhEZ4oVtaP. Touches: reads trial_abuse_ledger, writes one gate_decisions row, reads the clock.
+ * payment 100 days after signup was FAIL, and its CHALLENGE window overlapped PASS. Changed again the same day
+ * (Phase B.2 trial spec amendment): the trial starts at users.created_at, not the ledger's trial_started_at; a user
+ * with no users row was PASS ("no trial on record") and is now FAIL user_not_found; a user with no ledger row is
+ * judged from users.created_at with no earlier payment. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+ * Touches: reads users and trial_abuse_ledger, writes one gate_decisions row, reads the clock.
  */
 export function check_trial_payment_timing(userId: number, trialDays: number = 14): GateResult {
-  const ledgerRow = db.prepare(
-    `SELECT trial_started_at FROM trial_abuse_ledger WHERE user_id = ? ORDER BY id ASC LIMIT 1`
-  ).get(userId) as { trial_started_at: string } | undefined;
-  const trialStart = ledgerRow ? parseDbDate(ledgerRow.trial_started_at) : null;
+  const userRow = db.prepare(`SELECT created_at FROM users WHERE id = ?`).get(userId) as { created_at: string } | undefined;
+  const trialStart = userRow ? parseDbDate(userRow.created_at) : null;
   if (!trialStart) {
-    // No trial on record for this user: there is no trial to time, so the gate has nothing to object to.
+    // No users row (or no readable created_at): fail closed.
     why_chain({
       user_id: userId,
       gate_name: 'trial_payment_timing',
-      decision: 'PASS',
-      rule_inputs: { trial_started_at: null },
-      rule_outputs: { decision: 'PASS', reason: 'no_trial_on_record' }
+      decision: 'FAIL',
+      rule_inputs: { users_created_at: null },
+      rule_outputs: { decision: 'FAIL', reason: 'user_not_found' }
     });
-    return { decision: 'PASS', trialDuration: trialDays, paymentDelay: null };
+    return { decision: 'FAIL', trialDuration: trialDays, paymentDelay: null, error: 'user_not_found' };
   }
 
   const now = clock();
@@ -329,7 +343,7 @@ export function check_trial_payment_timing(userId: number, trialDays: number = 1
     user_id: userId,
     gate_name: 'trial_payment_timing',
     decision,
-    rule_inputs: { trial_started_at: trialStart.toISOString(), trial_days: trialDays, now: now.toISOString(),
+    rule_inputs: { users_created_at: trialStart.toISOString(), trial_days: trialDays, now: now.toISOString(),
       earlier_payment: earlierPayment },
     rule_outputs: { decision, trial_duration: trialDays, payment_delay: daysAfterTrial }
   });
@@ -403,8 +417,10 @@ let userIdSeq = 1;
  * Why changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (TRIAL-09/14): signup never ran the device gate; it now
  * runs it BEFORE recording the device, and records the device and the ledger row only after every gate passed or
  * challenged. A captcha-challenged signup is now recorded too (it returned before writing its ledger row, so an IP
- * could never reach the 10-signup FAIL).
- * Touches: trial_abuse_ledger, device_fingerprints, gate_decisions; reads the clock.
+ * could never reach the 10-signup FAIL). Changed again the same day (Phase B.2 trial spec amendment): signup also
+ * writes the users row (id, email, created_at = now, abuse_flags), because payment timing is judged from
+ * users.created_at.
+ * Touches: users, trial_abuse_ledger, device_fingerprints, gate_decisions; reads the clock.
  */
 export function signup(params: {
   email: string;
@@ -464,7 +480,10 @@ export function signup(params: {
     user.abuse_flags.push('new_device_login');
   }
 
-  // Recorded only now, after every gate has decided.
+  // Recorded only now, after every gate has decided. The users row starts the trial (payment timing reads
+  // users.created_at; Phase B.2, 2026-11-10).
+  db.prepare(`INSERT INTO users (id, email, created_at, abuse_flags) VALUES (?, ?, ?, ?)`)
+    .run(user.id, email, now.toISOString(), JSON.stringify(user.abuse_flags));
   record_device_fingerprint({ user_id: user.id, device });
   db.prepare(`
     INSERT INTO trial_abuse_ledger
@@ -491,8 +510,10 @@ export function signup(params: {
  * Runs the payment-method, timing and chargeback gates when a subscription (payment method) is created, then
  * records the payment. In: user id, Stripe payment method and customer ids, optional trial_days (default 14).
  * Out: { success, error?, challenge? }. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: trial_days is
- * configurable (TRIAL-10/11/15) and payment_added_date comes from the injected clock. Touches: trial_abuse_ledger,
- * gate_decisions; reads stripe_events and refunds when present.
+ * configurable (TRIAL-10/11/15) and payment_added_date comes from the injected clock. Changed again the same day
+ * (Phase B.2 trial spec amendment): a user with no users row is refused 403 {error: 'user_not_found'} (not
+ * trial_ended_no_payment_cannot_retry), and a user with no ledger row gets one, so the payment is recorded.
+ * Touches: users (read), trial_abuse_ledger, gate_decisions; reads stripe_events and refunds when present.
  */
 export function subscription_created(params: {
   user_id: number;
@@ -514,7 +535,9 @@ export function subscription_created(params: {
         errorObj = { error: 'payment_method_used_for_multiple_trials', message: 'Payment method reused', code: 403 };
         break;
       case timingGate:
-        errorObj = { error: 'trial_ended_no_payment_cannot_retry', message: 'Trial ended without payment', code: 403 };
+        errorObj = timingGate.error === 'user_not_found'
+          ? { error: 'user_not_found', message: 'No such user', code: 403 }
+          : { error: 'trial_ended_no_payment_cannot_retry', message: 'Trial ended without payment', code: 403 };
         break;
       case chargebackGate:
         errorObj = { error: 'chargeback_history_requires_prepayment', message: 'Chargeback history requires prepayment', code: 403 };
@@ -532,14 +555,27 @@ export function subscription_created(params: {
         gate_flags = json_set(gate_flags, '$.payment', ?, '$.timing', ?, '$.chargeback', ?)
     WHERE user_id = ?
   `);
-  updateStmt.run(
-    clock().toISOString(),
+  const paidAt = clock().toISOString();
+  const updated = updateStmt.run(
+    paidAt,
     stripe_payment_method_id,
     paymentGate.decision,
     timingGate.decision,
     chargebackGate.decision,
     user_id
   );
+  if (updated.changes === 0) {
+    // A user with a users row but no ledger row (Phase B.2): give them one, so the payment is recorded and a later
+    // check sees the earlier payment. The trial started at users.created_at; the signup IP is not known here.
+    const u = db.prepare(`SELECT email, created_at FROM users WHERE id = ?`).get(user_id) as { email: string; created_at: string };
+    db.prepare(`
+      INSERT INTO trial_abuse_ledger
+      (user_id, email, ip, signup_date, trial_started_at, payment_added_date, stripe_payment_method_id,
+       subscription_status, gate_flags)
+      VALUES (?, ?, '', ?, ?, ?, ?, 'completed', ?)
+    `).run(user_id, u.email, u.created_at, u.created_at, paidAt, stripe_payment_method_id,
+      JSON.stringify({ payment: paymentGate.decision, timing: timingGate.decision, chargeback: chargebackGate.decision }));
+  }
 
   // Handle challenges
   const challenges: string[] = [];

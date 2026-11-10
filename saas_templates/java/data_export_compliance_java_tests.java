@@ -155,6 +155,18 @@ public class DataExportComplianceTest {
         assertEquals(code, e.code());
     }
 
+    /**
+     * Asserts the call is refused with this HTTP status and code; returns the exception so a test can compare answers.
+     * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-15 names a status with each answer). Touches: nothing.
+     */
+    private DataExportCompliance.ComplianceException assertRefused(int status, String code, Runnable call) {
+        DataExportCompliance.ComplianceException e =
+                assertThrows(DataExportCompliance.ComplianceException.class, call::run);
+        assertEquals(code, e.code());
+        assertEquals(status, e.httpStatus());
+        return e;
+    }
+
     private AuditEntry auditOf(String action) {
         return audit.stream().filter(a -> a.action().equals(action)).findFirst()
                 .orElseThrow(() -> new AssertionError("no audit entry for " + action + ": " + audit));
@@ -387,14 +399,15 @@ public class DataExportComplianceTest {
         assertEquals(USER, auditOf("deletion_confirmed").userId());
     }
 
-    /** A wrong or missing token changes nothing. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: confirm takes the caller. */
+    /** A wrong or missing token changes nothing. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: confirm takes the
+     *  caller; the code is invalid_confirmation_token (EXPORT-15, Phase B.2 renamed it from invalid_token). */
     // EXPORT-14
     @Test
     void confirmingWithAWrongTokenChangesNothing() {
         UUID id = compliance.requestAccountDeletion(USER, "gdpr_request").deletionId();
 
-        assertRefused("invalid_token", () -> compliance.confirmDeletion(USER, id, "wrong"));
-        assertRefused("invalid_token", () -> compliance.confirmDeletion(USER, id, null));
+        assertRefused("invalid_confirmation_token", () -> compliance.confirmDeletion(USER, id, "wrong"));
+        assertRefused("invalid_confirmation_token", () -> compliance.confirmDeletion(USER, id, null));
         assertRefused("not_found", () -> compliance.confirmDeletion(USER, UUID.randomUUID(), "wrong"));
         assertEquals(DataExportCompliance.DeletionStatus.PENDING, deletion(id).status());
         assertTrue(erased.isEmpty(), "nothing is deleted before confirm, even for a statutory reason");
@@ -404,7 +417,8 @@ public class DataExportComplianceTest {
      * EXPORT-14: the token is single-use and valid 24 hours, and confirm/cancel act only on the caller's own request
      * (anyone else, an admin included, gets not_found, even with the right token). Changed 2026-11-10,
      * session_012zDydZCZ4AChqhEZ4oVtaP: a reused token was "not_pending" and a late one "grace_period_expired"; under
-     * the amended spec both are refused tokens (invalid_token), and expiry is 24 hours, not 30 days.
+     * the amended spec both are refused tokens (invalid_token), and expiry is 24 hours, not 30 days. Changed again
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-15, Phase B.2): the code is now invalid_confirmation_token.
      */
     // EXPORT-14
     @Test
@@ -415,12 +429,12 @@ public class DataExportComplianceTest {
         assertRefused("not_found", () -> compliance.confirmDeletion(ADMIN, id, token));
         assertEquals(DataExportCompliance.DeletionStatus.PENDING, deletion(id).status());
         compliance.confirmDeletion(USER, id, token);
-        assertRefused("invalid_token", () -> compliance.confirmDeletion(USER, id, token));
+        assertRefused("invalid_confirmation_token", () -> compliance.confirmDeletion(USER, id, token));
 
         UUID late = compliance.requestAccountDeletion(USER, "other").deletionId();
         String lateToken = tokenFromLastMail();
         clock.advance(Duration.ofHours(24).plusSeconds(1));
-        assertRefused("invalid_token", () -> compliance.confirmDeletion(USER, late, lateToken));
+        assertRefused("invalid_confirmation_token", () -> compliance.confirmDeletion(USER, late, lateToken));
         assertEquals(DataExportCompliance.DeletionStatus.PENDING, deletion(late).status());
         assertRefused("not_found", () -> compliance.cancelDeletion(late, STRANGER));
 
@@ -431,6 +445,61 @@ public class DataExportComplianceTest {
         compliance.confirmDeletion(USER, onTime, onTimeToken);
         assertEquals(DataExportCompliance.DeletionStatus.APPROVED, deletion(onTime).status());
         assertTrue(erased.isEmpty());
+    }
+
+    /**
+     * EXPORT-15: a wrong, a reused and an expired token all get the same 400 invalid_confirmation_token (same status, code
+     * and message) and change nothing; another user's request is 404 not_found; confirm and cancel of a cancelled request
+     * get 409 deletion_not_pending, even with the request's still-valid token; a completed request (user_id NULL,
+     * EXPORT-13) is 404 not_found to every caller, its former owner included (spec clarification 3abb340).
+     * Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2). Touches: test H2 DB.
+     */
+    // EXPORT-15
+    @Test
+    void wrongReusedOrExpiredTokensGetOneAnswerAndClosedRequestsAre409() {
+        UUID wrong = compliance.requestAccountDeletion(USER, "user_requested").deletionId();
+        DataExportCompliance.ComplianceException a = assertRefused(400, "invalid_confirmation_token",
+                () -> compliance.confirmDeletion(USER, wrong, "not-the-token"));
+
+        UUID reused = compliance.requestAccountDeletion(USER, "user_requested").deletionId();
+        String reusedToken = tokenFromLastMail();
+        compliance.confirmDeletion(USER, reused, reusedToken);
+        DataExportCompliance.ComplianceException b = assertRefused(400, "invalid_confirmation_token",
+                () -> compliance.confirmDeletion(USER, reused, reusedToken));
+
+        UUID expired = compliance.requestAccountDeletion(USER, "user_requested").deletionId();
+        String expiredToken = tokenFromLastMail();
+        clock.advance(Duration.ofHours(24).plusSeconds(1));
+        DataExportCompliance.ComplianceException c = assertRefused(400, "invalid_confirmation_token",
+                () -> compliance.confirmDeletion(USER, expired, expiredToken));
+        assertEquals(a.getMessage(), b.getMessage());
+        assertEquals(a.getMessage(), c.getMessage());
+        assertEquals(DataExportCompliance.DeletionStatus.PENDING, deletion(wrong).status());
+        assertEquals(DataExportCompliance.DeletionStatus.PENDING, deletion(expired).status());
+
+        UUID theirs = compliance.requestAccountDeletion(USER, "user_requested").deletionId();
+        String theirToken = tokenFromLastMail();
+        assertRefused(404, "not_found", () -> compliance.confirmDeletion(STRANGER, theirs, theirToken));
+        assertRefused(404, "not_found", () -> compliance.cancelDeletion(theirs, STRANGER));
+
+        UUID cancelled = compliance.requestAccountDeletion(USER, "user_requested").deletionId();
+        String cancelledToken = tokenFromLastMail();
+        compliance.cancelDeletion(cancelled, USER);
+        assertRefused(409, "deletion_not_pending", () -> compliance.confirmDeletion(USER, cancelled, cancelledToken));
+        assertRefused(409, "deletion_not_pending", () -> compliance.cancelDeletion(cancelled, USER));
+
+        assertTrue(erased.isEmpty(), "no refusal erased anything");
+
+        // A statutory request runs its cascade on confirm, so it is completed with user_id NULL.
+        UUID completed = compliance.requestAccountDeletion(USER, "gdpr_request").deletionId();
+        String completedToken = tokenFromLastMail();
+        compliance.confirmDeletion(USER, completed, completedToken);
+        assertEquals(DataExportCompliance.DeletionStatus.COMPLETED, deletion(completed).status());
+        assertNull(deletion(completed).userId());
+        for (UUID caller : List.of(USER, STRANGER, ADMIN)) {
+            assertRefused(404, "not_found", () -> compliance.confirmDeletion(caller, completed, completedToken));
+            assertRefused(404, "not_found", () -> compliance.cancelDeletion(completed, caller));
+        }
     }
 
     // EXPORT-06
@@ -455,11 +524,16 @@ public class DataExportComplianceTest {
         assertRefused("grace_period_expired", () -> compliance.cancelDeletion(id, USER));
     }
 
+    /**
+     * A cancelled request cannot be cancelled again; a completed one is nobody's any more. Changed 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-15, Phase B.2): a cancelled request answers 409 deletion_not_pending
+     * (it asserted cannot_cancel, the old code).
+     */
     @Test
     void aFinishedOrCancelledDeletionCannotBeCancelled() {
         UUID cancelled = confirmedDeletion();
         compliance.cancelDeletion(cancelled, USER);
-        assertRefused("cannot_cancel", () -> compliance.cancelDeletion(cancelled, USER));
+        assertRefused(409, "deletion_not_pending", () -> compliance.cancelDeletion(cancelled, USER));
 
         UUID finished = confirmedDeletion();
         clock.advance(Duration.ofDays(30));

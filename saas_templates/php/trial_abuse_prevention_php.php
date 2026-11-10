@@ -25,6 +25,8 @@ use RuntimeException;
  * recording (recording first made a device farm always pass). Payment timing judges the payment being added
  * now: days_after_trial = floor((now - (created_at + trial_days)) / 1 day); PASS < 5, FAIL >= 90 with no
  * earlier payment, else CHALLENGE; trial_days is configuration (default 14).
+ * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): payment timing for a user with no users row
+ * is FAIL user_not_found (fail closed); a user with no ledger row is judged from users.created_at.
  * Touches: the database (all tables below). No network.
  */
 final class TrialAbusePrevention
@@ -374,15 +376,21 @@ final class TrialAbusePrevention
      * trial_end = user.created_at + user.trial_days (negative while the trial runs; floor rounds toward
      * negative infinity) and earlier_payment = the ledger already has a payment_added_date for the user.
      * Decision: PASS if days_after_trial < 5; FAIL if days_after_trial >= 90 and no earlier payment;
-     * CHALLENGE otherwise. Throws InvalidArgumentException for an unknown user.
+     * CHALLENGE otherwise. A user with no users row is FAIL with ruleOutputs {decision, error: "user_not_found"}
+     * (fail closed); a user with no ledger row is judged from users.created_at with no earlier payment.
      * Why: the old rule compared days since signup and a stored payment date in ways the spec dropped.
-     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the database (reads; one gate_decisions row).
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Changed the same day (Phase B.2, one answer in every
+     * language): an unknown user is FAIL user_not_found instead of an InvalidArgumentException.
+     * Touches: the database (reads; one gate_decisions row).
      */
     public function checkTrialPaymentTiming(string $userId): GateResult
     {
         $user = $this->fetchUser($userId);
         if ($user === null) {
-            throw new InvalidArgumentException("User not found: {$userId}");
+            $inputs = ['user_found' => false];
+            $outputs = ['decision' => self::DECISION_FAIL, 'error' => 'user_not_found'];
+            $this->logGate(self::GATE_TRIAL_PAYMENT_TIMING, $userId, self::DECISION_FAIL, $inputs, $outputs);
+            return new GateResult(self::GATE_TRIAL_PAYMENT_TIMING, self::DECISION_FAIL, $inputs, $outputs);
         }
 
         $trialDays = (int) $user['trial_days'];
@@ -617,12 +625,28 @@ final class TrialAbusePrevention
     /**
      * Run the payment flow: payment + timing + chargeback gates, create subscription.
      *
+     * Inputs: the user id and the Stripe payment method id. Output: {status, body}; 403 with the first failing
+     * gate's error, 200 {success, ...} otherwise. A user with no users row is 403 {error: "user_not_found"}
+     * before the chargeback gate runs (the timing gate fails closed for it). Changed 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2: an unknown user threw an exception here).
+     * Touches: the database (gate_decisions, subscriptions, trial_abuse_ledger, users).
+     *
      * @return array{status: int, body: array<string, mixed>}
      */
     public function subscriptionCreated(string $userId, string $stripePaymentMethodId): array
     {
         $paymentGate = $this->checkPaymentMethodHistory($stripePaymentMethodId);
         $timingGate = $this->checkTrialPaymentTiming($userId);
+        if (($timingGate->ruleOutputs['error'] ?? null) === 'user_not_found') {
+            return [
+                'status' => 403,
+                'body' => [
+                    'error' => 'user_not_found',
+                    'message' => 'User not found.',
+                    'code' => 403,
+                ],
+            ];
+        }
         $chargebackGate = $this->checkChargebackHistory($userId);
 
         if ($paymentGate->decision === self::DECISION_FAIL) {

@@ -29,10 +29,21 @@ name or in a comment on the line above it (for example `# ADMIN-01`), so a missi
 | `ADMIN-16` | governance approve → action executed + status changed |
 | `ADMIN-17` | governance reject → action rejected + reason logged |
 | `ADMIN-18` | audit_log search → correct filters applied, pagination works |
+| `ADMIN-19` | a suspended owner calling any admin action → 403 {error: "account_suspended"}, nothing changed |
 
 ## Contract
 
 ```text
+EVERY ACTION: the caller is the verified session user. A caller whose account status is 'suspended' is refused
+  before any gate: 403 {error: "account_suspended"} (ADMIN-19). Amended 2026-11-10 (Phase B.2: one answer in every language).
+
+TIERS: two different things share the word.
+  - users.tier is the STAFF ROLE: 'owner' | 'admin' | 'user' (create, change_role, last-owner rules).
+  - a customer's or deployment's tier is the PLAN: 'solo' | 'team' | 'enterprise' (change_plan,
+    create_deployment, prices). A plan value given where a role is expected, or the reverse, is 400
+    {error: "invalid_tier"}. deployments carry domain_verified (BOOLEAN, default false); publish needs it.
+  Amended 2026-11-10 (Phase B.2).
+
 DOMAINS:
 
   USERS DOMAIN:
@@ -172,4 +183,5 @@ TESTS REQUIRED:
   - **ADMIN-16** governance approve → action executed + status changed
   - **ADMIN-17** governance reject → action rejected + reason logged
   - **ADMIN-18** audit_log search → correct filters applied, pagination works
+  - **ADMIN-19** a suspended owner calling any admin action → 403 {error: "account_suspended"}, nothing changed
 ```

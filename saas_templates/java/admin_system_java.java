@@ -185,19 +185,25 @@ final class SecurityUtil {
         return (User) u;
     }
 
-    /** Spec gate owner_only: returns the owner, else 403 owner_only. */
+    /**
+     * Spec gate owner_only: returns the owner, else 403 owner_only. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP
+     * (admin spec TIERS, Phase B.2): the staff role is lowercase 'owner' (it compared "OWNER"). Touches: nothing.
+     */
     static User requireOwner() {
         User u = getCurrentUser();
-        if (!"OWNER".equals(u.getTier())) {
+        if (!Tiers.OWNER.equals(u.getTier())) {
             throw new ResponseStatusException(HttpStatus.FORBIDDEN, "owner_only");
         }
         return u;
     }
 
-    /** Spec gate admin_or_owner: returns the user, else 403 admin_or_owner. */
+    /**
+     * Spec gate admin_or_owner: returns the user, else 403 admin_or_owner. Changed 2026-11-10,
+     * session_012zDydZCZ4AChqhEZ4oVtaP (admin spec TIERS): lowercase roles 'owner' / 'admin'. Touches: nothing.
+     */
     static User requireAdminOrOwner() {
         User u = getCurrentUser();
-        if (!"OWNER".equals(u.getTier()) && !"ADMIN".equals(u.getTier())) {
+        if (!Tiers.OWNER.equals(u.getTier()) && !Tiers.ADMIN.equals(u.getTier())) {
             throw new ResponseStatusException(HttpStatus.FORBIDDEN, "admin_or_owner");
         }
         return u;
@@ -208,6 +214,22 @@ final class SecurityUtil {
         if (a == null || b == null) return false;
         return MessageDigest.isEqual(a.getBytes(StandardCharsets.UTF_8), b.getBytes(StandardCharsets.UTF_8));
     }
+}
+
+/**
+ * The two things the admin spec calls "tier" (TIERS, amended 2026-11-10, Phase B.2): users.tier is the STAFF ROLE
+ * ('owner' | 'admin' | 'user'); a customer's or deployment's tier is the PLAN ('solo' | 'team' | 'enterprise').
+ * A plan where a role is expected, or the reverse, is 400 invalid_tier. Added 2026-11-10,
+ * session_012zDydZCZ4AChqhEZ4oVtaP (roles were "OWNER"/"ADMIN"/"USER" and a deployment took any tier). Touches nothing.
+ */
+final class Tiers {
+    static final String OWNER = "owner";
+    static final String ADMIN = "admin";
+    static final String USER = "user";
+    static final Set<String> ROLES = Set.of(OWNER, ADMIN, USER);
+    static final Set<String> PLANS = Set.of("solo", "team", "enterprise");
+
+    private Tiers() {}
 }
 
 /**
@@ -245,10 +267,11 @@ class CsrfFilter extends OncePerRequestFilter {
 
 /**
  * Authenticates the request from a header that the deployment's authentication proxy sets (and strips from
- * client requests) with the signed-in user's id. Only active users are accepted. With no trusted header
- * configured, nobody is authenticated and every endpoint answers 401.
- * Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (replaces MockAuthFilter). Touches: reads the
- * database.
+ * client requests) with the signed-in user's id. Only active users are accepted; a suspended user is refused right
+ * here, before any gate, with 403 {error: "account_suspended"} (ADMIN-19). With no trusted header configured,
+ * nobody is authenticated and every endpoint answers 401.
+ * Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (replaces MockAuthFilter). Changed the same day
+ * (ADMIN-19, Phase B.2): a suspended caller got 401 unauthenticated. Touches: reads the database, writes the response.
  */
 class AuthFilter extends OncePerRequestFilter {
     private final UserRepository users;
@@ -259,15 +282,25 @@ class AuthFilter extends OncePerRequestFilter {
         this.trustedHeader = trustedHeader;
     }
 
-    /** Sets the authenticated user (active only) from the trusted header, if configured. Touches: reads the database. */
+    /**
+     * Sets the authenticated user (active only) from the trusted header, if configured; answers 403 account_suspended
+     * for a suspended user without calling the rest of the chain, so nothing runs for them (ADMIN-19).
+     * In: the request. Out: the request passed on, or the 403. Touches: reads the database, writes the response.
+     */
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
             throws ServletException, IOException {
         if (trustedHeader != null && !trustedHeader.isEmpty()) {
             String uid = request.getHeader(trustedHeader);
             if (uid != null && uid.matches("\\d{1,18}")) {
-                users.findById(Long.parseLong(uid))
-                        .filter(u -> "active".equals(u.getStatus()))
+                Optional<User> found = users.findById(Long.parseLong(uid));
+                if (found.isPresent() && "suspended".equals(found.get().getStatus())) {
+                    response.setStatus(HttpStatus.FORBIDDEN.value());
+                    response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+                    response.getWriter().write("{\"error\":\"account_suspended\",\"message\":\"account_suspended\"}");
+                    return;
+                }
+                found.filter(u -> "active".equals(u.getStatus()))
                         .ifPresent(u -> request.setAttribute(SecurityUtil.ATTRIBUTE, u));
             }
         }
@@ -482,7 +515,7 @@ class SchemaInitializer {
 
 /* ---------- ENTITIES ---------- */
 
-/** An admin-console user (tier OWNER, ADMIN or USER). Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: plain class, no JPA. */
+/** An admin-console user (tier = staff role 'owner', 'admin' or 'user'; lowercase since 2026-11-10, Phase B.2). Repaired 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP: plain class, no JPA. */
 class User {
     private Long id;
     private String email;
@@ -789,7 +822,7 @@ class UserRepository extends JdbcRepository {
     }
 
     List<User> findActiveOwners() {
-        return jdbc.query("SELECT * FROM users WHERE tier = 'OWNER' AND status = 'active' ORDER BY id", MAPPER);
+        return jdbc.query("SELECT * FROM users WHERE tier = 'owner' AND status = 'active' ORDER BY id", MAPPER);
     }
 }
 
@@ -1105,7 +1138,8 @@ class AuditService {
  */
 @Service
 class UserService {
-    static final Set<String> VALID_TIERS = Set.of("OWNER", "ADMIN", "USER");
+    /** Staff roles a user may hold (admin spec TIERS; lowercase since 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). */
+    static final Set<String> VALID_TIERS = Tiers.ROLES;
     /**
      * An e-mail address: one "@", no spaces, and a domain of dot-separated labels with no empty label. Each label
      * excludes ".", so every "." in the domain can only be a separator and the match is linear. Changed 2026-11-10,
@@ -1199,7 +1233,7 @@ class UserService {
         return tx.execute(status -> {
             User target = userRepo.findById(userId)
                     .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "user_not_found"));
-            if (isLastActiveOwner(target) && !"OWNER".equals(newTier)) {
+            if (isLastActiveOwner(target) && !Tiers.OWNER.equals(newTier)) {
                 throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "cannot_demote_last_owner");
             }
             if (target.getId().equals(actor.getId())) {
@@ -1236,7 +1270,7 @@ class UserService {
 
     /** True when the user is the only active owner. */
     boolean isLastActiveOwner(User user) {
-        if (!"OWNER".equals(user.getTier()) || !"active".equals(user.getStatus())) return false;
+        if (!Tiers.OWNER.equals(user.getTier()) || !"active".equals(user.getStatus())) return false;
         List<User> owners = userRepo.findActiveOwners();
         return owners.size() == 1 && owners.get(0).getId().equals(user.getId());
     }
@@ -1299,10 +1333,12 @@ class CustomerService {
      * subscription_item_ambiguous; both before any update. Then Stripe updates that item's price with prorations,
      * and only on success the DB tier and audit change. In: actor, customer id, new tier. Out: the old tier.
      * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (ADMIN-12: the gateway used to pick the first item and,
-     * with none, sent a bare price). Touches: Stripe (money), the database.
+     * with none, sent a bare price). Changed again the same day (admin spec TIERS, Phase B.2): only a plan
+     * (solo/team/enterprise) is accepted, so a staff role such as 'owner' is 400 invalid_tier before any Stripe call.
+     * Touches: Stripe (money), the database.
      */
     String changePlan(User actor, Long customerId, String newTier) {
-        if (newTier == null || !TIER.matcher(newTier).matches()) {
+        if (newTier == null || !TIER.matcher(newTier).matches() || !Tiers.PLANS.contains(newTier)) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "invalid_tier");
         }
         String price = stripe.priceFor(newTier);
@@ -1397,13 +1433,19 @@ class DeploymentService {
         this.clock = clock;
     }
 
-    /** Creates a draft deployment with its initial config. Theme ids are not validated here: this template has no themes table. */
+    /**
+     * Creates a draft deployment (domain_verified false) with its initial config. Theme ids are not validated here:
+     * this template has no themes table. In: actor, customer id, domain, plan tier, theme id. Out: the deployment.
+     * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (admin spec TIERS, Phase B.2): the tier must be a plan
+     * (solo/team/enterprise); a staff role or anything else is 400 invalid_tier (any non-blank value was accepted).
+     * Touches: the database.
+     */
     Deployment createDeployment(User actor, Long customerId, String domain, String tier, Long themeId) {
         String normalizedDomain = domain == null ? "" : domain.trim().toLowerCase(Locale.ROOT);
         if (!DOMAIN.matcher(normalizedDomain).matches()) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "invalid_domain");
         }
-        if (tier == null || tier.isBlank()) {
+        if (tier == null || !Tiers.PLANS.contains(tier)) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "invalid_tier");
         }
         if (themeId == null || themeId <= 0) {

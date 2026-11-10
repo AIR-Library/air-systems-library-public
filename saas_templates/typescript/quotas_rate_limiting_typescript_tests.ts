@@ -210,6 +210,12 @@ async function testFeatureGatePass(): Promise<void> {
   console.log("✓ feature_gate PASS → feature available in tier");
 }
 
+/**
+ * QUOTA feature_gate FAIL: a solo user asking for a team or enterprise feature gets 403
+ * { error: "feature_not_available_in_tier", tier, minimum_tier, upgrade_url }. In: a fresh service. Out: throws on
+ * failure. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 quotas amendment): also asserts the 403 and
+ * the exact body keys. Touches: memory.
+ */
 async function testFeatureGateFail(): Promise<void> {
   const service = new InMemoryQuotaService();
   const userId = "user10";
@@ -222,10 +228,18 @@ async function testFeatureGateFail(): Promise<void> {
   assertEqual(result.error!.tier, "solo", "Tier should be solo");
   assertEqual(result.error!.minimum_tier, "team", "Minimum tier should be team");
   assert(result.error!.upgrade_url !== undefined, "Upgrade URL should be present");
+  // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 quotas amendment): the refusal is 403, and its body has
+  // exactly the four keys the spec names.
+  assertEqual(result.status, 403, "A feature-gate refusal is 403");
+  assertEqual(JSON.stringify(Object.keys(result.error!).sort()), JSON.stringify(["error", "minimum_tier", "tier", "upgrade_url"]),
+    "The refusal body is {error, tier, minimum_tier, upgrade_url}");
 
   const resultB = await service.checkFeatureGate(userId, tier, "feature_b");
   assert(!resultB.pass, "feature_b should not be available for solo");
   assertEqual(resultB.error!.minimum_tier, "enterprise", "Minimum tier for feature_b should be enterprise");
+  assertEqual(resultB.status, 403, "feature_b's refusal is 403 too");
+  const passed = await service.checkFeatureGate(userId, "team", "feature_a");
+  assertEqual(passed.status, undefined, "A pass carries no refusal status");
 
   console.log("✓ feature_gate FAIL → feature unavailable, 403 with upgrade hint");
 }

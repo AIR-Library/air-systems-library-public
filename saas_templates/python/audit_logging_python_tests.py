@@ -135,7 +135,10 @@ class TestAuditLogger(unittest.TestCase):
         self.logger.log_mutation(1, "user", "user_created", "user", 101, {}, {"name": "Alice"})
         self.logger.log_mutation(1, "user", "user_suspended", "user", 101, {"name": "Alice"}, {"name": "Alice", "suspended": True})
         self.logger.log_mutation(2, "user", "user_created", "user", 102, {}, {"name": "Bob"})
-        self.logger.log_mutation(3, "service", "billing_changed", "billing", 501, {}, {"amount": 100}, subject_user_id="none")
+        # [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2: a service actor must now name itself in
+        # actor_service (400 actor_service_required otherwise); it used to default to str(actor_id). Same name "3".
+        self.logger.log_mutation(3, "service", "billing_changed", "billing", 501, {}, {"amount": 100}, subject_user_id="none",
+                                 actor_service="3")
 
         # Filter by actor_id + action + resource_type
         res = self.logger.query_logs(actor_id=1, action="user_suspended", resource_type="user", caller=ADMIN)
@@ -319,6 +322,25 @@ class TestAuditLogger(unittest.TestCase):
                          {"log_id": own["log_id"], "timestamp": logs[own["log_id"]]["timestamp"], "erased": True,
                           "resource_state_at_time": None, "has_diverged": None})
 
+    # AUDIT-08
+    def test_replay_erased_follows_the_subject_row_not_the_actor_row(self):
+        """When only an entry's ACTOR is erased (an admin who acted on a user), replay still returns the subject's
+        state with erased absent; when the SUBJECT is erased, replay says erased. erased_rows counts the
+        audit_personal rows deleted. In: the test fixtures. Out: assertions. Why: Phase B.2 bug (replay reported
+        erased when only the actor row was gone) and the audit amendment (replay follows the subject row).
+        2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the test db."""
+        admin_id, user_id = 70, 71
+        first = self.logger.log_mutation(admin_id, "user", "subscription_changed", "subscription", "sub_9",
+                                         {"tier": "solo"}, {"tier": "team"}, subject_user_id=user_id)
+        self.assertEqual(self.logger.erase_subject(admin_id), {"erased_rows": 1})  # the admin's one actor row
+        replay = self.logger.replay(first["log_id"], caller=ADMIN)
+        self.assertEqual(replay, {"log_id": first["log_id"], "timestamp": replay["timestamp"],
+                                  "resource_state_at_time": {"tier": "solo"}, "has_diverged": False})
+        self.assertEqual(self.logger.erase_subject(user_id), {"erased_rows": 1})  # the user's one subject row
+        self.assertEqual(self.logger.replay(first["log_id"], caller=ADMIN),
+                         {"log_id": first["log_id"], "timestamp": replay["timestamp"], "erased": True,
+                          "resource_state_at_time": None, "has_diverged": None})
+
     # AUDIT-09
     def test_apply_retention_erases_only_old_personal_data(self):
         """Entries older than retention_days (30 here) lose their personal rows; newer ones keep them; no audit_log
@@ -347,7 +369,9 @@ class TestAuditLogger(unittest.TestCase):
         feature_flag / erased_rows (metadata_key_not_allowed), an api_key entry without actor_user_id
         (actor_user_required) and a 'user' entry whose subject differs (subject_mismatch), all 400 and writing
         nothing; reads by a non-admin caller get 403. Why: AUDIT-10 (amended 2026-11-10).
-        2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the test db."""
+        2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2):
+        also invalid_actor_type, actor_required ('user' without actor_id) and actor_service_required ('service'
+        without actor_service), each writing nothing. Touches: the test db."""
         cases = [
             (dict(resource_type="subscription", resource_id=1), "subject_required"),
             (dict(resource_type="subscription", resource_id=1, subject_user_id="none", metadata={"ip": "1.2.3.4"}),
@@ -366,6 +390,20 @@ class TestAuditLogger(unittest.TestCase):
         self.assertEqual(self.logger.conn.execute("SELECT COUNT(*) FROM audit_subjects").fetchone()[0], 0)
         ok = self.logger.log_mutation(1, "user", "flag_toggled", "flag", "f1", {}, {}, subject_user_id="none",
                                       metadata={"feature_flag": "beta"})
+        # [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2 refusals (the codes every language now shares).
+        for kwargs, code in [
+            (dict(actor_type="robot"), "invalid_actor_type"),
+            (dict(actor_type="user", actor_id=None), "actor_required"),
+            (dict(actor_type="service", actor_id="billing"), "actor_service_required"),
+            (dict(actor_type="service", actor_id=None, actor_service=""), "actor_service_required"),
+        ]:
+            args = dict(actor_id=1, action="x_changed", resource_type="flag", resource_id="f2", old_value={},
+                        new_value={}, subject_user_id="none")
+            args.update(kwargs)
+            with self.assertRaises(AuditError) as cm:
+                self.logger.log_mutation(**args)
+            self.assertEqual((cm.exception.status, cm.exception.code), (400, code))
+        self.assertEqual(self.logger.conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0], 1)
         for caller in (None, {"id": 1, "is_admin": False}, {"id": 1, "is_admin": "yes"}):
             for read in (lambda: self.logger.query_logs(caller=caller),
                          lambda: self.logger.replay(ok["log_id"], caller=caller),

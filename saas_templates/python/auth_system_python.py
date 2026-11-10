@@ -9,6 +9,49 @@ from typing import Callable, Optional, Dict, Any
 import hmac
 import sqlite3
 import time
+import os
+
+# OAuth state lifetime (auth spec, "Secrets at rest": single-use, expires in 10 minutes). Phase B.2, 2026-11-10,
+# session_012zDydZCZ4AChqhEZ4oVtaP.
+OAUTH_STATE_TTL = timedelta(minutes=10)
+
+
+# Minimum length of the HMAC key for stored secrets (spec d270fa3: AUTH_SECRET_KEY, at least 32 bytes).
+# 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+MIN_SECRET_KEY_BYTES = 32
+
+
+def _load_secret_key(secret_key) -> bytes:
+    """The HMAC key for stored secrets, as bytes: the secret_key argument if given, else the AUTH_SECRET_KEY
+    environment variable. In: str, bytes or None. Out: the key bytes. Raises ValueError when there is no key or it
+    is shorter than 32 bytes, so the service refuses to start without one. Why: spec d270fa3: keyed HMAC for
+    stored secrets (a plain SHA-256 of a 6-digit code can be brute-forced from a leaked table; code scanning
+    flagged it). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the process environment (read only)."""
+    if secret_key is None:
+        secret_key = os.environ.get("AUTH_SECRET_KEY")
+    if isinstance(secret_key, str):
+        secret_key = secret_key.encode("utf-8")
+    if not secret_key or len(secret_key) < MIN_SECRET_KEY_BYTES:
+        raise ValueError("AUTH_SECRET_KEY must be set and at least 32 bytes")
+    return bytes(secret_key)
+
+
+def _hmac_hex(key: bytes, value: str) -> str:
+    """Lowercase hex HMAC-SHA256(key, value's UTF-8 bytes): the only form in which refresh tokens, verification
+    codes and OAuth state values are stored. In: the key, the secret. Out: 64 hex chars. Why: spec d270fa3: keyed
+    HMAC for stored secrets (replaces the plain SHA-256 of Phase B.2). 2026-11-10,
+    session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing."""
+    return hmac.new(key, value.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _unconfigured_oauth_client(provider: str, code: str) -> Dict[str, Any]:
+    """Default OAuth provider client: refuses, so no account is ever made up. A real client exchanges the code at
+    the provider's token endpoint and returns the verified profile {id, email, email_verified}.
+    In: provider, code. Out: never returns; raises RuntimeError. Why: the auth spec (Phase B.2, 2026-11-10): the
+    callback exchanges the code through an injected provider client; the old default invented a new user for any
+    code. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing."""
+    raise RuntimeError("no OAuth provider client configured")
+
 
 class AuthSystem:
     def __init__(self, db_connection: sqlite3.Connection, jwt_secret: Optional[str] = None,
@@ -18,20 +61,30 @@ class AuthSystem:
                  signup_rate_limit_max: int = 5, login_rate_limit: int = 15,
                  login_rate_limit_max: int = 5,
                  oauth_profile: Optional[Callable[[str, str], Dict[str, Any]]] = None,
-                 email_sender: Optional[Callable[[str, str], None]] = None):
+                 email_sender: Optional[Callable[[str, str], None]] = None,
+                 clock: Optional[Callable[[], datetime]] = None,
+                 secret_key: Optional[Any] = None):
         """Set up the auth system on one SQLite connection.
+
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets. secret_key
+        (str or bytes, else the AUTH_SECRET_KEY environment variable) keys the HMAC-SHA256 under which refresh
+        tokens, verification codes and OAuth state are stored. Raises ValueError, before touching the database,
+        when it is missing or shorter than 32 bytes: the service refuses to start without it.
 
         [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] New optional email_sender(email, code): signup sends the
         verification code through it (AUTH-01 "email sent"; docs/specs/README.md: email goes through an
         injectable sender, tests pass a fake). The default sends nothing; wire a real mailer in production.
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2: oauth_profile(provider, code) is the injected
+        OAuth provider client that exchanges the one-time code for the verified profile {id, email,
+        email_verified}; the default now refuses (it invented a user for any code). clock() returns the aware UTC
+        now (default the wall clock), so state expiry can be tested.
         Touches: SQLite (creates tables); network only through the injected sender/oauth_profile."""
+        self._secret_key = _load_secret_key(secret_key)
         self.email_sender = email_sender or (lambda email, code: None)
         self.db = db_connection
-        # Exchanges a provider's one-time code for the user's verified profile. Replace this with a real call to the
-        # provider. The default invents a user, so the template runs without one.
-        self.oauth_profile = oauth_profile or (
-            lambda provider, code: {"id": f"{provider}-{secrets.token_hex(8)}",
-                                    "email": f"user_{secrets.token_hex(4)}@{provider}.com", "email_verified": True})
+        self.clock = clock
+        # Exchanges a provider's one-time code for the user's verified profile: pass a real provider client.
+        self.oauth_profile = oauth_profile or _unconfigured_oauth_client
         self.mfa_max_attempts = 5
         self.jwt_secret = jwt_secret or secrets.token_urlsafe(32)
         self.bcrypt_rounds = bcrypt_rounds
@@ -46,8 +99,10 @@ class AuthSystem:
         self._ensure_tables()
 
     def _now(self) -> datetime:
-        """Return current UTC time as timezone-aware datetime."""
-        return datetime.now(timezone.utc)
+        """Return current UTC time as timezone-aware datetime: the injected clock's, else the wall clock's.
+        Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2: injectable for the OAuth state expiry
+        test). Touches nothing."""
+        return self.clock() if self.clock is not None else datetime.now(timezone.utc)
 
     @staticmethod
     def _parse_time(value: str) -> datetime:
@@ -60,8 +115,24 @@ class AuthSystem:
         """Return current UTC time as ISO format string."""
         return self._now().isoformat()
 
+    def _hash_secret(self, value: str) -> str:
+        """The stored form of a refresh token, verification code or OAuth state: lowercase hex
+        HMAC-SHA256(secret_key, value). In: the secret. Out: 64 hex chars. Why: spec d270fa3: keyed HMAC for
+        stored secrets. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing."""
+        return _hmac_hex(self._secret_key, value)
+
     def _ensure_tables(self):
+        """Create the tables. [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2 (AUTH-16, "Secrets at
+        rest"): sessions keep refresh_token_hash and verification_codes keep code_hash, never the secret, and
+        oauth_states holds the HMAC-SHA256 of each issued OAuth state. A sessions or verification_codes table from
+        before this change holds plain-text secrets; it is dropped and recreated, which signs those sessions out
+        and voids those codes (they cannot be hashed in place without keeping the plain text readable).
+        In/Out: none. Touches: SQLite (DDL).
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: each stored or compared secret is now HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256)."""
         cursor = self.db.cursor()
+        for table, plain_column in (("sessions", "refresh_token"), ("verification_codes", "code")):
+            if plain_column in {row[1] for row in cursor.execute(f"PRAGMA table_info({table})")}:
+                cursor.execute(f"DROP TABLE {table}")
         cursor.executescript("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,7 +149,7 @@ class AuthSystem:
         CREATE TABLE IF NOT EXISTS sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
-            refresh_token TEXT UNIQUE NOT NULL,
+            refresh_token_hash TEXT UNIQUE NOT NULL,  -- HMAC-SHA256 hex of the refresh token (AUTH-16)
             created_at TEXT NOT NULL,
             expires_at TEXT NOT NULL,
             ip TEXT,
@@ -88,7 +159,7 @@ class AuthSystem:
         CREATE TABLE IF NOT EXISTS verification_codes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
-            code TEXT NOT NULL,
+            code_hash TEXT NOT NULL,  -- HMAC-SHA256 hex of the emailed / expected code (AUTH-16)
             created_at TEXT NOT NULL,
             expires_at TEXT NOT NULL,
             type TEXT NOT NULL CHECK (type IN ('email', 'mfa')),
@@ -107,6 +178,12 @@ class AuthSystem:
             updated_at TEXT NOT NULL,
             FOREIGN KEY (user_id) REFERENCES users(id),
             UNIQUE(provider, provider_user_id)
+        );
+        CREATE TABLE IF NOT EXISTS oauth_states (
+            state_hash TEXT PRIMARY KEY,  -- HMAC-SHA256 hex of the state sent to the provider; single-use
+            provider TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -132,7 +209,7 @@ class AuthSystem:
             timestamp TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
-        CREATE INDEX IF NOT EXISTS idx_sessions_refresh_token ON sessions(refresh_token);
+        CREATE INDEX IF NOT EXISTS idx_sessions_refresh_token_hash ON sessions(refresh_token_hash);
         CREATE INDEX IF NOT EXISTS idx_verification_codes_user_id_type ON verification_codes(user_id, type);
         CREATE INDEX IF NOT EXISTS idx_oauth_accounts_provider_provider_user_id ON oauth_accounts(provider, provider_user_id);
         CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);
@@ -144,6 +221,24 @@ class AuthSystem:
         if "attempts" not in columns:
             cursor.execute("ALTER TABLE verification_codes ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
         self.db.commit()
+
+    def _create_session(self, cursor: sqlite3.Cursor, user_id: int, ip: Optional[str] = None,
+                        device_id: Optional[str] = None) -> tuple:
+        """Insert a session for user_id and return (session_id, refresh_token). The refresh token is 32 random
+        bytes (URL-safe); only its HMAC-SHA256 is stored, so reading the sessions table hands out nothing usable.
+        The caller commits. In: an open cursor, the user id, the request's ip and device id. Out: (session id,
+        the plain refresh token, which the caller returns to the client once). Why: AUTH-16 (Phase B.2,
+        2026-11-10): every flow that creates a session returns its refresh_token, and sessions stored it in plain
+        text. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite (sessions).
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: each stored or compared secret is now HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256)."""
+        refresh_token = secrets.token_urlsafe(32)
+        cursor.execute(
+            """INSERT INTO sessions (user_id, refresh_token_hash, created_at, expires_at, ip, device_id)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (user_id, self._hash_secret(refresh_token), self._now_iso(),
+             (self._now() + timedelta(days=self.refresh_token_expires_days)).isoformat(), ip, device_id)
+        )
+        return cursor.lastrowid, refresh_token
 
     def _log_why_chain(self, flow: str, decision_points: list):
         cursor = self.db.cursor()
@@ -255,7 +350,9 @@ class AuthSystem:
         In: email, password, name, the server-observed IP. Out: {status: "pending_verification", email, message} or
         {error: "too_many_signups_from_ip" | "email_already_exists" | "password_rejected", reason}.
         [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Password checks run too_short, too_long, blocklisted (AUTH-03 as amended) and the code is sent
-        through the injected email_sender (AUTH-01). Touches: SQLite, the email sender."""
+        through the injected email_sender (AUTH-01). [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2
+        (AUTH-16): only the code's HMAC-SHA256 is stored. Touches: SQLite, the email sender.
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: each stored or compared secret is now HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256)."""
         decision_points = []
         # rate_limit_ip_24h
         if self._is_rate_limited(ip, ip, 'signup'):
@@ -290,9 +387,9 @@ class AuthSystem:
         # Send verification email (mock)
         code = self._generate_verification_code()
         cursor.execute(
-            """INSERT INTO verification_codes (user_id, code, created_at, expires_at, type)
+            """INSERT INTO verification_codes (user_id, code_hash, created_at, expires_at, type)
                VALUES (?, ?, ?, ?, ?)""",
-            (user_id, code, now_iso,
+            (user_id, self._hash_secret(code), now_iso,
              (self._now() + timedelta(hours=self.email_verification_expires_hours)).isoformat(), 'email')
         )
         self.db.commit()
@@ -310,7 +407,9 @@ class AuthSystem:
         In: email, the code. Out: {status: "verified", user_id, message} or {error: "invalid_email" |
         "email_already_verified" | "code_expired"}. [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] The code is now
         compared in constant time in Python (docs/specs/README.md); it was matched with "code = ?" in SQL.
-        Touches: SQLite (users, verification_codes, audit_log)."""
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2 (AUTH-16): the supplied code's HMAC-SHA256 is
+        compared with the stored code_hash. Touches: SQLite (users, verification_codes, audit_log).
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: each stored or compared secret is now HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256)."""
         decision_points = []
         cursor = self.db.cursor()
         cursor.execute("SELECT id, email_verified_at FROM users WHERE email = ?", (email,))
@@ -324,11 +423,11 @@ class AuthSystem:
             return {"error": "email_already_verified"}
         decision_points.append("user_unverified")
         cursor.execute(
-            """SELECT id, code FROM verification_codes
+            """SELECT id, code_hash FROM verification_codes
                WHERE user_id = ? AND type = 'email' AND expires_at > ? ORDER BY id""",
             (user_id, self._now_iso())
         )
-        supplied = (code_or_token if isinstance(code_or_token, str) else "").encode("utf-8")
+        supplied = self._hash_secret(code_or_token if isinstance(code_or_token, str) else "").encode("utf-8")
         code_record = None
         for candidate in cursor.fetchall():
             if hmac.compare_digest(str(candidate[1]).encode("utf-8"), supplied):
@@ -349,6 +448,16 @@ class AuthSystem:
         return {"status": "verified", "user_id": user_id, "message": "ready to login"}
 
     def login(self, email: str, password: str, device_id: str, ip: str) -> Dict[str, Any]:
+        """Flow 3: sign in with email and password; an MFA user gets a challenge instead of a session.
+
+        In: email, password, device id, the server-observed IP. Out: {status: "authenticated", session_id,
+        token, refresh_token, expires_in, user: {id, email, tier}} or {status: "mfa_required", challenge_id} or
+        {error: "too_many_failed_logins" | "invalid_credentials" | "unverified_email"}.
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2 bug fix (AUTH-16): login now returns the
+        session's refresh_token (it returned none, so token_refresh could never be used) and stores only its
+        HMAC-SHA256; the MFA challenge stores only the expected code's HMAC-SHA256.
+        Touches: SQLite (users read; sessions, verification_codes, rate_limit_log, audit_log, why_chain_log).
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: each stored or compared secret is now HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256)."""
         decision_points = []
         # rate_limit (5 failed per 15min per ip/user)
         if self._is_rate_limited(ip, email, 'login'):
@@ -383,9 +492,9 @@ class AuthSystem:
             current_code = totp.now()
             now_iso = self._now_iso()
             cursor.execute(
-                """INSERT INTO verification_codes (user_id, code, created_at, expires_at, type)
+                """INSERT INTO verification_codes (user_id, code_hash, created_at, expires_at, type)
                    VALUES (?, ?, ?, ?, ?)""",
-                (user_id, current_code, now_iso,
+                (user_id, self._hash_secret(current_code), now_iso,
                  (self._now() + timedelta(minutes=self.mfa_challenge_expires_minutes)).isoformat(), 'mfa')
             )
             challenge_id = cursor.lastrowid
@@ -398,16 +507,8 @@ class AuthSystem:
         # rate_limit (for failed attempts, but we passed so we clear? spec doesn't say to clear on success, but we'll not log failed attempt for this success)
         # We'll not log this attempt as failed since we passed
         # Create session
-        refresh_token = secrets.token_urlsafe(32)
         access_token = self._generate_token(user_id, tier, 'access')
-        now_iso = self._now_iso()
-        cursor.execute(
-            """INSERT INTO sessions (user_id, refresh_token, created_at, expires_at, ip, device_id)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (user_id, refresh_token, now_iso,
-             (self._now() + timedelta(days=self.refresh_token_expires_days)).isoformat(), ip, device_id)
-        )
-        session_id = cursor.lastrowid
+        session_id, refresh_token = self._create_session(cursor, user_id, ip, device_id)
         self.db.commit()
         self._log_why_chain("login", decision_points)
         self._log_audit_log("session_created", actor_id=user_id, resource_type="session", resource_id=session_id,
@@ -416,17 +517,78 @@ class AuthSystem:
             "status": "authenticated",
             "session_id": session_id,
             "token": access_token,
+            "refresh_token": refresh_token,
             "expires_in": self.access_token_expires_minutes * 60,
             "user": {"id": user_id, "email": email, "tier": tier}
         }
 
+    def oauth_start(self, provider: str) -> Dict[str, Any]:
+        """Begin an OAuth sign-in: issue the state value to send to the provider (and to keep in the visitor's
+        session cookie, which the caller compares with the callback's state before calling oauth_callback).
+
+        In: the provider name. Out: {state, expires_in: 600}. The state is 32 random bytes (URL-safe); only its
+        HMAC-SHA256 is stored, with the provider and an expiry 10 minutes ahead. Why: the auth spec's "Secrets at
+        rest" line (Phase B.2, 2026-11-10): OAuth state is single-use and expires in 10 minutes; nothing issued
+        or checked it. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite (oauth_states).
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: each stored or compared secret is now HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256)."""
+        state = secrets.token_urlsafe(32)
+        now = self._now()
+        cursor = self.db.cursor()
+        cursor.execute("DELETE FROM oauth_states WHERE expires_at <= ?", (now.isoformat(),))
+        cursor.execute("INSERT INTO oauth_states (state_hash, provider, created_at, expires_at) VALUES (?, ?, ?, ?)",
+                       (self._hash_secret(state), provider, now.isoformat(), (now + OAUTH_STATE_TTL).isoformat()))
+        self.db.commit()
+        return {"state": state, "expires_in": int(OAUTH_STATE_TTL.total_seconds())}
+
+    def _consume_oauth_state(self, provider: str, state: Any) -> bool:
+        """Spend an issued OAuth state: True only for a state oauth_start() issued for this provider, under 10
+        minutes old and not used before; it is deleted either way, so it works once. The hash is compared in
+        constant time, and only the call whose DELETE removes the row wins (two concurrent callbacks cannot both
+        pass). In: provider, the state from the callback. Out: bool. Why: auth spec "Secrets at rest" (Phase B.2,
+        2026-11-10). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite (oauth_states).
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: each stored or compared secret is now HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256)."""
+        if not isinstance(state, str) or not state:
+            return False
+        supplied = self._hash_secret(state)
+        cursor = self.db.cursor()
+        row = cursor.execute("SELECT state_hash, provider, expires_at FROM oauth_states WHERE state_hash = ?",
+                             (supplied,)).fetchone()
+        if row is None or not hmac.compare_digest(str(row[0]).encode("ascii"), supplied.encode("ascii")):
+            return False
+        cursor.execute("DELETE FROM oauth_states WHERE state_hash = ?", (supplied,))
+        won = cursor.rowcount == 1
+        self.db.commit()
+        return won and row[1] == provider and self._parse_time(row[2]) > self._now()
+
     def oauth_callback(self, provider: str, code: str, state: str) -> Dict[str, Any]:
+        """Flow 4: finish an OAuth sign-in. Out: {status: "authenticated", session_id, token, refresh_token,
+        user} or {error: "invalid_state" | "oauth_exchange_failed" | "email_not_verified"}.
+
+        In: the provider, the provider's one-time code and the state from the redirect. Gates, in order: the
+        state is one oauth_start() issued for this provider, unexpired (10 min) and unused (it is spent here);
+        the code is exchanged through the injected provider client (oauth_profile) for the verified profile,
+        and the code itself never identifies anyone; the provider vouches for the email. Then the account found
+        by provider id, else by email, is linked, or a verified user is created.
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2 (AUTH-16, "Secrets at rest"): state is now
+        checked server-side and single-use, a failed exchange is refused, and the refresh_token is returned
+        (stored only as its HMAC-SHA256). Touches: SQLite (oauth_states, users, oauth_accounts, sessions, audit_log,
+        why_chain_log); network through the provider client.
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: each stored or compared secret is now HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256)."""
         decision_points = []
-        # state_valid: the caller matches state to the visitor's session before calling this. state passes through the
+        # state_valid: the caller also matches state to the visitor's session cookie. state passes through the
         # visitor's browser, so nothing inside it is ever trusted: the e-mail comes only from the provider.
         # 2026-11-05, session f3daac6e: an earlier repair read the e-mail from state, which let anyone log in as anyone.
+        if not self._consume_oauth_state(provider, state):
+            self._log_why_chain("oauth_callback", decision_points + ["state_valid:failed"])
+            return {"error": "invalid_state"}
         decision_points.append("state_valid")
-        profile = self.oauth_profile(provider, code)
+        try:
+            profile = self.oauth_profile(provider, code)
+        except Exception:
+            profile = None
+        if not isinstance(profile, dict) or not profile.get("id") or not profile.get("email"):
+            self._log_why_chain("oauth_callback", decision_points + ["code_exchange:failed"])
+            return {"error": "oauth_exchange_failed"}
         # The provider must vouch for the address, or anyone could sign in by adding someone else's e-mail to their
         # account there (2026-11-08, session f3daac6e, from review).
         if not profile.get("email_verified"):
@@ -460,14 +622,7 @@ class AuthSystem:
             cursor.execute("SELECT tier FROM users WHERE id = ?", (user_id,))
             tier = cursor.fetchone()[0]
             access_token = self._generate_token(user_id, tier, 'access')
-            refresh_token = secrets.token_urlsafe(32)
-            cursor.execute(
-                """INSERT INTO sessions (user_id, refresh_token, created_at, expires_at)
-                   VALUES (?, ?, ?, ?)""",
-                (user_id, refresh_token, now_iso,
-                 (self._now() + timedelta(days=self.refresh_token_expires_days)).isoformat())
-            )
-            session_id = cursor.lastrowid
+            session_id, refresh_token = self._create_session(cursor, user_id)
             self.db.commit()
             self._log_why_chain("oauth_callback", decision_points)
             self._log_audit_log("oauth_login", actor_id=user_id, resource_type="user", resource_id=user_id,
@@ -476,6 +631,7 @@ class AuthSystem:
                 "status": "authenticated",
                 "session_id": session_id,
                 "token": access_token,
+                "refresh_token": refresh_token,
                 "user": {"id": user_id, "email": email, "tier": tier}
             }
         else:
@@ -493,14 +649,7 @@ class AuthSystem:
             )
             # Generate tokens
             access_token = self._generate_token(user_id, 'free', 'access')
-            refresh_token = secrets.token_urlsafe(32)
-            cursor.execute(
-                """INSERT INTO sessions (user_id, refresh_token, created_at, expires_at)
-                   VALUES (?, ?, ?, ?)""",
-                (user_id, refresh_token, now_iso,
-                 (self._now() + timedelta(days=self.refresh_token_expires_days)).isoformat())
-            )
-            session_id = cursor.lastrowid
+            session_id, refresh_token = self._create_session(cursor, user_id)
             self.db.commit()
             self._log_why_chain("oauth_callback", decision_points)
             self._log_audit_log("oauth_login", actor_id=user_id, resource_type="user", resource_id=user_id,
@@ -509,14 +658,24 @@ class AuthSystem:
                 "status": "authenticated",
                 "session_id": session_id,
                 "token": access_token,
+                "refresh_token": refresh_token,
                 "user": {"id": user_id, "email": email, "tier": "free"}
             }
 
     def mfa_challenge(self, challenge_id: int, code: str) -> Dict[str, Any]:
+        """Flow 5: answer the MFA challenge login issued. Out: {status: "authenticated", session_id, token,
+        refresh_token, user} or {error: "invalid_challenge" | "challenge_expired" | "invalid_code"}.
+
+        In: the challenge id and the code the user typed. The code's HMAC-SHA256 is compared in constant time with
+        the challenge's code_hash; wrong codes count and the challenge is deleted after mfa_max_attempts.
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2 (AUTH-16): the challenge stores only the code's
+        hash, and the new session's refresh_token is returned (stored only as its HMAC-SHA256).
+        Touches: SQLite (verification_codes, users, sessions, audit_log, why_chain_log).
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: each stored or compared secret is now HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256)."""
         decision_points = []
         cursor = self.db.cursor()
         cursor.execute(
-            """SELECT user_id, code, expires_at FROM verification_codes
+            """SELECT user_id, code_hash, expires_at FROM verification_codes
                WHERE id = ? AND type = 'mfa'""",
             (challenge_id,)
         )
@@ -530,7 +689,7 @@ class AuthSystem:
             return {"error": "challenge_expired"}
         decision_points.append("challenge_valid")
         # Bytes, not str: compare_digest raises TypeError on non-ASCII text such as full-width digits (from review).
-        if not hmac.compare_digest(str(code).encode("utf-8"), str(stored_code).encode("utf-8")):
+        if not hmac.compare_digest(self._hash_secret(str(code)).encode("ascii"), str(stored_code).encode("utf-8")):
             # Each wrong code counts; after mfa_max_attempts the challenge is gone and the user signs in again, so a
             # six digit code cannot be guessed (2026-11-08, session f3daac6e, from review).
             cursor.execute("UPDATE verification_codes SET attempts = attempts + 1 WHERE id = ?", (challenge_id,))
@@ -549,15 +708,7 @@ class AuthSystem:
         cursor.execute("SELECT tier FROM users WHERE id = ?", (user_id,))
         tier = cursor.fetchone()[0]
         access_token = self._generate_token(user_id, tier, 'access')
-        refresh_token = secrets.token_urlsafe(32)
-        now_iso = self._now_iso()
-        cursor.execute(
-            """INSERT INTO sessions (user_id, refresh_token, created_at, expires_at)
-               VALUES (?, ?, ?, ?)""",
-            (user_id, refresh_token, now_iso,
-             (self._now() + timedelta(days=self.refresh_token_expires_days)).isoformat())
-        )
-        session_id = cursor.lastrowid
+        session_id, refresh_token = self._create_session(cursor, user_id)
         self.db.commit()
         self._log_why_chain("mfa_challenge", decision_points)
         self._log_audit_log("mfa_verified", actor_id=user_id, resource_type="user", resource_id=user_id,
@@ -569,24 +720,36 @@ class AuthSystem:
             "status": "authenticated",
             "session_id": session_id,
             "token": access_token,
+            "refresh_token": refresh_token,
             "user": {"id": user_id, "email": email, "tier": tier}
         }
 
     def token_refresh(self, refresh_token: str) -> Dict[str, Any]:
+        """Flow 6: a new access token for a session's refresh token. Out: {status: "ok", token, expires_in} or
+        {error: "invalid_token" | "token_expired" | "user_banned"}.
+
+        In: the refresh_token that login, mfa_challenge or oauth_callback returned. Its HMAC-SHA256 finds the session
+        and is compared with the stored refresh_token_hash in constant time.
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2 (AUTH-16): sessions keep only the hash; the
+        token was looked up in plain text. Touches: SQLite (sessions, users read; audit_log, why_chain_log).
+        [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: each stored or compared secret is now HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256)."""
         decision_points = []
         cursor = self.db.cursor()
+        supplied = self._hash_secret(refresh_token if isinstance(refresh_token, str) else "")
         cursor.execute(
-            """SELECT s.user_id, s.expires_at, u.status, u.tier
+            """SELECT s.user_id, s.expires_at, u.status, u.tier, s.refresh_token_hash
                FROM sessions s
                JOIN users u ON s.user_id = u.id
-               WHERE s.refresh_token = ?""",
-            (refresh_token,)
+               WHERE s.refresh_token_hash = ?""",
+            (supplied,)
         )
         session = cursor.fetchone()
+        if session and not hmac.compare_digest(str(session[4]).encode("ascii"), supplied.encode("ascii")):
+            session = None
         if not session:
             self._log_why_chain("token_refresh", decision_points + ["token_valid:failed"])
             return {"error": "invalid_token"}
-        user_id, expires_at, status, tier = session
+        user_id, expires_at, status, tier = session[0], session[1], session[2], session[3]
         if self._parse_time(expires_at) < self._now():
             self._log_why_chain("token_refresh", decision_points + ["token_valid:failed"])
             return {"error": "token_expired"}

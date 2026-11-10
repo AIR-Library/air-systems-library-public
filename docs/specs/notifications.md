@@ -15,10 +15,10 @@ name or in a comment on the line above it (for example `# NOTIF-01`), so a missi
 | `NOTIF-02` | Send SMS |
 | `NOTIF-03` | Send in-app (stores in DB) |
 | `NOTIF-04` | Batch send 1000+ notifications |
-| `NOTIF-05` | Quiet hours: skip if in range |
+| `NOTIF-05` | Quiet hours: a send inside the user's window (UTC, may cross midnight) is not sent now; it is queued with scheduled_at = quiet_hours_end |
 | `NOTIF-06` | Do-not-disturb: skip if enabled |
-| `NOTIF-07` | Track: message marked as opened when user clicks link |
-| `NOTIF-08` | Retry: failed email retries and eventually succeeds |
+| `NOTIF-07` | Track: GET /notifications/open/:message_id sets opened_at and status 'opened' once; a second call changes nothing |
+| `NOTIF-08` | Retry: a failed email is retried at most 3 times (4 attempts, 1 s / 2 s / 4 s) and succeeds when the sender recovers; a 4th failure marks it failed |
 | `NOTIF-09` | Unsubscribe: user unsubscribed, future emails skipped |
 | `NOTIF-10` | User preferences honored: channels_enabled respected |
 | `NOTIF-11` | Unsubscribe link: POST with a valid token sets channels_enabled[channel] false; GET changes nothing; a missing, short, non-hex or altered token, or an unknown channel, gets 403 invalid_unsubscribe_token and the user stays subscribed |
@@ -94,7 +94,12 @@ IMPLEMENTATION:
   quiet_hours_end and sent by deliver_due (below)
 - Do-not-disturb: Skip sending if enabled, log as 'skipped'
 - Templating: Simple variable substitution {variable_name} → value
-- Retry: Email/SMS failures retry 3x with exponential backoff
+- Retry: Email/SMS failures retry up to 3 times after the first attempt (at most 4 attempts), waiting 1 s,
+  2 s and 4 s, the same counting as background jobs. Amended 2026-11-10 (Phase B.2: one answer in every language).
+- Quiet hours are "HH:MM" in UTC, and a window may cross midnight (22:00-08:00). The template stores no time
+  zone; a deployment that keeps one converts to UTC before comparing.
+- Opening: GET /notifications/open/:message_id records that a message was opened (the tracking pixel or
+  link): it sets opened_at and status 'opened' the first time only and answers 204 either way (NOTIF-07).
 - Unsubscribe: Include unsubscribe link in emails (legal requirement). The link is
   <base_url>/unsubscribe?user_id=<id>&channel=<channel>&token=<token> with
   token = lowercase hex of HMAC-SHA256(secret, "unsubscribe:" + user_id + ":" + channel), the secret
@@ -118,7 +123,8 @@ IMPLEMENTATION:
      UPDATE ... SET status = 'sending', claimed_at = now WHERE id = ? AND status = 'queued' (a row another
      worker claimed first is skipped);
   3. preferences are checked NOW, not when the message was queued: unsubscribed, channel off or
-     do-not-disturb -> 'skipped';
+     do-not-disturb -> 'skipped'; inside the user's quiet hours -> back to 'queued' with scheduled_at =
+     quiet_hours_end;
   4. the final write is UPDATE ... WHERE id = ? AND status = 'sending' AND claimed_at = <this claim>.
   That sends each message exactly once when no worker crashes, and at least once after a crash. A single
   send must finish in under 300 s. Amended 2026-11-10 after an independent security review.
@@ -128,10 +134,10 @@ TESTS:
 - **NOTIF-02** Send SMS
 - **NOTIF-03** Send in-app (stores in DB)
 - **NOTIF-04** Batch send 1000+ notifications
-- **NOTIF-05** Quiet hours: skip if in range
+- **NOTIF-05** Quiet hours: a send inside the user's window (UTC, may cross midnight) is not sent now; it is queued with scheduled_at = quiet_hours_end
 - **NOTIF-06** Do-not-disturb: skip if enabled
-- **NOTIF-07** Track: message marked as opened when user clicks link
-- **NOTIF-08** Retry: failed email retries and eventually succeeds
+- **NOTIF-07** Track: GET /notifications/open/:message_id sets opened_at and status 'opened' once; a second call changes nothing
+- **NOTIF-08** Retry: a failed email is retried at most 3 times (4 attempts, 1 s / 2 s / 4 s) and succeeds when the sender recovers; a 4th failure marks it failed
 - **NOTIF-09** Unsubscribe: user unsubscribed, future emails skipped
 - **NOTIF-10** User preferences honored: channels_enabled respected
 - **NOTIF-11** Unsubscribe link: POST with a valid token sets channels_enabled[channel] false; GET changes nothing; a missing, short, non-hex or altered token, or an unknown channel, gets 403 invalid_unsubscribe_token and the user stays subscribed

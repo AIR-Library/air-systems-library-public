@@ -4,7 +4,8 @@
 //! What: `AuthSystem` keeps users, sessions, codes and audit/why-chain rows in SQLite. Passwords follow
 //! NIST SP 800-63B-4 (15-64+ characters, no composition rules, a blocklist plus the user's own email,
 //! name and the service name) and are bcrypt-hashed. Email codes, refresh tokens and OAuth states are
-//! random, stored only as SHA-256 hashes, compared in constant time and single-use. Access tokens are
+//! random, stored only as keyed hashes (HMAC-SHA256 under the server key, spec d270fa3), compared in
+//! constant time and single-use. Access tokens are
 //! HS256 JWTs verified with the algorithm FIXED (the header's `alg` is never trusted; `none` is
 //! refused). Failed logins are limited to 5 per 15 minutes per IP and per account; signups to 5 per IP
 //! per 24 hours.
@@ -13,6 +14,9 @@
 //! 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
 //! Touches: the SQLite database it owns; email through `Mailer`; OAuth providers through
 //! `OAuthProvider` (network in production); the clock; OS randomness. No money.
+//! Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec d270fa3: keyed HMAC for stored secrets):
+//! the stored hashes were a plain SHA-256, which a leaked table of 6-digit codes gives up to brute force;
+//! `AuthSystem::new` now takes the HMAC key (AUTH_SECRET_KEY, 32+ bytes) and refuses to start without it.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use bcrypt::{hash, verify, DEFAULT_COST};
@@ -20,7 +24,7 @@ use hmac::{Hmac, Mac};
 use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -288,11 +292,19 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{:02x}", x)).collect()
 }
 
-/// What: SHA-256 hex of a secret, the only form secrets are stored in. 2026-11-10,
-/// session_012zDydZCZ4AChqhEZ4oVtaP.
-fn sha256_hex(s: &str) -> String {
-    hex(&Sha256::digest(s.as_bytes()))
+/// What: lowercase hex HMAC-SHA256(key, s), the only form secrets (email codes, refresh tokens, OAuth
+/// states) are stored in. In: the key, the secret. Out: 64 hex characters. Why: spec d270fa3: keyed HMAC
+/// for stored secrets (it replaced the plain SHA-256 helper `sha256_hex`). 2026-11-10,
+/// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+fn hmac_sha256_hex(key: &[u8], s: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(s.as_bytes());
+    hex(&mac.finalize().into_bytes())
 }
+
+/// What: the shortest HMAC key the service starts with (spec d270fa3: AUTH_SECRET_KEY, at least 32
+/// bytes). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+pub const MIN_SECRET_KEY_BYTES: usize = 32;
 
 /// What: constant-time equality. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
@@ -367,6 +379,8 @@ pub fn check_password(password: &str, email: &str, name: &str) -> Result<(), Aut
 pub struct AuthSystem {
     conn: Connection,
     jwt_secret: Vec<u8>,
+    /// HMAC key for stored secrets (spec d270fa3, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
+    secret_key: Vec<u8>,
     bcrypt_cost: u32,
     mailer: Box<dyn Mailer>,
     oauth: Box<dyn OAuthProvider>,
@@ -380,7 +394,14 @@ impl AuthSystem {
     /// (RFC 7518: the key must be as long as the hash output), bcrypt's default cost, an in-memory
     /// mailer and no OAuth codes. Out: the service or `InvalidInput("jwt_secret")`.
     /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database (DDL).
-    pub fn new(conn: Connection, jwt_secret: String) -> Result<Self, AuthError> {
+    /// [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets:
+    /// `secret_key` is the HMAC key every stored secret is kept under, injected like the JWT secret (load
+    /// it from the AUTH_SECRET_KEY environment variable). Out: `InvalidInput("secret_key ...")` when it is
+    /// shorter than 32 bytes, before any table is touched, so the service refuses to start without it.
+    pub fn new(conn: Connection, jwt_secret: String, secret_key: String) -> Result<Self, AuthError> {
+        if secret_key.len() < MIN_SECRET_KEY_BYTES {
+            return Err(AuthError::InvalidInput("secret_key (AUTH_SECRET_KEY needs 32+ bytes)".into()));
+        }
         if jwt_secret.len() < 32 {
             return Err(AuthError::InvalidInput("jwt_secret (needs 32+ bytes)".into()));
         }
@@ -405,12 +426,20 @@ impl AuthSystem {
         Ok(Self {
             conn,
             jwt_secret: jwt_secret.into_bytes(),
+            secret_key: secret_key.into_bytes(),
             bcrypt_cost: DEFAULT_COST,
             mailer: Box::new(InMemoryMailer::default()),
             oauth: Box::new(FakeOAuthProvider::default()),
             clock: Box::new(|| SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)),
             dummy_hash: OnceLock::new(),
         })
+    }
+
+    /// What: the stored form of a secret: lowercase hex HMAC-SHA256(secret_key, s). In: the secret. Out:
+    /// 64 hex characters. Why: spec d270fa3: keyed HMAC for stored secrets. 2026-11-10,
+    /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+    fn hash_secret(&self, s: &str) -> String {
+        hmac_sha256_hex(&self.secret_key, s)
     }
 
     /// What: set the bcrypt cost (4-31; tests use 4 because debug builds hash slowly).
@@ -521,6 +550,7 @@ impl AuthSystem {
 
     /// What: issue and email a new 6-digit verification code (earlier unused codes stop working).
     /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database, email.
+    /// [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
     fn send_email_code(&self, user_id: i64, email: &str) -> Result<(), AuthError> {
         let n = u32::from_be_bytes(random_bytes(4).try_into().unwrap_or([0; 4])) % 1_000_000;
         let code = format!("{:06}", n);
@@ -528,7 +558,7 @@ impl AuthSystem {
         self.conn.execute("UPDATE verification_codes SET consumed_at = ?2 WHERE user_id = ?1 AND type = 'email' AND consumed_at IS NULL", params![user_id, now])?;
         self.conn.execute(
             "INSERT INTO verification_codes (id, user_id, code_hash, created_at, expires_at, type) VALUES (?1, ?2, ?3, ?4, ?5, 'email')",
-            params![hex(&random_bytes(16)), user_id, sha256_hex(&code), now, now + 15 * 60],
+            params![hex(&random_bytes(16)), user_id, self.hash_secret(&code), now, now + 15 * 60],
         )?;
         self.mailer
             .send(Email { to: email.to_string(), subject: "Your verification code".into(), body: format!("Your code is {}", code) })
@@ -538,6 +568,7 @@ impl AuthSystem {
     /// What: flow 2. Gates: an unexpired, unused code that matches (5 tries), user still unverified.
     /// Unknown emails give `InvalidCode` (no account probing). Out: verified.
     /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
+    /// [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
     pub fn verify_email(&mut self, req: VerifyEmailRequest) -> Result<AuthResponse, AuthError> {
         let email = req.email.trim().to_lowercase();
         let user: Option<(i64, Option<i64>)> = self.conn.query_row("SELECT id, email_verified_at FROM users WHERE email = ?1", params![email], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
@@ -558,7 +589,7 @@ impl AuthSystem {
         if attempts >= 5 {
             return Err(AuthError::TooManyAttempts);
         }
-        if !ct_eq(sha256_hex(req.code_or_token.trim()).as_bytes(), code_hash.as_bytes()) {
+        if !ct_eq(self.hash_secret(req.code_or_token.trim()).as_bytes(), code_hash.as_bytes()) {
             self.conn.execute("UPDATE verification_codes SET attempts = attempts + 1 WHERE id = ?1", params![code_id])?;
             self.why("verify_email", &["code_valid"], "wrong_code");
             return Err(AuthError::InvalidCode);
@@ -588,13 +619,14 @@ impl AuthSystem {
 
     /// What: create a session with a random refresh token (stored hashed) and an access token.
     /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
+    /// [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
     fn create_session(&self, user: &PublicUser, ip: &str, device_id: &str) -> Result<AuthData, AuthError> {
         let session_id = hex(&random_bytes(16));
         let refresh = URL_SAFE_NO_PAD.encode(random_bytes(32));
         let now = self.now();
         self.conn.execute(
             "INSERT INTO sessions (id, user_id, refresh_token_hash, created_at, expires_at, ip, device_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![session_id, user.id, sha256_hex(&refresh), now, now + REFRESH_TOKEN_SECS, ip, device_id],
+            params![session_id, user.id, self.hash_secret(&refresh), now, now + REFRESH_TOKEN_SECS, ip, device_id],
         )?;
         self.audit(Some(user.id), "session_created", Some(session_id.clone()), json!({ "ip": ip, "device_id": device_id }))?;
         Ok(AuthData::Authenticated { session_id, token: self.issue_access_token(user), refresh_token: refresh, expires_in: ACCESS_TOKEN_SECS, user: user.clone() })
@@ -734,11 +766,12 @@ impl AuthSystem {
 
     /// What: begin an OAuth login: a random state (stored hashed, 10 minutes) to put in the provider
     /// redirect. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: database.
+    /// [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
     pub fn oauth_start(&mut self, provider: &str) -> Result<String, AuthError> {
         let state = URL_SAFE_NO_PAD.encode(random_bytes(24));
         self.conn.execute(
             "INSERT INTO oauth_states (state_hash, provider, expires_at) VALUES (?1, ?2, ?3)",
-            params![sha256_hex(&state), provider, self.now() + 600],
+            params![self.hash_secret(&state), provider, self.now() + 600],
         )?;
         Ok(state)
     }
@@ -747,10 +780,11 @@ impl AuthSystem {
     /// the provider verified the email. New email: an active user is created; existing email: the
     /// provider is linked to it. Out: authenticated. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
     /// Touches: database, the OAuth provider.
+    /// [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
     pub fn oauth_callback(&mut self, req: OAuthCallbackRequest) -> Result<AuthResponse, AuthError> {
         let consumed = self.conn.execute(
             "DELETE FROM oauth_states WHERE state_hash = ?1 AND provider = ?2 AND expires_at > ?3",
-            params![sha256_hex(&req.state), req.provider, self.now()],
+            params![self.hash_secret(&req.state), req.provider, self.now()],
         )?;
         if consumed != 1 {
             self.why("oauth_callback", &["state_valid"], "invalid_state");
@@ -802,12 +836,13 @@ impl AuthSystem {
     /// What: flow 6. Gates: the refresh token matches a live, unexpired session; the user is not banned
     /// or suspended. Out: a new access token. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
     /// Touches: database.
+    /// [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
     pub fn token_refresh(&mut self, req: TokenRefreshRequest) -> Result<AuthResponse, AuthError> {
         let row: Option<(i64, i64)> = self
             .conn
             .query_row(
                 "SELECT user_id, expires_at FROM sessions WHERE refresh_token_hash = ?1 AND revoked_at IS NULL",
-                params![sha256_hex(req.refresh_token.trim())],
+                params![self.hash_secret(req.refresh_token.trim())],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;

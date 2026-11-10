@@ -264,9 +264,25 @@ def test_generated_secret_format():
     assert key == decoded
 
 
+def _fail_message_fully(store, endpoint_id, message_id, sender):
+    """Deliver every attempt of one message (the first and each retry in RETRY_SCHEDULE) through sender, the
+    way the retry process would, each as its own delivery row. In: store, endpoint id, message id, sender.
+    Out: the last delivery. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 webhooks bug).
+    Touches: the in-memory store."""
+    delivery = [d for d in store.get_pending_deliveries(time.time() + 1) if d.message_id == message_id][0]
+    for attempt in range(len(RETRY_SCHEDULE) + 1):
+        if attempt:
+            delivery = store.create_delivery(message_id, endpoint_id, attempt)
+        delivery = deliver(delivery, store, sender)
+    return delivery
+
+
 def test_endpoint_disabled_after_5_failures():
-    """Five failed deliveries disable the endpoint.
+    """Five consecutive fully-failed MESSAGES disable the endpoint; failed attempts of one message, and fully
+    failed messages broken by a success, do not.
     In: the test fixtures. Out: assertions. Why: spec retry rule. Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: send_event now takes the org id.
+    Corrected 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 bug): it asserted that 5 failed ATTEMPTS
+    disable the endpoint, which the spec does not say ("5 consecutive fully-failed messages").
     Touches: the in-memory store."""
     store = InMemoryStore()
     endpoint_data = create_endpoint("org1", "https://example.com/webhook", ["event.test"], store)
@@ -275,13 +291,36 @@ def test_endpoint_disabled_after_5_failures():
     def sender_fail(url, headers, body):
         return (500, b"Error")
 
-    for i in range(5):
-        message_id = send_event("org1", "event.test", {"data": f"test{i}"}, store)
-        delivery = store.get_pending_deliveries(time.time() + 1)[0]
-        deliver(delivery, store, sender_fail)
+    def sender_ok(url, headers, body):
+        return (200, b"OK")
 
+    # Every failed attempt of one message but the last leaves the endpoint active, with nothing counted.
+    first = send_event("org1", "event.test", {"data": "first"}, store)
+    delivery = store.get_pending_deliveries(time.time() + 1)[0]
+    deliver(delivery, store, sender_fail)
+    for attempt in range(1, len(RETRY_SCHEDULE)):
+        deliver(store.create_delivery(first, endpoint_id, attempt), store, sender_fail)
     endpoint = store.get_endpoint(endpoint_id)
-    assert endpoint.active is False, "Endpoint should be disabled after 5 failures"
+    assert (endpoint.active, endpoint.failure_count) == (True, 0)
+    last = deliver(store.create_delivery(first, endpoint_id, len(RETRY_SCHEDULE)), store, sender_fail)
+    assert last.next_attempt_at is None
+    assert store.get_endpoint(endpoint_id).failure_count == 1
+
+    # Three more fully-failed messages (4 in a row), then a success resets the run.
+    for i in range(3):
+        _fail_message_fully(store, endpoint_id, send_event("org1", "event.test", {"data": f"a{i}"}, store), sender_fail)
+    assert store.get_endpoint(endpoint_id).failure_count == 4
+    ok = send_event("org1", "event.test", {"data": "ok"}, store)
+    deliver([d for d in store.get_pending_deliveries(time.time() + 1) if d.message_id == ok][0], store, sender_ok)
+    endpoint = store.get_endpoint(endpoint_id)
+    assert (endpoint.active, endpoint.failure_count) == (True, 0)
+
+    for i in range(4):
+        _fail_message_fully(store, endpoint_id, send_event("org1", "event.test", {"data": f"b{i}"}, store), sender_fail)
+    assert store.get_endpoint(endpoint_id).active is True
+    _fail_message_fully(store, endpoint_id, send_event("org1", "event.test", {"data": "b4"}, store), sender_fail)
+    endpoint = store.get_endpoint(endpoint_id)
+    assert endpoint.active is False, "Endpoint should be disabled after 5 consecutive fully-failed messages"
     assert endpoint.failure_count == 5
 
 

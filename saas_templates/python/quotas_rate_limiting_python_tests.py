@@ -360,7 +360,12 @@ class TestFeatureGateByTier(TestQuotaEngineBase):
 
     # QUOTA-10
     def test_feature_gate_fail_feature_unavailable_403(self) -> None:
-        """✓ feature_gate FAIL → feature unavailable, 403 with upgrade hint"""
+        """✓ feature_gate FAIL → feature unavailable, 403 with upgrade hint.
+
+        In: the engine fixture. Out: assertions. Why: QUOTA-10. Updated 2026-11-10,
+        session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2 quotas amendment): also asserts the body is exactly
+        {error: "feature_not_available_in_tier", tier, minimum_tier, upgrade_url}, the one shape in every
+        language. Touches: the engine's in-memory state only."""
         # feature_a not available for solo
         user = User(user_id="fg_fail1", tier="solo", ip="10.0.0.70")
         decision = self.engine.check_request(user, endpoint="/v1/feature_a", feature="feature_a")
@@ -370,6 +375,8 @@ class TestFeatureGateByTier(TestQuotaEngineBase):
         self.assertEqual(decision.body["tier"], "solo")
         self.assertEqual(decision.body["minimum_tier"], "team")
         self.assertIn("upgrade_url", decision.body)
+        self.assertEqual(set(decision.body), {"error", "tier", "minimum_tier", "upgrade_url"})
+        self.assertTrue(decision.body["upgrade_url"])
 
         # feature_b not available for team
         user2 = User(user_id="fg_fail2", tier="team", ip="10.0.0.71")

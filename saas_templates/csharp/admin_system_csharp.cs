@@ -36,7 +36,7 @@ CREATE TABLE deployments (
     deployment_id UUID PRIMARY KEY,
     customer_id   UUID REFERENCES customers(customer_id),
     domain        TEXT UNIQUE NOT NULL,
-    tier          TEXT NOT NULL,
+    tier          TEXT NOT NULL,          -- plan: solo, team, enterprise (never a staff role; 2026-11-10, Phase B.2)
     status        TEXT NOT NULL,          -- draft, live, suspended, archived
     theme_id      UUID,
     domain_verified BOOLEAN NOT NULL DEFAULT FALSE,
@@ -142,7 +142,12 @@ namespace AdminSystem
         public Guid DeploymentId { get; set; } = Guid.NewGuid();
         public Guid CustomerId { get; set; }
         public string Domain { get; set; }
-        public Role Tier { get; set; }
+
+        /// <summary>
+        /// The deployment's plan: solo, team or enterprise (lower case). Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP
+        /// (Phase B.2, admin spec TIERS): it was a staff Role (Owner/Admin/User). Pure data.
+        /// </summary>
+        public string Tier { get; set; } = "solo";
         public DeploymentStatus Status { get; set; } = DeploymentStatus.Draft;
         public Guid ThemeId { get; set; }
 
@@ -456,11 +461,11 @@ namespace AdminSystem
             Status = status ?? DefaultStatus(code);
         }
 
-        /// <summary>401 unauthorized; 403 permission and CSRF refusals; 404 *_not_found; 409 conflicts; 502 stripe_error; 400 otherwise. Pure.</summary>
+        /// <summary>401 unauthorized; 403 permission, CSRF and account_suspended (ADMIN-19, 2026-11-10) refusals; 404 *_not_found; 409 conflicts; 502 stripe_error; 400 otherwise. Pure.</summary>
         public static int DefaultStatus(string code) => code switch
         {
             "unauthorized" => 401,
-            "owner_only" or "admin_or_owner_required" or "csrf_invalid" or "publish_blocked" => 403,
+            "owner_only" or "admin_or_owner_required" or "csrf_invalid" or "publish_blocked" or "account_suspended" => 403,
             "email_exists" or "domain_exists" or "subscription_item_ambiguous" => 409,
             "stripe_error" => 502,
             _ when code != null && code.EndsWith("_not_found") => 404,
@@ -524,9 +529,11 @@ namespace AdminSystem
         /// Output: { success, user_id, email, tier, created_at, invite_sent, one_time_password }.
         /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the invite is really sent. Touches: the in-memory user
         /// and audit records, email through the mailer.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a suspended caller is refused first, 403 account_suspended (ADMIN-19).
         /// </summary>
         public object CreateUser(string csrfToken, string email, string name, string tier, bool notify)
         {
+            RequireActiveCaller(); // ADMIN-19, 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP)
             CsrfValidator.Verify(csrfToken);
             RequireOwner();
 
@@ -575,9 +582,11 @@ namespace AdminSystem
         /// Refuses the caller's own account (400 cannot_reset_own_password), then an unknown user, then the last active
         /// owner, in the spec's gate-then-check order (changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). Output: { success, ... }.
         /// Touches: the in-memory user and audit records. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a suspended caller is refused first, 403 account_suspended (ADMIN-19).
         /// </summary>
         public object ResetPassword(string csrfToken, Guid userId)
         {
+            RequireActiveCaller(); // ADMIN-19, 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP)
             CsrfValidator.Verify(csrfToken);
             RequireOwner();
 
@@ -607,9 +616,11 @@ namespace AdminSystem
         /// Refuses the caller's own role, then an unknown user, then demoting the last active owner (spec order; changed
         /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). Output: { success, old/new tier }.
         /// Touches: the in-memory user and audit records. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a suspended caller is refused first, 403 account_suspended (ADMIN-19).
         /// </summary>
         public object ChangeUserRole(string csrfToken, Guid userId, string newTier)
         {
+            RequireActiveCaller(); // ADMIN-19, 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP)
             CsrfValidator.Verify(csrfToken);
             RequireOwner();
 
@@ -647,9 +658,11 @@ namespace AdminSystem
         /// Owner-only: suspends a user with a reason after the CSRF check.
         /// Refuses the caller (cannot_suspend_yourself), then an unknown user, then the last active owner (spec order;
         /// changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). Touches: the in-memory user and audit records. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a suspended caller is refused first, 403 account_suspended (ADMIN-19).
         /// </summary>
         public object SuspendUser(string csrfToken, Guid userId, string reason)
         {
+            RequireActiveCaller(); // ADMIN-19, 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP)
             CsrfValidator.Verify(csrfToken);
             RequireOwner();
 
@@ -673,8 +686,14 @@ namespace AdminSystem
         }
 
         // ---------- CUSTOMERS ----------
+        /// <summary>
+        /// Admin or owner: one page of customers (customer_id, email, name, plan tier, signup_date, invoice_count, status). In: the CSRF token, page and page size. Out: the list. Touches: reads the in-memory customers.
+        /// Doc block added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, with the Phase B.2 change: a suspended caller is
+        /// refused first, 403 account_suspended (ADMIN-19).
+        /// </summary>
         public object ListCustomers(string csrfToken, int page = 1, int pageSize = 20)
         {
+            RequireActiveCaller(); // ADMIN-19, 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP)
             CsrfValidator.Verify(csrfToken);
             RequireAdminOrOwner();
 
@@ -693,8 +712,14 @@ namespace AdminSystem
             return items;
         }
 
+        /// <summary>
+        /// Admin or owner: one customer's detail (plan tier, subscription status, payment method, address, notes). In: the CSRF token and customer id. Out: the detail, or 404 customer_not_found. Touches: reads the in-memory customers.
+        /// Doc block added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, with the Phase B.2 change: a suspended caller is
+        /// refused first, 403 account_suspended (ADMIN-19).
+        /// </summary>
         public object GetCustomerDetail(string csrfToken, Guid customerId)
         {
+            RequireActiveCaller(); // ADMIN-19, 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP)
             CsrfValidator.Verify(csrfToken);
             RequireAdminOrOwner();
 
@@ -724,9 +749,11 @@ namespace AdminSystem
         /// Output: { success, customer_id, old_tier, new_tier, effective_date }.
         /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: plans instead of staff roles; injected Stripe client;
         /// item id rule. Touches: Stripe (network, money), the in-memory customer and audit records.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a suspended caller is refused first, 403 account_suspended (ADMIN-19).
         /// </summary>
         public object ChangeCustomerPlan(string csrfToken, Guid customerId, string newTier)
         {
+            RequireActiveCaller(); // ADMIN-19, 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP)
             CsrfValidator.Verify(csrfToken);
             RequireOwner();
 
@@ -766,9 +793,11 @@ namespace AdminSystem
         /// Owner-only: queues a refund on an invoice after the CSRF check.
         /// The amount must be positive, the invoice must exist and have succeeded, and all refunds on it may not exceed its amount.
         /// Output: { success, status: queued, amount }. Touches: the in-memory refund and audit records. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a suspended caller is refused first, 403 account_suspended (ADMIN-19).
         /// </summary>
         public object QueueRefund(string csrfToken, Guid invoiceId, decimal amount, string reason)
         {
+            RequireActiveCaller(); // ADMIN-19, 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP)
             CsrfValidator.Verify(csrfToken);
             RequireOwner();
 
@@ -811,8 +840,14 @@ namespace AdminSystem
         }
 
         // ---------- DEPLOYMENTS ----------
+        /// <summary>
+        /// Admin or owner: one page of deployments (deployment_id, customer_id, domain, plan tier, status, theme, published_at). In: the CSRF token, page and page size. Out: the list. Touches: reads the in-memory deployments.
+        /// Doc block added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, with the Phase B.2 change: a suspended caller is
+        /// refused first, 403 account_suspended (ADMIN-19).
+        /// </summary>
         public object ListDeployments(string csrfToken, int page = 1, int pageSize = 20)
         {
+            RequireActiveCaller(); // ADMIN-19, 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP)
             CsrfValidator.Verify(csrfToken);
             RequireAdminOrOwner();
 
@@ -822,7 +857,7 @@ namespace AdminSystem
                 deployment_id = d.DeploymentId,
                 customer_id = d.CustomerId,
                 domain = d.Domain,
-                tier = d.Tier.ToString(),
+                tier = d.Tier,
                 status = d.Status.ToString().ToLower(),
                 theme = d.ThemeId,
                 published_at = d.PublishedAt
@@ -832,16 +867,21 @@ namespace AdminSystem
         }
 
         /// <summary>
-        /// Owner-only: creates a deployment for a customer after the CSRF check; the tier cannot be Owner.
-        /// Refuses an unknown customer and a domain already registered. Touches: the in-memory deployment and audit records. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// Owner-only: creates a deployment for a customer after the CSRF check. In: the CSRF token, customer id, domain,
+        /// plan tier (solo, team or enterprise) and theme id. Out: { success, deployment_id, domain, tier }. Refuses a
+        /// tier that is not a plan, a staff role included (400 invalid_tier), an unknown customer and a domain already
+        /// registered. The new deployment's domain is not verified (domain_verified false), so it cannot be published
+        /// until it is. Touches: the in-memory deployment and audit records. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, admin spec TIERS): the tier is the plan; it
+        /// was validated and stored as a staff role.
         /// </summary>
         public object CreateDeployment(string csrfToken, Guid customerId, string domain, string tier, Guid themeId)
         {
+            RequireActiveCaller();
             CsrfValidator.Verify(csrfToken);
             RequireOwner();
 
-            Validation.ValidateTier(tier, allowOwner: false); // Deployments cannot be Owner tier
-            var role = (Role)Enum.Parse(typeof(Role), tier, true);
+            var plan = Validation.ValidatePlanTier(tier);
 
             if (!Database.Customers.Any(c => c.CustomerId == customerId))
                 throw new ApiException("customer_not_found", "Customer does not exist");
@@ -856,20 +896,21 @@ namespace AdminSystem
             {
                 CustomerId = customerId,
                 Domain = domain,
-                Tier = role,
+                Tier = plan,
                 ThemeId = themeId,
+                DomainVerified = false,
                 Config = new Dictionary<string, string>
                 {
                     { "domain", domain },
                     { "theme_id", themeId.ToString() },
-                    { "tier", role.ToString() },
+                    { "tier", plan },
                     { "created_by", AuthContext.CurrentUser.UserId.ToString() }
                 }
             };
 
             AuditLogger.Log("deployment_created", AuthContext.CurrentUser.UserId,
                 resourceType: "deployment", resourceId: deployment.DeploymentId,
-                newValue: $"domain={domain},tier={tier}");
+                newValue: $"domain={domain},tier={plan}");
 
             Database.Deployments.Add(deployment);
 
@@ -878,7 +919,7 @@ namespace AdminSystem
                 success = true,
                 deployment_id = deployment.DeploymentId,
                 domain = deployment.Domain,
-                tier = deployment.Tier.ToString()
+                tier = deployment.Tier
             };
         }
 
@@ -887,9 +928,11 @@ namespace AdminSystem
         /// the deployment must be a draft with a verified domain and a theme. Sets status 'live' and published_at.
         /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: domain_verified and theme_set are checked (they were
         /// assumed). Touches: the in-memory deployment and audit records.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a suspended caller is refused first, 403 account_suspended (ADMIN-19).
         /// </summary>
         public object PublishDeployment(string csrfToken, Guid deploymentId)
         {
+            RequireActiveCaller(); // ADMIN-19, 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP)
             CsrfValidator.Verify(csrfToken);
             RequireOwner();
             if (!SafetyFlags.CanPublish)
@@ -925,8 +968,14 @@ namespace AdminSystem
             };
         }
 
+        /// <summary>
+        /// Owner-only: suspends a deployment with a reason. In: the CSRF token, deployment id and reason. Out: { success, deployment_id, status: suspended }. Touches: the in-memory deployment and audit records.
+        /// Doc block added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, with the Phase B.2 change: a suspended caller is
+        /// refused first, 403 account_suspended (ADMIN-19).
+        /// </summary>
         public object SuspendDeployment(string csrfToken, Guid deploymentId, string reason)
         {
+            RequireActiveCaller(); // ADMIN-19, 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP)
             CsrfValidator.Verify(csrfToken);
             RequireOwner();
 
@@ -944,8 +993,14 @@ namespace AdminSystem
             return new { success = true, deployment_id = dep.DeploymentId, status = "suspended" };
         }
 
+        /// <summary>
+        /// Owner-only: archives a deployment (status archived, archived_at). In: the CSRF token and deployment id. Out: { success, deployment_id, status: archived }. Touches: the in-memory deployment and audit records.
+        /// Doc block added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, with the Phase B.2 change: a suspended caller is
+        /// refused first, 403 account_suspended (ADMIN-19).
+        /// </summary>
         public object RetireDeployment(string csrfToken, Guid deploymentId)
         {
+            RequireActiveCaller(); // ADMIN-19, 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP)
             CsrfValidator.Verify(csrfToken);
             RequireOwner();
 
@@ -963,8 +1018,14 @@ namespace AdminSystem
         }
 
         // ---------- GOVERNANCE ----------
+        /// <summary>
+        /// Admin or owner: one page of governance actions awaiting a decision. In: the CSRF token, page and page size. Out: the list. Touches: reads the in-memory governance actions.
+        /// Doc block added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, with the Phase B.2 change: a suspended caller is
+        /// refused first, 403 account_suspended (ADMIN-19).
+        /// </summary>
         public object ListGovernanceActions(string csrfToken, int page = 1, int pageSize = 20)
         {
+            RequireActiveCaller(); // ADMIN-19, 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP)
             CsrfValidator.Verify(csrfToken);
             RequireOwnerOrAdmin();
 
@@ -993,9 +1054,11 @@ namespace AdminSystem
         /// reason (400 missing_reason), status 'rejected', audit "action_rejected" with the reason (ADMIN-17).
         /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: approve executes the action. Touches: the in-memory
         /// governance and audit records, and whatever the executor touches.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a suspended caller is refused first, 403 account_suspended (ADMIN-19).
         /// </summary>
         public object DecideGovernanceAction(string csrfToken, Guid actionId, string decide, string reason = null)
         {
+            RequireActiveCaller(); // ADMIN-19, 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP)
             CsrfValidator.Verify(csrfToken);
             RequireOwner();
 
@@ -1046,11 +1109,13 @@ namespace AdminSystem
         /// <summary>
         /// Owner or admin: filters the admin audit log by action, resource and time window after the CSRF check.
         /// Output: the matching entries, newest first. Touches: reads the in-memory audit log only. Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a suspended caller is refused first, 403 account_suspended (ADMIN-19).
         /// </summary>
         public object SearchAuditLog(string csrfToken, string actionType = null,
             Guid? resourceId = null, DateTime? start = null, DateTime? end = null,
             int limit = 100, int offset = 0)
         {
+            RequireActiveCaller(); // ADMIN-19, 2026-11-10 (session_012zDydZCZ4AChqhEZ4oVtaP)
             CsrfValidator.Verify(csrfToken);
             RequireOwnerOrAdmin();
 
@@ -1085,6 +1150,22 @@ namespace AdminSystem
         }
 
         // ---------- HELPERS ----------
+        /// <summary>
+        /// ADMIN-19: refuses a caller whose account is suspended, before any other gate (CSRF, owner, admin), with 403
+        /// account_suspended, so a suspended owner changes nothing. The status is read from the stored users row when
+        /// there is one (a suspension by another owner takes effect at once), else from the session's user. In: none
+        /// (AuthContext.CurrentUser). Out: nothing, or throws. Why: admin spec "EVERY ACTION" (Phase B.2). Added
+        /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: reads the in-memory users.
+        /// </summary>
+        private static void RequireActiveCaller()
+        {
+            var caller = AuthContext.CurrentUser;
+            if (caller == null) return; // no session: the CSRF check or the role gate answers 401 / 403
+            var stored = Database.Users.FirstOrDefault(u => u.UserId == caller.UserId);
+            if (caller.Status == "suspended" || stored?.Status == "suspended")
+                throw new ApiException("account_suspended", "This account is suspended");
+        }
+
         private void RequireOwner()
         {
             if (AuthContext.CurrentUser == null || AuthContext.CurrentUser.Tier != Role.Owner)

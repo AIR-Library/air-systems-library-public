@@ -14,6 +14,7 @@ public class webhooks_java_tests {
             testWebhookIdAcrossRetries();
             testEventForOrgANeverReachesOrgB();
             testGeneratedSecretFormat();
+            testSqlStorageRoundTrip();
             System.out.println("All tests passed");
         } catch (Throwable e) {
             e.printStackTrace();
@@ -241,5 +242,70 @@ public class webhooks_java_tests {
         String b64 = secret.substring(6);
         byte[] decoded = Base64.getDecoder().decode(b64);
         check(decoded.length >= 24 && decoded.length <= 64, "Secret length should be 24-64 bytes, got " + decoded.length);
+    }
+    /**
+     * SQLStorage keeps everything the in-memory store keeps: endpoints (with event types, secret rotation, failure count),
+     * messages, and deliveries with their attempt, status, retry time and outcome, read back from the database by a
+     * fresh lookup; listings are scoped by org and in insertion order, so org1's event never reaches org2 (HOOK-06).
+     * Runs on in-memory H2 (the runner ships no SQLite driver; the store's SQL is portable to SQLite).
+     * In/out: none; fails by throwing. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (java bug list: SQLStorage was a
+     * stub that silently stored nothing). Touches: an in-memory H2 database only (fake sender, no network).
+     */
+    // HOOK-06
+    private static void testSqlStorageRoundTrip() throws Exception {
+        try (java.sql.Connection conn = java.sql.DriverManager.getConnection(
+                "jdbc:h2:mem:webhooks_" + UUID.randomUUID().toString().replace("-", ""))) {
+            Webhooks.SQLStorage storage = new Webhooks.SQLStorage(conn).createTables();
+            int[] statuses = {500, 200};
+            int[] calls = {0};
+            Webhooks.Sender sender = (url, headers, body) -> statuses[calls[0]++];
+            long[] now = {1_700_000_000L};
+            Webhooks webhooks = new Webhooks(storage, sender, () -> now[0]);
+
+            Map<String, String> a1 = webhooks.createEndpoint("org1", "https://a1.example.com/hook", Arrays.asList("order.created", "order.paid"));
+            Map<String, String> a2 = webhooks.createEndpoint("org1", "https://a2.example.com/hook", Arrays.asList("order.created"));
+            Map<String, String> b1 = webhooks.createEndpoint("org2", "https://b1.example.com/hook", Arrays.asList("order.created"));
+            Webhooks.WebhookEndpoint stored = storage.getEndpoint(a1.get("id"));
+            check(stored != null && "org1".equals(stored.orgId) && stored.secret.equals(a1.get("secret")), "endpoint read back");
+            check(stored.eventTypes.equals(new HashSet<>(Arrays.asList("order.created", "order.paid"))), "event types read back");
+            check(stored.active && stored.failureCount == 0 && stored.createdAt == now[0], "endpoint fields read back");
+
+            String msgId = webhooks.sendEvent("org1", "order.created", "{\"order_id\":7}");
+            Webhooks.WebhookMessage msg = storage.getMessage(msgId);
+            check(msg != null && "org1".equals(msg.orgId) && "{\"order_id\":7}".equals(msg.payload), "message read back");
+            List<Webhooks.WebhookDelivery> ds = storage.listDeliveriesByMessage(msgId);
+            check(ds.size() == 2, "one delivery per org1 endpoint, none for org2: " + ds.size());
+            check(ds.get(0).endpointId.equals(a1.get("id")) && ds.get(1).endpointId.equals(a2.get("id")), "insertion order");
+            for (Webhooks.WebhookDelivery d : ds) {
+                check(!d.endpointId.equals(b1.get("id")), "org1's event reached org2");
+            }
+
+            // First attempt fails: the stored row shows the status and the next attempt.
+            webhooks.deliver(storage.getDelivery(ds.get(0).id));
+            Webhooks.WebhookDelivery after = storage.getDelivery(ds.get(0).id);
+            check(!after.success && after.statusCode == 500 && after.attempt == 2, "failed attempt stored");
+            check(after.nextAttemptAt != null && after.nextAttemptAt == now[0] + 5, "retry time stored");
+            check("HTTP 500".equals(after.error) && after.deliveredAt == null, "error stored");
+
+            // The retry succeeds: the stored row shows it.
+            now[0] += 5;
+            webhooks.deliver(after);
+            Webhooks.WebhookDelivery done = storage.getDelivery(ds.get(0).id);
+            check(done.success && done.statusCode == 200 && done.deliveredAt == now[0], "success stored");
+            check(done.nextAttemptAt == null && done.error == null, "retry cleared");
+
+            // Rotation and disabling persist.
+            String newSecret = webhooks.rotateSecret(a2.get("id"));
+            check(storage.getEndpoint(a2.get("id")).secret.equals(newSecret), "rotated secret stored");
+            Webhooks.WebhookEndpoint off = storage.getEndpoint(a2.get("id"));
+            off.active = false;
+            off.failureCount = 5;
+            storage.updateEndpoint(off);
+            check(storage.getEndpoint(a2.get("id")).failureCount == 5, "failure count stored");
+            check(storage.listActiveEndpoints("org1", "order.created").size() == 1, "inactive endpoint not listed");
+            check(storage.listActiveEndpoints("org2", "order.paid").isEmpty(), "event type filter");
+            check(storage.getEndpoint("ep_missing") == null && storage.getMessage("msg_missing") == null
+                    && storage.getDelivery("missing") == null, "unknown ids are null");
+        }
     }
 }

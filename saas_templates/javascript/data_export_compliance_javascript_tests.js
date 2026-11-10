@@ -365,15 +365,91 @@ describe('Deletion rules amended 2026-11-10', () => {
         const ok = await confirm('confirm-user', d.token);
         expect(ok.status).toBe(200);
         const reused = await confirm('confirm-user', d.token);
-        expect(reused.status).toBe(409);
+        // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, EXPORT-15): was 409; the spec now gives a reused
+        // token the same 400 invalid_confirmation_token as a wrong or expired one.
+        expect(reused.status).toBe(400);
         expect(await get('SELECT id FROM users WHERE id = ?', ['confirm-user'])).toBeDefined(); // grace period: still there
 
         const late = await requestDeletion('intruder', 'other');
         clock += 24 * 60 * 60 * 1000 + 1;
         const expired = await request(app).post(`/compliance/delete/${late.deletion_id}/confirm`).set(authFor('intruder'))
             .send({ confirmation_token: late.token });
-        expect(expired.status).toBe(410);
+        // 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, EXPORT-15): was 410; an expired token is now the
+        // same 400 invalid_confirmation_token as a wrong or reused one.
+        expect(expired.status).toBe(400);
         expect((await get('SELECT status FROM deletion_requests WHERE id = ?', [late.deletion_id])).status).toBe('pending');
         expect(await get('SELECT id FROM users WHERE id = ?', ['intruder'])).toBeDefined();
+    });
+
+    /**
+     * EXPORT-15: a wrong, a reused and an expired (over 24 h) token all get the same 400
+     * {error: "invalid_confirmation_token"}; confirm or cancel of a cancelled request is 409
+     * {error: "deletion_not_pending"}; of a completed request, and of another user's request, 404 {error: "not_found"}
+     * (the completed case per the lead's clarification, commit 3abb340).
+     * In: the test app and clock. Out: assertions. Why: Phase B.2 gave these one answer in every language.
+     * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches the test database.
+     */
+    // EXPORT-15
+    test('One 400 for a wrong, reused or expired token; 409 deletion_not_pending once cancelled; 404 once completed', async () => {
+        await seedUser('e15-user', 'e15@example.com');
+        await seedUser('e15-other', 'e15-other@example.com');
+        const confirm = (deletionId, userId, token) => request(app).post(`/compliance/delete/${deletionId}/confirm`)
+            .set(authFor(userId)).send({ confirmation_token: token });
+        const cancel = (deletionId, userId) => request(app).delete(`/compliance/delete/${deletionId}`).set(authFor(userId));
+
+        const d = await requestDeletion('e15-user', 'user_requested');
+        const intruderConfirm = await confirm(d.deletion_id, 'e15-other', d.token);
+        expect(intruderConfirm.status).toBe(404);
+        expect(intruderConfirm.body.error).toBe('not_found');
+        const intruderCancel = await cancel(d.deletion_id, 'e15-other');
+        expect(intruderCancel.status).toBe(404);
+        expect(intruderCancel.body.error).toBe('not_found');
+
+        const wrong = await confirm(d.deletion_id, 'e15-user', 'f'.repeat(64));
+        expect(wrong.status).toBe(400);
+        expect(wrong.body.error).toBe('invalid_confirmation_token');
+        expect((await confirm(d.deletion_id, 'e15-user', d.token)).status).toBe(200);
+        const reused = await confirm(d.deletion_id, 'e15-user', d.token);
+        expect(reused.status).toBe(400);
+        expect(reused.body.error).toBe('invalid_confirmation_token');
+
+        // cancelled: confirm and cancel are both 409
+        expect((await cancel(d.deletion_id, 'e15-user')).status).toBe(200);
+        const confirmCancelled = await confirm(d.deletion_id, 'e15-user', d.token);
+        expect(confirmCancelled.status).toBe(409);
+        expect(confirmCancelled.body.error).toBe('deletion_not_pending');
+        const cancelCancelled = await cancel(d.deletion_id, 'e15-user');
+        expect(cancelCancelled.status).toBe(409);
+        expect(cancelCancelled.body.error).toBe('deletion_not_pending');
+
+        // expired: the same 400, and the request stays pending
+        const late = await requestDeletion('e15-other', 'other');
+        clock += DAY_MS + 1;
+        const expired = await confirm(late.deletion_id, 'e15-other', late.token);
+        expect(expired.status).toBe(400);
+        expect(expired.body).toEqual(wrong.body);
+        expect((await get('SELECT status FROM deletion_requests WHERE id = ?', [late.deletion_id])).status).toBe('pending');
+
+        // completed: 404 not_found for confirm and cancel (spec clarification, commit 3abb340: a completed request has no
+        // owner any more, EXPORT-13). Even a completed row that still names its user is 404 to that user.
+        await seedUser('e15-done', 'e15-done@example.com');
+        const c = await requestDeletion('e15-done', 'user_requested');
+        await run(`UPDATE deletion_requests SET status = 'completed', deleted_at = ? WHERE id = ?`,
+            [new Date(clock).toISOString(), c.deletion_id]);
+        const confirmCompleted = await confirm(c.deletion_id, 'e15-done', c.token);
+        expect(confirmCompleted.status).toBe(404);
+        expect(confirmCompleted.body.error).toBe('not_found');
+        const cancelCompleted = await cancel(c.deletion_id, 'e15-done');
+        expect(cancelCompleted.status).toBe(404);
+        expect(cancelCompleted.body.error).toBe('not_found');
+
+        // after a real cascade (statutory reason) the former owner cannot authenticate (401) and anyone else gets 404
+        await seedUser('e15-gdpr', 'e15-gdpr@example.com');
+        const g = await requestDeletion('e15-gdpr', 'gdpr_request');
+        expect((await confirm(g.deletion_id, 'e15-gdpr', g.token)).body.status).toBe('completed');
+        expect((await confirm(g.deletion_id, 'e15-gdpr', g.token)).status).toBe(401);
+        const strangerOnCompleted = await cancel(g.deletion_id, 'e15-other');
+        expect(strangerOnCompleted.status).toBe(404);
+        expect(strangerOnCompleted.body.error).toBe('not_found');
     });
 });

@@ -15,15 +15,37 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 const PASSWORD: &str = "correct horse battery staple";
 const JWT_SECRET: &str = "test-only-hs256-secret-0123456789abcdef";
+/// What: the fixed 32+ byte HMAC key for stored secrets (spec d270fa3: tests pass a fixed test key).
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+const TEST_SECRET_KEY: &str = "test-secret-key-0123456789abcdef-auth";
+
+/// What: the value the module stores for a secret, lowercase hex HMAC-SHA256(TEST_SECRET_KEY, s). In: the
+/// secret. Out: 64 hex characters. Why: spec d270fa3: keyed HMAC for stored secrets; the tests used the
+/// module's plain SHA-256 helper of this name until 2026-11-10 (changed 2026-11-10,
+/// session_012zDydZCZ4AChqhEZ4oVtaP). Touches: nothing.
+fn sha256_hex(s: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(TEST_SECRET_KEY.as_bytes()).unwrap();
+    mac.update(s.as_bytes());
+    hex(&mac.finalize().into_bytes())
+}
+
+/// What: the plain, unkeyed SHA-256 hex of s, which the module must no longer store. In: the secret.
+/// Out: 64 hex characters. Why: spec d270fa3: keyed HMAC for stored secrets (AUTH-16 asserts the stored
+/// value is not this). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: nothing.
+fn plain_sha256_hex(s: &str) -> String {
+    use sha2::Digest;
+    hex(&Sha256::digest(s.as_bytes()))
+}
 
 /// What: an auth system on in-memory SQLite with a fixed clock, bcrypt cost 4, an in-memory mailer and
 /// a fake OAuth provider; returns handles to all of them. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+/// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec d270fa3): passes the fixed TEST_SECRET_KEY.
 fn setup() -> (AuthSystem, InMemoryMailer, FakeOAuthProvider, Arc<AtomicI64>) {
     let mailer = InMemoryMailer::default();
     let oauth = FakeOAuthProvider::default();
     let now = Arc::new(AtomicI64::new(1_767_225_600));
     let clock = now.clone();
-    let sys = AuthSystem::new(Connection::open_in_memory().unwrap(), JWT_SECRET.to_string())
+    let sys = AuthSystem::new(Connection::open_in_memory().unwrap(), JWT_SECRET.to_string(), TEST_SECRET_KEY.to_string())
         .unwrap()
         .with_bcrypt_cost(4)
         .with_mailer(Box::new(mailer.clone()))
@@ -365,4 +387,124 @@ fn test_verify_access_token() {
     assert_eq!(auth_system.verify_access_token(VerifyAccessTokenRequest { token: forged }).unwrap_err(), AuthError::InvalidToken);
     now.fetch_add(ACCESS_TOKEN_SECS, Ordering::SeqCst);
     assert_eq!(auth_system.verify_access_token(VerifyAccessTokenRequest { token }).unwrap_err(), AuthError::TokenExpired);
+}
+
+/// What: the refresh token of an Authenticated result. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP
+/// (AUTH-16). Touches: nothing.
+fn refresh_of(data: AuthData) -> String {
+    match data {
+        AuthData::Authenticated { refresh_token, .. } => refresh_token,
+        other => panic!("unexpected {:?}", other),
+    }
+}
+
+/// What: AUTH-16 and the auth spec's "Secrets at rest" line (Phase B.2): login, MFA verify and OAuth each
+/// return a refresh_token that token_refresh accepts; the sessions table holds only its SHA-256 (no
+/// column of any session row contains a raw token); a verification code is stored only as its SHA-256
+/// (code_hash, never the emailed code); an OAuth state is stored only as its SHA-256, works once and
+/// expires after 10 minutes; the callback exchanges the provider code through the injected provider
+/// client, so a code the provider does not know fails (502 oauth_failed) even when it looks like an
+/// email. In: none. Out: panics on a leak or a refused token. Why: AUTH-16 (Phase B.2, 2026-11-10).
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite only.
+/// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec d270fa3: keyed HMAC for stored secrets):
+/// each stored value must equal HMAC-SHA256(TEST_SECRET_KEY, value) and not its plain SHA-256.
+// AUTH-16
+#[test]
+fn test_refresh_tokens_and_secrets_at_rest() {
+    let (mut sys, mailer, oauth, now) = setup();
+
+    // verification code: only its hash is stored
+    sys.signup(SignupRequest { email: "a@example.com".into(), password: PASSWORD.into(), name: "Test User".into() }).unwrap();
+    let code = last_code(&mailer, "a@example.com");
+    let cols: Vec<String> = sys.conn.prepare("SELECT name FROM pragma_table_info('verification_codes')").unwrap()
+        .query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    assert!(cols.contains(&"code_hash".to_string()) && !cols.contains(&"code".to_string()));
+    let stored: String = sys.conn.query_row("SELECT code_hash FROM verification_codes WHERE type = 'email'", [], |r| r.get(0)).unwrap();
+    assert_eq!(stored, sha256_hex(&code));
+    assert_ne!(stored, plain_sha256_hex(&code), "spec d270fa3 (2026-11-10): keyed HMAC, not a plain SHA-256");
+    assert_ne!(stored, code);
+    sys.verify_email(VerifyEmailRequest { email: "a@example.com".into(), code_or_token: code }).unwrap();
+
+    // login returns a refresh token that token_refresh accepts
+    let mut tokens = vec![refresh_of(sys.login(login_req("a@example.com", PASSWORD)).unwrap().data)];
+
+    // MFA verify returns one too
+    let b = verified_user(&mut sys, &mailer, "b@example.com");
+    let secret = sys.start_mfa_enrollment(b).unwrap();
+    sys.confirm_mfa_enrollment(b, &totp_code(&secret, now.load(Ordering::SeqCst) as u64).unwrap()).unwrap();
+    let challenge_id = match sys.login(login_req("b@example.com", PASSWORD)).unwrap().data {
+        AuthData::MfaRequired { challenge_id } => challenge_id,
+        other => panic!("unexpected {:?}", other),
+    };
+    now.fetch_add(30, Ordering::SeqCst);
+    let code = totp_code(&secret, now.load(Ordering::SeqCst) as u64).unwrap();
+    tokens.push(refresh_of(sys.mfa_challenge(MFAChallengeRequest { challenge_id, code }).unwrap().data));
+
+    // OAuth returns one too; the state is hashed, single-use and lives 10 minutes
+    oauth.codes.lock().unwrap().insert(
+        "google:pc-1".into(),
+        OAuthProfile { provider_user_id: "g-16".into(), email: "c@example.com".into(), email_verified: true },
+    );
+    let state = sys.oauth_start("google").unwrap();
+    let state_hash: String = sys.conn.query_row("SELECT state_hash FROM oauth_states", [], |r| r.get(0)).unwrap();
+    assert_eq!(state_hash, sha256_hex(&state));
+    assert_ne!(state_hash, plain_sha256_hex(&state), "spec d270fa3: the state's keyed HMAC is stored");
+    tokens.push(refresh_of(sys.oauth_callback(OAuthCallbackRequest { provider: "google".into(), code: "pc-1".into(), state: state.clone() }).unwrap().data));
+    assert_eq!(
+        sys.oauth_callback(OAuthCallbackRequest { provider: "google".into(), code: "pc-1".into(), state }).unwrap_err(),
+        AuthError::InvalidState,
+        "a state works once"
+    );
+    let late = sys.oauth_start("google").unwrap();
+    now.fetch_add(600, Ordering::SeqCst);
+    assert_eq!(
+        sys.oauth_callback(OAuthCallbackRequest { provider: "google".into(), code: "pc-1".into(), state: late }).unwrap_err(),
+        AuthError::InvalidState,
+        "a state expires after 10 minutes"
+    );
+    // the code is exchanged through the provider client, never used as an identity
+    let fresh = sys.oauth_start("google").unwrap();
+    let err = sys.oauth_callback(OAuthCallbackRequest { provider: "google".into(), code: "a@example.com".into(), state: fresh }).unwrap_err();
+    assert_eq!(err, AuthError::OAuthFailed);
+    assert_eq!(err.to_response().1, 502);
+
+    // every refresh token is accepted, and the sessions table holds only SHA-256 hashes of them
+    let hashes: Vec<String> = sys.conn.prepare("SELECT refresh_token_hash FROM sessions ORDER BY rowid").unwrap()
+        .query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    assert_eq!(hashes.len(), 3);
+    let cols: Vec<String> = sys.conn.prepare("SELECT name FROM pragma_table_info('sessions')").unwrap()
+        .query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    assert!(!cols.contains(&"refresh_token".to_string()));
+    let dump: Vec<String> = sys.conn.prepare("SELECT id || '|' || user_id || '|' || refresh_token_hash || '|' || COALESCE(ip, '') || '|' || COALESCE(device_id, '') FROM sessions").unwrap()
+        .query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    for (i, t) in tokens.iter().enumerate() {
+        assert!(hashes.contains(&sha256_hex(t)), "token {} stored as its HMAC-SHA256 under the test key", i);
+        assert!(!hashes.contains(&plain_sha256_hex(t)), "token {} not stored as its plain SHA-256 (spec d270fa3)", i);
+        assert!(dump.iter().all(|row| !row.contains(t.as_str())), "token {} not stored raw", i);
+        let r = sys.token_refresh(TokenRefreshRequest { refresh_token: t.clone() }).unwrap();
+        assert_eq!(r.data.status(), "ok", "token {} accepted", i);
+    }
+    // a stored hash is not itself a usable credential
+    assert_eq!(sys.token_refresh(TokenRefreshRequest { refresh_token: hashes[0].clone() }).unwrap_err(), AuthError::InvalidToken);
+}
+
+/// What: AUTH-16: the service refuses to start without a 32-byte HMAC key: `AuthSystem::new` returns
+/// `InvalidInput` for an empty or 31-byte `secret_key`, and with a 32-byte key it
+/// starts and stores HMAC-SHA256(key, value), not the plain SHA-256. In: none. Out: panics on a wrong
+/// answer. Why: spec d270fa3: keyed HMAC for stored secrets ("the service refuses to start without it").
+/// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite only.
+// AUTH-16
+#[test]
+fn test_service_refuses_to_start_without_a_32_byte_secret_key() {
+    for bad in ["", &"k".repeat(31)] {
+        let conn = Connection::open_in_memory().unwrap();
+        match AuthSystem::new(conn, JWT_SECRET.to_string(), bad.to_string()) {
+            Err(AuthError::InvalidInput(m)) => assert!(m.contains("AUTH_SECRET_KEY"), "{}", m),
+            Err(e) => panic!("a {}-byte key: unexpected error {:?}", bad.len(), e),
+            Ok(_) => panic!("a {}-byte key must refuse to start", bad.len()),
+        }
+    }
+    let sys = AuthSystem::new(Connection::open_in_memory().unwrap(), JWT_SECRET.to_string(), TEST_SECRET_KEY.to_string()).unwrap();
+    assert_eq!(sys.hash_secret("123456"), sha256_hex("123456"));
+    assert_ne!(sys.hash_secret("123456"), plain_sha256_hex("123456"));
 }

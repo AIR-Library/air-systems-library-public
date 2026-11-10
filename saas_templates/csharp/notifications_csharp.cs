@@ -9,8 +9,9 @@
 // HTML unescaped; and the unsubscribe link was an unsigned user id anyone could forge.
 // Now: delivery goes through IEmailGateway / ISmsGateway (SMTP adapter included; SMS adapters such as Twilio or SNS
 // plug in behind the interface; a development outbox is used when none is configured), addresses come from
-// IRecipientDirectory, a hosted worker delivers due messages from the database with 3 attempts and exponential
-// backoff, and unsubscribe links carry an HMAC that is checked in constant time.
+// IRecipientDirectory, a hosted worker delivers due messages from the database with up to 3 retries after the first
+// attempt (4 attempts; 1 s / 2 s / 4 s; Phase B.2, 2026-11-10), and unsubscribe links carry an HMAC that is checked in
+// constant time.
 // Touches: the notifications database; SMTP / SMS providers (network) when configured; nothing else.
 #nullable enable
 using System;
@@ -445,6 +446,20 @@ namespace Notifications
         }
 
         /// <summary>
+        /// The first moment at or after <paramref name="at"/> (UTC) that is the user's quiet_hours_end: today's end time,
+        /// or tomorrow's when today's has passed (a window crossing midnight, 22:00-07:00, ends the next morning). In:
+        /// the preferences (with quiet hours set) and a time inside them. Out: scheduled_at for a held message. Pure.
+        /// Why: NOTIF-05 and deliver_due step 3 both hold a message until quiet_hours_end. Added 2026-11-10,
+        /// session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2; was inline in SendAsync).
+        /// </summary>
+        public static DateTime QuietHoursEndAfter(UserNotificationPreference pref, DateTime at)
+        {
+            var end = at.Date.Add(pref.QuietHoursEnd!.Value);
+            if (end <= at) end = end.AddDays(1);
+            return DateTime.SpecifyKind(end, DateTimeKind.Utc);
+        }
+
+        /// <summary>
         /// Picks the channel: an explicitly requested channel must be enabled (otherwise null: the user opted out);
         /// with none requested, the template's default channels in order, then email, sms, in_app, first enabled wins.
         /// Pure.
@@ -501,11 +516,7 @@ namespace Notifications
                 var due = scheduledAt.HasValue ? DateTime.SpecifyKind(scheduledAt.Value, DateTimeKind.Utc) : now;
                 if (due < now) due = now;
                 if (selected != "in_app" && IsInQuietHours(pref, due))
-                {
-                    var end = due.Date.Add(pref.QuietHoursEnd!.Value);
-                    if (end <= due) end = end.AddDays(1);
-                    due = end;
-                }
+                    due = QuietHoursEndAfter(pref, due);
                 log.ScheduledAt = due;
                 log.Status = "queued";
             }
@@ -597,18 +608,18 @@ namespace Notifications
         public bool CheckUnsubscribeLink(long userId, string? channel, string? token) => _tokens.Verify(userId, channel, token);
 
         /// <summary>
-        /// Tracking (NOTIF-07): the user clicked a link in a delivered message; marks it opened (opened_at, clicked_at,
-        /// status 'opened'). The message id is a random GUID, so it cannot be guessed. Out: false for an unknown or
-        /// undelivered message. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (there was no tracking write at all).
-        /// Touches: notification_logs.
+        /// Tracking (NOTIF-07): GET /notifications/open/:message_id, the tracking pixel or link of a delivered message.
+        /// The first time only it sets opened_at and status 'opened'; a later call changes nothing. In: the message id (a
+        /// random GUID, so it cannot be guessed). Out: true when this call recorded the opening; false for an unknown or
+        /// undelivered message or one already opened (the route answers 204 either way). Added 2026-11-10,
+        /// session_012zDydZCZ4AChqhEZ4oVtaP (there was no tracking write at all). Changed the same day (Phase B.2,
+        /// spec "Opening"): once only, and clicked_at is no longer set by an open. Touches: notification_logs.
         /// </summary>
         public async Task<bool> MarkOpenedAsync(Guid messageId)
         {
             var log = await _db.NotificationLogs.FirstOrDefaultAsync(l => l.Id == messageId);
-            if (log == null || log.SentAt == null) return false;
-            var now = _clock.Now();
-            log.OpenedAt ??= now;
-            log.ClickedAt ??= now;
+            if (log == null || log.SentAt == null || log.OpenedAt != null) return false;
+            log.OpenedAt = _clock.Now();
             log.Status = "opened";
             try
             {
@@ -634,14 +645,16 @@ namespace Notifications
     /// <summary>
     /// Delivers due messages: every 200 ms (or at once when signalled) it runs <see cref="DeliverDueAsync(DateTime, CancellationToken)"/>
     /// with the clock's time. Rendering: variables HTML-encoded in the HTML body; an email gets its signed unsubscribe
-    /// link. In-app messages are delivered by being stored. A failed attempt is retried after 1 s, then 2 s; the third
-    /// failure marks the message failed (spec: "retry 3x with exponential backoff"). Added 2026-11-10 (session
+    /// link. In-app messages are delivered by being stored. A failed attempt is retried after 1 s, 2 s, then 4 s; the
+    /// fourth failure marks the message failed (spec, amended in Phase B.2: up to 3 retries after the first attempt,
+    /// at most 4 attempts; MaxAttempts was 3 until 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). Added 2026-11-10 (session
     /// session_012zDydZCZ4AChqhEZ4oVtaP), replacing in-memory closures that used a disposed DbContext; deliver_due's
     /// four steps added the same day (NOTIF-12). Touches: notification_logs, preferences (read), the gateways.
     /// </summary>
     public class DeliveryWorker : BackgroundService
     {
-        public const int MaxAttempts = 3;
+        /// <summary>The first attempt plus up to 3 retries (NOTIF-08, Phase B.2 2026-11-10; was 3 attempts).</summary>
+        public const int MaxAttempts = 4;
 
         /// <summary>A 'sending' row claimed longer ago than this is re-queued (a crashed worker).</summary>
         public static readonly TimeSpan ClaimTimeout = TimeSpan.FromSeconds(300);
@@ -691,7 +704,9 @@ namespace Notifications
         /// 2. 'queued' rows with scheduled_at &lt;= now (and any retry wait over), by scheduled_at then insertion order, at
         ///    most 100, are claimed one by one with a conditional write (status 'queued' -&gt; 'sending', claimed_at = now);
         ///    a row another worker claimed first is skipped;
-        /// 3. preferences are read NOW: do-not-disturb or the channel turned off (unsubscribed) -&gt; 'skipped';
+        /// 3. preferences are read NOW: do-not-disturb or the channel turned off (unsubscribed) -&gt; 'skipped'; inside the
+        ///    user's quiet hours (email and SMS; in-app is never held, as in send) -&gt; back to 'queued' with
+        ///    scheduled_at = quiet_hours_end (added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, Phase B.2);
         /// 4. the outcome (sent / retry later / failed / skipped) is written conditionally on status 'sending' and this
         ///    claimed_at, so a row re-queued meanwhile is not overwritten.
         /// In: the time to judge "due" by. Out: how many messages were sent in this pass.
@@ -739,6 +754,12 @@ namespace Notifications
                 {
                     log.Status = "skipped";
                     log.Error = pref.DoNotDisturb ? "do_not_disturb" : "channel_disabled";
+                }
+                else if (log.Channel != "in_app" && NotificationService.IsInQuietHours(pref, now))
+                {
+                    log.Status = "queued";
+                    log.ClaimedAt = null;
+                    log.ScheduledAt = NotificationService.QuietHoursEndAfter(pref, now);
                 }
                 else
                 {
@@ -965,9 +986,15 @@ namespace Notifications
                     : Results.Json(new { error = "invalid_unsubscribe_token" }, statusCode: 403);
             });
 
-            // Tracking (NOTIF-07): a click on a link in the message marks it opened.
+            // Tracking (NOTIF-07): the tracking pixel or link marks a message opened the first time; the answer is 204
+            // either way, so the URL says nothing about the message. Changed 2026-11-10, session
+            // session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, spec "Opening": was 200, and 404 for an unknown message).
+            // Touches: notification_logs.
             app.MapGet("/notifications/open/{messageId:guid}", async (Guid messageId, NotificationService service) =>
-                await service.MarkOpenedAsync(messageId) ? Results.Ok(new { success = true }) : Results.NotFound());
+            {
+                await service.MarkOpenedAsync(messageId);
+                return Results.NoContent();
+            });
         }
 
         /// <summary>The unsubscribe link's user_id, channel and token from the query; ok false when user_id is not a number. Pure.</summary>

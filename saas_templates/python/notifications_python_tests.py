@@ -213,6 +213,33 @@ class TestNotificationService(unittest.TestCase):
         self.assertEqual(resp["status"], "sent")
         self.assertEqual(mock_send_email.call_count, 3)
 
+    # NOTIF-08
+    def test_retry_at_most_three_times_with_1_2_4_second_backoff(self):
+        """A failed email is retried at most 3 times after the first attempt: 3 failures then success is sent
+        after 4 attempts with waits of 1 s, 2 s and 4 s; 4 failures mark the message failed after 4 attempts,
+        with no 5th. In: the test fixtures, a recording sleep. Out: assertions. Why: NOTIF-08 as amended in
+        Phase B.2 (2026-11-10). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite, a
+        mocked email sender."""
+        waits = []
+        self.service._sleep = waits.append
+        payload = {"user_id": self.user_id, "template_key": "welcome_email", "channel": "email",
+                   "vars": {"app_name": "RetryApp"}, "scheduled_at": None}
+        with patch('notifications_python._send_email') as mock_email:
+            mock_email.side_effect = [Exception("SMTP error")] * 3 + [None]
+            resp = self.service.api_send(payload)
+            self.assertEqual((resp["success"], resp["status"]), (True, "sent"))
+            self.assertEqual(mock_email.call_count, 4)
+            self.assertEqual(waits, [1, 2, 4])
+        waits.clear()
+        with patch('notifications_python._send_email') as mock_email:
+            mock_email.side_effect = Exception("SMTP down")
+            resp = self.service.api_send(payload)
+            self.assertEqual((resp["success"], resp["status"]), (False, "failed"))
+            self.assertEqual(mock_email.call_count, 4)
+            self.assertEqual(waits, [1, 2, 4])
+        row = self._last_log()
+        self.assertEqual((row["status"], row["error"], row["attempt"]), ("failed", "SMTP down", 4))
+
     # NOTIF-09
     def test_unsubscribe_email(self):
         # User disables email channel
@@ -288,6 +315,52 @@ class TestNotificationService(unittest.TestCase):
         self.assertEqual(clicked["status"], "opened")
         self.assertEqual(clicked["opened_at"], "2026-11-10T12:05:00.000000Z")
         self.assertEqual(clicked["clicked_at"], "2026-11-10T12:05:00.000000Z")
+
+    # NOTIF-07
+    def test_open_endpoint_marks_opened_once_and_answers_204(self):
+        """GET /notifications/open/:message_id (api_open) sets opened_at and status 'opened' the first time; a
+        second call changes nothing; every call, an unknown or malformed id included, answers 204.
+        In: the test fixtures. Out: assertions. Why: NOTIF-07 as amended in Phase B.2 (2026-11-10).
+        2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite, mocked SMTP."""
+        with patch('notifications_python._send_email'):
+            resp = self.service.api_send({"user_id": self.user_id, "template_key": "welcome_email",
+                                          "channel": "email", "vars": {"app_name": "OpenApp"}})
+        mid = resp["message_id"]
+        self.now[0] = T0 + timedelta(minutes=3)
+        self.assertEqual(self.service.api_open(mid), {"status": 204, "body": None})
+        track = self.service.api_track(mid)
+        self.assertEqual((track["status"], track["opened_at"]), ("opened", "2026-11-10T12:03:00.000000Z"))
+        self.now[0] = T0 + timedelta(minutes=9)
+        self.assertEqual(self.service.api_open(mid), {"status": 204, "body": None})
+        self.assertEqual(self.service.api_track(mid), track)
+        self.assertEqual(self.service.api_open("999999"), {"status": 204, "body": None})
+        self.assertEqual(self.service.api_open("not-a-number"), {"status": 204, "body": None})
+
+    # NOTIF-05
+    def test_deliver_due_requeues_a_due_message_inside_quiet_hours(self):
+        """deliver_due step 3: a message that falls due inside the user's quiet hours (a window crossing
+        midnight, in UTC) goes back to 'queued' with scheduled_at = quiet_hours_end and is sent then, once.
+        In: the test fixtures. Out: assertions. Why: NOTIF-05 / deliver_due step 3 as amended in Phase B.2
+        (2026-11-10). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite, mocked SMTP."""
+        with patch('notifications_python._send_email') as mock_email:
+            resp = self.service.api_send({"user_id": self.user_id, "template_key": "welcome_email",
+                                          "channel": "email", "vars": {"app_name": "Night"},
+                                          "scheduled_at": "2026-11-10T23:00:00Z"})
+            self.assertEqual(resp["status"], "queued")
+            self.service.update_user_preferences(self.user_id, {"quiet_hours_start": "22:00",
+                                                                "quiet_hours_end": "08:00"})
+            self.now[0] = datetime(2026, 11, 10, 23, 0, tzinfo=timezone.utc)
+            self.assertEqual(self.service.deliver_due(), {"requeued": 1, "sent": 0, "skipped": 0, "failed": 0})
+            mock_email.assert_not_called()
+            row = self._last_log()
+            self.assertEqual((row["status"], row["scheduled_at"], row["claimed_at"]),
+                             ("queued", "2026-11-11T08:00:00.000000Z", None))
+            self.now[0] = datetime(2026, 11, 11, 7, 59, tzinfo=timezone.utc)
+            self.assertEqual(self.service.deliver_due()["sent"], 0)
+            self.now[0] = datetime(2026, 11, 11, 8, 0, tzinfo=timezone.utc)
+            self.assertEqual(self.service.deliver_due(), {"requeued": 0, "sent": 1, "skipped": 0, "failed": 0})
+            self.assertEqual(self.service.deliver_due()["sent"], 0)
+            mock_email.assert_called_once()
 
     # NOTIF-11
     def test_unsubscribe_link(self):

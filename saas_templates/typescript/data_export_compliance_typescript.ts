@@ -228,7 +228,9 @@ export interface AuditEraser {
 
 /**
  * An error with an HTTP status and a stable code. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: confirm and cancel
- * answer 404 not_found for a request that is not the caller's, 403 for a bad token. Touches nothing.
+ * answer 404 not_found for a request that is not the caller's, 400 invalid_confirmation_token for a wrong, reused
+ * or expired token, 409 deletion_not_pending for a cancelled request and 404 for a completed one (EXPORT-15).
+ * Touches nothing.
  */
 export class ComplianceError extends Error {
   constructor(public readonly code: string, message: string, public readonly status: number) {
@@ -510,8 +512,10 @@ export class ComplianceService {
   }
 
   /**
-   * The caller's own deletion request, or ComplianceError 404 (unknown, or someone else's). Touches: reads
-   * deletion_requests. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * The caller's own deletion request, or ComplianceError 404 {error: "not_found"}: unknown, someone else's, or
+   * completed (its user_id is NULL once completed, EXPORT-13, so it has no owner and is 404 to every caller,
+   * EXPORT-15 as clarified in spec commit 3abb340). In: caller id, deletion id. Out: the request.
+   * 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: reads deletion_requests.
    */
   private ownDeletion(callerUserId: string, deletionId: string): DeletionRequest {
     const req = this.db.deletionRequests.find(r => r.id === deletionId);
@@ -521,6 +525,20 @@ export class ComplianceService {
     return req;
   }
 
+  /**
+   * Refuses a request that is no longer pending: cancelled -> ComplianceError 409 {error: "deletion_not_pending"}
+   * (a completed one never gets here: ownDeletion answers 404, EXPORT-13/15; 'completed' is checked too as a guard).
+   * Checked before the token, so a spent token on a closed request does not read as a wrong token. In: the request.
+   * Out: nothing, or the throw.
+   * Why: EXPORT-15 (Phase B.2: one answer in every language). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * Touches nothing.
+   */
+  private refuseIfClosed(req: DeletionRequest): void {
+    if (req.status === 'cancelled' || req.status === 'completed') {
+      throw new ComplianceError('deletion_not_pending', `Deletion request is already ${req.status}`, 409);
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // 4. Approve/Confirm Deletion
   // ---------------------------------------------------------------------------
@@ -528,11 +546,14 @@ export class ComplianceService {
    * Confirms the caller's own deletion with the emailed token.
    *
    * In: the verified caller id, the deletion id and the token. Out: { success, deletion_scheduled_for }.
-   * Errors: 404 not_found (unknown or another user's request); 409 not_pending ("already approved", etc.);
-   * 403 confirmation_token_expired (over 24 h); 403 invalid_confirmation_token (wrong; compared in constant time as
-   * SHA-256 digests). The token is single-use: its hash is cleared on success. For a statutory reason the cascade
-   * runs before this returns: status 'completed', deleted_at = deletion_scheduled_for = now.
-   * Why: EXPORT-09/12/14 amendments 2026-11-10. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+   * Errors: 404 not_found (unknown, another user's or completed request); 409 deletion_not_pending (cancelled);
+   * 400 invalid_confirmation_token for a wrong, reused (already approved, hash cleared) or expired
+   * (over 24 h) token, one answer so the reply never says which (compared in constant time as SHA-256 digests).
+   * The token is single-use: its hash is cleared on success. For a statutory reason the cascade runs before this
+   * returns: status 'completed', deleted_at = deletion_scheduled_for = now.
+   * Why: EXPORT-09/12/14 amendments 2026-11-10. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP; Phase B.2 /
+   * EXPORT-15 the same day: a reused token was 409 not_pending, an expired one 403 confirmation_token_expired and a
+   * wrong one 403.
    * Touches: deletion_requests, audit_logs, and (statutory) every user table, S3 and the audit eraser.
    */
   public async confirmDeletion(
@@ -541,18 +562,15 @@ export class ComplianceService {
     confirmationToken: string
   ): Promise<{ success: boolean; deletion_scheduled_for: string }> {
     const req = this.ownDeletion(callerUserId, deletionId);
+    this.refuseIfClosed(req);
 
-    if (req.status !== 'pending' || req.confirmation_token_hash === null) {
-      throw new ComplianceError('not_pending', `Deletion request is already ${req.status}`, 409);
-    }
     const now = this.clock.now();
-    if (now.getTime() > req.token_expires_at.getTime()) {
-      throw new ComplianceError('confirmation_token_expired', 'Confirmation token expired', 403);
-    }
     const given = createHash('sha256').update(String(confirmationToken ?? ''), 'utf8').digest();
-    const stored = Buffer.from(req.confirmation_token_hash, 'hex');
-    if (stored.length !== given.length || !timingSafeEqual(given, stored)) {
-      throw new ComplianceError('invalid_confirmation_token', 'Invalid confirmation token', 403);
+    const stored = Buffer.from(req.confirmation_token_hash ?? '', 'hex');
+    const matches = req.status === 'pending' && stored.length === given.length && timingSafeEqual(given, stored);
+    if (!matches || now.getTime() > req.token_expires_at.getTime()) {
+      // Wrong, reused or expired: one answer (EXPORT-15).
+      throw new ComplianceError('invalid_confirmation_token', 'Invalid confirmation token', 400);
     }
 
     req.confirmation_token_hash = null;   // single use
@@ -577,16 +595,15 @@ export class ComplianceService {
   /**
    * Cancels the caller's own pending or approved deletion before it runs.
    * In: the verified caller id and the deletion id. Out: { success, status: 'cancelled' }. Errors: 404 not_found
-   * (unknown, another user's, or already completed: its user_id is gone), 409 not_cancellable (already cancelled,
-   * or past its scheduled time). Why: EXPORT-06/14. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the caller check
-   * is new. Touches: deletion_requests, audit_logs.
+   * (unknown, another user's, or completed: no owner any more), 409 deletion_not_pending (already cancelled),
+   * 409 not_cancellable
+   * (approved and past its scheduled time, waiting for the worker). Why: EXPORT-06/14. 2026-11-10,
+   * session_012zDydZCZ4AChqhEZ4oVtaP: the caller check is new; Phase B.2 / EXPORT-15 the same day: a cancelled
+   * request was 409 not_cancellable (a completed one stays 404, EXPORT-13/15). Touches: deletion_requests, audit_logs.
    */
   public async cancelDeletion(callerUserId: string, deletionId: string): Promise<{ success: boolean; status: 'cancelled' }> {
     const req = this.ownDeletion(callerUserId, deletionId);
-
-    if (req.status !== 'pending' && req.status !== 'approved') {
-      throw new ComplianceError('not_cancellable', `Cannot cancel a ${req.status} deletion`, 409);
-    }
+    this.refuseIfClosed(req);
     if (req.status === 'approved' && req.scheduled_for.getTime() <= this.clock.now().getTime()) {
       throw new ComplianceError('not_cancellable', 'The grace period is over', 409);
     }

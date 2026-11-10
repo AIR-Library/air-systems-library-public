@@ -147,6 +147,15 @@ func (tap *TrialAbusePrevention) Close() error {
 
 func (tap *TrialAbusePrevention) initSchema(ctx context.Context) error {
 	schema := `
+	-- users: the account a trial belongs to. created_at starts the trial (TRIAL_PAYMENT_TIMING). Added
+	-- 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2: payment timing is judged from users.created_at,
+	-- and a user with no users row fails closed with user_not_found).
+	CREATE TABLE IF NOT EXISTS users (
+		id TEXT PRIMARY KEY,
+		email TEXT NOT NULL,
+		created_at DATETIME NOT NULL
+	);
+
 	CREATE TABLE IF NOT EXISTS trial_abuse_ledger (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		user_id TEXT NOT NULL,
@@ -405,31 +414,37 @@ type execer interface {
 //
 // In: the user id and the trial length in days (<= 0 means TrialDays, default 14). Out: the GateResult;
 // Meta has days_after_trial, earlier_payment and trial_days.
-// trial_end = the user's first trial start + trial_days; days_after_trial = floor((now - trial_end) / 1 day),
-// rounding toward negative infinity; earlier_payment = the ledger already has a payment_added_date for the
-// user. PASS if days_after_trial < 5; FAIL (403 trial_ended_no_payment_cannot_retry) if >= 90 and no earlier
-// payment; CHALLENGE otherwise. A user with no ledger row FAILs closed (user_not_found), as in Python.
+// trial_end = users.created_at + trial_days; days_after_trial = floor((now - trial_end) / 1 day), rounding
+// toward negative infinity; earlier_payment = the ledger already has a payment_added_date for the user.
+// PASS if days_after_trial < 5; FAIL (403 trial_ended_no_payment_cannot_retry) if >= 90 and no earlier
+// payment; CHALLENGE otherwise. A user with no users row FAILs closed (403 user_not_found); a user with a
+// users row but no ledger row is judged from users.created_at with no earlier payment.
 // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (TRIAL-10/11/15): it counted days since the trial
-// START, truncated, with windows of its own, and PASSed a user it could not find. Touches: SQLite (read).
+// START, truncated, with windows of its own, and PASSed a user it could not find. Changed again the same day
+// (Phase B.2, trial spec amendment): the trial starts at users.created_at, not the ledger's trial_started_at,
+// so "not found" means no users row, and a missing ledger row is no longer a FAIL. Touches: SQLite (read).
 func (tap *TrialAbusePrevention) CheckTrialPaymentTiming(ctx context.Context, userID string, trialDays int) GateResult {
 	if trialDays <= 0 {
 		trialDays = tap.TrialDays
 	}
-	var started sql.NullString
-	var payments int
-	err := tap.db.QueryRowContext(ctx,
-		`SELECT MIN(trial_started_at), COUNT(payment_added_date) FROM trial_abuse_ledger WHERE user_id = ?`,
-		userID).Scan(&started, &payments)
+	var created string
+	err := tap.db.QueryRowContext(ctx, `SELECT created_at FROM users WHERE id = ?`, userID).Scan(&created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return GateResult{Gate: "trial_payment_timing", Decision: DecisionFail, Reason: "user_not_found", Code: 403,
+			Meta: map[string]any{"trial_days": trialDays, "error": "user_not_found"}}
+	}
 	if err != nil {
 		return GateResult{Gate: "trial_payment_timing", Decision: DecisionFail, Reason: "database error", Code: 500}
 	}
-	if !started.Valid {
-		return GateResult{Gate: "trial_payment_timing", Decision: DecisionFail, Reason: "user_not_found", Code: 403,
-			Meta: map[string]any{"trial_days": trialDays}}
+	var payments int
+	if err := tap.db.QueryRowContext(ctx,
+		`SELECT COUNT(payment_added_date) FROM trial_abuse_ledger WHERE user_id = ?`,
+		userID).Scan(&payments); err != nil {
+		return GateResult{Gate: "trial_payment_timing", Decision: DecisionFail, Reason: "database error", Code: 500}
 	}
-	start, err := parseDBTime(started.String)
+	start, err := parseDBTime(created)
 	if err != nil {
-		return GateResult{Gate: "trial_payment_timing", Decision: DecisionFail, Reason: "bad trial start", Code: 500}
+		return GateResult{Gate: "trial_payment_timing", Decision: DecisionFail, Reason: "bad users.created_at", Code: 500}
 	}
 	trialEnd := start.Add(time.Duration(trialDays) * 24 * time.Hour)
 	daysAfterTrial := floorDays(tap.now().Sub(trialEnd))
@@ -521,7 +536,9 @@ func (tap *TrialAbusePrevention) CheckChargebackHistory(ctx context.Context, use
 // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (TRIAL-09/14): the device gate now runs here, before
 // the device is recorded (it used to be recorded unchecked, so a device farm never failed); user ids are
 // random, not the clock's nanoseconds; challenge flags are merged into gate_flags instead of replacing them.
-// Touches: SQLite (trial_abuse_ledger, device_fingerprints, gate_decisions); crypto/rand.
+// Changed again 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): signup also writes the users row
+// (id, email, created_at = now) in the same transaction, because payment timing is judged from users.created_at.
+// Touches: SQLite (users, trial_abuse_ledger, device_fingerprints, gate_decisions); crypto/rand.
 func (tap *TrialAbusePrevention) OnSignup(ctx context.Context, input SignupInput) (string, GateResult, GateResult, error) {
 	emailGate := tap.CheckEmailTrialHistory(ctx, input.Email)
 	if emailGate.Decision == DecisionFail {
@@ -563,6 +580,10 @@ func (tap *TrialAbusePrevention) OnSignup(ctx context.Context, input SignupInput
 		return "", emailGate, ipGate, err
 	}
 	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO users (id, email, created_at) VALUES (?, ?, ?)`,
+		userID, input.Email, now); err != nil {
+		return "", emailGate, ipGate, fmt.Errorf("insert user: %w", err)
+	}
 	result, err := tx.ExecContext(ctx,
 		`INSERT INTO trial_abuse_ledger (user_id, email, ip, device_fingerprint, signup_date, trial_started_at, subscription_status, gate_flags, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, 'trial', ?, ?)`,
@@ -588,7 +609,9 @@ func (tap *TrialAbusePrevention) OnSignup(ctx context.Context, input SignupInput
 // In: the user id (verified caller), payment method and customer, and the trial length (<= 0 = default).
 // Out: the three gate results, or a *GateError (403) for the first FAIL.
 // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: typed errors, the gate flags are merged (they were
-// replaced) and created_at is no longer overwritten. Touches: SQLite.
+// replaced) and created_at is no longer overwritten. Changed again the same day (Phase B.2, trial spec): a
+// user with no users row is refused with ErrorCode "user_not_found", not "trial_ended_no_payment_cannot_retry".
+// Touches: SQLite.
 func (tap *TrialAbusePrevention) OnSubscriptionCreated(ctx context.Context, input PaymentInput, trialDays int) (GateResult, GateResult, GateResult, error) {
 	paymentGate := tap.CheckPaymentMethodHistory(ctx, input.StripePaymentMethodID)
 	timingGate := tap.CheckTrialPaymentTiming(ctx, input.UserID, trialDays)
@@ -598,7 +621,11 @@ func (tap *TrialAbusePrevention) OnSubscriptionCreated(ctx context.Context, inpu
 		return paymentGate, timingGate, chargebackGate, &GateError{ErrorCode: "payment_method_used_for_multiple_trials", Result: paymentGate}
 	}
 	if timingGate.Decision == DecisionFail {
-		return paymentGate, timingGate, chargebackGate, &GateError{ErrorCode: "trial_ended_no_payment_cannot_retry", Result: timingGate}
+		code := "trial_ended_no_payment_cannot_retry"
+		if timingGate.Reason == "user_not_found" {
+			code = "user_not_found"
+		}
+		return paymentGate, timingGate, chargebackGate, &GateError{ErrorCode: code, Result: timingGate}
 	}
 	if chargebackGate.Decision == DecisionFail {
 		return paymentGate, timingGate, chargebackGate, &GateError{ErrorCode: "chargeback_history_requires_prepayment", Result: chargebackGate}

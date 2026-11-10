@@ -11,8 +11,21 @@ package auth
 // checks a single-use state and takes the email from an injectable provider exchange (it used to take
 // the email from the client's code); the login failure limit is enforced (it was counted, never
 // checked). Touches: SQLite, the injected email sender and OAuth provider (network in production).
+//
+// Phase B.2, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16 and the spec's "Secrets at rest" line):
+// every flow that creates a session (login, MFA, OAuth) returns its refresh_token, which TokenRefresh
+// accepts; sessions keep only refresh_token_hash (HMAC-SHA256) and verification_codes only code_hash (the email
+// code's HMAC-SHA256, or the MFA challenge id's), so a database read hands out no usable credential. OAuth state
+// stays single-use, 10 minutes, stored as its hash, and the provider code is exchanged through the injected
+// OAuthProvider.
+//
+// spec d270fa3, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (keyed HMAC for stored secrets): those hashes
+// are now HMAC-SHA256 under a server key (Options.SecretKey, else the AUTH_SECRET_KEY environment variable,
+// at least 32 bytes; the constructor refuses to start without it), not a plain SHA-256, because a 6-digit
+// code's plain hash can be brute-forced from a leaked table. Touches also: the process environment (read).
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -22,6 +35,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -68,7 +82,7 @@ var schema = []string{
 	`CREATE TABLE IF NOT EXISTS sessions (
 		id TEXT PRIMARY KEY,
 		user_id INTEGER NOT NULL,
-		refresh_token TEXT NOT NULL,
+		refresh_token_hash TEXT NOT NULL UNIQUE, -- HMAC-SHA256 of the refresh token; the token itself is never stored (Phase B.2, 2026-11-10)
 		created_at TEXT NOT NULL,
 		expires_at TEXT NOT NULL,
 		ip TEXT,
@@ -87,14 +101,14 @@ var schema = []string{
 	`CREATE TABLE IF NOT EXISTS verification_codes (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		user_id INTEGER NOT NULL,
-		code TEXT NOT NULL,
+		code_hash TEXT NOT NULL, -- HMAC-SHA256 of the email code or MFA challenge id; never the value (Phase B.2, 2026-11-10)
 		created_at TEXT NOT NULL,
 		expires_at TEXT NOT NULL,
 		type TEXT NOT NULL,
 		FOREIGN KEY(user_id) REFERENCES users(id)
 	);`,
 	// oauth_states and oauth_accounts added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the state an
-	// oauth_callback must match (stored as a SHA-256 hash, single use) and the provider links AUTH-10/11
+	// oauth_callback must match (stored as a HMAC-SHA256 hash, single use) and the provider links AUTH-10/11
 	// require.
 	`CREATE TABLE IF NOT EXISTS oauth_states (
 		state_hash TEXT PRIMARY KEY,
@@ -260,12 +274,26 @@ func (a *AuthSystem) createAccessToken(userID int64, tier string) (string, error
 	return token.SignedString(a.jwtSecret)
 }
 
-// sha256Hex is the lowercase hex SHA-256 of s (stored instead of raw challenge ids and OAuth states).
-// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
-func sha256Hex(s string) string {
-	h := sha256.Sum256([]byte(s))
-	return hex.EncodeToString(h[:])
+// hmacSHA256Hex is the lowercase hex HMAC-SHA256(key, s): the only form in which refresh tokens,
+// verification codes, MFA challenge ids and OAuth states are stored. In: the key, the secret. Out: 64 hex
+// characters. Why: spec d270fa3: keyed HMAC for stored secrets (it replaced the plain SHA-256 helper
+// sha256Hex). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+func hmacSHA256Hex(key []byte, s string) string {
+	m := hmac.New(sha256.New, key)
+	m.Write([]byte(s))
+	return hex.EncodeToString(m.Sum(nil))
 }
+
+// hashSecret is the stored form of a secret under this instance's key: hmacSHA256Hex(a.secretKey, s).
+// In: the secret. Out: 64 hex characters. Why: spec d270fa3: keyed HMAC for stored secrets.
+// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+func (a *AuthSystem) hashSecret(s string) string {
+	return hmacSHA256Hex(a.secretKey, s)
+}
+
+// minSecretKeyBytes is the shortest HMAC key the service starts with (spec d270fa3: AUTH_SECRET_KEY, at
+// least 32 bytes). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+const minSecretKeyBytes = 32
 
 // constantTimeEqual compares two secrets without leaking where they differ.
 // Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec README: secrets compared in constant time).
@@ -297,8 +325,12 @@ type OAuthProvider interface {
 // Options configures NewAuthSystemWithOptions. JWTSecret must be at least 32 bytes (a random one is
 // generated when empty); Now is the clock (nil = time.Now). Added 2026-11-10,
 // session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing.
+// SecretKey (added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP, spec d270fa3: keyed HMAC for stored
+// secrets) keys the HMAC-SHA256 every stored secret is kept as; empty means the AUTH_SECRET_KEY
+// environment variable. It must be at least 32 bytes, or the constructor returns an error.
 type Options struct {
 	JWTSecret []byte
+	SecretKey []byte
 	Email     EmailSender
 	OAuth     OAuthProvider
 	Now       func() time.Time
@@ -308,6 +340,7 @@ type Options struct {
 type AuthSystem struct {
 	db        *sql.DB
 	jwtSecret []byte
+	secretKey []byte // HMAC key for stored secrets (spec d270fa3, 2026-11-10)
 	email     EmailSender
 	oauth     OAuthProvider
 	now       func() time.Time
@@ -318,6 +351,9 @@ type AuthSystem struct {
 // NewAuthSystem creates an instance on an in-memory SQLite DB with a random JWT secret and no email
 // sender or OAuth provider (signup then refuses with email_unavailable, and OAuth with
 // oauth_unavailable, rather than pretend). Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+// Since spec d270fa3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP) it reads the HMAC key from
+// AUTH_SECRET_KEY and returns an error when that is unset or shorter than 32 bytes. Touches: SQLite,
+// the process environment (read).
 func NewAuthSystem() (*AuthSystem, error) {
 	return NewAuthSystemWithOptions(Options{})
 }
@@ -326,7 +362,18 @@ func NewAuthSystem() (*AuthSystem, error) {
 // every new :memory: connection is a separate empty database).
 // In: Options. Out: the system, or an error for a JWT secret shorter than 32 bytes.
 // Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: SQLite; crypto/rand.
+// [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: the HMAC key
+// is opts.SecretKey, else AUTH_SECRET_KEY; with neither, or one shorter than 32 bytes, it returns an error
+// before opening the database, so the service refuses to start. Touches also: the process environment (read).
 func NewAuthSystemWithOptions(opts Options) (*AuthSystem, error) {
+	secretKey := opts.SecretKey
+	if len(secretKey) == 0 {
+		secretKey = []byte(os.Getenv("AUTH_SECRET_KEY"))
+	}
+	if len(secretKey) < minSecretKeyBytes {
+		return nil, errors.New("AUTH_SECRET_KEY must be set and at least 32 bytes")
+	}
+	secretKey = append([]byte(nil), secretKey...)
 	secret := opts.JWTSecret
 	if len(secret) == 0 {
 		secret = make([]byte, 32)
@@ -350,17 +397,8 @@ func NewAuthSystemWithOptions(opts Options) (*AuthSystem, error) {
 			return nil, err
 		}
 	}
-	return &AuthSystem{db: db, jwtSecret: secret, email: opts.Email, oauth: opts.OAuth, now: now,
+	return &AuthSystem{db: db, jwtSecret: secret, secretKey: secretKey, email: opts.Email, oauth: opts.OAuth, now: now,
 		signups: &rateLimiter{buckets: map[string]*rateBucket{}}, loginFail: &rateLimiter{buckets: map[string]*rateBucket{}}}, nil
-}
-
-// getLatestVerificationCode is a test helper to retrieve the most recent verification code for a user.
-func (a *AuthSystem) getLatestVerificationCode(ctx context.Context, userID int64, codeType string) (string, error) {
-	var code string
-	err := a.db.QueryRowContext(ctx,
-		`SELECT code FROM verification_codes WHERE user_id = ? AND type = ? ORDER BY id DESC LIMIT 1`,
-		userID, codeType).Scan(&code)
-	return code, err
 }
 
 // getUserIDByEmail retrieves user ID by email (test helper).
@@ -370,28 +408,32 @@ func (a *AuthSystem) getUserIDByEmail(ctx context.Context, email string) (int64,
 	return userID, err
 }
 
-// createSession stores a session with a fresh refresh token and returns its id and an access token.
-// In: user id, tier, ip and device id. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (one place
-// for login, OAuth and MFA, which each repeated it). Touches: SQLite (sessions).
-func (a *AuthSystem) createSession(ctx context.Context, userID int64, tier, ip, deviceID string) (string, string, error) {
+// createSession stores a session with a fresh refresh token and returns its id, an access token and the
+// refresh token. Only the refresh token's HMAC-SHA256 is stored (refresh_token_hash); the caller hands the
+// token itself to the client, once. In: user id, tier, ip and device id. Out: session id, access token,
+// refresh token, error. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (one place for login, OAuth and
+// MFA, which each repeated it). Changed the same day (Phase B.2, AUTH-16): it stored the refresh token in
+// plain text and returned none, so no flow could hand it out. Touches: SQLite (sessions); crypto/rand.
+// [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
+func (a *AuthSystem) createSession(ctx context.Context, userID int64, tier, ip, deviceID string) (string, string, string, error) {
 	sessionID, err := generateRandomString(24)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	refreshToken, err := generateRandomString(32)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	now := a.now().UTC()
 	if _, err = a.db.ExecContext(ctx,
-		`INSERT INTO sessions (id, user_id, refresh_token, created_at, expires_at, ip, device_id)
+		`INSERT INTO sessions (id, user_id, refresh_token_hash, created_at, expires_at, ip, device_id)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		sessionID, userID, refreshToken, now.Format(time.RFC3339), now.Add(refreshTokenTTL).Format(time.RFC3339),
+		sessionID, userID, a.hashSecret(refreshToken), now.Format(time.RFC3339), now.Add(refreshTokenTTL).Format(time.RFC3339),
 		ip, deviceID); err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	token, err := a.createAccessToken(userID, tier)
-	return sessionID, token, err
+	return sessionID, token, refreshToken, err
 }
 
 // Signup creates an unverified user and emails a verification code.
@@ -400,7 +442,10 @@ func (a *AuthSystem) createSession(ctx context.Context, userID int64, tier, ip, 
 // (with reason) | email_unavailable | internal_error}.
 // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-01, AUTH-03): password_rejected with a
 // reason replaces password_too_weak; the verification email is really sent through EmailSender, and a
-// failed send rolls the user back so the address can sign up again. Touches: SQLite, the email sender.
+// failed send rolls the user back so the address can sign up again. Changed the same day (Phase B.2,
+// AUTH-16): the code is stored only as its HMAC-SHA256 (code_hash); the email carries the code itself.
+// Touches: SQLite, the email sender.
+// [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
 func (a *AuthSystem) Signup(ctx context.Context, email, password, name, ip string) jsonResponse {
 	decision := []string{}
 	if !a.signups.hit(ip, maxSignupPerIP24h, 24*time.Hour, a.now()) {
@@ -450,8 +495,8 @@ func (a *AuthSystem) Signup(ctx context.Context, email, password, name, ip strin
 	}
 	userID, _ := res.LastInsertId()
 	if _, err = tx.ExecContext(ctx,
-		`INSERT INTO verification_codes (user_id, code, created_at, expires_at, type) VALUES (?, ?, ?, ?, 'email')`,
-		userID, code, now.Format(time.RFC3339), now.Add(verificationTTL).Format(time.RFC3339)); err != nil {
+		`INSERT INTO verification_codes (user_id, code_hash, created_at, expires_at, type) VALUES (?, ?, ?, ?, 'email')`,
+		userID, a.hashSecret(code), now.Format(time.RFC3339), now.Add(verificationTTL).Format(time.RFC3339)); err != nil {
 		return jsonError("internal_error", "database error")
 	}
 	if err := a.email.SendVerificationEmail(ctx, email, code); err != nil {
@@ -475,23 +520,25 @@ func (a *AuthSystem) Signup(ctx context.Context, email, password, name, ip strin
 // VerifyEmail marks a user verified when the code matches (constant time) and has not expired.
 // In: email and code. Out: {success, status: "verified", user_id, message} or {error: code_invalid |
 // code_expired}. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: constant-time compare and the
-// injectable clock. Touches: SQLite.
+// injectable clock; the same day (Phase B.2, AUTH-16) the HMAC-SHA256 of the given code is compared, in constant
+// time, with the stored code_hash (the code was stored in plain text). Touches: SQLite.
+// [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
 func (a *AuthSystem) VerifyEmail(ctx context.Context, email, code string) jsonResponse {
 	decision := []string{}
 	var userID int64
-	var storedCode, expiresAt string
+	var storedHash, expiresAt string
 	var emailVerifiedAt sql.NullString
 	err := a.db.QueryRowContext(ctx,
-		`SELECT vc.user_id, vc.code, vc.expires_at, u.email_verified_at
+		`SELECT vc.user_id, vc.code_hash, vc.expires_at, u.email_verified_at
 		 FROM verification_codes vc
 		 JOIN users u ON u.id = vc.user_id
 		 WHERE u.email = ? AND vc.type = 'email' ORDER BY vc.id DESC LIMIT 1`,
-		email).Scan(&userID, &storedCode, &expiresAt, &emailVerifiedAt)
+		email).Scan(&userID, &storedHash, &expiresAt, &emailVerifiedAt)
 	if err != nil {
 		whyChain("verify_email", []string{"code_valid"})
 		return jsonError("code_invalid", "Invalid verification code")
 	}
-	if !constantTimeEqual(storedCode, code) {
+	if !constantTimeEqual(storedHash, a.hashSecret(code)) {
 		whyChain("verify_email", []string{"code_valid"})
 		return jsonError("code_invalid", "Invalid verification code")
 	}
@@ -525,12 +572,14 @@ func (a *AuthSystem) VerifyEmail(ctx context.Context, email, code string) jsonRe
 
 // Login checks the password and either opens a session or, with MFA on, starts a challenge.
 // In: email, password, device id, IP. Out: {success, status: "authenticated", session_id, token,
-// expires_in, user} or {success, status: "mfa_required", challenge_id} or {error: invalid_credentials |
-// too_many_login_attempts | internal_error}.
+// refresh_token, expires_in, user} or {success, status: "mfa_required", challenge_id} or {error:
+// invalid_credentials | too_many_login_attempts | internal_error}. refresh_token added 2026-11-10,
+// session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, AUTH-16: login returned none).
 // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the 5-failures-per-15-minutes limit per
 // ip+email is now enforced before the password is checked (it was counted, never read); the MFA
-// challenge row stores the SHA-256 of a random challenge id, and the code is checked later against the
+// challenge row stores the HMAC-SHA256 of a random challenge id, and the code is checked later against the
 // user's TOTP secret, not stored. Touches: SQLite.
+// [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
 func (a *AuthSystem) Login(ctx context.Context, email, password, deviceID, ip string) jsonResponse {
 	decision := []string{}
 	rateKey := ip + "\x00" + strings.ToLower(email)
@@ -570,8 +619,8 @@ func (a *AuthSystem) Login(ctx context.Context, email, password, deviceID, ip st
 		}
 		now := a.now().UTC()
 		if _, err := a.db.ExecContext(ctx,
-			`INSERT INTO verification_codes (user_id, code, created_at, expires_at, type) VALUES (?, ?, ?, ?, 'mfa')`,
-			userID, sha256Hex(challengeID), now.Format(time.RFC3339), now.Add(mfaChallengeTTL).Format(time.RFC3339)); err != nil {
+			`INSERT INTO verification_codes (user_id, code_hash, created_at, expires_at, type) VALUES (?, ?, ?, ?, 'mfa')`,
+			userID, a.hashSecret(challengeID), now.Format(time.RFC3339), now.Add(mfaChallengeTTL).Format(time.RFC3339)); err != nil {
 			return jsonError("internal_error", "database error")
 		}
 		whyChain("login", append(decision, "mfa_gate"))
@@ -581,7 +630,7 @@ func (a *AuthSystem) Login(ctx context.Context, email, password, deviceID, ip st
 		})
 	}
 	decision = append(decision, "mfa_gate")
-	sessionID, accessToken, err := a.createSession(ctx, userID, tier, ip, deviceID)
+	sessionID, accessToken, refreshToken, err := a.createSession(ctx, userID, tier, ip, deviceID)
 	if err != nil {
 		return jsonError("internal_error", "session error")
 	}
@@ -590,10 +639,11 @@ func (a *AuthSystem) Login(ctx context.Context, email, password, deviceID, ip st
 		"session_created", "session", sql.NullInt64{Int64: userID, Valid: true}, "", "")
 
 	return jsonSuccess(map[string]interface{}{
-		"status":     "authenticated",
-		"session_id": sessionID,
-		"token":      accessToken,
-		"expires_in": int(accessTokenTTL.Seconds()),
+		"status":        "authenticated",
+		"session_id":    sessionID,
+		"token":         accessToken,
+		"refresh_token": refreshToken,
+		"expires_in":    int(accessTokenTTL.Seconds()),
 		"user": map[string]interface{}{
 			"id":    userID,
 			"email": email,
@@ -603,16 +653,17 @@ func (a *AuthSystem) Login(ctx context.Context, email, password, deviceID, ip st
 }
 
 // StartOAuth begins an OAuth sign-in: it returns a random state to send to the provider and keeps
-// only its SHA-256, for 10 minutes, bound to the provider. In: the provider name. Out: the state.
+// only its HMAC-SHA256, for 10 minutes, bound to the provider. In: the provider name. Out: the state.
 // Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: oauth_callback's state_valid gate ("matches
 // session, not expired") had nothing to match. Touches: SQLite (oauth_states); crypto/rand.
+// [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
 func (a *AuthSystem) StartOAuth(ctx context.Context, provider string) (string, error) {
 	state, err := generateRandomString(32)
 	if err != nil {
 		return "", err
 	}
 	_, err = a.db.ExecContext(ctx, `INSERT INTO oauth_states (state_hash, provider, expires_at) VALUES (?, ?, ?)`,
-		sha256Hex(state), provider, a.now().Add(oauthStateTTL).UTC().Format(time.RFC3339))
+		a.hashSecret(state), provider, a.now().Add(oauthStateTTL).UTC().Format(time.RFC3339))
 	return state, err
 }
 
@@ -621,14 +672,18 @@ func (a *AuthSystem) StartOAuth(ctx context.Context, provider string) (string, e
 // whose email the provider must have verified. Case A: a new email creates a verified user. Case B:
 // an existing email links the provider to that account. Either way the provider identity is linked
 // in oauth_accounts and a session is opened.
-// In: provider, code, state. Out: {success, status: "authenticated", session_id, token, user} or
-// {error: invalid_state | oauth_unavailable | oauth_exchange_failed | email_not_verified | internal_error}.
+// In: provider, code, state. Out: {success, status: "authenticated", session_id, token, refresh_token,
+// expires_in, user} or {error: invalid_state | oauth_unavailable | oauth_exchange_failed |
+// email_not_verified | oauth_account_conflict | internal_error}. refresh_token and expires_in added
+// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, AUTH-16: every flow that creates a session
+// returns its refresh token).
 // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the old callback skipped the state check and
 // used the client's code AS the email, so anyone could sign in as any account. Touches: SQLite, the
 // OAuth provider (network in production).
+// [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
 func (a *AuthSystem) OAuthCallback(ctx context.Context, provider, code, state string) jsonResponse {
 	res, err := a.db.ExecContext(ctx, `DELETE FROM oauth_states WHERE state_hash = ? AND provider = ? AND expires_at > ?`,
-		sha256Hex(state), provider, a.now().UTC().Format(time.RFC3339))
+		a.hashSecret(state), provider, a.now().UTC().Format(time.RFC3339))
 	if err != nil {
 		return jsonError("internal_error", "database error")
 	}
@@ -688,7 +743,7 @@ func (a *AuthSystem) OAuthCallback(ctx context.Context, provider, code, state st
 	if err := tx.Commit(); err != nil {
 		return jsonError("internal_error", "database error")
 	}
-	sessionID, accessToken, err := a.createSession(ctx, userID, tier, "", "")
+	sessionID, accessToken, refreshToken, err := a.createSession(ctx, userID, tier, "", "")
 	if err != nil {
 		return jsonError("internal_error", "session error")
 	}
@@ -697,9 +752,11 @@ func (a *AuthSystem) OAuthCallback(ctx context.Context, provider, code, state st
 		"oauth_login", "session", sql.NullInt64{Int64: userID, Valid: true}, "", provider)
 
 	return jsonSuccess(map[string]interface{}{
-		"status":     "authenticated",
-		"session_id": sessionID,
-		"token":      accessToken,
+		"status":        "authenticated",
+		"session_id":    sessionID,
+		"token":         accessToken,
+		"refresh_token": refreshToken,
+		"expires_in":    int(accessTokenTTL.Seconds()),
 		"user": map[string]interface{}{
 			"id":    userID,
 			"email": id.Email,
@@ -712,9 +769,12 @@ func (a *AuthSystem) OAuthCallback(ctx context.Context, provider, code, state st
 // and the code must be a valid TOTP for that challenge's user (30 s steps, one step of skew). The
 // challenge is consumed on success.
 // In: challenge id (from Login) and the 6-digit code. Out: {success, status: "authenticated",
-// session_id, token, user} or {error: invalid_code | code_expired}.
+// session_id, token, refresh_token, expires_in, user} or {error: invalid_code | code_expired}.
 // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: it used to ignore challenge_id and compare the
-// code with the newest MFA row of ANY user, so one user's code could log in as another. Touches: SQLite.
+// code with the newest MFA row of ANY user, so one user's code could log in as another. Changed again the
+// same day (Phase B.2, AUTH-16): the answer carries refresh_token (and expires_in), and the challenge is
+// found by its code_hash. Touches: SQLite.
+// [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
 func (a *AuthSystem) MFAChallenge(ctx context.Context, challengeID, code string) jsonResponse {
 	var rowID, userID int64
 	var expiresAt string
@@ -722,8 +782,8 @@ func (a *AuthSystem) MFAChallenge(ctx context.Context, challengeID, code string)
 	var tier string
 	err := a.db.QueryRowContext(ctx,
 		`SELECT vc.id, vc.user_id, vc.expires_at, u.mfa_secret, u.tier FROM verification_codes vc
-		 JOIN users u ON u.id = vc.user_id WHERE vc.type = 'mfa' AND vc.code = ?`,
-		sha256Hex(challengeID)).Scan(&rowID, &userID, &expiresAt, &secret, &tier)
+		 JOIN users u ON u.id = vc.user_id WHERE vc.type = 'mfa' AND vc.code_hash = ?`,
+		a.hashSecret(challengeID)).Scan(&rowID, &userID, &expiresAt, &secret, &tier)
 	if err != nil || !secret.Valid || secret.String == "" {
 		whyChain("mfa_challenge", []string{"challenge_valid"})
 		return jsonError("invalid_code", "Challenge not found")
@@ -747,7 +807,7 @@ func (a *AuthSystem) MFAChallenge(ctx context.Context, challengeID, code string)
 	if n, _ := res.RowsAffected(); n != 1 {
 		return jsonError("invalid_code", "Challenge already used")
 	}
-	sessionID, accessToken, err := a.createSession(ctx, userID, tier, "", "")
+	sessionID, accessToken, refreshToken, err := a.createSession(ctx, userID, tier, "", "")
 	if err != nil {
 		return jsonError("internal_error", "session error")
 	}
@@ -756,9 +816,11 @@ func (a *AuthSystem) MFAChallenge(ctx context.Context, challengeID, code string)
 		"mfa_verified", "user", sql.NullInt64{Int64: userID, Valid: true}, "", "")
 
 	return jsonSuccess(map[string]interface{}{
-		"status":     "authenticated",
-		"session_id": sessionID,
-		"token":      accessToken,
+		"status":        "authenticated",
+		"session_id":    sessionID,
+		"token":         accessToken,
+		"refresh_token": refreshToken,
+		"expires_in":    int(accessTokenTTL.Seconds()),
 		"user": map[string]interface{}{
 			"id":   userID,
 			"tier": tier,
@@ -769,15 +831,19 @@ func (a *AuthSystem) MFAChallenge(ctx context.Context, challengeID, code string)
 // TokenRefresh issues a new access token for a valid, unexpired refresh token of an active user.
 // In: the refresh token. Out: {success, status: "ok", token, expires_in} or {error: invalid_token |
 // token_expired | user_banned}. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the instance's
-// secret and clock. Touches: SQLite.
+// secret and clock. Changed again the same day (Phase B.2, AUTH-16): the session is found by the HMAC-SHA256 of
+// the given token (refresh_token_hash), and the stored hash is compared with it in constant time; the
+// table no longer holds the token itself. Touches: SQLite.
+// [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] spec d270fa3: keyed HMAC for stored secrets: secrets are now stored and compared as HMAC-SHA256 under AUTH_SECRET_KEY (was a plain SHA-256).
 func (a *AuthSystem) TokenRefresh(ctx context.Context, refreshToken string) jsonResponse {
 	decision := []string{}
 	var userID int64
-	var expiresAt string
+	var storedHash, expiresAt string
+	given := a.hashSecret(refreshToken)
 	err := a.db.QueryRowContext(ctx,
-		`SELECT user_id, expires_at FROM sessions WHERE refresh_token = ?`,
-		refreshToken).Scan(&userID, &expiresAt)
-	if err != nil || refreshToken == "" {
+		`SELECT user_id, refresh_token_hash, expires_at FROM sessions WHERE refresh_token_hash = ?`,
+		given).Scan(&userID, &storedHash, &expiresAt)
+	if err != nil || refreshToken == "" || !constantTimeEqual(storedHash, given) {
 		whyChain("token_refresh", []string{"token_valid"})
 		return jsonError("invalid_token", "Refresh token not found")
 	}

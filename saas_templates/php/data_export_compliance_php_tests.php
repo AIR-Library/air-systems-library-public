@@ -13,6 +13,8 @@
  * Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP for the amended spec (EXPORT-05/12/13/14): confirm, cancel and export
  * status take the authenticated user; tokens are 64 hex characters; statutory reasons are deleted when
  * confirmed; the cascade ends with the audit eraser (a fake records each call); tests EXPORT-12/13/14 added.
+ * Changed again the same day (Phase B.2, EXPORT-15): the refusal codes are invalid_confirmation_token (400),
+ * deletion_not_pending (409) and not_found (404); the fake eraser returns {erased_rows} like AuditLogger.
  *
  * Touches: an in-memory SQLite database, in-memory storage and mail. No network, no files.
  */
@@ -30,19 +32,23 @@ require_once __DIR__ . '/data_export_compliance_php.php';
 
 /**
  * Fake audit eraser: records each eraseSubject() call with what the database looked like at that moment
- * (users rows of the subject, the last audit_log row), so EXPORT-13 can check the order; can be told to fail.
- * Why: EXPORT-13. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: reads the test database.
+ * (users rows of the subject, the last audit_log row), so EXPORT-13 can check the order; can be told to fail
+ * or to return a malformed answer. Returns {erased_rows: 0} like AuditLogger::eraseSubject().
+ * Why: EXPORT-13. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP; the return value and $malformed are the same day
+ * (Phase B.2 bug: the interface returned void, AuditLogger returns {erased_rows}). Touches: reads the test database.
  */
 final class RecordingAuditEraser implements Compliance\AuditEraser
 {
     /** @var list<array{user_id: int, user_rows: int, last_audit: array|false}> */
     public array $calls = [];
     public bool $fail = false;
+    public bool $malformed = false;
     public function __construct(private PDO $db)
     {
     }
-    public function eraseSubject(int $userId): void
+    public function eraseSubject(int|string $userId): array
     {
+        $userId = (int) $userId;
         $users = $this->db->prepare('SELECT COUNT(*) FROM users WHERE id = ?');
         $users->execute([$userId]);
         $this->calls[] = [
@@ -53,6 +59,7 @@ final class RecordingAuditEraser implements Compliance\AuditEraser
         if ($this->fail) {
             throw new RuntimeException('audit system unavailable');
         }
+        return $this->malformed ? [] : ['erased_rows' => 0];
     }
 }
 
@@ -241,12 +248,13 @@ final class DataExportComplianceTest extends TestCase
         $this->assertNotEmpty($matches[1]);
         $token = $matches[1];
 
-        // A wrong token is refused and the request stays pending
+        // A wrong token is refused and the request stays pending. The code was invalid_token; EXPORT-15 names it
+        // invalid_confirmation_token (400). Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2).
         try {
             $this->service->confirmDeletion($userId, $deletionId, str_repeat('0', 64));
             $this->fail('wrong token accepted');
         } catch (ComplianceException $e) {
-            $this->assertSame('invalid_token', $e->errorCode);
+            $this->assertSame('invalid_confirmation_token', $e->errorCode);
         }
 
         $confirmResp = $this->service->confirmDeletion($userId, $deletionId, $token);
@@ -540,22 +548,119 @@ final class DataExportComplianceTest extends TestCase
         };
         $refused(fn () => $this->service->confirmDeletion($intruder, $deletionId, $token), 'not_found');
         $refused(fn () => $this->service->cancelDeletion($intruder, $deletionId), 'not_found');
-        $refused(fn () => $this->service->confirmDeletion($userId, $deletionId, strrev($token)), 'invalid_token');
-        $refused(fn () => $this->service->confirmDeletion($userId, $deletionId, ''), 'invalid_token');
+        // The codes below were invalid_token, token_expired and not_pending; EXPORT-15 gives a wrong, expired or
+        // reused token the one answer invalid_confirmation_token. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2).
+        $refused(fn () => $this->service->confirmDeletion($userId, $deletionId, strrev($token)), 'invalid_confirmation_token');
+        $refused(fn () => $this->service->confirmDeletion($userId, $deletionId, ''), 'invalid_confirmation_token');
         $this->assertSame('pending', $this->db->query("SELECT status FROM deletion_requests WHERE id = '$deletionId'")->fetchColumn());
 
         // Expired: just over 24 hours after the request.
         [$late, $lateToken] = $this->requestDeletionAndToken($userId, 'user_requested');
         $this->now = $this->now->modify('+24 hours');
-        $refused(fn () => $this->service->confirmDeletion($userId, $late, $lateToken), 'token_expired');
+        $refused(fn () => $this->service->confirmDeletion($userId, $late, $lateToken), 'invalid_confirmation_token');
         $this->now = $this->now->modify('-24 hours');
 
         // The right token works once; a reuse is refused.
         $this->service->confirmDeletion($userId, $deletionId, $token);
-        $refused(fn () => $this->service->confirmDeletion($userId, $deletionId, $token), 'not_pending');
+        $refused(fn () => $this->service->confirmDeletion($userId, $deletionId, $token), 'invalid_confirmation_token');
 
         // Another user's export status is not found either.
         $export = $this->service->requestExport($userId, 'json');
         $refused(fn () => $this->service->getExportStatus($export['export_id'], $intruder), 'not_found');
+    }
+
+    /**
+     * EXPORT-15: a wrong, a reused and an expired token all get the same 400 invalid_confirmation_token and change
+     * nothing; confirm and cancel of a cancelled request are 409 deletion_not_pending (even with the right token);
+     * another user's request, and a completed one (user_id is NULL, EXPORT-13), are 404 not_found. Each answer
+     * carries its HTTP status. The completed case follows the spec as clarified the same day (commit 3abb340).
+     * Input: a fresh database and clock. Output: assertions only.
+     * Why: the amended spec (Phase B.2: one answer in every language). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches: the in-memory SQLite database, in-memory mail and storage.
+     */
+    // EXPORT-15
+    public function testRefusalCodesForConfirmAndCancel(): void
+    {
+        $answer = function (callable $call): array {
+            try {
+                $call();
+            } catch (ComplianceException $e) {
+                return [$e->httpStatus, $e->errorCode, $e->getMessage()];
+            }
+            $this->fail('the call was not refused');
+        };
+        $userId = $this->seedUser();
+        $intruder = $this->seedUser();
+
+        // Wrong, expired and reused tokens: one answer, word for word.
+        [$wrongId, $wrongToken] = $this->requestDeletionAndToken($userId, 'user_requested');
+        $wrong = $answer(fn () => $this->service->confirmDeletion($userId, $wrongId, str_repeat('a', 64)));
+        $this->assertSame(400, $wrong[0]);
+        $this->assertSame('invalid_confirmation_token', $wrong[1]);
+        $this->assertSame('pending', $this->db->query("SELECT status FROM deletion_requests WHERE id = '$wrongId'")->fetchColumn());
+        [$expiredId, $expiredToken] = $this->requestDeletionAndToken($userId, 'user_requested');
+        $this->now = $this->now->modify('+24 hours +1 second');
+        $this->assertSame($wrong, $answer(fn () => $this->service->confirmDeletion($userId, $expiredId, $expiredToken)), 'expired = wrong');
+        $this->assertSame('pending', $this->db->query("SELECT status FROM deletion_requests WHERE id = '$expiredId'")->fetchColumn());
+        $this->now = $this->now->modify('-24 hours -1 second');
+        $this->service->confirmDeletion($userId, $wrongId, $wrongToken);
+        $this->assertSame($wrong, $answer(fn () => $this->service->confirmDeletion($userId, $wrongId, $wrongToken)), 'reused = wrong');
+
+        // Another user's request: 404 not_found for confirm and cancel.
+        $this->assertSame([404, 'not_found'], array_slice($answer(fn () => $this->service->confirmDeletion($intruder, $expiredId, $expiredToken)), 0, 2));
+        $this->assertSame([404, 'not_found'], array_slice($answer(fn () => $this->service->cancelDeletion($intruder, $expiredId)), 0, 2));
+        $this->assertSame([404, 'not_found'], array_slice($answer(fn () => $this->service->cancelDeletion($userId, 'no-such-id')), 0, 2));
+
+        // Cancelled: confirm (even with the right token) and cancel are 409 deletion_not_pending.
+        [$cancelId, $cancelToken] = $this->requestDeletionAndToken($userId, 'user_requested');
+        $this->service->cancelDeletion($userId, $cancelId);
+        $this->assertSame([409, 'deletion_not_pending'], array_slice($answer(fn () => $this->service->confirmDeletion($userId, $cancelId, $cancelToken)), 0, 2));
+        $this->assertSame([409, 'deletion_not_pending'], array_slice($answer(fn () => $this->service->cancelDeletion($userId, $cancelId)), 0, 2));
+        $this->assertSame('cancelled', $this->db->query("SELECT status FROM deletion_requests WHERE id = '$cancelId'")->fetchColumn());
+
+        // Completed (a statutory reason runs the cascade at confirm): it has no owner any more, so confirm and
+        // cancel are 404 not_found for its former owner and for anyone else.
+        $gone = $this->seedUser();
+        [$doneId, $doneToken] = $this->requestDeletionAndToken($gone, 'gdpr_request');
+        $this->assertSame('completed', $this->service->confirmDeletion($gone, $doneId, $doneToken)['status']);
+        foreach ([$gone, $intruder] as $caller) {
+            $this->assertSame([404, 'not_found'], array_slice($answer(fn () => $this->service->confirmDeletion($caller, $doneId, $doneToken)), 0, 2));
+            $this->assertSame([404, 'not_found'], array_slice($answer(fn () => $this->service->cancelDeletion($caller, $doneId)), 0, 2));
+        }
+        $this->assertSame(1, $this->countFor('users', $userId), 'no refusal deleted anything');
+    }
+
+    /**
+     * EXPORT-13 with the audit system's real signature: AuditEraser::eraseSubject(int|string): array is the
+     * signature of AuditLogger::eraseSubject() in audit_logging_php.php, so the logger is passed in as it is; an
+     * eraser that does not report erased_rows rolls the cascade back (audit_eraser_failed, 500).
+     * Input: a fresh database. Output: assertions only.
+     * Why: Phase B.2 bug "AuditLogger::eraseSubject returns an array while the AuditEraser interface returns
+     * void". 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory SQLite database.
+     */
+    // EXPORT-13
+    public function testAuditEraserReturnsErasedRows(): void
+    {
+        $method = new ReflectionMethod(Compliance\AuditEraser::class, 'eraseSubject');
+        $this->assertSame('array', (string) $method->getReturnType());
+        $param = $method->getParameters()[0]->getType();
+        $this->assertInstanceOf(ReflectionUnionType::class, $param);
+        $names = array_map(static fn (ReflectionNamedType $t): string => $t->getName(), $param->getTypes());
+        sort($names);
+        $this->assertSame(['int', 'string'], $names);
+
+        $userId = $this->seedUser();
+        [$deletionId, $token] = $this->requestDeletionAndToken($userId, 'gdpr_request');
+        $this->eraser->malformed = true;
+        try {
+            $this->service->confirmDeletion($userId, $deletionId, $token);
+            $this->fail('cascade completed although the eraser reported nothing');
+        } catch (ComplianceException $e) {
+            $this->assertSame([500, 'audit_eraser_failed'], [$e->httpStatus, $e->errorCode]);
+        }
+        $this->assertSame(1, $this->countFor('users', $userId), 'rolled back');
+        $this->eraser->malformed = false;
+        $this->assertSame(1, $this->service->processDueDeletions(), 'the confirmed request is retried and completes');
+        $this->assertSame(0, $this->countFor('users', $userId));
     }
 }

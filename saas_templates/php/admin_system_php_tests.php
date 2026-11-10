@@ -71,9 +71,10 @@ final class AdminSystemTest extends TestCase
         $stmt->execute([':email' => 'cust1@example.com', ':name' => 'Customer One', ':tier' => 'solo', ':signup_date' => $now, ':invoice_count' => 5, ':status' => 'active', ':sub' => 'sub_cust1', ':created_at' => $now, ':updated_at' => $now]);
         $stmt->execute([':email' => 'cust2@example.com', ':name' => 'Customer Two', ':tier' => 'team', ':signup_date' => $now, ':invoice_count' => 3, ':status' => 'active', ':sub' => 'sub_cust2', ':created_at' => $now, ':updated_at' => $now]);
 
-        // Seed deployments
+        // Seed deployments. The tier is the plan 'solo' (it was the staff role 'user'; deployments carry a plan
+        // since the Phase B.2 spec, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).
         $stmt = $this->pdo->prepare('INSERT INTO deployments (customer_id, domain, tier, status, theme_id, created_at, updated_at) VALUES (:customer_id, :domain, :tier, :status, :theme_id, :created_at, :updated_at)');
-        $stmt->execute([':customer_id' => 1, ':domain' => 'example.com', ':tier' => 'user', ':status' => 'draft', ':theme_id' => 1, ':created_at' => $now, ':updated_at' => $now]);
+        $stmt->execute([':customer_id' => 1, ':domain' => 'example.com', ':tier' => 'solo', ':status' => 'draft', ':theme_id' => 1, ':created_at' => $now, ':updated_at' => $now]);
 
         // Set current user to owner for tests
         $stmt = $this->pdo->query('SELECT id FROM users WHERE tier = \'owner\'');
@@ -215,9 +216,12 @@ final class AdminSystemTest extends TestCase
         $this->assertTrue($response['success']);
         $this->assertTrue($response['suspended']);
         $this->assertEquals('suspended', $this->pdo->query("SELECT status FROM users WHERE id = $user_id")->fetchColumn());
-        // A suspended user can no longer act as the caller.
-        $this->expectException(RuntimeException::class);
+        // A suspended user can no longer act as the caller. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP
+        // (Phase B.2, ADMIN-19): setCurrentUser threw for a suspended user; the spec now answers every action of a
+        // suspended caller with 403 account_suspended, so the test checks that answer instead of the exception.
         $this->admin->setCurrentUser($user_id);
+        $refused = $this->admin->listCustomers();
+        $this->assertSame(['account_suspended', 403], [$refused['error'] ?? null, $refused['status'] ?? null]);
     }
 
     // ADMIN-09
@@ -326,7 +330,9 @@ final class AdminSystemTest extends TestCase
             'csrf_token' => $this->admin->csrfToken(),
             'customer_id' => 1,
             'domain' => 'newdomain.com',
-            'tier' => 'user',
+            // The plan tier 'team' (it was the staff role 'user'; Phase B.2, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP:
+            // a deployment's tier is the plan, and a staff role there is 400 invalid_tier).
+            'tier' => 'team',
             'theme_id' => 2,
         ]);
         $this->assertTrue($response['success']);
@@ -334,7 +340,8 @@ final class AdminSystemTest extends TestCase
         $this->assertEquals('draft', $this->pdo->query('SELECT status FROM deployments WHERE id = ' . (int)$response['deployment_id'])->fetchColumn());
         // "config initialized"
         $config = $this->pdo->query('SELECT theme_id, tier FROM deployment_configs WHERE deployment_id = ' . (int)$response['deployment_id'])->fetch(PDO::FETCH_ASSOC);
-        $this->assertSame([2, 'user'], [(int)$config['theme_id'], $config['tier']]);
+        $this->assertSame([2, 'team'], [(int)$config['theme_id'], $config['tier']]);
+        $this->assertSame(0, (int)$this->pdo->query('SELECT domain_verified FROM deployments WHERE id = ' . (int)$response['deployment_id'])->fetchColumn(), 'domain_verified starts false');
     }
 
     // ADMIN-15
@@ -345,7 +352,7 @@ final class AdminSystemTest extends TestCase
             'csrf_token' => $this->admin->csrfToken(),
             'customer_id' => 1,
             'domain' => 'publish.com',
-            'tier' => 'user',
+            'tier' => 'enterprise', // a plan (was 'user'; Phase B.2, 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
             'theme_id' => 3,
         ]);
         $stmt = $this->pdo->query('SELECT id FROM deployments WHERE domain = "publish.com"');
@@ -464,5 +471,110 @@ final class AdminSystemTest extends TestCase
 
         $stranger = new AdminSystem($this->pdo);
         $this->assertNotSame($page->csrfToken(), $stranger->csrfToken());
+    }
+
+    /**
+     * ADMIN-19: a suspended owner calling any admin action (every write and every read) gets 403
+     * {error: "account_suspended"} before any gate, even with a wrong CSRF token, and nothing changes.
+     * Input: the seeded database with the owner suspended. Output: assertions only.
+     * Why: the amended spec (Phase B.2). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory SQLite database.
+     */
+    // ADMIN-19
+    public function testSuspendedOwnerIsRefusedEverywhere(): void
+    {
+        $now = (new DateTime('now', new DateTimeZone('UTC')))->format('Y-m-d H:i:s');
+        $this->pdo->prepare('INSERT INTO governance_actions (action_type, actor_id, target_resource_id, reason, submitted_at) VALUES (?, ?, ?, ?, ?)')
+            ->execute(['suspend_user', 1, 3, 'x', $now]);
+        $this->pdo->exec("UPDATE deployments SET domain_verified = 1 WHERE id = 1");
+        // A second active owner exists, so the suspended one is not the last owner.
+        $this->pdo->exec("INSERT INTO users (email, name, tier, status, created_at, updated_at) VALUES ('owner2@example.com', 'Owner Two', 'owner', 'active', '$now', '$now')");
+        $owner = $this->admin->getCurrentUserId();
+        $this->pdo->exec("UPDATE users SET status = 'suspended' WHERE id = $owner");
+        $this->admin->setCurrentUser($owner);
+        $snapshot = function (): string {
+            $rows = [];
+            foreach (['users', 'customers', 'deployments', 'deployment_configs', 'password_resets', 'refunds', 'governance_actions', 'audit_logs'] as $table) {
+                $rows[$table] = $this->pdo->query("SELECT * FROM $table ORDER BY rowid")->fetchAll(PDO::FETCH_ASSOC);
+            }
+            return json_encode($rows);
+        };
+        $before = $snapshot();
+        $t = $this->admin->csrfToken();
+        $calls = [
+            'createUser' => fn() => $this->admin->createUser(['csrf_token' => $t, 'email' => 'x@example.com', 'name' => 'X', 'tier' => 'user', 'notify' => true]),
+            'createUser (bad csrf)' => fn() => $this->admin->createUser(['csrf_token' => 'wrong', 'email' => 'y@example.com', 'name' => 'Y', 'tier' => 'user']),
+            'resetPassword' => fn() => $this->admin->resetPassword(['csrf_token' => $t, 'user_id' => 3]),
+            'changeRole' => fn() => $this->admin->changeRole(['csrf_token' => $t, 'user_id' => 3, 'new_tier' => 'admin']),
+            'suspendUser' => fn() => $this->admin->suspendUser(['csrf_token' => $t, 'user_id' => 3, 'reason' => 'x']),
+            'listCustomers' => fn() => $this->admin->listCustomers(),
+            'getCustomer' => fn() => $this->admin->getCustomer(1),
+            'changePlan' => fn() => $this->admin->changePlan(['csrf_token' => $t, 'customer_id' => 1, 'new_tier' => 'team']),
+            'queueRefund' => fn() => $this->admin->queueRefund(['csrf_token' => $t, 'invoice_id' => 9, 'amount' => 5, 'reason' => 'x']),
+            'listDeployments' => fn() => $this->admin->listDeployments(),
+            'createDeployment' => fn() => $this->admin->createDeployment(['csrf_token' => $t, 'customer_id' => 1, 'domain' => 'z.com', 'tier' => 'solo', 'theme_id' => 1]),
+            'publishDeployment' => fn() => $this->admin->publishDeployment(['csrf_token' => $t, 'deployment_id' => 1]),
+            'suspendDeployment' => fn() => $this->admin->suspendDeployment(['csrf_token' => $t, 'deployment_id' => 1, 'reason' => 'x']),
+            'retireDeployment' => fn() => $this->admin->retireDeployment(['csrf_token' => $t, 'deployment_id' => 1]),
+            'listGovernanceActions' => fn() => $this->admin->listGovernanceActions(),
+            'decideGovernanceAction' => fn() => $this->admin->decideGovernanceAction(1, 'approve', ['csrf_token' => $t]),
+            'searchAuditLog' => fn() => $this->admin->searchAuditLog([]),
+        ];
+        foreach ($calls as $name => $call) {
+            $r = $call();
+            $this->assertSame(['account_suspended', 403], [$r['error'] ?? null, $r['status'] ?? null], $name);
+        }
+        $this->assertSame($before, $snapshot(), 'nothing changed');
+        $this->assertSame([], $this->mail, 'no e-mail sent');
+        $this->assertSame([], $this->stripe->calls, 'Stripe not called');
+    }
+
+    /**
+     * Phase B.2: users.tier is the staff role and a customer's or deployment's tier is the plan, never mixed (400
+     * invalid_tier both ways), and every admin error carries its HTTP status (403 owner_only, 409 email_exists,
+     * 400 cannot_* and invalid_tier, 404 not found, 409 conflicts, 403 publish_not_allowed and CSRF).
+     * Input: the seeded database. Output: assertions only. Why: the amended spec (TIERS) and the bug "admin errors
+     * are {error} arrays without an HTTP status". 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+     * Touches: the in-memory SQLite database; fake Stripe and mail.
+     */
+    // ADMIN-02
+    // ADMIN-03
+    // ADMIN-05
+    // ADMIN-07
+    // ADMIN-09
+    // ADMIN-14
+    public function testTiersAreNeverMixedAndErrorsCarryStatus(): void
+    {
+        $t = $this->admin->csrfToken();
+        $pair = static fn(array $r): array => [$r['error'] ?? null, $r['status'] ?? null];
+        $owner = $this->admin->getCurrentUserId();
+        // Roles where a role belongs, plans where a plan belongs.
+        $this->assertSame(['invalid_tier', 400], $pair($this->admin->createUser(['csrf_token' => $t, 'email' => 'p@example.com', 'name' => 'P', 'tier' => 'team'])));
+        $this->assertSame(['invalid_tier', 400], $pair($this->admin->changeRole(['csrf_token' => $t, 'user_id' => 3, 'new_tier' => 'enterprise'])));
+        $this->assertSame(['invalid_tier', 400], $pair($this->admin->createDeployment(['csrf_token' => $t, 'customer_id' => 1, 'domain' => 'r.com', 'tier' => 'owner', 'theme_id' => 1])));
+        $this->assertSame(['invalid_tier', 400], $pair($this->admin->changePlan(['csrf_token' => $t, 'customer_id' => 1, 'new_tier' => 'user'])));
+        $this->assertSame(0, (int)$this->pdo->query("SELECT COUNT(*) FROM deployments WHERE domain = 'r.com'")->fetchColumn());
+        $this->assertSame('user', $this->pdo->query('SELECT tier FROM users WHERE id = 3')->fetchColumn());
+        foreach (['solo', 'team', 'enterprise'] as $i => $plan) {
+            $this->assertTrue($this->admin->createDeployment(['csrf_token' => $t, 'customer_id' => 1, 'domain' => "plan$i.com", 'tier' => $plan, 'theme_id' => 1])['success'] ?? false, $plan);
+        }
+        // Statuses.
+        $this->assertSame(['email_exists', 409], $pair($this->admin->createUser(['csrf_token' => $t, 'email' => 'user@example.com', 'name' => 'D', 'tier' => 'user'])));
+        $this->assertSame(['Invalid CSRF token', 403], $pair($this->admin->createUser(['csrf_token' => 'nope', 'email' => 'q@example.com', 'name' => 'Q', 'tier' => 'user'])));
+        $this->assertSame(['cannot_reset_own_password', 400], $pair($this->admin->resetPassword(['csrf_token' => $t, 'user_id' => $owner])));
+        $this->assertSame(['cannot_demote_last_owner', 400], $pair($this->admin->changeRole(['csrf_token' => $t, 'user_id' => $owner, 'new_tier' => 'admin'])));
+        $this->assertSame(['cannot_suspend_yourself', 400], $pair($this->admin->suspendUser(['csrf_token' => $t, 'user_id' => $owner, 'reason' => 'x'])));
+        $this->assertSame(['user_not_found', 404], $pair($this->admin->resetPassword(['csrf_token' => $t, 'user_id' => 999])));
+        $this->assertSame(['customer_not_found', 404], $pair($this->admin->getCustomer(999)));
+        $this->assertSame(['domain_already_registered', 409], $pair($this->admin->createDeployment(['csrf_token' => $t, 'customer_id' => 1, 'domain' => 'example.com', 'tier' => 'solo', 'theme_id' => 1])));
+        $this->canPublish = false;
+        $this->assertSame(['publish_not_allowed', 403], $pair($this->admin->publishDeployment(['csrf_token' => $t, 'deployment_id' => 1])));
+        $this->canPublish = true;
+        $this->assertSame(['domain_not_verified', 409], $pair($this->admin->publishDeployment(['csrf_token' => $t, 'deployment_id' => 1])));
+        $this->assertSame(['deployment_not_found', 404], $pair($this->admin->retireDeployment(['csrf_token' => $t, 'deployment_id' => 999])));
+        $this->assertSame(['action_not_found', 404], $pair($this->admin->decideGovernanceAction(999, 'approve', ['csrf_token' => $t])));
+        $this->admin->setCurrentUser((int)$this->pdo->query("SELECT id FROM users WHERE tier = 'admin'")->fetchColumn());
+        $this->assertSame(['owner_only', 403], $pair($this->admin->createUser(['csrf_token' => $t, 'email' => 'a@example.com', 'name' => 'A', 'tier' => 'user'])));
+        $this->admin->setCurrentUser(3);
+        $this->assertSame(['admin_or_owner', 403], $pair($this->admin->listCustomers()));
     }
 }

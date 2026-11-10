@@ -163,13 +163,19 @@ async fn feature_gate_pass() {
 }
 
 /// What: the refusal and its HTTP status (403). Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the status assertion was added.
-/// Touches: in-memory SQLite.
+/// Changed 2026-11-10 (Phase B.2): the response body is checked too: 403 {error: "feature_not_available_in_tier",
+/// tier, minimum_tier, upgrade_url}. Touches: in-memory SQLite.
 // QUOTA-10
 #[tokio::test]
 async fn feature_gate_fail() {
     let user = User { id: 8, tier: Tier::Solo };
     let err = check_feature_gate(&user, "feature_a").await.unwrap_err();
     assert_eq!(err.http_status(), 403); // spec status (assertion added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+    // Phase B.2 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): the body uses the spec's one error name
+    let body: serde_json::Value = serde_json::from_str(&err.to_string()).unwrap();
+    assert_eq!(body["error"], "feature_not_available_in_tier");
+    assert_eq!((body["tier"].as_str(), body["minimum_tier"].as_str()), (Some("solo"), Some("team")));
+    assert!(body["upgrade_url"].as_str().map_or(false, |u| !u.is_empty()));
     match err {
         QuotaError::FeatureNotAvailable { tier, minimum_tier, .. } => {
             assert_eq!(tier, Tier::Solo);

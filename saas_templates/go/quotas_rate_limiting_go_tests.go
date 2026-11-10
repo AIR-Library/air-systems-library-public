@@ -233,6 +233,11 @@ func TestFeatureGatePASS(t *testing.T) {
 }
 
 // QUOTA-10
+// TestFeatureGateFAIL proves a tier below a feature's minimum gets 403 with the spec's body: error
+// "feature_not_available_in_tier", tier, minimum_tier and upgrade_url. Input: none; output: test failures.
+// Corrected 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): the quotas spec now names the refusal
+// "feature_not_available_in_tier" in every language, so the expected code changed from "feature_not_available";
+// the tier field is now asserted too. Touches an in-memory SQLite database only.
 func TestFeatureGateFAIL(t *testing.T) {
 	l := newTestLimiter(t)
 	ctx := context.Background()
@@ -255,8 +260,11 @@ func TestFeatureGateFAIL(t *testing.T) {
 		if ok {
 			t.Fatalf("tier=%s feature=%s: expected FAIL, got PASS", tc.tier, tc.feature)
 		}
-		if qerr == nil || qerr.Code != "feature_not_available" || qerr.Status != 403 {
-			t.Fatalf("expected feature_not_available error, got %v", qerr)
+		if qerr == nil || qerr.Code != "feature_not_available_in_tier" || qerr.Status != 403 {
+			t.Fatalf("expected 403 feature_not_available_in_tier, got %v", qerr)
+		}
+		if qerr.Details["tier"] != string(tc.tier) {
+			t.Fatalf("expected tier=%s, got %v", tc.tier, qerr.Details["tier"])
 		}
 		if qerr.Details["minimum_tier"] != tc.minTier {
 			t.Fatalf("expected minimum_tier=%s, got %v", tc.minTier, qerr.Details["minimum_tier"])

@@ -336,7 +336,8 @@ impl AuditLogger {
     /// subject_user_id is subject_mismatch, for any other resource_type subject_user_id (a user id or
     /// "none") is required (subject_required); a 'user' actor needs actor_id (actor_required), an
     /// 'api_key' actor needs actor_user_id (actor_user_required), a 'service' actor needs actor_service
-    /// or actor_id (actor_service_required). Then, in ONE transaction: the subjects are found or created,
+    /// (actor_service_required; changed 2026-11-10, Phase B.2: actor_id no longer stands in for it, as the
+    /// spec's refusal list now says). Then, in ONE transaction: the subjects are found or created,
     /// the event row is inserted (resource_id, old/new values and why_chain_id only when the subject is
     /// "none"), and its 'actor' row ({actor_id, ip, user_agent, request_id}) and 'subject' row
     /// ({resource_id, old_value, new_value, why_chain_id}) go to audit_personal.
@@ -373,7 +374,7 @@ impl AuditLogger {
         let (actor_person, actor_service): (Option<String>, Option<String>) = match req.actor_type.as_str() {
             "user" => (Some(nonempty(&req.actor_id).ok_or(AuditError::BadRequest("actor_required"))?), None),
             "api_key" => (Some(nonempty(&req.actor_user_id).ok_or(AuditError::BadRequest("actor_user_required"))?), None),
-            _ => (None, Some(nonempty(&req.actor_service).or_else(|| nonempty(&req.actor_id)).ok_or(AuditError::BadRequest("actor_service_required"))?)),
+            _ => (None, Some(nonempty(&req.actor_service).ok_or(AuditError::BadRequest("actor_service_required"))?)),
         };
         let mut roles = Vec::new();
         if actor_person.is_some() {

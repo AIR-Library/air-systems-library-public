@@ -4,17 +4,75 @@ import tempfile
 import os
 import json
 from datetime import datetime, timedelta, timezone
+import hashlib
+import hmac
 import pyotp
 from auth_system_python import AuthSystem
 
+# [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2 (AUTH-16, "Secrets at rest"): the database keeps only
+# SHA-256 hashes of verification codes and refresh tokens, so the tests take each code from the (fake) email
+# sender and each refresh token from the flow's response, never from a table; rows a test inserts by hand store
+# code_hash; OAuth tests get their state from oauth_start() and pass a fake provider client.
+
+
+# Fixed 32+ byte HMAC key the tests pass to the module (spec d270fa3: tests pass a fixed test key).
+# 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+TEST_SECRET_KEY = 'test-secret-key-0123456789abcdef-auth'
+
+
+def _sha(value):
+    """HMAC-SHA256(TEST_SECRET_KEY, value) as lowercase hex: the value the module stores for a secret. In: the
+    secret. Out: 64 hex chars. Why: spec d270fa3: keyed HMAC for stored secrets; this helper computed a plain
+    SHA-256 until 2026-11-10 (changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP). Touches nothing."""
+    return hmac.new(TEST_SECRET_KEY.encode('utf-8'), value.encode('utf-8'), hashlib.sha256).hexdigest()
+
+
+def _plain_sha256(value):
+    """Plain, unkeyed SHA-256 hex of a secret, which the module must no longer store. In: the secret. Out: 64 hex
+    chars. Why: spec d270fa3: keyed HMAC for stored secrets (AUTH-16 asserts the stored value is not this).
+    2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing."""
+    return hashlib.sha256(value.encode('utf-8')).hexdigest()
+
+
 @pytest.fixture
 def auth_system():
+    """An AuthSystem on an in-memory database whose email sender records (email, code) in auth.sent_codes.
+    Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2: codes are no longer readable from the
+    database). Updated 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec d270fa3: keyed HMAC for stored secrets):
+    passes the fixed TEST_SECRET_KEY. Touches: in-memory SQLite only."""
     # Create an in-memory database
     db_connection = sqlite3.connect(':memory:')
     db_connection.row_factory = sqlite3.Row
-    auth = AuthSystem(db_connection, jwt_secret='test_secret', bcrypt_rounds=4)
+    auth = AuthSystem(db_connection, jwt_secret='test_secret', bcrypt_rounds=4, secret_key=TEST_SECRET_KEY)
+    auth.sent_codes = []
+    auth.email_sender = lambda email, code: auth.sent_codes.append((email, code))
     yield auth
     db_connection.close()
+
+
+def _sent_code(auth_system, email):
+    """The newest verification code the fake sender delivered to email. 2026-11-10,
+    session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2). Touches nothing."""
+    return [code for to, code in auth_system.sent_codes if to == email][-1]
+
+
+class FakeOAuthClient:
+    """A fake provider client: exchange(provider, code) returns the profile registered for that one-time code and
+    raises for any other code, like a provider's token endpoint. Records every exchange. 2026-11-10,
+    session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, auth "Secrets at rest"). Touches nothing; no network."""
+
+    def __init__(self, profiles):
+        """profiles: {code: profile dict}. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP."""
+        self.profiles = dict(profiles)
+        self.exchanged = []
+
+    def __call__(self, provider, code):
+        """Exchange code (once) for its profile, or raise ValueError("invalid_grant"). 2026-11-10,
+        session_012zDydZCZ4AChqhEZ4oVtaP."""
+        self.exchanged.append((provider, code))
+        if code not in self.profiles:
+            raise ValueError("invalid_grant")
+        return self.profiles.pop(code)
 
 # AUTH-01
 def test_signup_happy_path(auth_system):
@@ -37,8 +95,10 @@ def test_signup_happy_path(auth_system):
     # Check verification code exists
     cursor.execute("SELECT COUNT(*) FROM verification_codes WHERE user_id = ?", (user['id'],))
     assert cursor.fetchone()[0] == 1
-    cursor.execute("SELECT code FROM verification_codes WHERE user_id = ?", (user['id'],))
-    assert sent == [('test@example.com', cursor.fetchone()['code'])]
+    # [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2 (AUTH-16): the table keeps the code's SHA-256 only.
+    cursor.execute("SELECT code_hash FROM verification_codes WHERE user_id = ?", (user['id'],))
+    assert len(sent) == 1 and sent[0][0] == 'test@example.com'
+    assert cursor.fetchone()['code_hash'] == _sha(sent[0][1])
 
 # AUTH-02
 def test_signup_duplicate_email(auth_system):
@@ -101,9 +161,8 @@ def test_verify_email_happy_path(auth_system):
     cursor.execute("SELECT id FROM users WHERE email = 'test@example.com'")
     user = cursor.fetchone()
     user_id = user['id']
-    # Get the verification code
-    cursor.execute("SELECT code FROM verification_codes WHERE user_id = ? AND type = 'email'", (user_id,))
-    code = cursor.fetchone()['code']
+    # Get the verification code (from the email; the table keeps only its hash)
+    code = _sent_code(auth_system, 'test@example.com')
     # Verify
     result = auth_system.verify_email('test@example.com', code)
     assert result['status'] == 'verified'
@@ -126,8 +185,8 @@ def test_verify_email_expired_code(auth_system):
     # Manually insert an expired code
     expired_time = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
     cursor.execute(
-        "INSERT INTO verification_codes (user_id, code, created_at, expires_at, type) VALUES (?, ?, ?, ?, ?)",
-        (user_id, 'expired', expired_time, expired_time, 'email')
+        "INSERT INTO verification_codes (user_id, code_hash, created_at, expires_at, type) VALUES (?, ?, ?, ?, ?)",
+        (user_id, _sha('expired'), expired_time, expired_time, 'email')
     )
     auth_system.db.commit()
     result = auth_system.verify_email('test@example.com', 'expired')
@@ -141,8 +200,7 @@ def test_login_happy_path_no_mfa(auth_system):
     cursor.execute("SELECT id FROM users WHERE email = 'test@example.com'")
     user_id = cursor.fetchone()['id']
     # Verify email
-    cursor.execute("SELECT code FROM verification_codes WHERE user_id = ? AND type = 'email'", (user_id,))
-    code = cursor.fetchone()['code']
+    code = _sent_code(auth_system, 'test@example.com')
     auth_system.verify_email('test@example.com', code)
     # Login
     result = auth_system.login('test@example.com', 'a' * 16, 'device123', '192.168.1.1')
@@ -162,8 +220,7 @@ def test_login_with_mfa_enabled(auth_system):
     cursor.execute("SELECT id FROM users WHERE email = 'test@example.com'")
     user_id = cursor.fetchone()['id']
     # Verify email to make user verified
-    cursor.execute("SELECT code FROM verification_codes WHERE user_id = ? AND type = 'email'", (user_id,))
-    code = cursor.fetchone()['code']
+    code = _sent_code(auth_system, 'test@example.com')
     auth_system.verify_email('test@example.com', code)
     # Enable MFA manually
     mfa_secret = pyotp.random_base32()
@@ -191,8 +248,7 @@ def test_login_invalid_password(auth_system):
     cursor = auth_system.db.cursor()
     cursor.execute("SELECT id FROM users WHERE email = 'test@example.com'")
     user_id = cursor.fetchone()['id']
-    cursor.execute("SELECT code FROM verification_codes WHERE user_id = ? AND type = 'email'", (user_id,))
-    code = cursor.fetchone()['code']
+    code = _sent_code(auth_system, 'test@example.com')
     auth_system.verify_email('test@example.com', code)
     result = auth_system.login('test@example.com', 'wrongpassword', 'device123', '192.168.1.1')
     assert result['error'] == 'invalid_credentials'
@@ -206,8 +262,7 @@ def test_login_rate_limit(auth_system):
     cursor = auth_system.db.cursor()
     cursor.execute("SELECT id FROM users WHERE email = 'test@example.com'")
     user_id = cursor.fetchone()['id']
-    cursor.execute("SELECT code FROM verification_codes WHERE user_id = ? AND type = 'email'", (user_id,))
-    code = cursor.fetchone()['code']
+    code = _sent_code(auth_system, 'test@example.com')
     auth_system.verify_email('test@example.com', code)
     ip = '192.168.1.50'
     # 5 failed attempts
@@ -220,7 +275,14 @@ def test_login_rate_limit(auth_system):
 
 # AUTH-10
 def test_oauth_callback_new_user(auth_system):
-    result = auth_system.oauth_callback('google', 'auth_code', 'state')
+    """A first OAuth sign-in creates a verified user, links the provider account and opens a session.
+    Corrected 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, auth "Secrets at rest"): the state now comes
+    from oauth_start() and the profile from a fake provider client (the module's default client invented a user
+    for any code and is now a refusal). Touches: in-memory SQLite only."""
+    auth_system.oauth_profile = FakeOAuthClient(
+        {'auth_code': {'id': 'g-1', 'email': 'newuser@google.com', 'email_verified': True}})
+    state = auth_system.oauth_start('google')['state']
+    result = auth_system.oauth_callback('google', 'auth_code', state)
     assert result['status'] == 'authenticated'
     assert result['user']['tier'] == 'free'
     assert result['user']['email'].endswith('@google.com')
@@ -240,9 +302,16 @@ def test_oauth_callback_new_user(auth_system):
     assert cursor.fetchone()[0] == 1
 
 def test_oauth_callback_ignores_email_in_state(auth_system):
-    """state passes through the visitor's browser, so an e-mail placed there must never choose the account."""
+    """state passes through the visitor's browser, so an e-mail placed there must never choose the account.
+    Corrected 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2): a state the server never issued is now
+    refused outright (invalid_state, no user made); an issued state still signs in only the provider's account."""
+    auth_system.oauth_profile = FakeOAuthClient(
+        {'auth_code': {'id': 'gh-1', 'email': 'attacker@example.com', 'email_verified': True}})
     state = json.dumps({'email': 'victim@example.com'})
-    result = auth_system.oauth_callback('github', 'auth_code', state)
+    assert auth_system.oauth_callback('github', 'auth_code', state) == {'error': 'invalid_state'}
+    issued = auth_system.oauth_start('github')['state']
+    result = auth_system.oauth_callback('github', 'auth_code', issued)
+    assert result['user']['email'] == 'attacker@example.com'
     assert result['user']['email'] != 'victim@example.com'
 
 
@@ -253,12 +322,12 @@ def test_oauth_callback_existing_user(auth_system):
     cursor = auth_system.db.cursor()
     cursor.execute("SELECT id FROM users WHERE email = 'existing@example.com'")
     user_id = cursor.fetchone()['id']
-    cursor.execute("SELECT code FROM verification_codes WHERE user_id = ? AND type = 'email'", (user_id,))
-    code = cursor.fetchone()['code']
+    code = _sent_code(auth_system, 'existing@example.com')
     auth_system.verify_email('existing@example.com', code)
     # Now OAuth with the same e-mail, as the provider reports it
     auth_system.oauth_profile = lambda provider, code: {'id': 'gh-42', 'email': 'existing@example.com', 'email_verified': True}
-    result = auth_system.oauth_callback('github', 'auth_code', 'state')
+    # [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2: the state must be one oauth_start() issued.
+    result = auth_system.oauth_callback('github', 'auth_code', auth_system.oauth_start('github')['state'])
     assert result['status'] == 'authenticated'
     assert result['user']['id'] == user_id
     assert result['user']['email'] == 'existing@example.com'
@@ -277,8 +346,7 @@ def test_mfa_challenge_happy_path(auth_system):
     cursor = auth_system.db.cursor()
     cursor.execute("SELECT id FROM users WHERE email = 'test@example.com'")
     user_id = cursor.fetchone()['id']
-    cursor.execute("SELECT code FROM verification_codes WHERE user_id = ? AND type = 'email'", (user_id,))
-    code = cursor.fetchone()['code']
+    code = _sent_code(auth_system, 'test@example.com')
     auth_system.verify_email('test@example.com', code)
     # Enable MFA
     mfa_secret = pyotp.random_base32()
@@ -291,9 +359,9 @@ def test_mfa_challenge_happy_path(auth_system):
     totp = pyotp.TOTP(mfa_secret)
     current_code = totp.now()
     cursor.execute(
-        """INSERT INTO verification_codes (user_id, code, created_at, expires_at, type)
+        """INSERT INTO verification_codes (user_id, code_hash, created_at, expires_at, type)
            VALUES (?, ?, ?, ?, ?)""",
-        (user_id, current_code, datetime.now(timezone.utc).isoformat(),
+        (user_id, _sha(current_code), datetime.now(timezone.utc).isoformat(),
          (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(), 'mfa')
     )
     challenge_id = cursor.lastrowid
@@ -314,8 +382,7 @@ def test_mfa_challenge_wrong_code(auth_system):
     cursor = auth_system.db.cursor()
     cursor.execute("SELECT id FROM users WHERE email = 'test@example.com'")
     user_id = cursor.fetchone()['id']
-    cursor.execute("SELECT code FROM verification_codes WHERE user_id = ? AND type = 'email'", (user_id,))
-    code = cursor.fetchone()['code']
+    code = _sent_code(auth_system, 'test@example.com')
     auth_system.verify_email('test@example.com', code)
     mfa_secret = pyotp.random_base32()
     cursor.execute(
@@ -326,9 +393,9 @@ def test_mfa_challenge_wrong_code(auth_system):
     totp = pyotp.TOTP(mfa_secret)
     current_code = totp.now()
     cursor.execute(
-        """INSERT INTO verification_codes (user_id, code, created_at, expires_at, type)
+        """INSERT INTO verification_codes (user_id, code_hash, created_at, expires_at, type)
            VALUES (?, ?, ?, ?, ?)""",
-        (user_id, current_code, datetime.now(timezone.utc).isoformat(),
+        (user_id, _sha(current_code), datetime.now(timezone.utc).isoformat(),
          (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(), 'mfa')
     )
     challenge_id = cursor.lastrowid
@@ -340,17 +407,18 @@ def test_mfa_challenge_wrong_code(auth_system):
 def _login_and_get_refresh_token(auth_system):
     """Sign up, verify and log in test@example.com; return (user_id, the session's refresh token).
 
-    In: the auth_system fixture. Out: (user_id, refresh_token) read from the sessions table (login does not
-    return it). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the fixture's in-memory SQLite database."""
+    In: the auth_system fixture. Out: (user_id, refresh_token). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (Phase B.2, AUTH-16): the refresh token now comes from
+    login's response (it was read from the sessions table, which keeps only its hash now).
+    Touches: the fixture's in-memory SQLite database."""
     auth_system.signup('test@example.com', 'a' * 16, 'Test User', '127.0.0.1')
     cursor = auth_system.db.cursor()
     cursor.execute("SELECT id FROM users WHERE email = 'test@example.com'")
     user_id = cursor.fetchone()['id']
-    cursor.execute("SELECT code FROM verification_codes WHERE user_id = ? AND type = 'email'", (user_id,))
-    auth_system.verify_email('test@example.com', cursor.fetchone()['code'])
-    assert auth_system.login('test@example.com', 'a' * 16, 'device123', '192.168.1.1')['status'] == 'authenticated'
-    cursor.execute("SELECT refresh_token FROM sessions WHERE user_id = ?", (user_id,))
-    return user_id, cursor.fetchone()['refresh_token']
+    auth_system.verify_email('test@example.com', _sent_code(auth_system, 'test@example.com'))
+    login = auth_system.login('test@example.com', 'a' * 16, 'device123', '192.168.1.1')
+    assert login['status'] == 'authenticated'
+    return user_id, login['refresh_token']
 
 
 # AUTH-14
@@ -385,15 +453,18 @@ def test_token_refresh_banned_user(auth_system):
 def test_oauth_callback_refuses_an_unverified_email(auth_system):
     """The provider must vouch for the address before it can sign anyone in. 2026-11-08, from review."""
     auth_system.oauth_profile = lambda provider, code: {'id': 'gh-7', 'email': 'someone@example.com', 'email_verified': False}
-    assert auth_system.oauth_callback('github', 'auth_code', 'state') == {'error': 'email_not_verified'}
+    # [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2: the state must be one oauth_start() issued.
+    state = auth_system.oauth_start('github')['state']
+    assert auth_system.oauth_callback('github', 'auth_code', state) == {'error': 'email_not_verified'}
 
 
 def test_oauth_callback_finds_a_returning_user_by_provider_id(auth_system):
     """A user whose e-mail changed at the provider still reaches the same account. 2026-11-08, from review."""
     auth_system.oauth_profile = lambda provider, code: {'id': 'gh-9', 'email': 'old@example.com', 'email_verified': True}
-    first = auth_system.oauth_callback('github', 'code-1', 'state')
+    # [2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP] Phase B.2: each callback needs its own issued state.
+    first = auth_system.oauth_callback('github', 'code-1', auth_system.oauth_start('github')['state'])
     auth_system.oauth_profile = lambda provider, code: {'id': 'gh-9', 'email': 'new@example.com', 'email_verified': True}
-    second = auth_system.oauth_callback('github', 'code-2', 'state')
+    second = auth_system.oauth_callback('github', 'code-2', auth_system.oauth_start('github')['state'])
     assert second['user']['id'] == first['user']['id']
 
 
@@ -403,7 +474,132 @@ def test_mfa_challenge_treats_non_ascii_input_as_a_wrong_code(auth_system):
     cursor.execute("INSERT INTO users (email, password_hash, tier, status, created_at, updated_at) VALUES "
                    "('mfa@example.com', NULL, 'free', 'verified', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')")
     user_id = cursor.lastrowid
-    cursor.execute("INSERT INTO verification_codes (user_id, code, created_at, expires_at, type) VALUES (?, '123456', ?, ?, 'mfa')",
-                   (user_id, '2026-01-01T00:00:00+00:00', '2999-01-01T00:00:00+00:00'))
+    cursor.execute("INSERT INTO verification_codes (user_id, code_hash, created_at, expires_at, type) VALUES (?, ?, ?, ?, 'mfa')",
+                   (user_id, _sha('123456'), '2026-01-01T00:00:00+00:00', '2999-01-01T00:00:00+00:00'))
     auth_system.db.commit()
     assert auth_system.mfa_challenge(cursor.lastrowid, '１２３４５６') == {'error': 'invalid_code'}
+
+
+# AUTH-16
+def test_every_session_flow_returns_a_refresh_token_stored_only_as_its_hash(auth_system):
+    """login, mfa_challenge and oauth_callback each return a refresh_token that token_refresh accepts; the
+    sessions table has refresh_token_hash (no refresh_token column) holding each token's SHA-256, and no table
+    holds a refresh token or the emailed verification code in plain text (verification_codes keeps code_hash).
+    In: the fixture, a fake OAuth client. Out: assertions. Why: AUTH-16 and the Phase B.2 python bug (login
+    returned no refresh token). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: in-memory SQLite only.
+    Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec d270fa3: keyed HMAC for stored secrets): every
+    stored value must equal HMAC-SHA256(TEST_SECRET_KEY, value) and must not equal its plain SHA-256."""
+    auth_system.signup('sixteen@example.com', 'a' * 16, 'Sixteen', '127.0.0.1')
+    code = _sent_code(auth_system, 'sixteen@example.com')
+    cursor = auth_system.db.cursor()
+    columns = {row[1] for row in cursor.execute("PRAGMA table_info(verification_codes)")}
+    assert 'code_hash' in columns and 'code' not in columns
+    stored = cursor.execute("SELECT code_hash FROM verification_codes WHERE type = 'email'").fetchone()['code_hash']
+    assert stored == _sha(code)
+    # spec d270fa3 (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP): keyed HMAC, not a plain SHA-256.
+    assert stored != _plain_sha256(code)
+    assert code not in _all_rows_text(auth_system)
+    auth_system.verify_email('sixteen@example.com', code)
+
+    tokens = []
+    login = auth_system.login('sixteen@example.com', 'a' * 16, 'device16', '192.0.2.16')
+    tokens.append(login['refresh_token'])
+
+    mfa_secret = pyotp.random_base32()
+    cursor.execute("UPDATE users SET mfa_secret = ?, mfa_enabled = 1 WHERE email = 'sixteen@example.com'", (mfa_secret,))
+    auth_system.db.commit()
+    challenge = auth_system.login('sixteen@example.com', 'a' * 16, 'device16', '192.0.2.16')
+    mfa_code = pyotp.TOTP(mfa_secret).now()
+    challenge_hash = cursor.execute("SELECT code_hash FROM verification_codes WHERE id = ?",
+                                    (challenge['challenge_id'],)).fetchone()['code_hash']
+    assert challenge_hash == _sha(mfa_code) and challenge_hash != _plain_sha256(mfa_code)  # spec d270fa3
+    tokens.append(auth_system.mfa_challenge(challenge['challenge_id'], mfa_code)['refresh_token'])
+
+    auth_system.oauth_profile = FakeOAuthClient({'c16': {'id': 'g-16', 'email': 'o16@example.com', 'email_verified': True}})
+    tokens.append(auth_system.oauth_callback('google', 'c16', auth_system.oauth_start('google')['state'])['refresh_token'])
+
+    columns = {row[1] for row in cursor.execute("PRAGMA table_info(sessions)")}
+    assert 'refresh_token_hash' in columns and 'refresh_token' not in columns
+    hashes = {row['refresh_token_hash'] for row in cursor.execute("SELECT refresh_token_hash FROM sessions")}
+    assert hashes == {_sha(t) for t in tokens}
+    assert hashes.isdisjoint({_plain_sha256(t) for t in tokens})  # spec d270fa3, 2026-11-10
+    text = _all_rows_text(auth_system)
+    for token in tokens:
+        assert isinstance(token, str) and len(token) >= 43
+        assert token not in text
+        result = auth_system.token_refresh(token)
+        assert result['status'] == 'ok' and auth_system.verify_access_token(result['token'])['status'] == 'ok'
+    # The stored hash is not itself a usable token.
+    assert auth_system.token_refresh(_sha(tokens[0])) == {'error': 'invalid_token'}
+
+
+def _all_rows_text(auth_system):
+    """Every value in every table, as one string. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-16).
+    Touches: the fixture's database (read)."""
+    cursor = auth_system.db.cursor()
+    tables = [r[0] for r in cursor.execute("SELECT name FROM sqlite_master WHERE type = 'table'")]
+    return "\n".join(str(tuple(row)) for t in tables for row in cursor.execute(f"SELECT * FROM {t}"))
+
+
+# AUTH-16
+def test_oauth_state_single_use_expires_in_10_minutes_and_code_is_exchanged(auth_system):
+    """OAuth state works once, only for the provider it was issued for, and not after 10 minutes; a state never
+    issued is refused; the callback exchanges the code through the provider client, and a code the provider
+    rejects is refused with no user made (the code is never an identity). Only the state's SHA-256 is stored.
+    In: the fixture with an injected clock, a fake OAuth client. Out: assertions. Why: the auth spec's "Secrets
+    at rest" line (Phase B.2, 2026-11-10). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    Touches: in-memory SQLite only."""
+    now = [datetime(2026, 11, 10, 12, 0, tzinfo=timezone.utc)]
+    auth_system.clock = lambda: now[0]
+    client = FakeOAuthClient({'good': {'id': 'g-77', 'email': 'g77@example.com', 'email_verified': True}})
+    auth_system.oauth_profile = client
+
+    issued = auth_system.oauth_start('google')
+    assert issued['expires_in'] == 600
+    cursor = auth_system.db.cursor()
+    assert [r['state_hash'] for r in cursor.execute("SELECT state_hash FROM oauth_states")] == [_sha(issued['state'])]
+    assert _sha(issued['state']) != _plain_sha256(issued['state'])  # spec d270fa3, 2026-11-10: keyed, not plain
+
+    assert auth_system.oauth_callback('google', 'good', 'never-issued') == {'error': 'invalid_state'}
+    assert auth_system.oauth_callback('github', 'good', issued['state']) == {'error': 'invalid_state'}  # spent too
+    assert client.exchanged == []
+
+    state = auth_system.oauth_start('google')['state']
+    assert auth_system.oauth_callback('google', 'forged-code', state) == {'error': 'oauth_exchange_failed'}
+    assert client.exchanged == [('google', 'forged-code')]
+    assert cursor.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
+
+    state = auth_system.oauth_start('google')['state']
+    first = auth_system.oauth_callback('google', 'good', state)
+    assert first['status'] == 'authenticated' and first['user']['email'] == 'g77@example.com'
+    client.profiles['good'] = {'id': 'g-77', 'email': 'g77@example.com', 'email_verified': True}
+    assert auth_system.oauth_callback('google', 'good', state) == {'error': 'invalid_state'}  # reused
+
+    late = auth_system.oauth_start('google')['state']
+    now[0] = now[0] + timedelta(minutes=10)
+    assert auth_system.oauth_callback('google', 'good', late) == {'error': 'invalid_state'}
+    fresh = auth_system.oauth_start('google')['state']
+    now[0] = now[0] + timedelta(minutes=9, seconds=59)
+    assert auth_system.oauth_callback('google', 'good', fresh)['user']['id'] == first['user']['id']
+
+
+# AUTH-16
+@pytest.mark.parametrize('key', [None, '', 'k' * 31, b'k' * 31])
+def test_service_refuses_to_start_without_a_32_byte_secret_key(monkeypatch, key):
+    """AuthSystem refuses to start (raises ValueError) when neither secret_key nor AUTH_SECRET_KEY gives a key,
+    or the key is shorter than 32 bytes; a 32-byte key from AUTH_SECRET_KEY is accepted and keys the stored HMAC.
+    In: pytest's monkeypatch, a missing or short key. Out: assertions. Why: spec d270fa3: keyed HMAC for stored
+    secrets ("the service refuses to start without it"). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+    Touches: the process environment (patched), in-memory SQLite only."""
+    monkeypatch.delenv('AUTH_SECRET_KEY', raising=False)
+    db_connection = sqlite3.connect(':memory:')
+    with pytest.raises(ValueError):
+        AuthSystem(db_connection, jwt_secret='test_secret', bcrypt_rounds=4, secret_key=key)
+    if key is not None:
+        monkeypatch.setenv('AUTH_SECRET_KEY', key if isinstance(key, str) else key.decode())
+        with pytest.raises(ValueError):
+            AuthSystem(db_connection, jwt_secret='test_secret', bcrypt_rounds=4)
+    monkeypatch.setenv('AUTH_SECRET_KEY', TEST_SECRET_KEY)
+    from_env = AuthSystem(db_connection, jwt_secret='test_secret', bcrypt_rounds=4)
+    assert from_env._hash_secret('123456') == _sha('123456') != _plain_sha256('123456')
+    db_connection.close()

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Threading.Tasks;
@@ -591,6 +592,38 @@ namespace SaaSLibrary.ApiKeys.Tests
                 _service.GetApiKeyUsageAsync(_testUserId, apiKey.Id, null, null));
         }
 
+        /// <summary>
+        /// An authenticated caller with the given roles. In: the user id and roles. Out: the principal. Why: the admin
+        /// list now checks its caller itself (Phase B.2). Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Pure.
+        /// </summary>
+        private static ClaimsPrincipal Caller(Guid userId, params string[] roles) =>
+            new ClaimsPrincipal(new ClaimsIdentity(
+                new[] { new Claim(ClaimTypes.NameIdentifier, userId.ToString()) }.Concat(roles.Select(r => new Claim(ClaimTypes.Role, r))),
+                authenticationType: "test"));
+
+        /// <summary>An authenticated admin. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Pure.</summary>
+        private static ClaimsPrincipal AdminCaller() => Caller(Guid.NewGuid(), "admin");
+
+        /// <summary>
+        /// KEYS-09 (Phase B.2 bug fix): AdminListApiKeysAsync refuses a non-admin caller itself, not only at the route:
+        /// a signed-in user without the admin role, an anonymous identity and no caller at all each get 403
+        /// admin_only; an admin sees every user's keys. In: nothing. Out: asserts. Added 2026-11-10,
+        /// session_012zDydZCZ4AChqhEZ4oVtaP. Touches: the in-memory database.
+        /// </summary>
+        // KEYS-09
+        [Fact]
+        public async Task AdminListApiKeysAsync_NonAdminCaller_Forbidden()
+        {
+            await CreateTestApiKeyInDb("Someone Else's Key", new List<string> { "read:deployments" }, Guid.NewGuid());
+            foreach (var caller in new ClaimsPrincipal[] { Caller(_testUserId), Caller(_testUserId, "user"), new ClaimsPrincipal(new ClaimsIdentity()), null })
+            {
+                var ex = await Assert.ThrowsAsync<ApiKeysForbiddenException>(() => _service.AdminListApiKeysAsync(caller, null, null));
+                Assert.Equal(403, ex.StatusCode);
+                Assert.Equal("admin_only", ex.Code);
+            }
+            Assert.Equal(1, (await _service.AdminListApiKeysAsync(AdminCaller(), null, null)).Total);
+        }
+
         // KEYS-09
         [Fact]
         public async Task AdminListApiKeysAsync_NoFilters_ReturnsAllKeys()
@@ -603,7 +636,7 @@ namespace SaaSLibrary.ApiKeys.Tests
             await CreateTestApiKeyInDb("User2 Key", new List<string> { "read:webhooks" }, user2Id);
 
             // Act
-            var result = await _service.AdminListApiKeysAsync(null, null);
+            var result = await _service.AdminListApiKeysAsync(AdminCaller(), null, null);
 
             // Assert
             Assert.NotNull(result);
@@ -621,7 +654,7 @@ namespace SaaSLibrary.ApiKeys.Tests
             await CreateTestApiKeyInDb("User2 Key", new List<string> { "read:webhooks" }, user2Id);
 
             // Act
-            var result = await _service.AdminListApiKeysAsync(user1Id, null);
+            var result = await _service.AdminListApiKeysAsync(AdminCaller(), user1Id, null);
 
             // Assert
             Assert.NotNull(result);
@@ -639,7 +672,7 @@ namespace SaaSLibrary.ApiKeys.Tests
             await _service.RevokeApiKeyAsync(_testUserId, revokedKey.Id);
 
             // Act
-            var result = await _service.AdminListApiKeysAsync(null, "active");
+            var result = await _service.AdminListApiKeysAsync(AdminCaller(), null, "active");
 
             // Assert
             Assert.NotNull(result);
@@ -658,7 +691,7 @@ namespace SaaSLibrary.ApiKeys.Tests
             await _service.RevokeApiKeyAsync(_testUserId, revokedKey.Id);
 
             // Act
-            var result = await _service.AdminListApiKeysAsync(null, "inactive");
+            var result = await _service.AdminListApiKeysAsync(AdminCaller(), null, "inactive");
 
             // Assert
             Assert.NotNull(result);

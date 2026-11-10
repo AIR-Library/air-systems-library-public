@@ -43,9 +43,10 @@ var (
 )
 
 // AuditError is a refusal with the HTTP status and error code the spec names (400 subject_required,
-// metadata_key_not_allowed, actor_user_required, subject_mismatch, invalid_actor_type; 403 admin_only; 404
-// log_not_found). Unwrap returns the matching sentinel where one exists. Added 2026-11-10,
-// session_012zDydZCZ4AChqhEZ4oVtaP (AUDIT-10).
+// metadata_key_not_allowed, actor_user_required, subject_mismatch, invalid_actor_type, actor_required,
+// actor_service_required; 403 admin_only; 404 log_not_found). Unwrap returns the matching sentinel where one
+// exists. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUDIT-10); actor_required and
+// actor_service_required added the same day (Phase B.2, audit spec "Refusals by log()").
 type AuditError struct {
 	Status  int
 	Code    string
@@ -160,12 +161,14 @@ type QueryLogsResponse struct {
 	HasMore bool       `json:"has_more"`
 }
 
-// ReplayResponse is the state an entry recorded. For an entry whose subject data was erased, Erased is
-// true and the state and HasDiverged are null. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+// ReplayResponse is the state an entry recorded. Erased reflects the entry's own 'subject' row: true when the
+// entry was written with one and it is gone (the state and HasDiverged are then null), false otherwise, and
+// it is always in the JSON. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP; the same day (Phase B.2,
+// audit spec) "erased" stopped being omitted when false, so every replay answers it. Touches nothing.
 type ReplayResponse struct {
 	LogID               string          `json:"log_id"`
 	Timestamp           string          `json:"timestamp"`
-	Erased              bool            `json:"erased,omitempty"`
+	Erased              bool            `json:"erased"`
 	ResourceStateAtTime json.RawMessage `json:"resource_state_at_time"`
 	HasDiverged         *bool           `json:"has_diverged"`
 }
@@ -392,12 +395,21 @@ func subjectRef(ctx context.Context, tx *sql.Tx, userID, now string) (string, er
 // LogMutation appends one entry (POST /audit/log, an internal service-authenticated call: the actor is the
 // verified caller, never taken from a client body).
 //
-// In: LogMutationRequest. Out: the new log id, or an *AuditError 400: invalid_actor_type,
-// metadata_key_not_allowed, subject_required, subject_mismatch, actor_user_required (nothing is written).
+// In: LogMutationRequest. Out: the new log id, or an *AuditError 400: invalid_actor_type (actor_type not
+// user/service/api_key), actor_required (a 'user' actor without ActorID), actor_service_required (a 'service'
+// actor without a non-empty ActorService; ActorID never stands in for it),
+// metadata_key_not_allowed, subject_required, subject_mismatch, actor_user_required (an api_key without
+// ActorUserID). Nothing is written on a refusal.
 // Writes in ONE transaction: the subject(s) in audit_subjects, the audit_log event (resource fields only when
 // the subject is 'none'), the 'subject' row {resource_id, old_value, new_value, why_chain_id} and the 'actor'
 // row {actor_id, ip, user_agent, request_id} for user and api_key actors.
-// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUDIT-01/08/10, amended). Touches: the database.
+// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUDIT-01/08/10, amended). Changed again the same day
+// (Phase B.2, audit spec "Refusals by log()"): a user actor without actor_id is actor_required (it was
+// actor_user_required, the api_key code), and a service actor with no name is refused with
+// actor_service_required (it was written with a NULL actor_service). Changed again the same day (Phase B.2
+// follow-up from the coordinator, audit spec: "actor_type 'service' without actor_service ->
+// actor_service_required"): the fallback that used ActorID as the service name is removed, so a service
+// entry must name its service in ActorService. Touches: the database.
 func (a *AuditLogger) LogMutation(ctx context.Context, req LogMutationRequest) (string, error) {
 	if req.ActorType != "user" && req.ActorType != "service" && req.ActorType != "api_key" {
 		return "", &AuditError{Status: 400, Code: "invalid_actor_type", Message: ErrInvalidActorType.Error(), wrapped: ErrInvalidActorType}
@@ -439,7 +451,7 @@ func (a *AuditLogger) LogMutation(ctx context.Context, req LogMutationRequest) (
 	switch req.ActorType {
 	case "user":
 		if req.ActorID == nil || *req.ActorID == "" {
-			return "", auditErr(400, "actor_user_required", "a user actor needs actor_id")
+			return "", auditErr(400, "actor_required", "a user actor needs actor_id")
 		}
 		actorOwner = *req.ActorID
 	case "api_key":
@@ -450,12 +462,12 @@ func (a *AuditLogger) LogMutation(ctx context.Context, req LogMutationRequest) (
 	}
 	var service interface{}
 	if req.ActorType == "service" {
-		switch {
-		case req.ActorService != nil:
-			service = *req.ActorService
-		case req.ActorID != nil:
-			service = *req.ActorID
+		// Only ActorService names a service; ActorID is never used as the name (Phase B.2 follow-up, 2026-11-10,
+		// session_012zDydZCZ4AChqhEZ4oVtaP).
+		if req.ActorService == nil || *req.ActorService == "" {
+			return "", auditErr(400, "actor_service_required", "a service actor needs actor_service")
 		}
+		service = *req.ActorService
 	}
 	var roles []string
 	if actorOwner != "" {
