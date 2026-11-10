@@ -46,8 +46,9 @@ namespace AuthSystem
             modelBuilder.Entity<Session>(entity =>
             {
                 entity.HasKey(e => e.Id);
-                entity.Property(e => e.RefreshToken).IsRequired().HasMaxLength(255);
-                entity.HasIndex(e => e.RefreshToken).IsUnique();
+                entity.Property(e => e.RefreshTokenHash).IsRequired().HasMaxLength(64);
+                entity.HasIndex(e => e.RefreshTokenHash).IsUnique();
+                entity.Ignore(e => e.RefreshToken);
                 entity.Property(e => e.CreatedAt).IsRequired();
                 entity.Property(e => e.ExpiresAt).IsRequired();
                 entity.Property(e => e.Ip).IsRequired().HasMaxLength(45);
@@ -96,10 +97,17 @@ namespace AuthSystem
         public bool MfaEnabled { get; set; }
     }
 
+    /// <summary>
+    /// A login session. The refresh token is stored only as its SHA-256 (lower-case hex) in RefreshTokenHash; the raw
+    /// token exists only in memory (RefreshToken, not mapped) when the session is created, to be handed to the client
+    /// once. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the raw token was stored and looked up as is (a
+    /// database leak handed out every session; docs/specs/README.md "Secure by default"). Pure data.
+    /// </summary>
     public class Session
     {
         public int Id { get; set; }
         public int UserId { get; set; }
+        public string RefreshTokenHash { get; set; }
         public string RefreshToken { get; set; }
         public DateTime CreatedAt { get; set; }
         public DateTime ExpiresAt { get; set; }
@@ -485,9 +493,11 @@ namespace AuthSystem
         {
             if (string.IsNullOrEmpty(refreshToken))
                 return new { error = "invalid_token" };
+            // looked up by the token's SHA-256: equal hashes leak nothing about the token (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+            var hash = HashRefreshToken(refreshToken);
             var session = await _db.Sessions
                 .Include(s => s.User)
-                .FirstOrDefaultAsync(s => s.RefreshToken == refreshToken && s.ExpiresAt > DateTime.UtcNow);
+                .FirstOrDefaultAsync(s => s.RefreshTokenHash == hash && s.ExpiresAt > DateTime.UtcNow);
             if (session == null || session.User == null)
                 return new { error = "invalid_token" };
 
@@ -601,13 +611,25 @@ namespace AuthSystem
             public DateTimeOffset ExpiresAt { get; set; }
         }
 
-        /// <summary>Creates a session with a random refresh token valid 7 days. Touches: sessions.</summary>
+        /// <summary>
+        /// SHA-256 of a refresh token as lower-case hex: what the sessions table stores and is searched by.
+        /// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Pure.
+        /// </summary>
+        public static string HashRefreshToken(string refreshToken) =>
+            Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(refreshToken))).ToLowerInvariant();
+
+        /// <summary>
+        /// Creates a session with a random refresh token valid 7 days; only its hash is stored, the raw token is on the
+        /// returned object for the response. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: sessions.
+        /// </summary>
         private async Task<Session> CreateSessionAsync(int userId, string ip, string deviceId)
         {
+            var raw = GenerateOpaqueToken();
             var session = new Session
             {
                 UserId = userId,
-                RefreshToken = GenerateOpaqueToken(),
+                RefreshToken = raw,
+                RefreshTokenHash = HashRefreshToken(raw),
                 CreatedAt = DateTime.UtcNow,
                 ExpiresAt = DateTime.UtcNow.AddDays(7),
                 Ip = ip ?? string.Empty,
@@ -660,11 +682,15 @@ namespace AuthSystem
         /// <summary>
         /// NIST SP 800-63B-4 password check: 15 to 64 characters, not on the bundled blocklist, not the user's email,
         /// name or the service name. No composition rules. Output: (true, null) or (false, reason). Pure.
+        /// Checks run too_short, too_long, blocklisted and the first failure wins (AUTH-03, spec amended 2026-11-10).
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: length counts Unicode characters (runes), not UTF-16
+        /// code units, so eight emoji are 8 characters (too_short), not 16.
         /// </summary>
         private (bool Success, string Reason) ValidatePassword(string password, string email, string name)
         {
-            if (password.Length < 15) return (false, "too_short");
-            if (password.Length > 64) return (false, "too_long");
+            var length = password.EnumerateRunes().Count();
+            if (length < 15) return (false, "too_short");
+            if (length > 64) return (false, "too_long");
             if (_commonPasswords.Contains(password)) return (false, "blocklisted");
             if (password.Equals(email, StringComparison.OrdinalIgnoreCase)) return (false, "blocklisted");
             if (!string.IsNullOrEmpty(name) && password.Equals(name, StringComparison.OrdinalIgnoreCase)) return (false, "blocklisted");

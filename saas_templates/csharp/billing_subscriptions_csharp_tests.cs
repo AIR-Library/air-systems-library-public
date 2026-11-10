@@ -74,6 +74,7 @@ namespace BillingSubscriptionsTests
             status_transitions = new { paid_at = DateTimeOffset.UtcNow.ToUnixTimeSeconds() }
         };
 
+        // BILL-01
         [Fact]
         public async Task CreateSubscription_HappyPath()
         {
@@ -104,6 +105,7 @@ namespace BillingSubscriptionsTests
             Assert.Equal("solo", dbSub.Tier);
         }
 
+        // BILL-02
         [Fact]
         public async Task CreateSubscription_InvalidTier()
         {
@@ -116,8 +118,10 @@ namespace BillingSubscriptionsTests
 
             Assert.False(response.Success);
             Assert.Equal("invalid_tier", response.Error.Code);
+            Assert.Equal(400, response.Status);
         }
 
+        // BILL-03
         [Fact]
         public async Task ChangePlan_HappyPath()
         {
@@ -143,13 +147,18 @@ namespace BillingSubscriptionsTests
                 CurrentPeriodStart = DateTime.UtcNow,
                 ProrationCredit = 0
             };
-            stripeMock.Setup(s => s.UpdateSubscriptionAsync("sub_123", It.IsAny<string>()))
+            // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (BILL-03 amendment): the service retrieves the
+            // subscription, then updates its one existing item (id si_1) with the new price and create_prorations.
+            stripeMock.Setup(s => s.RetrieveSubscriptionAsync("sub_123"))
+                .ReturnsAsync(new StripeSubscriptionInfo { Id = "sub_123", ItemIds = new List<string> { "si_1" } });
+            stripeMock.Setup(s => s.UpdateSubscriptionAsync("sub_123", "si_1", It.IsAny<string>(), "create_prorations"))
                 .ReturnsAsync(stripeSub);
 
             var service = NewService(ctx, stripeMock.Object, logger);
             var response = await service.ChangePlanAsync("sub_123", "team");
 
             Assert.True(response.Success);
+            stripeMock.Verify(s => s.UpdateSubscriptionAsync("sub_123", "si_1", "price_1UI_team", "create_prorations"), Times.Once);
             var data = Assert.IsType<ChangePlanResult>(response.Data);
             Assert.Equal("sub_123", data.SubscriptionId);
             Assert.Equal("solo", data.OldTier);
@@ -159,8 +168,44 @@ namespace BillingSubscriptionsTests
 
             var dbSub = await ctx.Subscriptions.FirstAsync(s => s.StripeSubscriptionId == "sub_123");
             Assert.Equal("team", dbSub.Tier);
+            Assert.Contains(await ctx.AuditLogs.ToListAsync(), a => a.Action == "plan_changed");
         }
 
+        /// <summary>
+        /// BILL-03 refusals: an unknown tier is 400 invalid_tier, and a subscription with no item or with two items is
+        /// 409 subscription_item_ambiguous; in every case Stripe is never asked to update and the row keeps its tier.
+        /// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (spec amendment). Touches: in-memory database, mocked Stripe.
+        /// </summary>
+        // BILL-03
+        [Fact]
+        public async Task ChangePlan_UnknownTierOrNotExactlyOneItem_RefusedBeforeUpdate()
+        {
+            var ctx = GetInMemoryContext();
+            ctx.Subscriptions.Add(new Subscription { StripeSubscriptionId = "sub_9", CustomerId = "cust_1", Tier = "solo", Status = "active", CreatedAt = DateTime.UtcNow });
+            await ctx.SaveChangesAsync();
+            var stripeMock = GetMockStripeService();
+            var service = NewService(ctx, stripeMock.Object, GetLogger());
+
+            var badTier = await service.ChangePlanAsync("sub_9", "platinum");
+            Assert.Equal("invalid_tier", badTier.Error.Code);
+            Assert.Equal(400, badTier.Status);
+            stripeMock.Verify(s => s.RetrieveSubscriptionAsync(It.IsAny<string>()), Times.Never);
+
+            foreach (var items in new[] { new List<string>(), new List<string> { "si_a", "si_b" } })
+            {
+                stripeMock.Setup(s => s.RetrieveSubscriptionAsync("sub_9"))
+                    .ReturnsAsync(new StripeSubscriptionInfo { Id = "sub_9", ItemIds = items });
+                var ambiguous = await service.ChangePlanAsync("sub_9", "team");
+                Assert.False(ambiguous.Success);
+                Assert.Equal("subscription_item_ambiguous", ambiguous.Error.Code);
+                Assert.Equal(409, ambiguous.Status);
+            }
+
+            stripeMock.Verify(s => s.UpdateSubscriptionAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>()), Times.Never);
+            Assert.Equal("solo", (await ctx.Subscriptions.FirstAsync(s => s.StripeSubscriptionId == "sub_9")).Tier);
+        }
+
+        // BILL-04
         [Fact]
         public async Task QueueRefund_HappyPath()
         {
@@ -192,6 +237,7 @@ namespace BillingSubscriptionsTests
             Assert.Equal(3000, dbRefund.Amount);
         }
 
+        // BILL-05
         [Fact]
         public async Task QueueRefund_AmountExceedsInvoice()
         {
@@ -215,6 +261,7 @@ namespace BillingSubscriptionsTests
             Assert.Equal("refund_exceeds_invoice", response.Error.Code);
         }
 
+        // BILL-06
         [Fact]
         public async Task HandleWebhook_PaymentSucceeded()
         {
@@ -234,8 +281,11 @@ namespace BillingSubscriptionsTests
             var dbInvoice = await ctx.Invoices.FirstAsync(i => i.StripeInvoiceId == "in_123");
             Assert.Equal("succeeded", dbInvoice.Status);
             Assert.Equal(5000, dbInvoice.Amount);
+            // BILL-06 says "audit logged" (assert added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+            Assert.Contains(await ctx.AuditLogs.ToListAsync(), a => a.Action == "payment_succeeded");
         }
 
+        // BILL-07
         [Fact]
         public async Task HandleWebhook_DuplicateEvent_Idempotent()
         {
@@ -262,6 +312,7 @@ namespace BillingSubscriptionsTests
             Assert.Single(invoices);
         }
 
+        // BILL-08
         [Fact]
         public async Task HandleWebhook_SubscriptionUpdated()
         {
@@ -275,7 +326,7 @@ namespace BillingSubscriptionsTests
                 StripeSubscriptionId = "sub_123",
                 CustomerId = "cust_1",
                 Tier = "solo",
-                Status = "active",
+                Status = "past_due", // was "active", so the test could not see the status change BILL-08 names (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
                 CreatedAt = DateTime.UtcNow
             });
             await ctx.SaveChangesAsync();
@@ -298,6 +349,7 @@ namespace BillingSubscriptionsTests
             Assert.Equal("active", sub.Status);
         }
 
+        // BILL-09
         [Fact]
         public async Task HandleWebhook_InvalidSignature()
         {
@@ -310,8 +362,10 @@ namespace BillingSubscriptionsTests
             var response = await service.HandleStripeWebhookAsync("{}", "invalid_signature");
             Assert.False(response.Success);
             Assert.Equal("invalid_signature", response.Error.Code);
+            Assert.Equal(403, response.Status);
         }
 
+        // BILL-10
         [Fact]
         public async Task Webhook_ResponseTime_UnderThreeSeconds()
         {
@@ -328,6 +382,7 @@ namespace BillingSubscriptionsTests
             var elapsed = DateTime.UtcNow - start;
 
             Assert.True(response.Success);
+            Assert.True(Assert.IsType<WebhookResponse>(response.Data).Received);
             Assert.True(elapsed.TotalSeconds < 3, $"Elapsed {elapsed.TotalSeconds}s exceeds 3 seconds");
         }
     

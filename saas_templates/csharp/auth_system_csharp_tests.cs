@@ -39,6 +39,7 @@ namespace AuthSystemTests
         private AuthDbContext CreateDb() => new AuthDbContext(_dbOptions);
         private AuthService CreateService() => new AuthService(CreateDb(), _emailSenderMock.Object, _oauthProviderMock.Object, _cache, _jwtSecret);
 
+        // AUTH-01
         [Fact]
         public async Task Signup_HappyPath_CreatesUserAndSendsEmail()
         {
@@ -47,8 +48,12 @@ namespace AuthSystemTests
             Assert.Equal("pending_verification", ((dynamic)result).status);
             Assert.Equal("test@example.com", ((dynamic)result).email);
             _emailSenderMock.Verify(es => es.SendVerificationEmailAsync("test@example.com", It.IsAny<string>()), Times.Once);
+            // the row exists and is unverified (AUTH-01 "user created"; added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+            using var db = CreateDb();
+            Assert.Equal("unverified", (await db.Users.SingleAsync(u => u.Email == "test@example.com")).Status);
         }
 
+        // AUTH-02
         [Fact]
         public async Task Signup_DuplicateEmail_ReturnsError()
         {
@@ -61,6 +66,7 @@ namespace AuthSystemTests
             Assert.Equal("email_already_exists", ((dynamic)result).error);
         }
 
+        // AUTH-03
         [Fact]
         public async Task Signup_WeakPassword_TooShort_ReturnsError()
         {
@@ -68,8 +74,20 @@ namespace AuthSystemTests
             var result = await service.SignupAsync("test@example.com", "short", "Test User");
             Assert.Equal("password_rejected", ((dynamic)result).error);
             Assert.Equal("too_short", ((dynamic)result).reason);
+
+            // Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (AUTH-03 amendment): checks run too_short, too_long,
+            // blocklisted and the first failure wins; "password123" is on the blocklist but is too_short first.
+            Assert.Equal("too_short", ((dynamic)await service.SignupAsync("a@example.com", "password123", "A")).reason);
+            Assert.Equal("too_long", ((dynamic)await service.SignupAsync("b@example.com", new string('x', 65), "B")).reason);
+            Assert.Equal("too_short", ((dynamic)await service.SignupAsync("c@example.com", string.Concat(Enumerable.Repeat("\U0001F600", 8)), "C")).reason);
+            var own = await service.SignupAsync("long.address.user@example.com", "long.address.user@example.com", "D");
+            Assert.Equal("password_rejected", ((dynamic)own).error);
+            Assert.Equal("blocklisted", ((dynamic)own).reason);
+            using var db = CreateDb();
+            Assert.False(await db.Users.AnyAsync(), "a rejected password creates no user");
         }
 
+        // AUTH-04
         [Fact]
         public async Task Signup_IPRateLimit_Exceeded_ReturnsError()
         {
@@ -85,6 +103,7 @@ namespace AuthSystemTests
             Assert.Equal("too_many_signups_from_ip", ((dynamic)result).error);
         }
 
+        // AUTH-05
         [Fact]
         public async Task VerifyEmail_HappyPath_VerifiesUser()
         {
@@ -116,6 +135,7 @@ namespace AuthSystemTests
             Assert.NotNull(updatedUser.EmailVerifiedAt);
         }
 
+        // AUTH-06
         [Fact]
         public async Task VerifyEmail_ExpiredCode_ReturnsError()
         {
@@ -140,6 +160,7 @@ namespace AuthSystemTests
             Assert.Equal("code_expired", ((dynamic)result).error);
         }
 
+        // AUTH-07
         [Fact]
         public async Task Login_NoMFA_ReturnsToken()
         {
@@ -155,6 +176,7 @@ namespace AuthSystemTests
             Assert.Equal(user.Id, ((dynamic)result).user.id);
         }
 
+        // AUTH-08
         [Fact]
         public async Task Login_WithMFAEnabled_ReturnsMFARequired()
         {
@@ -176,6 +198,7 @@ namespace AuthSystemTests
             Assert.NotNull(((dynamic)result).challenge_id);
         }
 
+        // AUTH-09
         [Fact]
         public async Task Login_InvalidPassword_ReturnsError()
         {
@@ -189,6 +212,7 @@ namespace AuthSystemTests
             Assert.Equal("invalid_credentials", ((dynamic)result).error);
         }
 
+        // AUTH-10
         [Fact]
         public async Task OAuthCallback_NewUser_CreatesUserAndLinksProvider()
         {
@@ -208,6 +232,7 @@ namespace AuthSystemTests
             Assert.Equal("verified", user.Status);
         }
 
+        // AUTH-11
         [Fact]
         public async Task OAuthCallback_ExistingUser_LinksProvider()
         {
@@ -226,6 +251,7 @@ namespace AuthSystemTests
             Assert.Equal(user.Id, ((dynamic)result).user.id);
         }
 
+        // AUTH-12
         [Fact]
         public async Task MfaChallenge_ValidCode_ReturnsToken()
         {
@@ -261,6 +287,7 @@ namespace AuthSystemTests
             Assert.NotNull(((dynamic)result).token);
         }
 
+        // AUTH-13
         [Fact]
         public async Task MfaChallenge_InvalidCode_ReturnsError()
         {
@@ -292,6 +319,7 @@ namespace AuthSystemTests
             Assert.Equal("invalid_code", ((dynamic)result).error);
         }
 
+        // AUTH-14
         [Fact]
         public async Task TokenRefresh_HappyPath_IssuesNewToken()
         {
@@ -304,7 +332,7 @@ namespace AuthSystemTests
             db.Sessions.Add(new Session
             {
                 UserId = user.Id,
-                RefreshToken = refreshToken,
+                RefreshTokenHash = AuthService.HashRefreshToken(refreshToken), // only the hash is stored (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
                 CreatedAt = DateTime.UtcNow,
                 ExpiresAt = DateTime.UtcNow.AddDays(7),
                 Ip = "127.0.0.1",
@@ -318,6 +346,7 @@ namespace AuthSystemTests
             Assert.NotNull(((dynamic)result).token);
         }
 
+        // AUTH-15
         [Fact]
         public async Task TokenRefresh_BannedUser_ReturnsError()
         {
@@ -330,7 +359,7 @@ namespace AuthSystemTests
             db.Sessions.Add(new Session
             {
                 UserId = user.Id,
-                RefreshToken = refreshToken,
+                RefreshTokenHash = AuthService.HashRefreshToken(refreshToken), // only the hash is stored (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
                 CreatedAt = DateTime.UtcNow,
                 ExpiresAt = DateTime.UtcNow.AddDays(7),
                 Ip = "127.0.0.1",

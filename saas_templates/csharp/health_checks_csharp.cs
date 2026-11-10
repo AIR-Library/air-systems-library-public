@@ -244,32 +244,7 @@ namespace HealthChecks
             {
                 if (functionsSnapshot.TryGetValue(metadata.ComponentId, out var checkFn))
                 {
-                    HealthCheckResult result = null;
-                    var cts = new CancellationTokenSource();
-                    try
-                    {
-                        var task = Task.Run(() => checkFn(), cts.Token);
-                        if (task.Wait(TimeSpan.FromMilliseconds(metadata.TimeoutMs)))
-                        {
-                            try
-                            {
-                                result = task.Result;
-                            }
-                            catch (Exception)
-                            {
-                                result = CreateFailedHealthCheckResult(metadata);
-                            }
-                        }
-                        else
-                        {
-                            cts.Cancel();
-                            result = CreateFailedHealthCheckResult(metadata);
-                        }
-                    }
-                    finally
-                    {
-                        cts.Dispose();
-                    }
+                    var result = RunCheck(checkFn, metadata);
 
                     executionResults.Add(new CheckExecutionResult { Metadata = metadata, Result = result });
                 }
@@ -337,6 +312,37 @@ namespace HealthChecks
                 ContentType = "application/health+json",
                 Body = bodyBuilder.ToString()
             };
+        }
+
+        /// <summary>
+        /// Runs one check with its own timeout.
+        /// In: the check function and its metadata (timeout_ms). Out: the check's result, or a "fail" result with
+        /// no observed value when the check times out, throws, or returns null.
+        /// Why: HEALTH-04 (a check past its timeout fails) and HEALTH-06 (never put secrets, connection strings or
+        /// stack traces in the output). Before 2026-11-10 a check that threw made Task.Wait raise an
+        /// AggregateException out of readiness(), carrying the exception's message (often a connection string);
+        /// now the exception is caught and nothing from it reaches the body.
+        /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: whatever the check function touches; a thread-pool task.
+        /// </summary>
+        private static HealthCheckResult RunCheck(CheckFunction checkFn, CheckMetadata metadata)
+        {
+            using var cts = new CancellationTokenSource();
+            var task = Task.Run(() => checkFn(), cts.Token);
+            try
+            {
+                if (!task.Wait(TimeSpan.FromMilliseconds(metadata.TimeoutMs)))
+                {
+                    cts.Cancel();
+                    // observe a later fault so it never surfaces as an unobserved task exception
+                    task.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
+                    return CreateFailedHealthCheckResult(metadata);
+                }
+                return task.Result ?? CreateFailedHealthCheckResult(metadata);
+            }
+            catch (AggregateException)
+            {
+                return CreateFailedHealthCheckResult(metadata);
+            }
         }
 
         private static HealthCheckResult CreateFailedHealthCheckResult(CheckMetadata metadata)

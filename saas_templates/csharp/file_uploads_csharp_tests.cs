@@ -29,6 +29,14 @@ namespace FileUploadsTests
             }
         }
 
+        /// <summary>The test clock; tests move it forward instead of sleeping (2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP).</summary>
+        private static DateTimeOffset _now = new DateTimeOffset(2026, 1, 1, 12, 0, 0, TimeSpan.Zero);
+
+        /// <summary>
+        /// Builds a service over an in-memory store and a fresh temporary directory, with the test clock.
+        /// Out: the service, the store, the directory and the membership set ("user:org").
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: passes the injectable clock. Touches: a temp directory.
+        /// </summary>
         private static FileUploadService CreateService(out InMemoryFileStore store, out string storageDir, out HashSet<string> members, long sizeLimitBytes = 10 * 1024 * 1024)
         {
             store = new InMemoryFileStore();
@@ -36,7 +44,7 @@ namespace FileUploadsTests
             HashSet<string> membersSet = new HashSet<string>();
             members = membersSet;
             Func<Guid, Guid, bool> isMember = (u, o) => membersSet.Contains($"{u}:{o}");
-            return new FileUploadService(store, storageDir, HmacKey, isMember, sizeLimitBytes);
+            return new FileUploadService(store, storageDir, HmacKey, isMember, sizeLimitBytes, () => _now);
         }
 
         private static void CleanupDirectory(string dir)
@@ -51,6 +59,7 @@ namespace FileUploadsTests
             catch { }
         }
 
+        // UPLOAD-01
         public static void TestExeRejection()
         {
             var user = Guid.NewGuid();
@@ -73,6 +82,7 @@ namespace FileUploadsTests
             }
         }
 
+        // UPLOAD-02
         public static void TestPngAccepted()
         {
             var user = Guid.NewGuid();
@@ -95,6 +105,7 @@ namespace FileUploadsTests
             }
         }
 
+        // UPLOAD-03
         public static void TestPathSanitization()
         {
             var user = Guid.NewGuid();
@@ -118,6 +129,7 @@ namespace FileUploadsTests
             }
         }
 
+        // UPLOAD-04
         public static void TestSizeLimit()
         {
             var user = Guid.NewGuid();
@@ -137,6 +149,7 @@ namespace FileUploadsTests
             }
         }
 
+        // UPLOAD-05
         public static void TestNonMemberAccess()
         {
             var user = Guid.NewGuid();
@@ -160,8 +173,13 @@ namespace FileUploadsTests
                     "Non-member should not delete");
 
                 string token = svc.CreateDownloadLink(user, fileId);
+                // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: download() takes the caller (spec), so a
+                // member's link forwarded to a non-member must fail, and the member can still use it.
+                AssertThrows<FileUploadException>(() => svc.Download(otherUser, token),
+                    "Non-member should not download with a member's link");
+                Assert(svc.Download(user, token).Length == pngBytes.Length, "Member downloads with the link");
                 members.Remove($"{user}:{org}");
-                AssertThrows<FileUploadException>(() => svc.Download(token),
+                AssertThrows<FileUploadException>(() => svc.Download(user, token),
                     "Removed member should not download");
             }
             finally
@@ -170,6 +188,7 @@ namespace FileUploadsTests
             }
         }
 
+        // UPLOAD-06
         public static void TestExpiredLink()
         {
             var user = Guid.NewGuid();
@@ -182,14 +201,25 @@ namespace FileUploadsTests
                 byte[] pngBytes = new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
                 Guid fileId = svc.Upload(user, org, "image.png", pngBytes, "image/png");
                 string token = svc.CreateDownloadLink(user, fileId, ttlSeconds: 1);
-                System.Threading.Thread.Sleep(2000); // wait for expiry
-                AssertThrows<FileUploadException>(() => svc.Download(token),
+                // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the clock is moved 2 s instead of a real
+                // 2 s sleep (deterministic tests); download() now takes the caller.
+                Assert(svc.Download(user, token).Length == pngBytes.Length, "Fresh link works");
+                _now = _now.AddSeconds(2);
+                AssertThrows<FileUploadException>(() => svc.Download(user, token),
                     "Expired link should be rejected");
 
                 string validToken = svc.CreateDownloadLink(user, fileId, ttlSeconds: 300);
+                Assert(svc.Download(user, validToken).Length == pngBytes.Length, "Valid link works");
+                // change one character in the payload and one in the signature
+                int dot = validToken.IndexOf('.');
+                string tamperedPayload = validToken.Substring(0, dot - 1) + (validToken[dot - 1] == 'A' ? "B" : "A") + validToken.Substring(dot);
                 string tampered = validToken.Substring(0, validToken.Length - 1) + (validToken.EndsWith("A") ? "B" : "A");
-                AssertThrows<FileUploadException>(() => svc.Download(tampered),
+                AssertThrows<FileUploadException>(() => svc.Download(user, tampered),
                     "Tampered link should be rejected");
+                AssertThrows<FileUploadException>(() => svc.Download(user, tamperedPayload),
+                    "Link with a changed payload character should be rejected");
+                AssertThrows<FileUploadException>(() => svc.Download(user, "not-a-token"),
+                    "Malformed link is an ordinary invalid-link error");
             }
             finally
             {
@@ -197,6 +227,7 @@ namespace FileUploadsTests
             }
         }
 
+        // UPLOAD-07
         public static void TestDeletePreventsAccess()
         {
             var user = Guid.NewGuid();
@@ -213,7 +244,7 @@ namespace FileUploadsTests
 
                 AssertThrows<FileUploadException>(() => svc.CreateDownloadLink(user, fileId),
                     "Link creation after delete should fail");
-                AssertThrows<FileUploadException>(() => svc.Download(token),
+                AssertThrows<FileUploadException>(() => svc.Download(user, token),
                     "Download after delete should fail");
             }
             finally

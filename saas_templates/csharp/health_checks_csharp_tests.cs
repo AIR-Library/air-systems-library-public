@@ -35,6 +35,7 @@ public static class HealthChecksTests
         }
     }
 
+    // HEALTH-01
     public static void TestAllChecksPass()
     {
         HealthCheckService.Reset();
@@ -63,6 +64,7 @@ public static class HealthChecksTests
         Assert(response.Body.Contains("\"status\":\"pass\""), "Expected status pass in body");
     }
 
+    // HEALTH-02
     public static void TestCriticalCheckFails()
     {
         HealthCheckService.Reset();
@@ -82,6 +84,7 @@ public static class HealthChecksTests
         Assert(response.Body.Contains("\"status\":\"fail\""), "Expected status fail in body");
     }
 
+    // HEALTH-03
     public static void TestOnlyNonCriticalCheckFails()
     {
         HealthCheckService.Reset();
@@ -110,6 +113,7 @@ public static class HealthChecksTests
         Assert(response.Body.Contains("\"status\":\"warn\""), "Expected status warn in body");
     }
 
+    // HEALTH-04
     public static void TestSlowCheckTimesOut()
     {
         HealthCheckService.Reset();
@@ -137,6 +141,7 @@ public static class HealthChecksTests
         resetEvent.Set();
     }
 
+    // HEALTH-05
     public static void TestLivenessUnaffectedByDependencyFailure()
     {
         HealthCheckService.Reset();
@@ -159,6 +164,7 @@ public static class HealthChecksTests
         Assert(readinessResponse.HttpStatus == 503, "Readiness should return HTTP 503 due to critical check failure");
     }
 
+    // HEALTH-06
     public static void TestOutputContainsNoConnectionString()
     {
         HealthCheckService.Reset();
@@ -172,7 +178,15 @@ public static class HealthChecksTests
             Time = DateTime.UtcNow
         }, false, 1000);
 
+        // Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: a failing check whose exception carries a connection
+        // string, so the test proves the string is kept out of the output (before, nothing could have leaked it).
+        HealthCheckService.RegisterCheck("db", "datastore", () =>
+            throw new InvalidOperationException("cannot open Server=db.internal;User Id=app;Password=hunter2;Database=prod"),
+            false, 1000);
+
         var response = HealthCheckService.Readiness();
+        Assert(response.Body.Contains("\"status\":\"fail\""), "The throwing check should be reported as fail");
+        Assert(!response.Body.Contains("hunter2") && !response.Body.Contains("db.internal"), "Output should not contain the exception's connection string");
         Assert(!response.Body.Contains("Server="), "Output should not contain a connection string (Server=)");
         Assert(!response.Body.Contains("Password="), "Output should not contain a connection string (Password=)");
         Assert(!response.Body.Contains("User Id="), "Output should not contain a connection string (User Id=)");

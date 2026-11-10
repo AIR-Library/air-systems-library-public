@@ -117,6 +117,12 @@ namespace BillingSubscriptions
         public DateTime CurrentPeriodStart { get; set; }
         public DateTime CurrentPeriodEnd { get; set; }
         public long ProrationCredit { get; set; }
+
+        /// <summary>
+        /// The ids of the subscription's items (stripe subscription.items.data[].id), as retrieved. change_plan needs
+        /// exactly one (BILL-03). Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Pure data.
+        /// </summary>
+        public List<string> ItemIds { get; set; } = new List<string>();
     }
 
     /// <summary>
@@ -152,7 +158,21 @@ namespace BillingSubscriptions
     public interface IStripeService
     {
         Task<StripeSubscriptionInfo> CreateSubscriptionAsync(string customerId, string priceId);
-        Task<StripeSubscriptionInfo> UpdateSubscriptionAsync(string subscriptionId, string newPriceId);
+
+        /// <summary>
+        /// stripe.subscriptions.retrieve: the subscription with its item ids. Null when Stripe has no such subscription.
+        /// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (BILL-03 / ADMIN-12: the item id is read before any update).
+        /// </summary>
+        Task<StripeSubscriptionInfo> RetrieveSubscriptionAsync(string subscriptionId);
+
+        /// <summary>
+        /// stripe.subscriptions.update(subscriptionId, {items: [{id: itemId, price: newPriceId}], proration_behavior}).
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the caller passes the existing item id and the
+        /// proration behaviour, so the item replacement is decided (and tested) in the billing service, never a bare
+        /// price that would add a second item and bill both plans.
+        /// </summary>
+        Task<StripeSubscriptionInfo> UpdateSubscriptionAsync(string subscriptionId, string itemId, string newPriceId, string prorationBehavior);
+
         Task<StripeInvoiceInfo> RetrieveInvoiceAsync(string invoiceId);
     }
 
@@ -195,42 +215,54 @@ namespace BillingSubscriptions
         }
 
         /// <summary>
-        /// stripe.subscriptions.update replacing the current item's price, with prorations. Output: the updated
-        /// subscription and the proration credit in cents. Touches: Stripe (money).
+        /// stripe.subscriptions.retrieve. Output: the subscription with its item ids, or null when Stripe answers
+        /// resource_missing. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: Stripe (network).
         /// </summary>
-        public async Task<StripeSubscriptionInfo> UpdateSubscriptionAsync(string subscriptionId, string newPriceId)
+        public async Task<StripeSubscriptionInfo> RetrieveSubscriptionAsync(string subscriptionId)
         {
-            var service = new Stripe.SubscriptionService(_client);
-            Stripe.Subscription current;
             try
             {
-                current = await service.GetAsync(subscriptionId);
+                var current = await new Stripe.SubscriptionService(_client).GetAsync(subscriptionId);
+                return current == null ? null : Map(current, 0);
+            }
+            catch (Stripe.StripeException e) when (e.StripeError?.Code == "resource_missing")
+            {
+                return null;
             }
             catch (Stripe.StripeException e)
             {
                 throw new PaymentProviderException(e.Message, e);
             }
-            var itemId = current.Items?.Data?.FirstOrDefault()?.Id
-                ?? throw new PaymentProviderException("Subscription has no item to change");
+        }
+
+        /// <summary>
+        /// stripe.subscriptions.update(subscriptionId, {items: [{id: itemId, price: newPriceId}], proration_behavior}).
+        /// Output: the updated subscription, with ProrationCredit = the credit (cents, positive) of the pending proration
+        /// invoice items Stripe created for this subscription. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP:
+        /// the item id and proration behaviour ('create_prorations' per the spec) come from the caller; it read the
+        /// first item itself and used 'always_invoice'. Touches: Stripe (network, money).
+        /// </summary>
+        public async Task<StripeSubscriptionInfo> UpdateSubscriptionAsync(string subscriptionId, string itemId, string newPriceId, string prorationBehavior)
+        {
             var options = new Stripe.SubscriptionUpdateOptions
             {
                 Items = new List<Stripe.SubscriptionItemOptions> { new Stripe.SubscriptionItemOptions { Id = itemId, Price = newPriceId } },
-                ProrationBehavior = "always_invoice",
-                Expand = new List<string> { "latest_invoice" }
+                ProrationBehavior = prorationBehavior
             };
-            Stripe.Subscription stripeSub;
             try
             {
-                stripeSub = await service.UpdateAsync(subscriptionId, options);
+                var stripeSub = await new Stripe.SubscriptionService(_client).UpdateAsync(subscriptionId, options);
+                var pending = await new Stripe.InvoiceItemService(_client).ListAsync(
+                    new Stripe.InvoiceItemListOptions { Customer = stripeSub.CustomerId, Pending = true });
+                var credit = pending.Data
+                    .Where(ii => ii.Proration && ii.Amount < 0 && ii.SubscriptionId == subscriptionId)
+                    .Sum(ii => -ii.Amount);
+                return Map(stripeSub, credit);
             }
             catch (Stripe.StripeException e)
             {
                 throw new PaymentProviderException(e.Message, e);
             }
-            var credit = stripeSub.LatestInvoice?.Lines?.Data?
-                .Where(l => l.Proration && l.Amount < 0)
-                .Sum(l => -l.Amount) ?? 0;
-            return Map(stripeSub, credit);
         }
 
         /// <summary>stripe.invoices.retrieve. Output: the invoice. Touches: Stripe (network).</summary>
@@ -261,7 +293,8 @@ namespace BillingSubscriptions
             Status = s.Status,
             CurrentPeriodStart = s.CurrentPeriodStart,
             CurrentPeriodEnd = s.CurrentPeriodEnd,
-            ProrationCredit = prorationCredit
+            ProrationCredit = prorationCredit,
+            ItemIds = s.Items?.Data?.Select(i => i.Id).ToList() ?? new List<string>()
         };
     }
 
@@ -271,6 +304,13 @@ namespace BillingSubscriptions
         public bool Success { get; set; }
         public object Data { get; set; }
         public ApiError Error { get; set; }
+
+        /// <summary>
+        /// The HTTP status the route returns: 200 on success; 400, 403, 404, 409 or 502 with an error.
+        /// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (the spec names 400 invalid_tier, 409
+        /// subscription_item_ambiguous, 403 invalid_signature). Pure data.
+        /// </summary>
+        public int Status { get; set; } = 200;
     }
 
     public class ApiError
@@ -367,9 +407,12 @@ namespace BillingSubscriptions
             });
         }
 
-        /// <summary>A failed response with an error code and message. Pure.</summary>
-        private static ApiResponse Fail(string code, string message) =>
-            new ApiResponse { Success = false, Error = new ApiError { Code = code, Message = message } };
+        /// <summary>
+        /// A failed response with an error code, message and HTTP status (default 400). Pure.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: carries the status.
+        /// </summary>
+        private static ApiResponse Fail(string code, string message, int status = 400) =>
+            new ApiResponse { Success = false, Status = status, Error = new ApiError { Code = code, Message = message } };
 
         // ---------- 1. create_subscription ----------
         /// <summary>
@@ -393,7 +436,7 @@ namespace BillingSubscriptions
             catch (PaymentProviderException ex)
             {
                 _logger.LogError(ex, "Error creating subscription");
-                return Fail("stripe_error", "The payment provider rejected the request");
+                return Fail("stripe_error", "The payment provider rejected the request", 502);
             }
 
             _db.Subscriptions.Add(new Subscription
@@ -424,8 +467,13 @@ namespace BillingSubscriptions
         /// <summary>
         /// Flow 2: moves a stored subscription to a new tier in Stripe (with proration), updates the row and audits old
         /// tier, new tier and the proration credit. Inputs: Stripe subscription id, new tier. Output: {subscription_id,
-        /// old_tier, new_tier, effective_date, proration_credit (cents)} or invalid_tier / not_found / stripe_error.
-        /// Touches: Stripe (money), subscriptions, audit_logs.
+        /// old_tier, new_tier, effective_date, proration_credit (cents)} or an error.
+        /// Order (BILL-03, amended 2026-11-10): unknown tier -> 400 invalid_tier; unknown subscription -> 404 not_found;
+        /// stripe.subscriptions.retrieve, and a subscription without exactly one item -> 409 subscription_item_ambiguous;
+        /// all before any update. Then stripe.subscriptions.update with {items: [{id: current_item_id, price}],
+        /// proration_behavior: 'create_prorations'}. A bare price would ADD a second item and bill both plans.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the item lookup moved here from the Stripe adapter and
+        /// the exactly-one-item rule is enforced. Touches: Stripe (network, money), subscriptions, audit_logs.
         /// </summary>
         public async Task<ApiResponse> ChangePlanAsync(string subscriptionId, string newTier)
         {
@@ -434,17 +482,23 @@ namespace BillingSubscriptions
 
             var subscription = await _db.Subscriptions.FirstOrDefaultAsync(s => s.StripeSubscriptionId == subscriptionId);
             if (subscription == null)
-                return Fail("not_found", "Subscription not found");
+                return Fail("not_found", "Subscription not found", 404);
 
             StripeSubscriptionInfo stripeSub;
             try
             {
-                stripeSub = await _stripe.UpdateSubscriptionAsync(subscriptionId, newPriceId);
+                var current = await _stripe.RetrieveSubscriptionAsync(subscriptionId);
+                if (current == null)
+                    return Fail("not_found", "Subscription not found", 404);
+                if (current.ItemIds == null || current.ItemIds.Count != 1)
+                    return Fail("subscription_item_ambiguous", "The subscription does not have exactly one item", 409);
+
+                stripeSub = await _stripe.UpdateSubscriptionAsync(subscriptionId, current.ItemIds[0], newPriceId, "create_prorations");
             }
             catch (PaymentProviderException ex)
             {
                 _logger.LogError(ex, "Error changing plan");
-                return Fail("stripe_error", "The payment provider rejected the request");
+                return Fail("stripe_error", "The payment provider rejected the request", 502);
             }
 
             var oldTier = subscription.Tier;
@@ -527,7 +581,7 @@ namespace BillingSubscriptions
         public async Task<ApiResponse> HandleStripeWebhookAsync(string jsonPayload, string stripeSignatureHeader)
         {
             if (!VerifySignature(jsonPayload, stripeSignatureHeader))
-                return Fail("invalid_signature", "Webhook signature verification failed");
+                return Fail("invalid_signature", "Webhook signature verification failed", 403);
 
             JsonElement root, obj;
             string eventId, eventType;

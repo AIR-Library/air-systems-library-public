@@ -22,12 +22,21 @@ namespace SaaSLibrary.ApiKeys
         private readonly ApiKeysDbContext _dbContext;
         private readonly IConnectionMultiplexer _redis;
         private readonly ILogger<ApiKeysService> _logger;
+        private readonly Func<DateTime> _clock;
 
-        public ApiKeysService(ApiKeysDbContext dbContext, IConnectionMultiplexer redis, ILogger<ApiKeysService> logger)
+        /// <summary>
+        /// Builds the service. In: the EF context, the Redis connection (rate counters), a logger, and an optional
+        /// clock returning UTC now (default DateTime.UtcNow). Why the clock: KEYS-06 (the old key stops after the
+        /// 24 h grace period) and KEYS-07 are tested by moving time, not by waiting (docs/specs/README.md
+        /// "Deterministic"). 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing on construction.
+        /// </summary>
+        public ApiKeysService(ApiKeysDbContext dbContext, IConnectionMultiplexer redis, ILogger<ApiKeysService> logger,
+            Func<DateTime> clock = null)
         {
             _dbContext = dbContext;
             _redis = redis;
             _logger = logger;
+            _clock = clock ?? (() => DateTime.UtcNow);
         }
 
         public async Task<ApiKeyResponse> CreateApiKeyAsync(Guid userId, CreateApiKeyRequest request)
@@ -49,7 +58,7 @@ namespace SaaSLibrary.ApiKeys
                 RateLimit = request.RateLimit,
                 ExpiresAt = request.ExpiresAt,
                 IsActive = true,
-                CreatedAt = DateTime.UtcNow
+                CreatedAt = _clock()
             };
 
             _dbContext.ApiKeys.Add(apiKey);
@@ -102,7 +111,7 @@ namespace SaaSLibrary.ApiKeys
             return new RevokeApiKeyResponse
             {
                 Success = true,
-                RevokedAt = DateTime.UtcNow
+                RevokedAt = _clock()
             };
         }
 
@@ -126,11 +135,11 @@ namespace SaaSLibrary.ApiKeys
 
             // One grace period at a time: a second rotation now would overwrite the previous secret, and clients
             // still on it would lose access before the grace period they were promised ends (CodeRabbit, PR 18).
-            if (apiKey.GracePeriodEndsAt.HasValue && apiKey.GracePeriodEndsAt.Value > DateTime.UtcNow)
+            if (apiKey.GracePeriodEndsAt.HasValue && apiKey.GracePeriodEndsAt.Value > _clock())
                 throw new InvalidOperationException(
                     $"API key {apiKeyId} was rotated recently; rotate again after {apiKey.GracePeriodEndsAt.Value:o}");
 
-            var oldKeyRevokedAt = DateTime.UtcNow;
+            var oldKeyRevokedAt = _clock();
             var gracePeriodEndsAt = oldKeyRevokedAt.AddHours(24);
 
             apiKey.PreviousKeyPrefix = apiKey.KeyPrefix;
@@ -154,9 +163,29 @@ namespace SaaSLibrary.ApiKeys
         }
 
         /// <summary>
+        /// Checks the Authorization header of an API request (KEYS-02): "Bearer &lt;key&gt;" (scheme case-insensitive),
+        /// then <see cref="ValidateApiKeyAsync"/>. In: the raw header value, the request path and method. Out: the
+        /// validation result; a missing header or another scheme is 401 "Missing API key".
+        /// Why: the spec's "Use API key (in request headers) Authorization: Bearer sk_live_..."; before 2026-11-10 only
+        /// a bare key could be validated. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: as ValidateApiKeyAsync.
+        /// </summary>
+        public Task<ApiKeyValidationResult> ValidateAuthorizationHeaderAsync(string authorizationHeader, string endpoint, HttpMethod method)
+        {
+            const string scheme = "Bearer ";
+            if (string.IsNullOrWhiteSpace(authorizationHeader) ||
+                !authorizationHeader.StartsWith(scheme, StringComparison.OrdinalIgnoreCase))
+                return Task.FromResult(new ApiKeyValidationResult { IsValid = false, ErrorMessage = "Missing API key", StatusCode = System.Net.HttpStatusCode.Unauthorized });
+            return ValidateApiKeyAsync(authorizationHeader.Substring(scheme.Length).Trim(), endpoint, method);
+        }
+
+        /// <summary>
         /// Validates a presented key for a request: format, prefix (current or in-grace previous), bcrypt hash, expiry,
         /// the exact scope the route needs, and the rate limit. Output: IsValid or the error and HTTP status.
         /// Touches: the api_keys and usage tables, Redis (rate counter). Reviewed in PR 18 (2026-11-09, session 04ec72ff).
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: time comes from the injected clock, and a rejection
+        /// of an identified key (401 expired, 403 scope, 429 rate limit) is written to api_key_usage, so usage stats
+        /// count rate-limit hits and errors (spec: "Log usage: record endpoint, method, status"). A success is logged
+        /// by the caller with the handler's final status (LogApiKeyUsageAsync).
         /// </summary>
         public async Task<ApiKeyValidationResult> ValidateApiKeyAsync(string key, string endpoint, HttpMethod method)
         {
@@ -170,6 +199,7 @@ namespace SaaSLibrary.ApiKeys
                 return new ApiKeyValidationResult { IsValid = false, ErrorMessage = "API key too short", StatusCode = System.Net.HttpStatusCode.Unauthorized };
 
             var prefix = key.Substring(8, 8);
+            var now = _clock();
             var apiKey = await _dbContext.ApiKeys
                 .AsNoTracking()
                 .FirstOrDefaultAsync(k => k.KeyPrefix == prefix && k.IsActive);
@@ -178,14 +208,14 @@ namespace SaaSLibrary.ApiKeys
             {
                 apiKey = await _dbContext.ApiKeys
                     .AsNoTracking()
-                    .FirstOrDefaultAsync(k => k.PreviousKeyPrefix == prefix && k.IsActive && k.GracePeriodEndsAt.HasValue && k.GracePeriodEndsAt.Value > DateTime.UtcNow);
+                    .FirstOrDefaultAsync(k => k.PreviousKeyPrefix == prefix && k.IsActive && k.GracePeriodEndsAt.HasValue && k.GracePeriodEndsAt.Value > now);
             }
 
             if (apiKey == null)
                 return new ApiKeyValidationResult { IsValid = false, ErrorMessage = "Invalid API key", StatusCode = System.Net.HttpStatusCode.Unauthorized };
 
             string secretHash = apiKey.KeySecretHash;
-            if (apiKey.PreviousKeyPrefix == prefix && apiKey.GracePeriodEndsAt.HasValue && apiKey.GracePeriodEndsAt.Value > DateTime.UtcNow)
+            if (apiKey.PreviousKeyPrefix == prefix && apiKey.GracePeriodEndsAt.HasValue && apiKey.GracePeriodEndsAt.Value > now)
             {
                 secretHash = apiKey.PreviousKeySecretHash!;
             }
@@ -197,29 +227,38 @@ namespace SaaSLibrary.ApiKeys
             if (!BCrypt.Net.BCrypt.Verify(key, secretHash))
                 return new ApiKeyValidationResult { IsValid = false, ErrorMessage = "Invalid API key", StatusCode = System.Net.HttpStatusCode.Unauthorized };
 
-            if (apiKey.ExpiresAt.HasValue && apiKey.ExpiresAt.Value < DateTime.UtcNow)
+            if (apiKey.ExpiresAt.HasValue && apiKey.ExpiresAt.Value < now)
+            {
+                await LogApiKeyUsageAsync(apiKey.Id, endpoint, method, 401);
                 return new ApiKeyValidationResult { IsValid = false, ErrorMessage = "API key expired", StatusCode = System.Net.HttpStatusCode.Unauthorized };
+            }
 
             var scopes = JsonSerializer.Deserialize<List<string>>(apiKey.ScopesJson)!;
             // A key needs the exact scope for the route. There is no wildcard: keys are not checked for their scopes
             // when created, so a "*" would let any key holder grant itself everything.
             var requiredScope = GetRequiredScope(endpoint, method);
             if (!scopes.Contains(requiredScope))
+            {
+                await LogApiKeyUsageAsync(apiKey.Id, endpoint, method, 403);
                 return new ApiKeyValidationResult { IsValid = false, ErrorMessage = "Insufficient scope", StatusCode = System.Net.HttpStatusCode.Forbidden };
+            }
 
             var redisDb = _redis.GetDatabase();
-            var redisKey = $"rate_limit:{apiKey.Id}:{DateTime.UtcNow:yyyy-MM-dd HH}";
+            var redisKey = $"rate_limit:{apiKey.Id}:{now:yyyy-MM-dd HH}";
             long current = await redisDb.StringIncrementAsync(redisKey);
             if (current == 1)
                 await redisDb.KeyExpireAsync(redisKey, TimeSpan.FromHours(2));
 
             if (current > apiKey.RateLimit)
+            {
+                await LogApiKeyUsageAsync(apiKey.Id, endpoint, method, 429);
                 return new ApiKeyValidationResult { IsValid = false, ErrorMessage = "Rate limit exceeded", StatusCode = (System.Net.HttpStatusCode)429 };
+            }
 
             var trackedKey = await _dbContext.ApiKeys.FindAsync(apiKey.Id);
             if (trackedKey != null)
             {
-                trackedKey.LastUsedAt = DateTime.UtcNow;
+                trackedKey.LastUsedAt = now;
                 await _dbContext.SaveChangesAsync();
             }
 
@@ -235,7 +274,7 @@ namespace SaaSLibrary.ApiKeys
                 Endpoint = endpoint,
                 Method = method.ToString(),
                 Status = statusCode,
-                Timestamp = DateTime.UtcNow
+                Timestamp = _clock()
             };
 
             _dbContext.ApiKeyUsages.Add(usage);

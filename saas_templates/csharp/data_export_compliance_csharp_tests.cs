@@ -167,6 +167,7 @@ namespace ComplianceModule.Tests
             Assert.NotNull(exportResponse.WillEmailAt);
         }
 
+        // EXPORT-01
         [Fact]
         public async Task RequestExport_JsonAndCsvFormatsBothWork()
         {
@@ -189,6 +190,25 @@ namespace ComplianceModule.Tests
             var csvExportResponse = JsonConvert.DeserializeObject<ExportResponse>(csvResponseString);
             Assert.Equal("pending", csvExportResponse.Status);
             Assert.Equal("csv", csvExportResponse.Format);
+
+            // both files are built and download in their format (added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP:
+            // the test only checked the requests were accepted)
+            using (var scope = _factory.Services.CreateScope())
+                await scope.ServiceProvider.GetRequiredService<ExportProcessor>().ProcessPendingExportsAsync(CancellationToken.None);
+            var anonymous = _factory.CreateClient();
+            var jsonFile = await anonymous.GetStringAsync((await Status(jsonExportResponse.ExportId)).FileUrl);
+            Assert.Equal($"{_userId:N}@example.test", (string)JObject.Parse(jsonFile).SelectToken("profile.email"));
+            var csvFile = await anonymous.GetStringAsync((await Status(csvExportResponse.ExportId)).FileUrl);
+            Assert.StartsWith("section,path,value\n", csvFile);
+            Assert.Contains("\"profile\",\"profile.email\"", csvFile);
+        }
+
+        /// <summary>GET /compliance/exports/{id} as the test user. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.</summary>
+        private async Task<ExportStatusResponse> Status(string exportId)
+        {
+            var r = await _client.GetAsync($"/compliance/exports/{exportId}");
+            r.EnsureSuccessStatusCode();
+            return JsonConvert.DeserializeObject<ExportStatusResponse>(await r.Content.ReadAsStringAsync());
         }
 
         [Fact]
@@ -213,11 +233,14 @@ namespace ComplianceModule.Tests
             Assert.Equal("pending", statusResponseObj.Status);
         }
 
+        // EXPORT-05
         [Fact]
         public async Task RequestDeletion_ReturnsPendingStatusWithGracePeriod()
         {
             // Arrange
-            var request = new DeletionRequestDto { Reason = "gdpr_request" };
+            // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-05/12 amendment): the 30-day grace period is for
+            // user_requested / other; gdpr_request now has none (see Deletion_StatutoryReason_HasNoGracePeriod).
+            var request = new DeletionRequestDto { Reason = "user_requested" };
             using var content = new StringContent(JsonConvert.SerializeObject(request), Encoding.UTF8, "application/json");
 
             // Act
@@ -237,8 +260,13 @@ namespace ComplianceModule.Tests
             var willDeleteAt = DateTime.Parse(deletionResponse.WillDeleteAt, null, System.Globalization.DateTimeStyles.RoundtripKind);
             var now = DateTime.UtcNow;
             Assert.InRange(willDeleteAt.Subtract(now).TotalDays, 29, 31);
+            using var scope = _factory.Services.CreateScope();
+            var row = await scope.ServiceProvider.GetRequiredService<ComplianceDbContext>().DeletionRequests.AsNoTracking()
+                .SingleAsync(d => d.Id == Guid.Parse(deletionResponse.DeletionId));
+            Assert.Equal(row.RequestedAt.AddDays(30), row.ScheduledFor); // exactly requested_at + 30 days
         }
 
+        // EXPORT-06
         [Fact]
         public async Task DeletionCanBeCancelledWithinGracePeriod()
         {
@@ -283,6 +311,7 @@ namespace ComplianceModule.Tests
             // In a real test we would generate a valid token using the same encryption as the service
         }
 
+        // EXPORT-10
         [Fact]
         public async Task AdminCanListExportRequests()
         {
@@ -301,6 +330,7 @@ namespace ComplianceModule.Tests
             Assert.Contains(adminResponse.Exports, e => e.Format == "csv");
         }
 
+        // EXPORT-10
         [Fact]
         public async Task AdminCanListDeletionRequestsByStatus()
         {
@@ -346,10 +376,15 @@ namespace ComplianceModule.Tests
         /// The emailed token confirms the deletion (once); after the 30-day grace period the cascade removes the user's
         /// data and the audit log survives. Added 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP).
         /// </summary>
+        // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-12/13 amendment): reason user_requested (a gdpr
+        // reason has no grace period now); the audit rows are found by id after the deletion, because erase_subject
+        // removes their link to the user; 'user_deleted_cascade' is logged instead of 'deletion_completed'.
+        // EXPORT-08
+        // EXPORT-09
         [Fact]
         public async Task ConfirmedDeletionCascadesAfterGracePeriodAndKeepsAudit()
         {
-            var deletion = await PostAs<DeletionResponse>(_client, "/compliance/delete", new DeletionRequestDto { Reason = "gdpr_request" });
+            var deletion = await PostAs<DeletionResponse>(_client, "/compliance/delete", new DeletionRequestDto { Reason = "user_requested" });
             var mailer = _factory.Services.GetRequiredService<DevelopmentComplianceMailer>();
             var token = mailer.Sent.Last(m => m.DeletionId == Guid.Parse(deletion.DeletionId)).Secret;
 
@@ -361,22 +396,31 @@ namespace ComplianceModule.Tests
 
             var store = _factory.Services.GetRequiredService<InMemoryUserDataStore>();
             using var scope = _factory.Services.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<ComplianceDbContext>();
+            var auditIds = await db.AuditLogs.Where(a => a.UserId == _userId).Select(a => a.Id).ToListAsync();
             var processor = scope.ServiceProvider.GetRequiredService<ExportProcessor>();
             Assert.Equal(0, await processor.ProcessDueDeletionsAsync(DateTime.UtcNow.AddDays(29), CancellationToken.None));
             Assert.True(store.Exists(_userId));
             await processor.ProcessDueDeletionsAsync(DateTime.UtcNow.AddDays(31), CancellationToken.None);
             Assert.False(store.Exists(_userId));
 
-            var db = scope.ServiceProvider.GetRequiredService<ComplianceDbContext>();
-            var actions = await db.AuditLogs.Where(a => a.UserId == _userId).Select(a => a.Action).ToListAsync();
+            // EXPORT-08: every earlier audit row is still there, no longer linked to the user
+            var kept = await db.AuditLogs.AsNoTracking().Where(a => auditIds.Contains(a.Id)).ToListAsync();
+            Assert.Equal(auditIds.Count, kept.Count);
+            Assert.All(kept, a => Assert.True(a.PersonalErased && a.UserId == Guid.Empty));
+            var actions = kept.Select(a => a.Action).ToList();
             Assert.Contains("deletion_requested", actions);
-            Assert.Contains("deletion_completed", actions);
+            Assert.Contains("deletion_confirmed", actions);
+            Assert.Contains(await db.AuditLogs.AsNoTracking().ToListAsync(), a => a.Action == "user_deleted_cascade" && a.Details.Contains(deletion.DeletionId));
         }
 
         /// <summary>
         /// A processed export is completed with a 7-day signed link that downloads a file holding every data category,
         /// CSV-formula-safe; a tampered or expired link is refused. Added 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP).
         /// </summary>
+        // EXPORT-02
+        // EXPORT-03
+        // EXPORT-04
         [Fact]
         public async Task ProcessedExportHasWorkingSignedLink()
         {
@@ -387,6 +431,9 @@ namespace ComplianceModule.Tests
             var status = JsonConvert.DeserializeObject<ExportStatusResponse>(await (await _client.GetAsync($"/compliance/exports/{export.ExportId}")).Content.ReadAsStringAsync());
             Assert.Equal("completed", status.Status);
             Assert.InRange(DateTime.Parse(status.ExpiresAt, null, System.Globalization.DateTimeStyles.RoundtripKind).Subtract(DateTime.UtcNow).TotalDays, 6.9, 7.1);
+            // EXPORT-03: the link was emailed to the user (assert added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+            Assert.Contains(_factory.Services.GetRequiredService<DevelopmentComplianceMailer>().Sent,
+                m => m.Kind == "export_ready" && m.To == $"{_userId:N}@example.test" && m.Secret == status.FileUrl);
 
             var anonymous = _factory.CreateClient();
             var file = await anonymous.GetStringAsync(status.FileUrl);
@@ -406,6 +453,7 @@ namespace ComplianceModule.Tests
         /// audit log survives. Added 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit review on PR 19:
         /// a deleted user's unexpired signed link still downloaded the export). Touches: the in-process test server.
         /// </summary>
+        // EXPORT-07
         [Fact]
         public async Task DeletedUsersExportLinkIsRefusedAndFileIsGone()
         {
@@ -417,7 +465,7 @@ namespace ComplianceModule.Tests
             var anonymous = _factory.CreateClient();
             Assert.Equal(HttpStatusCode.OK, (await anonymous.GetAsync(status.FileUrl)).StatusCode); // the link works before
 
-            await ConfirmDeletionAsync();
+            var deletionId = await ConfirmDeletionAsync();
             using (var scope = _factory.Services.CreateScope())
                 await scope.ServiceProvider.GetRequiredService<ExportProcessor>().ProcessDueDeletionsAsync(DateTime.UtcNow.AddDays(31), CancellationToken.None);
 
@@ -428,11 +476,17 @@ namespace ComplianceModule.Tests
             {
                 var db = scope.ServiceProvider.GetRequiredService<ComplianceDbContext>();
                 Assert.False(await db.ExportRequests.AnyAsync(e => e.UserId == _userId));
-                Assert.Equal("completed", (await db.DeletionRequests.SingleAsync(d => d.UserId == _userId)).Status);
-                var actions = await db.AuditLogs.Where(a => a.UserId == _userId).Select(a => a.Action).ToListAsync();
+                // Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (EXPORT-13): the request's user_id is NULL once
+                // completed and the audit rows lose their link to the user, so both are found by the export/deletion id.
+                var completed = await db.DeletionRequests.SingleAsync(d => d.Id == deletionId);
+                Assert.Equal("completed", completed.Status);
+                Assert.Null(completed.UserId);
+                var actions = (await db.AuditLogs.AsNoTracking().ToListAsync())
+                    .Where(a => a.Details.Contains(export.ExportId) || a.Details.Contains(deletionId.ToString())).Select(a => a.Action).ToList();
                 Assert.Contains("data_export_requested", actions);
                 Assert.Contains("data_export_completed", actions);
-                Assert.Contains("deletion_completed", actions);
+                Assert.Contains("user_deleted_cascade", actions);
+                Assert.False(await db.AuditLogs.AnyAsync(a => a.UserId == _userId));
             }
         }
 
@@ -445,7 +499,7 @@ namespace ComplianceModule.Tests
         public async Task DeletionStaysRetryableWhenExportCleanupFails()
         {
             await PostAs<ExportResponse>(_client, "/compliance/export", new ExportRequestDto { Format = "csv" });
-            await ConfirmDeletionAsync();
+            var deletionId = await ConfirmDeletionAsync();
             var store = _factory.Services.GetRequiredService<InMemoryUserDataStore>();
             var later = DateTime.UtcNow.AddDays(31);
 
@@ -467,7 +521,8 @@ namespace ComplianceModule.Tests
             {
                 await scope.ServiceProvider.GetRequiredService<ExportProcessor>().ProcessDueDeletionsAsync(later, CancellationToken.None);
                 var db = scope.ServiceProvider.GetRequiredService<ComplianceDbContext>();
-                Assert.Equal("completed", (await db.DeletionRequests.AsNoTracking().SingleAsync(d => d.UserId == _userId)).Status);
+                // by id: user_id is NULL once completed (EXPORT-13; changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP)
+                Assert.Equal("completed", (await db.DeletionRequests.AsNoTracking().SingleAsync(d => d.Id == deletionId)).Status);
                 Assert.False(await db.ExportRequests.AnyAsync(e => e.UserId == _userId));
             }
             Assert.False(store.Exists(_userId));
@@ -485,13 +540,184 @@ namespace ComplianceModule.Tests
             public bool VerifyDownload(string key, long expiresUnix, string signature, DateTimeOffset now) => _inner.VerifyDownload(key, expiresUnix, signature, now);
         }
 
-        /// <summary>Requests this test user's deletion and confirms it with the emailed token. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.</summary>
-        private async Task ConfirmDeletionAsync()
+        /// <summary>
+        /// Requests this test user's deletion (user_requested: 30-day grace) and confirms it with the emailed token.
+        /// Out: the deletion id. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: was gdpr_request, which now runs
+        /// the cascade at confirm (EXPORT-12); returns the id because user_id is NULL after completion.
+        /// </summary>
+        private async Task<Guid> ConfirmDeletionAsync()
         {
-            var deletion = await PostAs<DeletionResponse>(_client, "/compliance/delete", new DeletionRequestDto { Reason = "gdpr_request" });
+            var deletion = await PostAs<DeletionResponse>(_client, "/compliance/delete", new DeletionRequestDto { Reason = "user_requested" });
             var token = _factory.Services.GetRequiredService<DevelopmentComplianceMailer>().Sent.Last(m => m.DeletionId == Guid.Parse(deletion.DeletionId)).Secret;
             var confirm = await PostAs<DeletionConfirmationResponse>(_client, $"/compliance/delete/{deletion.DeletionId}/confirm", new ConfirmDeletionDto { ConfirmationToken = token });
             Assert.True(confirm.Success);
+            return Guid.Parse(deletion.DeletionId);
+        }
+
+        /// <summary>The emailed confirmation token of a deletion. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.</summary>
+        private string TokenOf(string deletionId) =>
+            _factory.Services.GetRequiredService<DevelopmentComplianceMailer>().Sent.Last(m => m.DeletionId == Guid.Parse(deletionId)).Secret;
+
+        /// <summary>POSTs a confirm with a token and returns the raw response. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.</summary>
+        private async Task<HttpResponseMessage> Confirm(HttpClient client, string deletionId, string token)
+        {
+            using var content = new StringContent(JsonConvert.SerializeObject(new ConfirmDeletionDto { ConfirmationToken = token }), Encoding.UTF8, "application/json");
+            return await client.PostAsync($"/compliance/delete/{deletionId}/confirm", content);
+        }
+
+        /// <summary>
+        /// EXPORT-12: a gdpr_request or gdpr_right_to_be_forgotten deletion is not held for 30 days: will_delete_at =
+        /// requested_at, nothing is deleted before confirm, and confirm runs the cascade before it returns (status
+        /// completed, deleted_at = deletion_scheduled_for = now). Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        /// </summary>
+        // EXPORT-12
+        [Fact]
+        public async Task Deletion_StatutoryReason_HasNoGracePeriod()
+        {
+            foreach (var reason in new[] { "gdpr_request", "gdpr_right_to_be_forgotten" })
+            {
+                var userId = Guid.NewGuid();
+                _factory.Services.GetRequiredService<InMemoryUserDataStore>().Seed(userId, SampleUser(userId));
+                var client = _factory.CreateClient();
+                client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", CustomWebApplicationFactory<ComplianceModule.Startup>.Token(userId));
+
+                var deletion = await PostAs<DeletionResponse>(client, "/compliance/delete", new DeletionRequestDto { Reason = reason });
+                using (var scope = _factory.Services.CreateScope())
+                {
+                    var row = await scope.ServiceProvider.GetRequiredService<ComplianceDbContext>().DeletionRequests.AsNoTracking().SingleAsync(d => d.Id == Guid.Parse(deletion.DeletionId));
+                    Assert.Equal(row.RequestedAt, row.ScheduledFor);
+                    Assert.Equal(ComplianceService.Iso(row.RequestedAt), deletion.WillDeleteAt);
+                    // nothing is deleted before confirm, even when the worker runs
+                    await scope.ServiceProvider.GetRequiredService<ExportProcessor>().ProcessDueDeletionsAsync(DateTime.UtcNow.AddDays(400), CancellationToken.None);
+                }
+                Assert.True(_factory.Services.GetRequiredService<InMemoryUserDataStore>().Exists(userId));
+
+                var confirmResponse = await Confirm(client, deletion.DeletionId, TokenOf(deletion.DeletionId));
+                confirmResponse.EnsureSuccessStatusCode();
+                var confirm = JsonConvert.DeserializeObject<DeletionConfirmationResponse>(await confirmResponse.Content.ReadAsStringAsync());
+                Assert.Equal("completed", confirm.Status);
+                Assert.False(_factory.Services.GetRequiredService<InMemoryUserDataStore>().Exists(userId));
+                using (var scope = _factory.Services.CreateScope())
+                {
+                    var row = await scope.ServiceProvider.GetRequiredService<ComplianceDbContext>().DeletionRequests.AsNoTracking().SingleAsync(d => d.Id == Guid.Parse(deletion.DeletionId));
+                    Assert.Equal(row.ScheduledFor, row.DeletedAt);
+                    Assert.Equal(ComplianceService.Iso(row.ScheduledFor), confirm.DeletionScheduledFor);
+                    Assert.Null(row.UserId);
+                }
+            }
+        }
+
+        /// <summary>
+        /// EXPORT-13: the cascade deletes the user's rows, logs 'user_deleted_cascade', then calls the audit eraser's
+        /// erase_subject(user_id) LAST, and nothing is logged for the user after it; deletion_requests.user_id is NULL
+        /// once completed. A recording eraser checks the state at the moment it is called. Added 2026-11-10,
+        /// session_012zDydZCZ4AChqhEZ4oVtaP.
+        /// </summary>
+        // EXPORT-13
+        [Fact]
+        public async Task DeletionCascade_Order_EraseSubjectLast()
+        {
+            var deletionId = await ConfirmDeletionAsync();
+            using var scope = _factory.Services.CreateScope();
+            var sp = scope.ServiceProvider;
+            var db = sp.GetRequiredService<ComplianceDbContext>();
+            var store = sp.GetRequiredService<InMemoryUserDataStore>();
+            var eraser = new RecordingEraser(db, store);
+            var processor = new ExportProcessor(db, sp.GetRequiredService<IUserDataStore>(), sp.GetRequiredService<IExportStorage>(),
+                sp.GetRequiredService<IComplianceMailer>(), NullLogger<ExportProcessor>.Instance, eraser);
+
+            await processor.ProcessDueDeletionsAsync(DateTime.UtcNow.AddDays(31), CancellationToken.None);
+
+            Assert.Equal(new[] { _userId }, eraser.Calls);
+            Assert.False(eraser.UserExistedAtCall, "the user's rows are deleted before erase_subject");
+            Assert.True(eraser.CascadeLoggedAtCall, "'user_deleted_cascade' is logged before erase_subject");
+            var rows = await db.AuditLogs.AsNoTracking().ToListAsync();
+            Assert.Equal(eraser.AuditRowsAtCall, rows.Count); // nothing logged after erase_subject
+            Assert.DoesNotContain(rows, a => a.UserId == _userId || a.ActorId == _userId);
+            var completed = await db.DeletionRequests.AsNoTracking().SingleAsync(d => d.Id == deletionId);
+            Assert.Equal("completed", completed.Status);
+            Assert.Null(completed.UserId);
+        }
+
+        /// <summary>An audit eraser that records what was true when it was called, then erases like the default one. Test double.</summary>
+        private sealed class RecordingEraser : IAuditEraser
+        {
+            private readonly ComplianceDbContext _db;
+            private readonly InMemoryUserDataStore _store;
+            public readonly List<Guid> Calls = new();
+            public bool UserExistedAtCall;
+            public bool CascadeLoggedAtCall;
+            public int AuditRowsAtCall;
+
+            public RecordingEraser(ComplianceDbContext db, InMemoryUserDataStore store) { _db = db; _store = store; }
+
+            public async Task EraseSubjectAsync(Guid userId, CancellationToken ct)
+            {
+                Calls.Add(userId);
+                UserExistedAtCall = _store.Exists(userId);
+                CascadeLoggedAtCall = _db.AuditLogs.Local.Any(a => a.UserId == userId && a.Action == "user_deleted_cascade");
+                AuditRowsAtCall = await _db.AuditLogs.CountAsync(ct) + _db.AuditLogs.Local.Count(a => _db.Entry(a).State == EntityState.Added);
+                await new LocalAuditEraser(_db).EraseSubjectAsync(userId, ct);
+            }
+        }
+
+        /// <summary>
+        /// EXPORT-14: nothing is deleted before confirm; a wrong token is refused (400) and changes nothing; a token over
+        /// 24 h old is refused (400); a reused token is refused (409, already confirmed); another user's request is 404 for
+        /// confirm and cancel. Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Moves the shared clock and restores it.
+        /// </summary>
+        // EXPORT-14
+        [Fact]
+        public async Task DeletionConfirmation_WrongReusedExpiredForeign_AllRefused()
+        {
+            var store = _factory.Services.GetRequiredService<InMemoryUserDataStore>();
+            var deletion = await PostAs<DeletionResponse>(_client, "/compliance/delete", new DeletionRequestDto { Reason = "user_requested" });
+            var token = TokenOf(deletion.DeletionId);
+            Assert.True(store.Exists(_userId));
+
+            Assert.Equal(HttpStatusCode.BadRequest, (await Confirm(_client, deletion.DeletionId, token.Substring(0, token.Length - 1) + (token.EndsWith("A") ? "B" : "A"))).StatusCode);
+
+            var stranger = _factory.CreateClient();
+            stranger.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", CustomWebApplicationFactory<ComplianceModule.Startup>.Token(Guid.NewGuid()));
+            Assert.Equal(HttpStatusCode.NotFound, (await Confirm(stranger, deletion.DeletionId, token)).StatusCode);
+            Assert.Equal(HttpStatusCode.NotFound, (await stranger.DeleteAsync($"/compliance/delete/{deletion.DeletionId}")).StatusCode);
+
+            var clock = _factory.Services.GetRequiredService<ComplianceClock>();
+            var original = clock.Now;
+            try
+            {
+                clock.Now = () => DateTime.UtcNow.AddHours(24).AddMinutes(1);
+                Assert.Equal(HttpStatusCode.BadRequest, (await Confirm(_client, deletion.DeletionId, token)).StatusCode);
+            }
+            finally
+            {
+                clock.Now = original;
+            }
+            Assert.True(store.Exists(_userId)); // nothing deleted by any refused attempt
+
+            (await Confirm(_client, deletion.DeletionId, token)).EnsureSuccessStatusCode();
+            Assert.Equal(HttpStatusCode.Conflict, (await Confirm(_client, deletion.DeletionId, token)).StatusCode);
+            Assert.True(store.Exists(_userId)); // approved, waiting out the grace period
+        }
+
+        /// <summary>
+        /// EXPORT-11: every export and deletion request is audited with its reason (action, the acting user and the
+        /// details: format, reason, request id). Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP.
+        /// </summary>
+        // EXPORT-11
+        [Fact]
+        public async Task AllRequestsAreAudited()
+        {
+            var export = await PostAs<ExportResponse>(_client, "/compliance/export", new ExportRequestDto { Format = "json" });
+            var deletion = await PostAs<DeletionResponse>(_client, "/compliance/delete", new DeletionRequestDto { Reason = "other" });
+            await _client.DeleteAsync($"/compliance/delete/{deletion.DeletionId}");
+            using var scope = _factory.Services.CreateScope();
+            var rows = await scope.ServiceProvider.GetRequiredService<ComplianceDbContext>().AuditLogs.AsNoTracking()
+                .Where(a => a.UserId == _userId).OrderBy(a => a.Sequence).ToListAsync();
+            Assert.Equal(new[] { "data_export_requested", "deletion_requested", "deletion_cancelled" }, rows.Select(a => a.Action).ToArray());
+            Assert.All(rows, a => Assert.Equal(_userId, a.ActorId));
+            Assert.Contains(export.ExportId, rows[0].Details);
+            Assert.Contains("\"reason\":\"other\"", rows[1].Details);
         }
 
         /// <summary>POSTs a JSON body, requires success and reads the answer. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.</summary>

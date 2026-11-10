@@ -25,6 +25,7 @@ namespace AOI.Rbac.Tests
         // ─────────────────────────────────────────────────────────────────────
         // TEST 1: require_owner on non-owner → 403
         // ─────────────────────────────────────────────────────────────────────
+        // RBAC-01
         [Fact]
         public void RequireOwner_NonOwner_Returns403()
         {
@@ -82,6 +83,7 @@ namespace AOI.Rbac.Tests
         // ─────────────────────────────────────────────────────────────────────
         // TEST 2: require_admin on member → 403
         // ─────────────────────────────────────────────────────────────────────
+        // RBAC-02
         [Fact]
         public void RequireAdmin_Member_Returns403()
         {
@@ -137,6 +139,7 @@ namespace AOI.Rbac.Tests
         // ─────────────────────────────────────────────────────────────────────
         // TEST 3: require_authenticated on public → 401
         // ─────────────────────────────────────────────────────────────────────
+        // RBAC-03
         [Fact]
         public void RequireAuthenticated_NullUser_Returns401()
         {
@@ -187,6 +190,7 @@ namespace AOI.Rbac.Tests
         // ─────────────────────────────────────────────────────────────────────
         // TEST 4: cascade_delete user → all related records deleted in transaction
         // ─────────────────────────────────────────────────────────────────────
+        // RBAC-04
         [Fact]
         public void CascadeDeleteUser_DeletesAllRelatedRecords()
         {
@@ -239,6 +243,7 @@ namespace AOI.Rbac.Tests
         // ─────────────────────────────────────────────────────────────────────
         // TEST 5: cascade_delete deployment → all related records deleted
         // ─────────────────────────────────────────────────────────────────────
+        // RBAC-05
         [Fact]
         public void CascadeDeleteDeployment_DeletesAllRelatedRecords()
         {
@@ -270,42 +275,108 @@ namespace AOI.Rbac.Tests
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // TEST 6: cascade_delete org → all nested records deleted
+        // TEST 6: cascade_delete org (RBAC-06, amended 2026-11-10)
         // ─────────────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Builds two orgs: org A (owner, a member who also belongs to org B, two deployments with child rows, one org
+        /// key, one invitation) and org B (its own owner and key). Every user also has a personal key and a session.
+        /// Added 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches: memory.
+        /// </summary>
+        private static (OrgDataStore Store, Guid OrgA, Guid OrgB, User OwnerA, User Shared, User OwnerB) BuildOrgs()
+        {
+            var store = new OrgDataStore();
+            Guid orgA = Guid.NewGuid(), orgB = Guid.NewGuid();
+            var ownerA = new User { Id = Guid.NewGuid(), Email = "a@test.com", Tier = Tier.Owner };
+            var shared = new User { Id = Guid.NewGuid(), Email = "shared@test.com", Tier = Tier.Member };
+            var ownerB = new User { Id = Guid.NewGuid(), Email = "b@test.com", Tier = Tier.Owner };
+            store.Users.AddRange(new[] { ownerA, shared, ownerB });
+            foreach (var u in store.Users)
+            {
+                store.Sessions.Add((Guid.NewGuid(), u.Id));
+                store.ApiKeys.Add(new OrgApiKey { UserId = u.Id, OrgId = null });
+            }
+            store.Memberships.Add(new OrgMembership { OrgId = orgA, UserId = ownerA.Id, Role = "owner" });
+            store.Memberships.Add(new OrgMembership { OrgId = orgA, UserId = shared.Id, Role = "member" });
+            store.Memberships.Add(new OrgMembership { OrgId = orgB, UserId = ownerB.Id, Role = "owner" });
+            store.Memberships.Add(new OrgMembership { OrgId = orgB, UserId = shared.Id, Role = "admin" });
+            store.ApiKeys.Add(new OrgApiKey { UserId = ownerA.Id, OrgId = orgA });
+            store.ApiKeys.Add(new OrgApiKey { UserId = ownerB.Id, OrgId = orgB });
+            store.Invitations.Add(new OrgInvitation { OrgId = orgA, Email = "new@test.com" });
+            store.Invitations.Add(new OrgInvitation { OrgId = orgB, Email = "other@test.com" });
+            for (var i = 0; i < 2; i++)
+                store.Deployments.Add(new OrgDeployment
+                {
+                    OrgId = orgA,
+                    Children = new CascadeDeleteContext { DnsRecords = new() { "a" }, ThemeConfigs = new() { "t" }, DeploymentLogs = new() { "l" } }
+                });
+            store.Deployments.Add(new OrgDeployment { OrgId = orgB });
+            return (store, orgA, orgB, ownerA, shared, ownerB);
+        }
+
+        /// <summary>
+        /// RBAC-06: org B's owner (a global owner tier) gets 404 and nothing changes; org A's owner deletes org A's
+        /// deployments (with their child rows), org key, invitations and memberships, while every user, session and
+        /// personal key, and the shared member's org-B membership, stay. Rewritten 2026-11-10,
+        /// session_012zDydZCZ4AChqhEZ4oVtaP: the old test expected the org cascade to delete user accounts.
+        /// </summary>
+        // RBAC-06
         [Fact]
         public void CascadeDeleteOrganization_DeletesAllNestedRecords()
         {
-            var orgId = Guid.NewGuid();
-            var context = new CascadeDeleteContext
-            {
-                Deployments = new List<Guid> { Guid.NewGuid(), Guid.NewGuid() },
-                Users = new List<Guid> { Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid() },
-                OrgApiKeys = new List<Guid> { Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid() },
-                OrgSessions = new List<Guid> { Guid.NewGuid(), Guid.NewGuid() }
-            };
+            var (store, orgA, orgB, ownerA, shared, ownerB) = BuildOrgs();
 
-            var (success, error) = _rbac.CascadeService.DeleteOrganization(orgId, context);
+            var (refused, notFound) = _rbac.TransactionalService.DeleteOrganizationTransactional(ownerB, orgA, store);
+            Assert.False(refused);
+            Assert.Equal(404, notFound!.Code);
+            Assert.Equal(3, store.Deployments.Count);
+            Assert.Equal(4, store.Memberships.Count);
+
+            var (memberTried, memberError) = _rbac.TransactionalService.DeleteOrganizationTransactional(shared, orgA, store);
+            Assert.False(memberTried);
+            Assert.Equal(404, memberError!.Code);
+
+            var orgADeployments = store.Deployments.Where(d => d.OrgId == orgA).ToList();
+            var (success, error) = _rbac.TransactionalService.DeleteOrganizationTransactional(ownerA, orgA, store);
 
             Assert.True(success);
             Assert.Null(error);
-            Assert.Empty(context.Deployments);
-            Assert.Empty(context.Users);
-            Assert.Empty(context.OrgApiKeys);
-            Assert.Empty(context.OrgSessions);
+            Assert.DoesNotContain(store.Deployments, d => d.OrgId == orgA);
+            Assert.All(orgADeployments, d => Assert.Empty(d.Children.DnsRecords));
+            Assert.DoesNotContain(store.ApiKeys, k => k.OrgId == orgA);
+            Assert.DoesNotContain(store.Invitations, i => i.OrgId == orgA);
+            Assert.DoesNotContain(store.Memberships, m => m.OrgId == orgA);
+            // kept: accounts, sessions, personal keys, org B and the shared member's org-B membership
+            Assert.Equal(3, store.Users.Count);
+            Assert.Equal(3, store.Sessions.Count);
+            Assert.Equal(3, store.ApiKeys.Count(k => k.OrgId == null));
+            Assert.Contains(store.Memberships, m => m.OrgId == orgB && m.UserId == shared.Id && m.Role == "admin");
+            Assert.Contains(store.ApiKeys, k => k.OrgId == orgB);
+            Assert.Single(store.Deployments, d => d.OrgId == orgB);
+            Assert.Single(store.Invitations, i => i.OrgId == orgB);
 
             var auditEntries = _auditLog.QueryByAction("org_deleted_cascade");
             Assert.Single(auditEntries);
             var entry = auditEntries[0];
-            Assert.Equal(orgId.ToString(), entry.OrganizationId);
+            Assert.Equal(orgA.ToString(), entry.OrganizationId);
             Assert.Equal(2, entry.DeletedItems!["deployments"]);
-            Assert.Equal(3, entry.DeletedItems!["users"]);
-            Assert.Equal(4, entry.DeletedItems!["api_keys"]);
-            Assert.Equal(2, entry.DeletedItems!["sessions"]);
+            Assert.Equal(1, entry.DeletedItems!["api_keys"]);
+            Assert.Equal(1, entry.DeletedItems!["invitations"]);
+            Assert.Equal(2, entry.DeletedItems!["memberships"]);
+            Assert.False(entry.DeletedItems!.ContainsKey("users"));
+            Assert.Equal(2, _auditLog.QueryByAction("deployment_deleted_cascade").Count);
         }
 
         // ─────────────────────────────────────────────────────────────────────
         // TEST 7: cascade on error → rollback (no partial deletes)
         // ─────────────────────────────────────────────────────────────────────
+        /// <summary>
+        /// RBAC-07 on the real transactional service: the fault hook throws when the cascade reaches "files", after
+        /// sessions and keys were already cleared; everything is restored and no audit row remains. Rewritten
+        /// 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the old test exercised a failing service defined in this file,
+        /// so it never tested the implementation's rollback.
+        /// </summary>
+        // RBAC-07
         [Fact]
         public void CascadeDeleteUser_RollbackOnFailure_NoPartialDeletes()
         {
@@ -315,12 +386,11 @@ namespace AOI.Rbac.Tests
                 Sessions = new List<Guid> { Guid.NewGuid(), Guid.NewGuid() },
                 ApiKeys = new List<Guid> { Guid.NewGuid() },
                 Files = new List<Guid> { Guid.NewGuid() },
-                Preferences = new List<string> { "theme" }
+                Preferences = new List<string> { "theme" },
+                BeforeDelete = table => { if (table == "files") throw new InvalidOperationException("Simulated DB failure during cascade"); }
             };
 
-            // Simulate a failure by using a service that throws
-            var failingService = new FailingCascadeService(_auditLog);
-            var (success, error) = failingService.DeleteUser(userId, context);
+            var (success, error) = _rbac.TransactionalService.DeleteUserTransactional(userId, context);
 
             Assert.False(success);
             Assert.NotNull(error);
@@ -331,8 +401,10 @@ namespace AOI.Rbac.Tests
             Assert.Equal(1, context.ApiKeys.Count);
             Assert.Equal(1, context.Files.Count);
             Assert.Equal(1, context.Preferences.Count);
+            Assert.Empty(_auditLog.QueryByAction("user_deleted_cascade"));
         }
 
+        /// <summary>RBAC-07 for a deployment: fails at theme_configs after DNS rows were cleared; all restored. Rewritten 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (real service).</summary>
         [Fact]
         public void CascadeDeleteDeployment_RollbackOnFailure_NoPartialDeletes()
         {
@@ -341,11 +413,11 @@ namespace AOI.Rbac.Tests
             {
                 DnsRecords = new List<string> { "a.example.com" },
                 ThemeConfigs = new List<string> { "default" },
-                DeploymentLogs = new List<string> { "log1" }
+                DeploymentLogs = new List<string> { "log1" },
+                BeforeDelete = table => { if (table == "theme_configs") throw new InvalidOperationException("Simulated DB failure during cascade"); }
             };
 
-            var failingService = new FailingCascadeService(_auditLog);
-            var (success, error) = failingService.DeleteDeployment(deploymentId, context);
+            var (success, error) = _rbac.TransactionalService.DeleteDeploymentTransactional(deploymentId, context);
 
             Assert.False(success);
             Assert.NotNull(error);
@@ -357,34 +429,37 @@ namespace AOI.Rbac.Tests
             Assert.False(context.ArchivedToS3);
         }
 
+        /// <summary>
+        /// RBAC-07 for an organization: fails at "invitations" after both deployments' rows, the deployments and the org
+        /// key were deleted (and two deployment audit rows written); everything, audit included, is restored.
+        /// Rewritten 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (real service, RBAC-06 model).
+        /// </summary>
         [Fact]
         public void CascadeDeleteOrganization_RollbackOnFailure_NoPartialDeletes()
         {
-            var orgId = Guid.NewGuid();
-            var context = new CascadeDeleteContext
-            {
-                Deployments = new List<Guid> { Guid.NewGuid() },
-                Users = new List<Guid> { Guid.NewGuid() },
-                OrgApiKeys = new List<Guid> { Guid.NewGuid() },
-                OrgSessions = new List<Guid> { Guid.NewGuid() }
-            };
+            var (store, orgA, _, ownerA, _, _) = BuildOrgs();
+            store.BeforeDelete = table => { if (table == "invitations") throw new InvalidOperationException("Simulated DB failure during cascade"); };
 
-            var failingService = new FailingCascadeService(_auditLog);
-            var (success, error) = failingService.DeleteOrganization(orgId, context);
+            var (success, error) = _rbac.TransactionalService.DeleteOrganizationTransactional(ownerA, orgA, store);
 
             Assert.False(success);
             Assert.NotNull(error);
+            Assert.Equal(500, error!.Code);
 
             // Verify rollback
-            Assert.Single(context.Deployments);
-            Assert.Single(context.Users);
-            Assert.Single(context.OrgApiKeys);
-            Assert.Single(context.OrgSessions);
+            Assert.Equal(2, store.Deployments.Count(d => d.OrgId == orgA));
+            Assert.All(store.Deployments.Where(d => d.OrgId == orgA), d => Assert.Single(d.Children.DnsRecords));
+            Assert.Single(store.ApiKeys, k => k.OrgId == orgA);
+            Assert.Single(store.Invitations, i => i.OrgId == orgA);
+            Assert.Equal(2, store.Memberships.Count(m => m.OrgId == orgA));
+            Assert.Empty(_auditLog.QueryByAction("deployment_deleted_cascade"));
+            Assert.Empty(_auditLog.QueryByAction("org_deleted_cascade"));
         }
 
         // ─────────────────────────────────────────────────────────────────────
         // TEST 8: permission audit logged → queries show who accessed what
         // ─────────────────────────────────────────────────────────────────────
+        // RBAC-08
         [Fact]
         public void PermissionAudit_LogsAllChecks()
         {
@@ -459,6 +534,7 @@ namespace AOI.Rbac.Tests
         // ─────────────────────────────────────────────────────────────────────
         // TEST 9: tier hierarchy → member cannot do admin actions, admin cannot do owner actions
         // ─────────────────────────────────────────────────────────────────────
+        // RBAC-09
         [Fact]
         public void TierHierarchy_MemberCannotDoAdminActions()
         {
@@ -470,6 +546,7 @@ namespace AOI.Rbac.Tests
             Assert.Equal(403, result.Error.Code);
         }
 
+        // RBAC-09
         [Fact]
         public void TierHierarchy_AdminCannotDoOwnerActions()
         {
@@ -534,6 +611,7 @@ namespace AOI.Rbac.Tests
         // ─────────────────────────────────────────────────────────────────────
         // TEST 10: permission check response time < 10ms → no performance impact
         // ─────────────────────────────────────────────────────────────────────
+        // RBAC-10
         [Fact]
         public void PermissionCheck_ResponseTime_Under10ms()
         {
@@ -658,106 +736,19 @@ namespace AOI.Rbac.Tests
             Assert.Equal(deploymentId.ToString(), entries[0].DeploymentId);
         }
 
+        /// <summary>The org cascade logs org_deleted_cascade with the org id and the caller. Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (RBAC-06 model).</summary>
         [Fact]
         public void CascadeAudit_OrgDeleted_LoggedWithCorrectAction()
         {
-            var orgId = Guid.NewGuid();
-            var context = new CascadeDeleteContext
-            {
-                Deployments = new List<Guid> { Guid.NewGuid() },
-                Users = new List<Guid> { Guid.NewGuid() },
-                OrgApiKeys = new List<Guid> { Guid.NewGuid() },
-                OrgSessions = new List<Guid> { Guid.NewGuid() }
-            };
+            var (store, orgA, _, ownerA, _, _) = BuildOrgs();
 
-            _rbac.CascadeService.DeleteOrganization(orgId, context);
+            _rbac.CascadeService.DeleteOrganization(ownerA, orgA, store);
 
             var entries = _auditLog.QueryByAction("org_deleted_cascade");
             Assert.Single(entries);
-            Assert.Equal(orgId.ToString(), entries[0].OrganizationId);
+            Assert.Equal(orgA.ToString(), entries[0].OrganizationId);
+            Assert.Equal(ownerA.Id, entries[0].UserId);
         }
 
-        // ─────────────────────────────────────────────────────────────────────
-        // Helper: Failing cascade service for rollback tests
-        // ─────────────────────────────────────────────────────────────────────
-        private class FailingCascadeService
-        {
-            private readonly AuditLogStore _auditLog;
-
-            public FailingCascadeService(AuditLogStore auditLog)
-            {
-                _auditLog = auditLog;
-            }
-
-            public (bool Success, ErrorResponse? Error) DeleteUser(Guid userId, CascadeDeleteContext context)
-            {
-                // Snapshot
-                var snapshotSessions = new List<Guid>(context.Sessions);
-                var snapshotKeys = new List<Guid>(context.ApiKeys);
-                var snapshotFiles = new List<Guid>(context.Files);
-                var snapshotPrefs = new List<string>(context.Preferences);
-
-                try
-                {
-                    // Simulate partial delete then failure
-                    context.Sessions.Clear();
-                    context.ApiKeys.Clear();
-                    throw new InvalidOperationException("Simulated DB failure during cascade");
-                }
-                catch (Exception)
-                {
-                    // Rollback
-                    context.Sessions = snapshotSessions;
-                    context.ApiKeys = snapshotKeys;
-                    context.Files = snapshotFiles;
-                    context.Preferences = snapshotPrefs;
-                    return (false, ErrorResponse.PermissionDenied("cascade_rollback", 500, "Cascade delete failed, transaction rolled back"));
-                }
-            }
-
-            public (bool Success, ErrorResponse? Error) DeleteDeployment(Guid deploymentId, CascadeDeleteContext context)
-            {
-                var snapshotDns = new List<string>(context.DnsRecords);
-                var snapshotThemes = new List<string>(context.ThemeConfigs);
-                var snapshotLogs = new List<string>(context.DeploymentLogs);
-                var snapshotArchived = context.ArchivedToS3;
-
-                try
-                {
-                    context.DnsRecords.Clear();
-                    throw new InvalidOperationException("Simulated DB failure during cascade");
-                }
-                catch (Exception)
-                {
-                    context.DnsRecords = snapshotDns;
-                    context.ThemeConfigs = snapshotThemes;
-                    context.DeploymentLogs = snapshotLogs;
-                    context.ArchivedToS3 = snapshotArchived;
-                    return (false, ErrorResponse.PermissionDenied("cascade_rollback", 500, "Cascade delete failed, transaction rolled back"));
-                }
-            }
-
-            public (bool Success, ErrorResponse? Error) DeleteOrganization(Guid orgId, CascadeDeleteContext context)
-            {
-                var snapshotDeployments = new List<Guid>(context.Deployments);
-                var snapshotUsers = new List<Guid>(context.Users);
-                var snapshotKeys = new List<Guid>(context.OrgApiKeys);
-                var snapshotSessions = new List<Guid>(context.OrgSessions);
-
-                try
-                {
-                    context.Deployments.Clear();
-                    throw new InvalidOperationException("Simulated DB failure during cascade");
-                }
-                catch (Exception)
-                {
-                    context.Deployments = snapshotDeployments;
-                    context.Users = snapshotUsers;
-                    context.OrgApiKeys = snapshotKeys;
-                    context.OrgSessions = snapshotSessions;
-                    return (false, ErrorResponse.PermissionDenied("cascade_rollback", 500, "Cascade delete failed, transaction rolled back"));
-                }
-            }
-        }
     }
 }

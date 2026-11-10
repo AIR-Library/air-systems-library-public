@@ -258,11 +258,15 @@ namespace BackgroundJobs
         /// Atomically moves an enqueued job to running (status, started_at, progress "0/0") and opens a job_runs row.
         /// Output: false when another worker or a cancel got there first. Added 2026-11-10 (session
         /// session_012zDydZCZ4AChqhEZ4oVtaP). Touches: jobs, job_runs.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP (JOBS-03 amendment): the conditional update also requires
+        /// the job to be due (scheduled_at and next_retry_at passed), so a job waiting for its retry is never claimed early.
         /// </summary>
         public async Task<bool> ClaimAsync(Guid jobId, DateTime now)
         {
             var claimed = await _db.Jobs
-                .Where(j => j.Id == jobId && j.Status == JobStatus.Enqueued)
+                .Where(j => j.Id == jobId && j.Status == JobStatus.Enqueued &&
+                            (j.ScheduledAt == null || j.ScheduledAt <= now) &&
+                            (j.NextRetryAt == null || j.NextRetryAt <= now))
                 .ExecuteUpdateAsync(u => u
                     .SetProperty(j => j.Status, JobStatus.Running)
                     .SetProperty(j => j.StartedAt, now)
@@ -287,18 +291,20 @@ namespace BackgroundJobs
         }
 
         /// <summary>
-        /// Records a failed attempt: retry_count + 1; past max_retries the job is failed for good, otherwise it is
-        /// re-enqueued with next_retry_at = now + 2^(retry_count-1) seconds (1s, 2s, 4s, ...; spec "Exponential
-        /// backoff"). Output: the job's new status. Added 2026-11-10 (session session_012zDydZCZ4AChqhEZ4oVtaP): the
-        /// old code saved the final failure without its retry count. Touches: jobs, job_runs.
+        /// Records a failed attempt (JOBS-03/04, amended 2026-11-10). max_retries counts retries AFTER the first attempt,
+        /// so a job runs at most max_retries + 1 times. While retries remain: retry_count = n (the retry now scheduled),
+        /// status 'enqueued', next_retry_at = now + 2^(n-1) seconds (1s, 2s, 4s, ...). When the last attempt fails
+        /// (retry_count already = max_retries): status 'failed', retry_count stays max_retries, next_retry_at null.
+        /// In: job id, the error, the failure time. Output: the job's new status.
+        /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the final failure counted one retry too many
+        /// (max_retries = 3 ended with retry_count = 4). Touches: jobs, job_runs.
         /// </summary>
         public async Task<JobStatus> RecordFailureAsync(Guid jobId, string error, DateTime now)
         {
             var job = await _db.Jobs.FirstOrDefaultAsync(j => j.Id == jobId);
             if (job == null) return JobStatus.Failed;
-            job.RetryCount++;
             job.Error = error;
-            if (job.RetryCount > job.MaxRetries)
+            if (job.RetryCount >= job.MaxRetries)
             {
                 job.Status = JobStatus.Failed;
                 job.CompletedAt = now;
@@ -306,6 +312,7 @@ namespace BackgroundJobs
             }
             else
             {
+                job.RetryCount++;
                 job.Status = JobStatus.Enqueued;
                 job.NextRetryAt = now.AddSeconds(Math.Pow(2, job.RetryCount - 1));
             }
@@ -485,22 +492,32 @@ namespace BackgroundJobs
     }
 
     /// <summary>
-    /// send_bulk_email: walks the recipients in batches, reporting "sent/total" progress. This template simulates
-    /// sending (no SMTP); a real one calls the Notifications system per recipient. Touches: jobs (progress).
+    /// send_bulk_email: walks the recipients in about 20 batches, reporting "sent/total" progress after each. This
+    /// template simulates sending (no SMTP); a real one calls the Notifications system per recipient.
+    /// params.count sets how many recipients to walk (default 500, at most 1,000,000).
+    /// Changed 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: the count was fixed at 500 in batches of 25 with a 100 ms
+    /// pause each, so JOBS-08 (10,000 items) could not be shown; batches now scale with the count. Touches: jobs (progress).
     /// </summary>
     public class SendBulkEmailHandler : IJobHandler
     {
         /// <summary>Runs this task for one job and returns its result; throws to make the job retry. 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP. Touches: see the class summary.</summary>
         public async Task<object> ExecuteAsync(Job job, IJobRepository repo, CancellationToken ct)
         {
-            const int total = 500;
+            var total = 500;
+            using (var doc = JsonDocument.Parse(job.ParamsJson))
+            {
+                if (doc.RootElement.ValueKind == JsonValueKind.Object &&
+                    doc.RootElement.TryGetProperty("count", out var c) && c.TryGetInt32(out var n))
+                    total = Math.Clamp(n, 0, 1_000_000);
+            }
+            var batch = Math.Max(25, (total + 19) / 20);
             int sent = 0;
             await repo.UpdateProgressAsync(job.Id, $"0/{total}");
             for (int i = 1; i <= total; i++)
             {
                 ct.ThrowIfCancellationRequested();
                 sent++;
-                if (i % 25 == 0)
+                if (i % batch == 0 || i == total)
                 {
                     await Task.Delay(100, ct); // one simulated batch
                     await repo.UpdateProgressAsync(job.Id, $"{i}/{total}");
@@ -624,11 +641,18 @@ namespace BackgroundJobs
         public static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(500);
         private readonly IServiceProvider _sp;
         private readonly ILogger<JobProcessor> _logger;
+        private readonly Func<DateTime> _clock;
 
-        public JobProcessor(IServiceProvider sp, ILogger<JobProcessor> logger)
+        /// <summary>
+        /// Builds the worker. In: the service provider (scoped repository, dispatcher), a logger and an optional clock
+        /// returning UTC now (default DateTime.UtcNow). Why the clock: JOBS-03/04 check the 1s/2s/4s waits exactly,
+        /// without sleeping. 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP. Touches nothing on construction.
+        /// </summary>
+        public JobProcessor(IServiceProvider sp, ILogger<JobProcessor> logger, Func<DateTime>? clock = null)
         {
             _sp = sp;
             _logger = logger;
+            _clock = clock ?? (() => DateTime.UtcNow);
         }
 
         /// <summary>Polls until the host stops. Touches: see the class summary.</summary>
@@ -657,7 +681,8 @@ namespace BackgroundJobs
         /// OperationCanceledException when the host stops, after re-enqueueing the job that was running (see
         /// <see cref="IJobRepository.RequeueInterruptedAsync"/>). Internal (was private) so a test can run one poll
         /// deterministically. Changed 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP (CodeRabbit review on PR 19).
-        /// Touches: jobs, job_runs, and whatever the handlers touch.
+        /// Changed again 2026-11-10, session_012zDydZCZ4AChqhEZ4oVtaP: "now" (due check, claim, failure time) comes from
+        /// the injected clock. Touches: jobs, job_runs, and whatever the handlers touch.
         /// </summary>
         internal async Task ProcessPendingJobs(CancellationToken ct)
         {
@@ -665,7 +690,7 @@ namespace BackgroundJobs
             using (var scope = _sp.CreateScope())
             {
                 var db = scope.ServiceProvider.GetRequiredService<JobsDbContext>();
-                var now = DateTime.UtcNow;
+                var now = _clock();
                 due = await db.Jobs
                     .AsNoTracking()
                     .Where(j => j.Status == JobStatus.Enqueued &&
@@ -682,7 +707,7 @@ namespace BackgroundJobs
                 ct.ThrowIfCancellationRequested();
                 using var scope = _sp.CreateScope();
                 var repo = scope.ServiceProvider.GetRequiredService<IJobRepository>();
-                if (!await repo.ClaimAsync(jobId, DateTime.UtcNow)) continue; // cancelled or taken meanwhile
+                if (!await repo.ClaimAsync(jobId, _clock())) continue; // cancelled, taken or not yet due
                 var job = await repo.GetAsync(jobId);
                 if (job == null) continue;
                 try
@@ -698,7 +723,7 @@ namespace BackgroundJobs
                     // stay "running" forever. CodeRabbit review on PR 19; 2026-11-10, session session_012zDydZCZ4AChqhEZ4oVtaP.
                     try
                     {
-                        await repo.RequeueInterruptedAsync(job.Id, DateTime.UtcNow);
+                        await repo.RequeueInterruptedAsync(job.Id, _clock());
                     }
                     // Only database failures are caught (ExecuteUpdate raises the provider's DbException, SaveChanges a
                     // DbUpdateException); the cancellation is rethrown either way. Narrowed from a catch-all for code
@@ -716,7 +741,7 @@ namespace BackgroundJobs
                 catch (Exception ex)
                 {
                     _logger.LogWarning("Job {JobId} ({TaskType}) attempt failed: {Error}", job.Id, job.TaskType, ex.Message);
-                    await repo.RecordFailureAsync(job.Id, ex.Message, DateTime.UtcNow);
+                    await repo.RecordFailureAsync(job.Id, ex.Message, _clock());
                 }
             }
         }
